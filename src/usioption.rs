@@ -88,7 +88,13 @@ impl UsiOptions {
         options.insert(Self::BOOK_FILE, UsiOptionValue::filename("book/20191216/book.json"));
         options.insert(Self::BYOYOMI_MARGIN, UsiOptionValue::spin(500, 0, i64::MAX));
         options.insert(Self::CLEAR_HASH, UsiOptionValue::Button);
-        options.insert(Self::EVAL_DIR, UsiOptionValue::string("eval/20190617"));
+        #[cfg(feature = "kppt")]
+        const EVAL_DIR_DEFAULT: &str = "eval/20190617";
+        #[cfg(feature = "nnue")]
+        const EVAL_DIR_DEFAULT: &str = "eval/nnue";
+        #[cfg(feature = "material")]
+        const EVAL_DIR_DEFAULT: &str = "";
+        options.insert(Self::EVAL_DIR, UsiOptionValue::string(EVAL_DIR_DEFAULT));
         #[cfg(feature = "kppt")]
         options.insert(Self::EVAL_HASH, UsiOptionValue::spin(256, 1, 1024 * 1024));
         options.insert(Self::MULTI_PV, UsiOptionValue::spin(1, 1, 500));

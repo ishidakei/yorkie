@@ -3,6 +3,8 @@ use crate::book::*;
 use crate::evaluate::kppt::*;
 #[cfg(feature = "material")]
 use crate::evaluate::material::*;
+#[cfg(feature = "nnue")]
+use crate::evaluate::nnue::evaluate_at_root;
 use crate::file_to_vec::*;
 use crate::huffman_code::*;
 use crate::learn::*;
@@ -111,6 +113,13 @@ fn isready(
         if *is_ready {
             return Ok(());
         }
+        #[cfg(feature = "nnue")]
+        {
+            let eval_dir = usi_options.get_string(UsiOptions::EVAL_DIR);
+            for line in nnue_isready_lines(&eval_dir) {
+                println!("{}", line);
+            }
+        }
         #[cfg(feature = "kppt")]
         load_evaluate_files(&usi_options.get_string(UsiOptions::EVAL_DIR))?;
         if usi_options.get_bool(UsiOptions::BOOK_ENABLE) {
@@ -134,6 +143,24 @@ fn isready(
     ) {
         Ok(()) => println!("readyok"),
         Err(e) => println!("info {}", e),
+    }
+}
+
+#[cfg(feature = "nnue")]
+fn nnue_isready_lines(eval_dir: &str) -> Vec<String> {
+    if eval_dir.is_empty() {
+        return vec!["info string nnue: Eval_Dir is not set".to_string()];
+    }
+    let requested = std::path::PathBuf::from(format!("{}/nn.bin", eval_dir));
+    if crate::evaluate::nnue::loaded_path().as_deref() == Some(requested.as_path()) {
+        return Vec::new();
+    }
+    match crate::evaluate::nnue::load_network_from_path(&requested) {
+        Ok(()) => {
+            let sha = crate::evaluate::nnue::loaded_sha256_hex().unwrap_or_default();
+            vec![format!("info string nnue: loaded {} sha256 {}", requested.display(), sha)]
+        }
+        Err(e) => vec![format!("info string nnue: {}", e)],
     }
 }
 
@@ -669,5 +696,55 @@ mod tests {
                 "sfen lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1 moves 2g2f 3c3d"
             );
         }
+    }
+
+    #[cfg(feature = "nnue")]
+    #[test]
+    fn nnue_isready_lines_reports_empty_eval_dir() {
+        let _guard = crate::evaluate::nnue::TEST_MUTEX.lock().expect("TEST_MUTEX poisoned");
+        crate::evaluate::nnue::clear_loaded_for_test();
+
+        let lines = nnue_isready_lines("");
+        assert_eq!(lines, vec!["info string nnue: Eval_Dir is not set".to_string()]);
+        assert!(!crate::evaluate::nnue::is_loaded());
+    }
+
+    #[cfg(feature = "nnue")]
+    #[test]
+    fn nnue_isready_lines_surfaces_loader_error_without_mutating_slot() {
+        let _guard = crate::evaluate::nnue::TEST_MUTEX.lock().expect("TEST_MUTEX poisoned");
+        crate::evaluate::nnue::clear_loaded_for_test();
+
+        let missing_dir = "/definitely-does-not-exist-28-wire";
+        let lines = nnue_isready_lines(missing_dir);
+        assert_eq!(lines.len(), 1, "expected exactly one info line, got {:?}", lines);
+        assert!(
+            lines[0].starts_with("info string nnue: "),
+            "line does not carry the nnue prefix: {}",
+            lines[0]
+        );
+        assert!(!crate::evaluate::nnue::is_loaded());
+    }
+
+    #[cfg(feature = "nnue")]
+    #[test]
+    fn nnue_isready_lines_is_idempotent_for_same_path() {
+        use std::sync::Arc;
+        let _guard = crate::evaluate::nnue::TEST_MUTEX.lock().expect("TEST_MUTEX poisoned");
+        crate::evaluate::nnue::clear_loaded_for_test();
+
+        let eval_dir = "/tmp/apery-nnue-idempotent";
+        let path = std::path::PathBuf::from(format!("{}/nn.bin", eval_dir));
+        let mut sha = [0u8; 32];
+        sha[0] = 0x01;
+        sha[31] = 0xEE;
+        let net = Arc::new(crate::evaluate::nnue::make_placeholder_network(sha));
+        crate::evaluate::nnue::set_loaded_for_test(net, path.clone());
+
+        let lines = nnue_isready_lines(eval_dir);
+        assert!(lines.is_empty(), "expected no lines for already-loaded path, got {:?}", lines);
+        assert!(crate::evaluate::nnue::is_loaded());
+
+        crate::evaluate::nnue::clear_loaded_for_test();
     }
 }
