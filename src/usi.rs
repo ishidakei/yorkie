@@ -98,23 +98,44 @@ fn go(
 
 fn isready(
     is_ready: &mut bool,
-    usi_options: &UsiOptions,
+    usi_options: &mut UsiOptions,
     thread_pool: &mut ThreadPool,
     tt: &mut TranspositionTable,
     #[cfg(feature = "kppt")] ehash: &mut EvalHash,
+    reductions: &mut Reductions,
 ) {
     fn isready_impl(
         is_ready: &mut bool,
-        usi_options: &UsiOptions,
+        usi_options: &mut UsiOptions,
         thread_pool: &mut ThreadPool,
         tt: &mut TranspositionTable,
         #[cfg(feature = "kppt")] ehash: &mut EvalHash,
+        reductions: &mut Reductions,
     ) -> Result<()> {
         if *is_ready {
             return Ok(());
         }
+        // Apply eval_options.txt before any evaluator initialisation so its
+        // overrides reach the upcoming nn.bin / load_evaluate_files calls.
+        let eval_dir = usi_options.get_string(UsiOptions::EVAL_DIR);
+        if !eval_dir.is_empty() {
+            let path = format!("{}/eval_options.txt", eval_dir);
+            let lines = usi_options.read_eval_options(
+                std::path::Path::new(&path),
+                thread_pool,
+                tt,
+                #[cfg(feature = "kppt")]
+                ehash,
+                reductions,
+                is_ready,
+            );
+            for line in lines {
+                println!("{}", line);
+            }
+        }
         #[cfg(feature = "nnue")]
         {
+            // Re-read in case eval_options.txt rewrote Eval_Dir.
             let eval_dir = usi_options.get_string(UsiOptions::EVAL_DIR);
             for line in nnue_isready_lines(&eval_dir) {
                 println!("{}", line);
@@ -140,6 +161,7 @@ fn isready(
         tt,
         #[cfg(feature = "kppt")]
         ehash,
+        reductions,
     ) {
         Ok(()) => println!("readyok"),
         Err(e) => println!("info {}", e),
@@ -604,11 +626,12 @@ pub fn cmd_loop() {
             "isready" => {
                 isready(
                     &mut is_ready,
-                    &usi_options,
+                    &mut usi_options,
                     &mut thread_pool,
                     &mut tt,
                     #[cfg(feature = "kppt")]
                     &mut ehash,
+                    &mut reductions,
                 );
             }
             "ponderhit" => {
