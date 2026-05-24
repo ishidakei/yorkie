@@ -1,5 +1,7 @@
 #[cfg(feature = "kppt")]
 use crate::evaluate::kppt::*;
+#[cfg(feature = "nnue")]
+use crate::evaluate::nnue;
 use crate::movegen::*;
 use crate::movepick::*;
 use crate::movetypes::*;
@@ -141,7 +143,8 @@ impl RootMove {
 
 pub type RootMoves = Vec<RootMove>;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
+#[cfg_attr(not(feature = "nnue"), derive(Copy))]
 pub struct Stack {
     pub continuation_history: *mut PieceToHistory,
     pub ply: i32,
@@ -157,6 +160,8 @@ pub struct Stack {
     pub tt_pv: bool,
     pub tt_hit: bool,
     pub double_extensions: i32,
+    #[cfg(feature = "nnue")]
+    pub accumulator: nnue::types::Accumulator,
 }
 
 impl Stack {
@@ -176,7 +181,64 @@ impl Stack {
             tt_pv: false,
             tt_hit: false,
             double_extensions: 0,
+            #[cfg(feature = "nnue")]
+            accumulator: nnue::types::Accumulator::zeroed(),
         }
+    }
+}
+
+#[cfg(feature = "nnue")]
+pub fn do_move_with_accumulator(
+    stack: &mut [Stack],
+    ply: usize,
+    pos: &mut Position,
+    mv: Move,
+    gives_check: bool,
+    net: &nnue::types::NnueNetwork,
+) {
+    debug_assert!(ply + 1 < stack.len());
+
+    let must_refresh = !stack[ply].accumulator.computed
+        || nnue::features::requires_full_refresh(pos, mv, Color::BLACK)
+        || nnue::features::requires_full_refresh(pos, mv, Color::WHITE);
+
+    if must_refresh {
+        pos.do_move(mv, gives_check);
+        nnue::transformer::refresh(&mut stack[ply + 1].accumulator, net, pos);
+        return;
+    }
+
+    // feature_diff needs the pre-move position; collect before do_move.
+    let (removed_black, added_black) = nnue::features::feature_diff(pos, mv, Color::BLACK);
+    let (removed_white, added_white) = nnue::features::feature_diff(pos, mv, Color::WHITE);
+
+    pos.do_move(mv, gives_check);
+
+    let (before, after) = stack.split_at_mut(ply + 1);
+    nnue::transformer::update_on_move(
+        &before[ply].accumulator,
+        &mut after[0].accumulator,
+        net,
+        &removed_black,
+        &added_black,
+        &removed_white,
+        &added_white,
+    );
+
+    #[cfg(debug_assertions)]
+    {
+        let mut tmp = nnue::types::Accumulator::zeroed();
+        nnue::transformer::refresh(&mut tmp, net, pos);
+        debug_assert_eq!(
+            tmp.us,
+            stack[ply + 1].accumulator.us,
+            "nnue: incremental `.us` drifted from fresh refresh"
+        );
+        debug_assert_eq!(
+            tmp.them,
+            stack[ply + 1].accumulator.them,
+            "nnue: incremental `.them` drifted from fresh refresh"
+        );
     }
 }
 
@@ -363,5 +425,75 @@ impl Mate {
                 println!("checkmate none");
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "nnue"))]
+mod nnue_tests {
+    use super::*;
+    use crate::evaluate::nnue::test_fixtures::{run_with_large_stack, synthetic_net};
+    use crate::evaluate::nnue::{self, types::Accumulator};
+
+    #[test]
+    fn do_move_with_accumulator_matches_fresh_refresh() {
+        run_with_large_stack(|| {
+            let net = synthetic_net();
+            let mut pos = Position::new();
+            let mut stack: Vec<Stack> = (0..10).map(|_| Stack::new()).collect();
+
+            nnue::transformer::refresh(&mut stack[0].accumulator, net, &pos);
+
+            let usi_moves = ["7g7f", "3c3d", "2g2f", "8c8d"];
+            for (ply, usi) in usi_moves.iter().enumerate() {
+                let mv = Move::new_from_usi_str(usi, &pos).expect("legal move");
+                let gives_check = pos.gives_check(mv);
+                do_move_with_accumulator(&mut stack, ply, &mut pos, mv, gives_check, net);
+                assert!(stack[ply + 1].accumulator.computed);
+            }
+
+            let mut expected = Accumulator::zeroed();
+            nnue::transformer::refresh(&mut expected, net, &pos);
+            assert_eq!(stack[usi_moves.len()].accumulator.us, expected.us);
+            assert_eq!(stack[usi_moves.len()].accumulator.them, expected.them);
+        });
+    }
+
+    #[test]
+    fn do_move_with_accumulator_refreshes_on_king_move() {
+        run_with_large_stack(|| {
+            let net = synthetic_net();
+            let mut pos = Position::new_from_sfen("4k4/9/9/9/9/9/9/9/4K4 b - 1").expect("valid sfen");
+            let mut stack: Vec<Stack> = (0..4).map(|_| Stack::new()).collect();
+            nnue::transformer::refresh(&mut stack[0].accumulator, net, &pos);
+
+            let mv = Move::new_from_usi_str("5i5h", &pos).expect("legal king move");
+            assert!(nnue::features::requires_full_refresh(&pos, mv, Color::BLACK));
+            let gives_check = pos.gives_check(mv);
+            do_move_with_accumulator(&mut stack, 0, &mut pos, mv, gives_check, net);
+
+            let mut expected = Accumulator::zeroed();
+            nnue::transformer::refresh(&mut expected, net, &pos);
+            assert_eq!(stack[1].accumulator.us, expected.us);
+            assert_eq!(stack[1].accumulator.them, expected.them);
+        });
+    }
+
+    #[test]
+    fn do_move_with_accumulator_forces_refresh_when_prev_not_computed() {
+        run_with_large_stack(|| {
+            let net = synthetic_net();
+            let mut pos = Position::new();
+            let mut stack: Vec<Stack> = (0..4).map(|_| Stack::new()).collect();
+            // stack[0].accumulator.computed is false: no refresh call.
+
+            let mv = Move::new_from_usi_str("7g7f", &pos).expect("legal move");
+            let gives_check = pos.gives_check(mv);
+            do_move_with_accumulator(&mut stack, 0, &mut pos, mv, gives_check, net);
+
+            let mut expected = Accumulator::zeroed();
+            nnue::transformer::refresh(&mut expected, net, &pos);
+            assert_eq!(stack[1].accumulator.us, expected.us);
+            assert_eq!(stack[1].accumulator.them, expected.them);
+        });
     }
 }

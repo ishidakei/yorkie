@@ -3,6 +3,8 @@ use crate::book::*;
 use crate::evaluate::kppt::*;
 #[cfg(feature = "material")]
 use crate::evaluate::material::*;
+#[cfg(feature = "nnue")]
+use crate::evaluate::nnue::{self, current_network, evaluate, evaluate_at_root};
 use crate::movegen::*;
 use crate::movepick::*;
 use crate::movetypes::*;
@@ -53,6 +55,10 @@ struct Thread {
     best_move_changess: Vec<Arc<AtomicU64>>,
 
     nodes: Arc<AtomicI64>,
+    // Cached for the duration of one search so descent sites avoid re-locking
+    // the process-wide RwLock. Populated in iterative_deepening_loop.
+    #[cfg(feature = "nnue")]
+    nnue_network: Option<Arc<nnue::types::NnueNetwork>>,
     // following variables are shared one object that ThreadPool has.
     best_previous_score: Arc<Mutex<Value>>,
     iter_values: Arc<Mutex<[Value; 4]>>,
@@ -110,7 +116,7 @@ impl Thread {
         });
     }
     fn iterative_deepening_loop(&mut self) {
-        let mut stack = [Stack::new(); MAX_PLY as usize + 10];
+        let mut stack: [Stack; MAX_PLY as usize + 10] = std::array::from_fn(|_| Stack::new());
         let mut best_value = -Value::INFINITE;
         let mut last_best_move = None;
         let mut last_best_move_depth = Depth::ZERO; // not Option<Depth>
@@ -146,6 +152,11 @@ impl Thread {
         self.tt_hit_average = TT_HIT_AVERAGE_WINDOW * TT_HIT_AVERAGE_RESOLUTION / 2;
 
         let mut search_again_counter = 0;
+
+        #[cfg(feature = "nnue")]
+        {
+            self.nnue_network = Some(current_network().expect("nnue network must be loaded before iterative_deepening_loop"));
+        }
 
         evaluate_at_root(&self.position, &mut stack);
         while {
@@ -726,6 +737,16 @@ impl Thread {
                         debug_assert!(depth.0 >= 5);
 
                         let gives_check = self.position.gives_check(m);
+                        #[cfg(feature = "nnue")]
+                        do_move_with_accumulator(
+                            stack,
+                            CURRENT_STACK_INDEX,
+                            &mut self.position,
+                            m,
+                            gives_check,
+                            self.nnue_network.as_ref().expect("nnue network must be loaded before search"),
+                        );
+                        #[cfg(not(feature = "nnue"))]
                         self.position.do_move(m, gives_check);
                         #[cfg(feature = "kppt")]
                         get_stack_mut(stack, 1).static_eval_raw.set_not_evaluated();
@@ -955,6 +976,16 @@ impl Thread {
             .get_mut(piece_moved_after_move, to);
 
             // Step 15
+            #[cfg(feature = "nnue")]
+            do_move_with_accumulator(
+                stack,
+                CURRENT_STACK_INDEX,
+                &mut self.position,
+                m,
+                gives_check,
+                self.nnue_network.as_ref().expect("nnue network must be loaded before search"),
+            );
+            #[cfg(not(feature = "nnue"))]
             self.position.do_move(m, gives_check);
 
             #[cfg(feature = "kppt")]
@@ -1367,6 +1398,16 @@ impl Thread {
                 continue;
             }
 
+            #[cfg(feature = "nnue")]
+            do_move_with_accumulator(
+                stack,
+                CURRENT_STACK_INDEX,
+                &mut self.position,
+                m,
+                gives_check,
+                self.nnue_network.as_ref().expect("nnue network must be loaded before search"),
+            );
+            #[cfg(not(feature = "nnue"))]
             self.position.do_move(m, gives_check);
             #[cfg(feature = "kppt")]
             get_stack_mut(stack, 1).static_eval_raw.set_not_evaluated();
@@ -1657,6 +1698,8 @@ impl ThreadPool {
                     best_move_changes: self.best_move_changess[i].clone(),
                     best_move_changess: self.best_move_changess.clone(),
                     nodes: self.nodess[i].clone(),
+                    #[cfg(feature = "nnue")]
+                    nnue_network: None,
                     best_previous_score: self.best_previous_score.clone(),
                     iter_values: self.iter_values.clone(),
                     increase_depth: self.increase_depth.clone(),

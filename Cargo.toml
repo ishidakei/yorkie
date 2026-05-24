@@ -3,7 +3,7 @@ name = "apery"
 version = "2.1.0"
 authors = ["HiraokaTakuya <hiraoka64@gmail.com>"]
 edition = "2021"
-rust-version = "1.75.0"
+rust-version = "1.89.0"
 
 [dependencies]
 anyhow = "1.0.86"
@@ -29,3 +29,4 @@ lto = true
 default = ["kppt"]
 kppt = []
 material = []
+nnue = []
