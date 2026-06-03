@@ -822,7 +822,7 @@ impl<'a> MagicTable<'a> {
         }
     }
 
-    pub fn magic(&self, sq: Square) -> &Magic {
+    pub fn magic(&self, sq: Square) -> &Magic<'_> {
         debug_assert!(0 <= sq.0 && (sq.0 as usize) < self.magics.len());
         unsafe { self.magics.get_unchecked(sq.0 as usize) }
     }

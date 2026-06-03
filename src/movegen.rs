@@ -9,7 +9,6 @@ pub trait AllowMovesTrait {
     const EVASIONS: bool;
     const LEGALS: bool;
     const ALL: bool;
-    const ALLOW_PSEUDO_LEGAL: bool;
 }
 
 pub struct CaptureOrPawnPromotionsType;
@@ -27,7 +26,6 @@ impl AllowMovesTrait for CaptureOrPawnPromotionsType {
     const EVASIONS: bool = false;
     const LEGALS: bool = false;
     const ALL: bool = false;
-    const ALLOW_PSEUDO_LEGAL: bool = true;
 }
 impl AllowMovesTrait for QuietsWithoutPawnPromotionsType {
     const ALLOW_CAPTURES: bool = false;
@@ -35,7 +33,6 @@ impl AllowMovesTrait for QuietsWithoutPawnPromotionsType {
     const EVASIONS: bool = false;
     const LEGALS: bool = false;
     const ALL: bool = false;
-    const ALLOW_PSEUDO_LEGAL: bool = true;
 }
 impl AllowMovesTrait for EvasionsType {
     const ALLOW_CAPTURES: bool = true;
@@ -43,7 +40,6 @@ impl AllowMovesTrait for EvasionsType {
     const EVASIONS: bool = true;
     const LEGALS: bool = false;
     const ALL: bool = false;
-    const ALLOW_PSEUDO_LEGAL: bool = true;
 }
 impl AllowMovesTrait for EvasionsAllType {
     const ALLOW_CAPTURES: bool = true;
@@ -51,7 +47,6 @@ impl AllowMovesTrait for EvasionsAllType {
     const EVASIONS: bool = true;
     const LEGALS: bool = false;
     const ALL: bool = true;
-    const ALLOW_PSEUDO_LEGAL: bool = true;
 }
 impl AllowMovesTrait for NonEvasionsType {
     const ALLOW_CAPTURES: bool = true;
@@ -59,7 +54,6 @@ impl AllowMovesTrait for NonEvasionsType {
     const EVASIONS: bool = false;
     const LEGALS: bool = false;
     const ALL: bool = false;
-    const ALLOW_PSEUDO_LEGAL: bool = true;
 }
 impl AllowMovesTrait for NonEvasionsAllType {
     const ALLOW_CAPTURES: bool = true;
@@ -67,7 +61,6 @@ impl AllowMovesTrait for NonEvasionsAllType {
     const EVASIONS: bool = false;
     const LEGALS: bool = false;
     const ALL: bool = true;
-    const ALLOW_PSEUDO_LEGAL: bool = true;
 }
 impl AllowMovesTrait for LegalType {
     const ALLOW_CAPTURES: bool = true;
@@ -75,7 +68,6 @@ impl AllowMovesTrait for LegalType {
     const EVASIONS: bool = false;
     const LEGALS: bool = true;
     const ALL: bool = false;
-    const ALLOW_PSEUDO_LEGAL: bool = false;
 }
 impl AllowMovesTrait for LegalAllType {
     const ALLOW_CAPTURES: bool = true;
@@ -83,7 +75,6 @@ impl AllowMovesTrait for LegalAllType {
     const EVASIONS: bool = false;
     const LEGALS: bool = true;
     const ALL: bool = true;
-    const ALLOW_PSEUDO_LEGAL: bool = false;
 }
 
 pub struct MoveList {

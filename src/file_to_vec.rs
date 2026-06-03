@@ -18,7 +18,7 @@ where
 {
     let mut f = std::fs::File::open(&input_file)?;
     let file_size = std::fs::metadata(&input_file)?.len() as usize;
-    if file_size % std::mem::size_of::<T>() != 0 {
+    if !file_size.is_multiple_of(std::mem::size_of::<T>()) {
         anyhow::bail!(
             "File size of {} must be a multiple of {}.",
             input_file,

@@ -634,14 +634,17 @@ pub fn load_evaluate_files(eval_dir: &str) -> Result<()> {
         path.push("KPP.bin");
         path.as_path().as_os_str().to_str().unwrap().to_string()
     };
-    unsafe { EVALUATOR.load_kpp(&kpp_file_name) }.map_err(|e| anyhow!("{}: {}", e, kpp_file_name))?;
+    // Raw pointer to avoid a reference to the mutable static (`static_mut_refs`); mutated
+    // only here at load time, before any concurrent reads.
+    let evaluator = &raw mut EVALUATOR;
+    unsafe { (*evaluator).load_kpp(&kpp_file_name) }.map_err(|e| anyhow!("{}: {}", e, kpp_file_name))?;
 
     let kkp_file_name = {
         let mut path = std::path::PathBuf::from(eval_dir);
         path.push("KKP.bin");
         path.as_path().as_os_str().to_str().unwrap().to_string()
     };
-    unsafe { EVALUATOR.load_kkp(&kkp_file_name) }.map_err(|e| anyhow!("{}: {}", e, kkp_file_name))?;
+    unsafe { (*evaluator).load_kkp(&kkp_file_name) }.map_err(|e| anyhow!("{}: {}", e, kkp_file_name))?;
 
     Ok(())
 }
@@ -649,17 +652,22 @@ pub fn load_evaluate_files(eval_dir: &str) -> Result<()> {
 pub fn write_evaluate_files() -> Result<()> {
     let kpp_file_name = "KPP.bin";
     let kkp_file_name = "KKP.bin";
-    unsafe { EVALUATOR.write_kpp(kpp_file_name) }.map_err(|e| anyhow!("{}: {}", e, kpp_file_name))?;
-    unsafe { EVALUATOR.write_kkp(kkp_file_name) }.map_err(|e| anyhow!("{}: {}", e, kkp_file_name))?;
+    let evaluator = &raw mut EVALUATOR;
+    unsafe { (*evaluator).write_kpp(kpp_file_name) }.map_err(|e| anyhow!("{}: {}", e, kpp_file_name))?;
+    unsafe { (*evaluator).write_kkp(kkp_file_name) }.map_err(|e| anyhow!("{}: {}", e, kkp_file_name))?;
     Ok(())
 }
 
 pub fn evaluate(pos: &mut Position, stack: &mut [Stack], ehash: *mut EvalHash) -> Value {
-    unsafe { EVALUATOR.evaluate_difference_calc(pos, stack, ehash) }
+    // Raw pointer to avoid a reference to the mutable static (`static_mut_refs`); immutable
+    // after `load_evaluate_files`.
+    let evaluator = &raw const EVALUATOR;
+    unsafe { (*evaluator).evaluate_difference_calc(pos, stack, ehash) }
 }
 
 pub fn evaluate_at_root(pos: &Position, stack: &mut [Stack]) -> Value {
-    unsafe { EVALUATOR.evaluate_at_root(pos, stack) }
+    let evaluator = &raw const EVALUATOR;
+    unsafe { (*evaluator).evaluate_at_root(pos, stack) }
 }
 
 #[derive(Clone, Copy)]

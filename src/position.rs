@@ -432,10 +432,10 @@ impl PositionBase {
                 ranks: rank_str_vec.len(),
             });
         }
+        let re = regex::Regex::new(r"(\d+|\+?[[:alpha:]])").unwrap();
         for (rank_idx, rank) in Rank::ALL_FROM_UPPER.iter().enumerate() {
             let rank_str = rank_str_vec[rank_idx];
             let mut file_idx: usize = 0;
-            let re = regex::Regex::new(r"(\d+|\+?[[:alpha:]])").unwrap();
             for cap in re.captures_iter(rank_str) {
                 if file_idx >= File::NUM {
                     return Err(SfenError::InvalidNumberOfFiles { files: file_idx });
@@ -1236,11 +1236,11 @@ impl Position {
                             return false;
                         }
                     }
-                    PieceType::BISHOP | PieceType::ROOK => {
-                        if T::IS_SEARCHING && (Rank::new(from).is_opponent_field(us) || Rank::new(to).is_opponent_field(us)) {
-                            // legal but avoid unpromote move.
-                            return false;
-                        }
+                    PieceType::BISHOP | PieceType::ROOK
+                        if T::IS_SEARCHING && (Rank::new(from).is_opponent_field(us) || Rank::new(to).is_opponent_field(us)) =>
+                    {
+                        // legal but avoid unpromote move.
+                        return false;
                     }
                     _ => {}
                 }

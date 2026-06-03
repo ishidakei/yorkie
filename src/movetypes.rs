@@ -36,9 +36,10 @@ impl Move {
     const PIECE_DROPPED_SHIFT: i32 = 9;
     pub const MOVED_PIECE_SHIFT: i32 = 16;
 
-    pub const NULL: Move = Move(unsafe { std::num::NonZeroU32::new_unchecked(1 | (1 << Move::FROM_SHIFT)) }); // !is_promotion() && to() == from()
-    pub const WIN: Move = Move(unsafe { std::num::NonZeroU32::new_unchecked(2 | (2 << Move::FROM_SHIFT)) });
-    pub const RESIGN: Move = Move(unsafe { std::num::NonZeroU32::new_unchecked(3 | (3 << Move::FROM_SHIFT)) });
+    // !is_promotion() && to() == from()
+    pub const NULL: Move = Move(std::num::NonZeroU32::new(1 | (1 << Move::FROM_SHIFT)).unwrap());
+    pub const WIN: Move = Move(std::num::NonZeroU32::new(2 | (2 << Move::FROM_SHIFT)).unwrap());
+    pub const RESIGN: Move = Move(std::num::NonZeroU32::new(3 | (3 << Move::FROM_SHIFT)).unwrap());
 
     pub fn new_unpromote(from: Square, to: Square, pc: Piece) -> Move {
         Move(unsafe {

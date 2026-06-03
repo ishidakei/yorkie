@@ -243,7 +243,7 @@ pub struct BitStreamWriter<'a> {
 }
 
 impl<'a> BitStreamReader<'a> {
-    pub fn new(buf: &[u8]) -> BitStreamReader {
+    pub fn new(buf: &'a [u8]) -> BitStreamReader<'a> {
         BitStreamReader {
             slice: buf,
             current_index: 0,
@@ -273,7 +273,7 @@ impl<'a> BitStreamReader<'a> {
 }
 
 impl<'a> BitStreamWriter<'a> {
-    fn new(buf: &mut [u8]) -> BitStreamWriter {
+    fn new(buf: &'a mut [u8]) -> BitStreamWriter<'a> {
         BitStreamWriter {
             slice: buf,
             current_index: 0,
