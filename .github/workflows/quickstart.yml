@@ -3,77 +3,83 @@
 # While our "example" application has the platform-specific code,
 # for simplicity we are compiling and testing everything on the Ubuntu environment only.
 # For multi-OS testing see the `cross.yml` workflow.
+#
+# The eval features `kppt`, `material`, and `nnue` are mutually exclusive (they hit a
+# `compile_error!` together in `src/evaluate/mod.rs`), so `--all-features` can never
+# compile. Each job therefore builds/lints/tests one feature at a time via a matrix.
+# `nnue` is `x86_64`-only, which is satisfied by `ubuntu-latest`.
 
 on: [push, pull_request]
 
 name: Quickstart
 
 jobs:
-  check:
-    name: Check
+  fmt:
+    name: Format
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
+          components: rustfmt, clippy
+
+      # `cargo fmt --check` is feature-independent, so run it once.
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        feature: [kppt, material, nnue]
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Run cargo check
-        uses: actions-rs/cargo@v1
-        continue-on-error: false
-        with:
-          command: check
+        run: cargo check --all-targets --no-default-features --features ${{ matrix.feature }}
 
   test:
     name: Test Suite
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        feature: [kppt, material, nnue]
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
+          components: rustfmt, clippy
 
       - name: Run cargo test
-        uses: actions-rs/cargo@v1
-        continue-on-error: false
-        with:
-          command: test
+        run: cargo test --no-default-features --features ${{ matrix.feature }}
 
   lints:
     name: Lints
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        feature: [kppt, material, nnue]
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
           components: rustfmt, clippy
 
-      - name: Run cargo fmt
-        uses: actions-rs/cargo@v1
-        continue-on-error: false
-        with:
-          command: fmt
-          args: --all -- --check
-
       - name: Run cargo clippy
-        uses: actions-rs/cargo@v1
-        continue-on-error: false
-        with:
-          command: clippy
-          args: -- -D warnings
+        run: cargo clippy --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
