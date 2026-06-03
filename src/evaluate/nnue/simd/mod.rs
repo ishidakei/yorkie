@@ -1,4 +1,4 @@
-use super::types::{Accumulator, FeatureIndex, FC_0_INPUT_DIMS};
+use super::types::{Accumulator, FC_0_INPUT_DIMS, FeatureIndex};
 use crate::types::Color;
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]

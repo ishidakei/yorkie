@@ -7,12 +7,12 @@ use crate::movetypes::*;
 use crate::piecevalue::*;
 use crate::sfen::*;
 use crate::types::*;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use rand::prelude::*;
 use rand::{Rng, SeedableRng};
 use std::convert::TryFrom;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 pub trait IsSearchingTrait {
     const IS_SEARCHING: bool;

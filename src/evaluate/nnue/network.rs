@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use super::simd::post_ft_kernel;
-use super::types::{Accumulator, NnueNetwork, FC_0_INPUT_DIMS};
+use super::types::{Accumulator, FC_0_INPUT_DIMS, NnueNetwork};
 #[cfg(not(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -9,8 +9,8 @@ use super::types::{Accumulator, NnueNetwork, FC_0_INPUT_DIMS};
     target_feature = "avx512vnni"
 )))]
 use super::types::{
-    NetworkStack, FC_0_OUTPUT_DIMS, FC_0_PADDED_INPUT_DIMS, FC_1_INPUT_DIMS, FC_1_OUTPUT_DIMS, FC_1_PADDED_INPUT_DIMS,
-    FC_2_INPUT_DIMS, FC_2_OUTPUT_DIMS, FC_2_PADDED_INPUT_DIMS, HIDDEN1_DIMS,
+    FC_0_OUTPUT_DIMS, FC_0_PADDED_INPUT_DIMS, FC_1_INPUT_DIMS, FC_1_OUTPUT_DIMS, FC_1_PADDED_INPUT_DIMS, FC_2_INPUT_DIMS,
+    FC_2_OUTPUT_DIMS, FC_2_PADDED_INPUT_DIMS, HIDDEN1_DIMS, NetworkStack,
 };
 use crate::types::{Color, Value};
 
@@ -126,8 +126,8 @@ fn per_layer_flow(transformed: &[u8; FC_0_INPUT_DIMS], stack: &NetworkStack) -> 
 #[cfg(test)]
 mod tests {
     use super::super::types::{
-        NetHeader, NetworkStack, FC_0_OUTPUT_DIMS, FC_0_PADDED_INPUT_DIMS, FC_1_OUTPUT_DIMS, FC_1_PADDED_INPUT_DIMS,
-        FC_2_OUTPUT_DIMS, FC_2_PADDED_INPUT_DIMS, HIDDEN1_DIMS, HIDDEN_SIZE,
+        FC_0_OUTPUT_DIMS, FC_0_PADDED_INPUT_DIMS, FC_1_OUTPUT_DIMS, FC_1_PADDED_INPUT_DIMS, FC_2_OUTPUT_DIMS,
+        FC_2_PADDED_INPUT_DIMS, HIDDEN_SIZE, HIDDEN1_DIMS, NetHeader, NetworkStack,
     };
     use super::*;
 

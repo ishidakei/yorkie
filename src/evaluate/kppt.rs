@@ -3,7 +3,7 @@ use crate::position::*;
 use crate::search::*;
 use crate::thread::*;
 use crate::types::*;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use rayon::prelude::*;
 use std::io::prelude::*;
 

@@ -869,21 +869,31 @@ mod tests {
         assert_eq!(move_vec[2].unwrap(), killers[0].unwrap()); // Refutation
         assert_eq!(move_vec[3].unwrap(), killers[1].unwrap()); // Refutation
         assert_eq!(move_vec[4], cm); // Refutation
-        assert!(move_vec[5..10]
-            .iter()
-            .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ88, Square::SQ55, Piece::B_BISHOP))); // Quiet
-        assert!(move_vec[5..10]
-            .iter()
-            .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ89, Square::SQ78, Piece::B_KING))); // Quiet
-        assert!(move_vec[5..10]
-            .iter()
-            .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ89, Square::SQ79, Piece::B_KING))); // Quiet
-        assert!(move_vec[5..10]
-            .iter()
-            .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ89, Square::SQ98, Piece::B_KING))); // Quiet
-        assert!(move_vec[5..10]
-            .iter()
-            .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ89, Square::SQ99, Piece::B_KING))); // Quiet
+        assert!(
+            move_vec[5..10]
+                .iter()
+                .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ88, Square::SQ55, Piece::B_BISHOP))
+        ); // Quiet
+        assert!(
+            move_vec[5..10]
+                .iter()
+                .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ89, Square::SQ78, Piece::B_KING))
+        ); // Quiet
+        assert!(
+            move_vec[5..10]
+                .iter()
+                .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ89, Square::SQ79, Piece::B_KING))
+        ); // Quiet
+        assert!(
+            move_vec[5..10]
+                .iter()
+                .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ89, Square::SQ98, Piece::B_KING))
+        ); // Quiet
+        assert!(
+            move_vec[5..10]
+                .iter()
+                .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ89, Square::SQ99, Piece::B_KING))
+        ); // Quiet
         assert_eq!(
             move_vec[10].unwrap(),
             Move::new_unpromote(Square::SQ88, Square::SQ97, Piece::B_BISHOP)
@@ -926,27 +936,41 @@ mod tests {
             move_vec.push(m);
         }
         assert_eq!(move_vec[0], tt_move); // EvasionTT
-        assert!(move_vec[1..8]
-            .iter()
-            .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ25, Piece::B_KING))); // Evasion
-        assert!(move_vec[1..8]
-            .iter()
-            .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ34, Piece::B_KING))); // Evasion
-        assert!(move_vec[1..8]
-            .iter()
-            .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ36, Piece::B_KING))); // Evasion
-        assert!(move_vec[1..8]
-            .iter()
-            .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ44, Piece::B_KING))); // Evasion
-        assert!(move_vec[1..8]
-            .iter()
-            .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ45, Piece::B_KING))); // Evasion
-        assert!(move_vec[1..8]
-            .iter()
-            .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ46, Piece::B_KING))); // Evasion
-        assert!(move_vec[1..8]
-            .iter()
-            .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ88, Square::SQ44, Piece::B_BISHOP))); // Evasion
+        assert!(
+            move_vec[1..8]
+                .iter()
+                .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ25, Piece::B_KING))
+        ); // Evasion
+        assert!(
+            move_vec[1..8]
+                .iter()
+                .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ34, Piece::B_KING))
+        ); // Evasion
+        assert!(
+            move_vec[1..8]
+                .iter()
+                .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ36, Piece::B_KING))
+        ); // Evasion
+        assert!(
+            move_vec[1..8]
+                .iter()
+                .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ44, Piece::B_KING))
+        ); // Evasion
+        assert!(
+            move_vec[1..8]
+                .iter()
+                .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ45, Piece::B_KING))
+        ); // Evasion
+        assert!(
+            move_vec[1..8]
+                .iter()
+                .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ46, Piece::B_KING))
+        ); // Evasion
+        assert!(
+            move_vec[1..8]
+                .iter()
+                .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ88, Square::SQ44, Piece::B_BISHOP))
+        ); // Evasion
         let m = mp.next_move(&pos, skip_quiets);
         assert!(m.is_none());
     }
@@ -1005,27 +1029,41 @@ mod tests {
             move_vec.push(m);
         }
         assert_eq!(move_vec[0], tt_move); // EvasionTT
-        assert!(move_vec[1..8]
-            .iter()
-            .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ25, Piece::B_KING))); // Evasion
-        assert!(move_vec[1..8]
-            .iter()
-            .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ34, Piece::B_KING))); // Evasion
-        assert!(move_vec[1..8]
-            .iter()
-            .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ36, Piece::B_KING))); // Evasion
-        assert!(move_vec[1..8]
-            .iter()
-            .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ44, Piece::B_KING))); // Evasion
-        assert!(move_vec[1..8]
-            .iter()
-            .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ45, Piece::B_KING))); // Evasion
-        assert!(move_vec[1..8]
-            .iter()
-            .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ46, Piece::B_KING))); // Evasion
-        assert!(move_vec[1..8]
-            .iter()
-            .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ88, Square::SQ44, Piece::B_BISHOP))); // Evasion
+        assert!(
+            move_vec[1..8]
+                .iter()
+                .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ25, Piece::B_KING))
+        ); // Evasion
+        assert!(
+            move_vec[1..8]
+                .iter()
+                .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ34, Piece::B_KING))
+        ); // Evasion
+        assert!(
+            move_vec[1..8]
+                .iter()
+                .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ36, Piece::B_KING))
+        ); // Evasion
+        assert!(
+            move_vec[1..8]
+                .iter()
+                .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ44, Piece::B_KING))
+        ); // Evasion
+        assert!(
+            move_vec[1..8]
+                .iter()
+                .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ45, Piece::B_KING))
+        ); // Evasion
+        assert!(
+            move_vec[1..8]
+                .iter()
+                .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ35, Square::SQ46, Piece::B_KING))
+        ); // Evasion
+        assert!(
+            move_vec[1..8]
+                .iter()
+                .any(|x| x.unwrap() == Move::new_unpromote(Square::SQ88, Square::SQ44, Piece::B_BISHOP))
+        ); // Evasion
         let m = mp.next_move(&pos);
         assert!(m.is_none());
     }

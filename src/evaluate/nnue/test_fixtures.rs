@@ -1,8 +1,8 @@
 use std::sync::{Arc, OnceLock};
 
 use super::types::{
-    NetHeader, NetworkStack, NnueNetwork, FC_0_OUTPUT_DIMS, FC_0_PADDED_INPUT_DIMS, FC_1_OUTPUT_DIMS, FC_1_PADDED_INPUT_DIMS,
-    FC_2_OUTPUT_DIMS, FC_2_PADDED_INPUT_DIMS, HIDDEN_SIZE, LAYER_STACKS, NUM_FEATURES,
+    FC_0_OUTPUT_DIMS, FC_0_PADDED_INPUT_DIMS, FC_1_OUTPUT_DIMS, FC_1_PADDED_INPUT_DIMS, FC_2_OUTPUT_DIMS, FC_2_PADDED_INPUT_DIMS,
+    HIDDEN_SIZE, LAYER_STACKS, NUM_FEATURES, NetHeader, NetworkStack, NnueNetwork,
 };
 
 pub(crate) fn run_with_large_stack<F>(f: F)

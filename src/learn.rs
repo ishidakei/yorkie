@@ -12,9 +12,9 @@ use crate::tt::*;
 use crate::types::*;
 use crate::usi::*;
 use crate::usioption::*;
-use anyhow::{anyhow, Context, Result};
-use rand::prelude::*;
+use anyhow::{Context, Result, anyhow};
 use rand::Rng;
+use rand::prelude::*;
 use std::io::prelude::*;
 
 #[allow(dead_code)]

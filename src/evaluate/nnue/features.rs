@@ -50,11 +50,7 @@ const PIECE_NUMBER_NB: usize = 40;
 
 #[inline]
 fn from_persp(sq: Square, persp: Color) -> Square {
-    if persp == Color::BLACK {
-        sq
-    } else {
-        sq.inverse()
-    }
+    if persp == Color::BLACK { sq } else { sq.inverse() }
 }
 
 #[inline]
@@ -64,11 +60,7 @@ fn needs_mirror(king_sq_persp: Square) -> bool {
 
 #[inline]
 fn mirror_if_needed(sq: Square, mirror: bool) -> Square {
-    if mirror {
-        sq.inverse_file()
-    } else {
-        sq
-    }
+    if mirror { sq.inverse_file() } else { sq }
 }
 
 #[inline]

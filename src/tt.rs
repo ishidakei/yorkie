@@ -35,11 +35,7 @@ impl TtEntry {
                 std::num::NonZeroU32::new_unchecked(m.0.get() | ((pos.piece_on(m.from()).0 as u32) << Move::MOVED_PIECE_SHIFT))
             })
         };
-        if pos.pseudo_legal::<SearchingType>(m) {
-            Some(m)
-        } else {
-            None
-        }
+        if pos.pseudo_legal::<SearchingType>(m) { Some(m) } else { None }
     }
     pub fn value(&self) -> Value {
         Value(i32::from(self.value16))

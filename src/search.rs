@@ -272,11 +272,7 @@ pub fn value_to_tt(v: Value, ply: i32) -> Value {
 
 pub fn stat_bonus(depth: Depth) -> i32 {
     let d = depth.0;
-    if d > 14 {
-        73
-    } else {
-        6 * d * d + 229 * d - 215
-    }
+    if d > 14 { 73 } else { 6 * d * d + 229 * d - 215 }
 }
 
 pub fn value_draw(nodes: i64) -> Value {

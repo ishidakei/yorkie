@@ -17,7 +17,7 @@ use crate::thread::*;
 use crate::tt::*;
 use crate::types::*;
 use crate::usioption::*;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::io::prelude::*;
 
 fn go(

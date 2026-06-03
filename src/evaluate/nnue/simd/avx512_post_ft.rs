@@ -1,15 +1,15 @@
 use std::arch::x86_64::{
-    __m128i, __m256i, __m512i, _mm256_loadu_si256, _mm256_storeu_si256, _mm512_castsi512_si256, _mm512_cvtepi16_epi8,
-    _mm512_cvtepi32_epi64, _mm512_cvtepi32_epi8, _mm512_cvtepi64_epi8, _mm512_dpbusd_epi32, _mm512_extracti64x4_epi64,
-    _mm512_loadu_si512, _mm512_max_epi16, _mm512_max_epi32, _mm512_min_epi16, _mm512_min_epi32, _mm512_min_epi64,
-    _mm512_mul_epi32, _mm512_mulhi_epi16, _mm512_reduce_add_epi32, _mm512_set1_epi16, _mm512_set1_epi32, _mm512_set1_epi64,
-    _mm512_setzero_si512, _mm512_slli_epi16, _mm512_srai_epi32, _mm512_srai_epi64, _mm512_zextsi256_si512, _mm_storeu_si128,
-    _mm_unpacklo_epi64,
+    __m128i, __m256i, __m512i, _mm_storeu_si128, _mm_unpacklo_epi64, _mm256_loadu_si256, _mm256_storeu_si256,
+    _mm512_castsi512_si256, _mm512_cvtepi16_epi8, _mm512_cvtepi32_epi8, _mm512_cvtepi32_epi64, _mm512_cvtepi64_epi8,
+    _mm512_dpbusd_epi32, _mm512_extracti64x4_epi64, _mm512_loadu_si512, _mm512_max_epi16, _mm512_max_epi32, _mm512_min_epi16,
+    _mm512_min_epi32, _mm512_min_epi64, _mm512_mul_epi32, _mm512_mulhi_epi16, _mm512_reduce_add_epi32, _mm512_set1_epi16,
+    _mm512_set1_epi32, _mm512_set1_epi64, _mm512_setzero_si512, _mm512_slli_epi16, _mm512_srai_epi32, _mm512_srai_epi64,
+    _mm512_zextsi256_si512,
 };
 
 use super::super::types::{
     Accumulator, FC_0_INPUT_DIMS, FC_0_OUTPUT_DIMS, FC_0_PADDED_INPUT_DIMS, FC_1_OUTPUT_DIMS, FC_1_PADDED_INPUT_DIMS,
-    FC_2_OUTPUT_DIMS, FC_2_PADDED_INPUT_DIMS, HIDDEN1_DIMS, HIDDEN_SIZE,
+    FC_2_OUTPUT_DIMS, FC_2_PADDED_INPUT_DIMS, HIDDEN_SIZE, HIDDEN1_DIMS,
 };
 use super::scalar_post_ft;
 use crate::types::Color;
@@ -558,7 +558,7 @@ mod tests {
         transformer_ewm_parity(&acc, Color::WHITE);
     }
 
-    use crate::evaluate::nnue::types::{NetworkStack, FC_1_INPUT_DIMS, FC_2_INPUT_DIMS, LAYER_STACKS};
+    use crate::evaluate::nnue::types::{FC_1_INPUT_DIMS, FC_2_INPUT_DIMS, LAYER_STACKS, NetworkStack};
 
     fn seeded_stack(seed: u32) -> NetworkStack {
         let fc_0_biases: Box<[i32]> = (0..FC_0_OUTPUT_DIMS)

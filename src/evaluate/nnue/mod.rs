@@ -15,13 +15,13 @@ pub mod types;
 pub(crate) mod test_fixtures;
 
 #[allow(unused_imports)]
-pub use types::{Accumulator, FeatureIndex, FeatureList, NetHeader, NnueError, NnueNetwork, FEATURE_LIST_CAPACITY, HIDDEN_SIZE};
+pub use types::{Accumulator, FEATURE_LIST_CAPACITY, FeatureIndex, FeatureList, HIDDEN_SIZE, NetHeader, NnueError, NnueNetwork};
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::position::*;
-use crate::search::{get_stack_mut, Stack};
+use crate::search::{Stack, get_stack_mut};
 use crate::types::*;
 
 struct LoadedNetwork {
