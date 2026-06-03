@@ -260,10 +260,12 @@ fn select_next_refutation(
 ) -> Option<Move> {
     for &mv in list {
         *current_index += 1;
-        if let Some(m) = mv {
-            if m != tt_move.non_zero_unwrap_unchecked() && !m.is_capture(pos) && pos.pseudo_legal::<SearchingType>(m) {
-                return Some(m);
-            }
+        if let Some(m) = mv
+            && m != tt_move.non_zero_unwrap_unchecked()
+            && !m.is_capture(pos)
+            && pos.pseudo_legal::<SearchingType>(m)
+        {
+            return Some(m);
         }
     }
     None
@@ -557,12 +559,11 @@ impl<'a> MovePickerForMainSearch<'a> {
                     self.stage = self.stage.next_variant().unwrap();
                 }
                 StagesForMainSearch::Quiet => {
-                    if !skip_quiets {
-                        if let Some(m) =
+                    if !skip_quiets
+                        && let Some(m) =
                             select_next_quiet(self.move_list.slice(self.cur), &mut self.cur, &self.refutations, self.tt_move)
-                        {
-                            return Some(m);
-                        }
+                    {
+                        return Some(m);
                     }
                     self.cur = 0;
                     self.move_list.size = self.end_bad_captures;

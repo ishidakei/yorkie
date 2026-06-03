@@ -169,11 +169,11 @@ impl UsiOptions {
         reductions: &mut Reductions,
         is_ready: &mut bool,
     ) {
-        if let Some(entry) = self.v.get(key) {
-            if entry.fixed {
-                println!("{}", Self::fixed_warning(key));
-                return;
-            }
+        if let Some(entry) = self.v.get(key)
+            && entry.fixed
+        {
+            println!("{}", Self::fixed_warning(key));
+            return;
         }
         self.set_internal_unchecked(
             key,

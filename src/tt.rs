@@ -271,7 +271,7 @@ mod tests {
 
                 fn gen_same_cluster_index_key(rng: &mut StdRng, cluster_index: usize, tt: &TranspositionTable) -> Key {
                     loop {
-                        let key = Key(rng.gen());
+                        let key = Key(rng.r#gen());
                         let c_index = tt.cluster_index(key);
                         if c_index == cluster_index {
                             return key;

@@ -139,14 +139,14 @@ static ZOBRIST_TABLES: once_cell::sync::Lazy<Zobrist> = once_cell::sync::Lazy::n
     for itemss in zobrist.field.iter_mut() {
         for items in itemss.iter_mut() {
             for item in items {
-                *item = Key(rng.gen::<u64>() & !1_u64); // Zobrist::COLOR is 1.
+                *item = Key(rng.r#gen::<u64>() & !1_u64); // Zobrist::COLOR is 1.
             }
         }
     }
     for itemss in zobrist.hand.iter_mut() {
         for items in itemss {
             for item in items {
-                *item = Key(rng.gen::<u64>() & !1_u64); // Zobrist::COLOR is 1.
+                *item = Key(rng.r#gen::<u64>() & !1_u64); // Zobrist::COLOR is 1.
             }
         }
     }
@@ -1335,7 +1335,7 @@ impl Position {
             }
             res.0 ^= 1;
             macro_rules! attacker_found {
-                ($pt: expr) => {{
+                ($pt: expr_2021) => {{
                     bb = side_to_move_attackers & self.pieces_p($pt);
                     bb.to_bool()
                 }};

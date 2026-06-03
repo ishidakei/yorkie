@@ -272,10 +272,11 @@ impl Thread {
                 last_best_move_depth = self.root_depth;
             }
 
-            if let Some(mate) = self.limits.mate {
-                if best_value >= Value::MATE_IN_MAX_PLY && Value::MATE - best_value <= Value(mate as i32) {
-                    self.stop.store(true, Ordering::Relaxed);
-                }
+            if let Some(mate) = self.limits.mate
+                && best_value >= Value::MATE_IN_MAX_PLY
+                && Value::MATE - best_value <= Value(mate as i32)
+            {
+                self.stop.store(true, Ordering::Relaxed);
             }
 
             if !self.is_main() {
@@ -550,22 +551,23 @@ impl Thread {
             return best_value;
         }
 
-        if !root_node && !get_stack(stack, 0).in_check {
-            if let Some(mate_move) = self.position.mate_move_in_1ply() {
-                best_value = Value::mate_in(get_stack(stack, 0).ply);
-                get_stack_mut(stack, 0).static_eval = best_value; // is this necessary?
-                tte.save(
-                    key,
-                    value_to_tt(best_value, get_stack(stack, 0).ply),
-                    get_stack(stack, 0).tt_pv,
-                    Bound::EXACT,
-                    depth,
-                    Some(mate_move),
-                    best_value,
-                    unsafe { (*self.tt).generation() },
-                );
-                return best_value;
-            }
+        if !root_node
+            && !get_stack(stack, 0).in_check
+            && let Some(mate_move) = self.position.mate_move_in_1ply()
+        {
+            best_value = Value::mate_in(get_stack(stack, 0).ply);
+            get_stack_mut(stack, 0).static_eval = best_value; // is this necessary?
+            tte.save(
+                key,
+                value_to_tt(best_value, get_stack(stack, 0).ply),
+                get_stack(stack, 0).tt_pv,
+                Bound::EXACT,
+                depth,
+                Some(mate_move),
+                best_value,
+                unsafe { (*self.tt).generation() },
+            );
+            return best_value;
         }
 
         let pure_static_eval = if root_node {
@@ -1597,7 +1599,9 @@ impl Thread {
                     "lowerbound "
                 } else if v <= alpha {
                     "upperbound "
-                } else {""},
+                } else {
+                    ""
+                },
                 nodes = nodes_searched,
                 nps = nodes_searched * 1000 / elapsed_millis,
                 time = elapsed_millis,
@@ -1905,26 +1909,26 @@ impl ThreadPool {
                         .lock()
                         .unwrap()
                         .nodes_searched();
-                    if let Ok(best_thread) = best_thread.lock() {
-                        if !hide_all_output_cloned.load(Ordering::Relaxed) {
-                            // Always send again PV info.
-                            println!(
-                                "{}",
-                                best_thread.pv_info_to_usi_string(
-                                    nodes_searched,
-                                    multi_pv,
-                                    best_thread.completed_depth,
-                                    -Value::INFINITE,
-                                    Value::INFINITE,
-                                    true,
-                                )
-                            );
-                            let mut s = format!("bestmove {}", best_thread.root_moves[0].pv[0].to_usi_string(),);
-                            if usi_options_cloned.get_bool(UsiOptions::USI_PONDER) && best_thread.root_moves[0].pv.len() >= 2 {
-                                s += &format!(" ponder {}", best_thread.root_moves[0].pv[1].to_usi_string());
-                            }
-                            println!("{}", s);
+                    if let Ok(best_thread) = best_thread.lock()
+                        && !hide_all_output_cloned.load(Ordering::Relaxed)
+                    {
+                        // Always send again PV info.
+                        println!(
+                            "{}",
+                            best_thread.pv_info_to_usi_string(
+                                nodes_searched,
+                                multi_pv,
+                                best_thread.completed_depth,
+                                -Value::INFINITE,
+                                Value::INFINITE,
+                                true,
+                            )
+                        );
+                        let mut s = format!("bestmove {}", best_thread.root_moves[0].pv[0].to_usi_string(),);
+                        if usi_options_cloned.get_bool(UsiOptions::USI_PONDER) && best_thread.root_moves[0].pv.len() >= 2 {
+                            s += &format!(" ponder {}", best_thread.root_moves[0].pv[1].to_usi_string());
                         }
+                        println!("{}", s);
                     }
                     *last_best_root_move_cloned.lock().unwrap() = Some(best_thread.lock().unwrap().root_moves[0].clone());
                 })

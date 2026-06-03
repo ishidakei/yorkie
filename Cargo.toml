@@ -2,7 +2,7 @@
 name = "yorkie"
 version = "0.0.1"
 authors = ["Kei Ishida <ishida.kei@gmail.com>"]
-edition = "2021"
+edition = "2024"
 rust-version = "1.96.0"
 
 [dependencies]

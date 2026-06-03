@@ -845,11 +845,11 @@ impl KingAttackTable {
         ];
         for sq in Square::ALL.iter() {
             for delta in deltas.iter() {
-                if let Some(sq_tmp) = sq.checked_add(*delta) {
-                    if (File::new(*sq).0 - File::new(sq_tmp).0).abs() <= 1 && (Rank::new(*sq).0 - Rank::new(sq_tmp).0).abs() <= 1
-                    {
-                        ret.0[sq.0 as usize].set(sq_tmp);
-                    }
+                if let Some(sq_tmp) = sq.checked_add(*delta)
+                    && (File::new(*sq).0 - File::new(sq_tmp).0).abs() <= 1
+                    && (Rank::new(*sq).0 - Rank::new(sq_tmp).0).abs() <= 1
+                {
+                    ret.0[sq.0 as usize].set(sq_tmp);
                 }
             }
         }
@@ -905,12 +905,11 @@ impl PieceAttackTable {
             for sq in Square::ALL.iter() {
                 let deltas = &deltass[c.0 as usize];
                 for delta in deltas.iter() {
-                    if let Some(sq_tmp) = sq.checked_add(*delta) {
-                        if (File::new(*sq).0 - File::new(sq_tmp).0).abs() <= 1
-                            && (Rank::new(*sq).0 - Rank::new(sq_tmp).0).abs() <= 2
-                        {
-                            ret.0[sq.0 as usize][c.0 as usize].set(sq_tmp);
-                        }
+                    if let Some(sq_tmp) = sq.checked_add(*delta)
+                        && (File::new(*sq).0 - File::new(sq_tmp).0).abs() <= 1
+                        && (Rank::new(*sq).0 - Rank::new(sq_tmp).0).abs() <= 2
+                    {
+                        ret.0[sq.0 as usize][c.0 as usize].set(sq_tmp);
                     }
                 }
             }
