@@ -756,7 +756,7 @@ mod tests {
         let _guard = crate::evaluate::nnue::TEST_MUTEX.lock().expect("TEST_MUTEX poisoned");
         crate::evaluate::nnue::clear_loaded_for_test();
 
-        let eval_dir = "/tmp/apery-nnue-idempotent";
+        let eval_dir = "/tmp/yorkie-nnue-idempotent";
         let path = std::path::PathBuf::from(format!("{}/nn.bin", eval_dir));
         let mut sha = [0u8; 32];
         sha[0] = 0x01;

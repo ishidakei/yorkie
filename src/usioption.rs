@@ -576,7 +576,7 @@ mod eval_options_tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
-            let path = std::env::temp_dir().join(format!("apery-eval-options-{}-{}-{}.txt", tag, std::process::id(), nanos,));
+            let path = std::env::temp_dir().join(format!("yorkie-eval-options-{}-{}-{}.txt", tag, std::process::id(), nanos,));
             std::fs::write(&path, content).expect("write temp eval_options");
             Self { path }
         }
@@ -630,7 +630,7 @@ mod eval_options_tests {
     #[test]
     fn missing_file_returns_empty_and_emits_nothing() {
         let mut opts = UsiOptions::new();
-        let missing = std::env::temp_dir().join("apery-eval-options-no-such.txt");
+        let missing = std::env::temp_dir().join("yorkie-eval-options-no-such.txt");
         let _ = std::fs::remove_file(&missing);
         let lines = read_eval_options(&mut opts, &missing);
         assert!(lines.is_empty(), "missing file must emit no info-strings; got {lines:?}");

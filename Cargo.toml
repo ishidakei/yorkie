@@ -1,7 +1,7 @@
 [package]
-name = "apery"
-version = "2.1.0"
-authors = ["HiraokaTakuya <hiraoka64@gmail.com>"]
+name = "yorkie"
+version = "0.0.1"
+authors = ["Kei Ishida <ishida.kei@gmail.com>"]
 edition = "2021"
 rust-version = "1.96.0"
 

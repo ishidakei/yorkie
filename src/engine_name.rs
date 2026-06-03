@@ -1,1 +1,1 @@
-pub const ENGINE_NAME: &str = concat!("Apery_", env!("CARGO_PKG_VERSION"));
+pub const ENGINE_NAME: &str = concat!("yorkie ", env!("CARGO_PKG_VERSION"));
