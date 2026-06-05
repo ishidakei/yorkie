@@ -12,20 +12,21 @@ struct Info {
     lose: u64,
 }
 
+/// The legacy JSON opening book: SFEN → moves with win/lose stats, probed by win-rate²-weighted
+/// random selection.
 #[derive(Serialize, Deserialize, Debug)]
-pub struct Book(std::collections::BTreeMap<String, std::collections::BTreeMap<UsiMove, Info>>);
+pub struct JsonBook(std::collections::BTreeMap<String, std::collections::BTreeMap<UsiMove, Info>>);
 
-impl Book {
+impl JsonBook {
     #[allow(dead_code)]
-    pub fn new() -> Book {
-        Book(std::collections::BTreeMap::new())
+    pub fn new() -> JsonBook {
+        JsonBook(std::collections::BTreeMap::new())
     }
     #[allow(dead_code)]
     fn insert(&mut self, sfen: String, mv: Move, info: Info) {
         let set = self.0.entry(sfen).or_default();
         set.insert(mv.to_usi(), info);
     }
-    #[allow(dead_code)]
     pub fn probe(&self, pos: &Position, rng: &mut ThreadRng) -> Option<Move> {
         let sfen = pos.to_sfen();
         let candidates = self.0.get(&sfen)?;
@@ -41,12 +42,11 @@ impl Book {
         let usi_move = move_and_weights[dist.sample(rng)].0;
         Move::new_from_usi(usi_move, pos)
     }
-    pub fn from_file<P>(path: P) -> Result<Book>
+    /// Parse a JSON opening book from an already-opened reader.
+    pub fn from_reader<R>(reader: R) -> Result<JsonBook>
     where
-        P: AsRef<std::path::Path>,
+        R: std::io::Read,
     {
-        let file = std::fs::File::open(path)?;
-        let reader = std::io::BufReader::new(file);
         let book = serde_json::from_reader(reader)?;
         Ok(book)
     }
@@ -63,7 +63,7 @@ mod tests {
         .spawn(|| {
             let sfen = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
             let mut pos = Position::new_from_sfen(sfen).unwrap();
-            let mut b = Book::new();
+            let mut b = JsonBook::new();
             b.insert(
                 sfen.to_string(),
                 Move::new_from_usi_str("2g2f", &pos).unwrap(),
@@ -130,7 +130,7 @@ mod tests {
             .spawn(|| {
                 let sfen = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
                 let pos = Position::new_from_sfen(sfen).unwrap();
-                let mut b = Book::new();
+                let mut b = JsonBook::new();
                 b.insert(
                     sfen.to_string(),
                     Move::new_from_usi_str("2g2f", &pos).unwrap(),
@@ -193,7 +193,8 @@ mod tests {
         .stack_size(crate::stack_size::STACK_SIZE)
         .spawn(|| {
             let path = std::path::Path::new("test/book.json");
-            let book = Book::from_file(path).unwrap();
+            let file = std::fs::File::open(path).unwrap();
+            let book = JsonBook::from_reader(std::io::BufReader::new(file)).unwrap();
             assert_eq!(
                 r#"{"lnsgkgsnl/1r5b1/ppppppppp/9/9/7P1/PPPPPPP1P/1B5R1/LNSGKGSNL w - 2":{"3c3d":{"value":-99,"win":1,"lose":2}},"lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1":{"2g2f":{"value":36,"win":6,"lose":4},"6i7h":{"value":20,"win":1,"lose":10},"7g7f":{"value":36,"win":3,"lose":9}}}"#,
                 serde_json::to_string(&book).unwrap(),

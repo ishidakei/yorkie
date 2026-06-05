@@ -80,6 +80,12 @@ pub struct UsiOptions {
 impl UsiOptions {
     pub const BOOK_ENABLE: &'static str = "Book_Enable";
     pub const BOOK_FILE: &'static str = "Book_File";
+    pub const BOOK_MOVES: &'static str = "BookMoves";
+    pub const IGNORE_BOOK_PLY: &'static str = "IgnoreBookPly";
+    pub const BOOK_DEPTH_LIMIT: &'static str = "BookDepthLimit";
+    pub const BOOK_EVAL_DIFF: &'static str = "BookEvalDiff";
+    pub const FLIPPED_BOOK: &'static str = "FlippedBook";
+    pub const BOOK_ON_THE_FLY: &'static str = "BookOnTheFly";
     pub const BYOYOMI_MARGIN: &'static str = "Byoyomi_Margin";
     const CLEAR_HASH: &'static str = "Clear_Hash";
     pub const EVAL_DIR: &'static str = "Eval_Dir";
@@ -103,6 +109,20 @@ impl UsiOptions {
             Self::BOOK_FILE,
             UsiOptionEntry::new(UsiOptionValue::filename("book/20191216/book.json")),
         );
+        // YaneuraOu-compatible opening-book probe options, snapshotted into `BookOptions`.
+        const SPIN_MAX: i64 = i32::MAX as i64;
+        options.insert(Self::BOOK_MOVES, UsiOptionEntry::new(UsiOptionValue::spin(16, 0, SPIN_MAX)));
+        options.insert(Self::IGNORE_BOOK_PLY, UsiOptionEntry::new(UsiOptionValue::check(false)));
+        options.insert(
+            Self::BOOK_DEPTH_LIMIT,
+            UsiOptionEntry::new(UsiOptionValue::spin(0, 0, SPIN_MAX)),
+        );
+        options.insert(
+            Self::BOOK_EVAL_DIFF,
+            UsiOptionEntry::new(UsiOptionValue::spin(30, 0, SPIN_MAX)),
+        );
+        options.insert(Self::FLIPPED_BOOK, UsiOptionEntry::new(UsiOptionValue::check(true)));
+        options.insert(Self::BOOK_ON_THE_FLY, UsiOptionEntry::new(UsiOptionValue::check(false)));
         options.insert(
             Self::BYOYOMI_MARGIN,
             UsiOptionEntry::new(UsiOptionValue::spin(500, 0, i64::MAX)),

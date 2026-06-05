@@ -1758,7 +1758,10 @@ impl ThreadPool {
             let mut root_moves = RootMoves::new();
             let book_move = if usi_options.get_bool(UsiOptions::BOOK_ENABLE) {
                 match &self.book {
-                    Some(book) => book.probe(pos, &mut rand::thread_rng()),
+                    Some(book) => {
+                        let book_options = BookOptions::from_usi_options(usi_options);
+                        book.probe(pos, &book_options, &mut rand::thread_rng())
+                    }
                     None => None,
                 }
             } else {
