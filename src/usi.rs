@@ -41,6 +41,11 @@ fn go(
     while let Some(&limit_type) = iter.next() {
         match limit_type {
             "btime" | "wtime" => {
+                // Margin responsibility split (no physical delay is counted twice): `Time_Margin`
+                // is a one-time conservative haircut on the *reported main clock*, applied here at
+                // parse time before the time manager sees it. The per-move `Move_Overhead` and the
+                // near-deadline `Timeout_Safety_Margin` act later inside `timeman::compute`'s caps;
+                // `Byoyomi_Margin` is the analogous haircut on the byoyomi/movetime path below.
                 let color = if limit_type == "btime" { Color::BLACK } else { Color::WHITE };
                 let n = next_num(limit_type, &mut iter)?;
                 let time_margin = usi_options.get_i64(UsiOptions::TIME_MARGIN) as u64;

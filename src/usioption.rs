@@ -93,10 +93,13 @@ impl UsiOptions {
     pub const EVAL_HASH: &'static str = "Eval_Hash";
     #[cfg(feature = "nnue")]
     pub const FV_SCALE: &'static str = "FV_SCALE";
+    pub const MINIMUM_THINKING_TIME: &'static str = "Minimum_Thinking_Time";
+    pub const MOVE_OVERHEAD: &'static str = "Move_Overhead";
     pub const MULTI_PV: &'static str = "MultiPV";
-    pub const SLOW_MOVER: &'static str = "Slow_Mover";
+    pub const OPENING_TIME_WEIGHT: &'static str = "Opening_Time_Weight";
     pub const THREADS: &'static str = "Threads";
     pub const TIME_MARGIN: &'static str = "Time_Margin";
+    pub const TIMEOUT_SAFETY_MARGIN: &'static str = "Timeout_Safety_Margin";
     pub const USI_HASH: &'static str = "USI_Hash";
     pub const USI_PONDER: &'static str = "USI_Ponder";
 
@@ -144,7 +147,23 @@ impl UsiOptions {
         #[cfg(feature = "nnue")]
         options.insert(Self::FV_SCALE, UsiOptionEntry::new(UsiOptionValue::spin(16, 1, 128)));
         options.insert(Self::MULTI_PV, UsiOptionEntry::new(UsiOptionValue::spin(1, 1, 500)));
-        options.insert(Self::SLOW_MOVER, UsiOptionEntry::new(UsiOptionValue::spin(100, 10, 1000)));
+        // Time-management options (see `timeman::compute`). Per-move round-trip overhead (ms).
+        options.insert(Self::MOVE_OVERHEAD, UsiOptionEntry::new(UsiOptionValue::spin(200, 0, 10000)));
+        // Near-deadline cushion (ms): caps a single move in the low-time regime so it never times out.
+        options.insert(
+            Self::TIMEOUT_SAFETY_MARGIN,
+            UsiOptionEntry::new(UsiOptionValue::spin(1200, 0, 60000)),
+        );
+        // Floor on the committed think time (ms).
+        options.insert(
+            Self::MINIMUM_THINKING_TIME,
+            UsiOptionEntry::new(UsiOptionValue::spin(1000, 0, 60000)),
+        );
+        // Opening-phase time weight (percent): scales allocated time; 100 = neutral.
+        options.insert(
+            Self::OPENING_TIME_WEIGHT,
+            UsiOptionEntry::new(UsiOptionValue::spin(100, 10, 1000)),
+        );
         options.insert(Self::THREADS, UsiOptionEntry::new(UsiOptionValue::spin(1, 1, 8192)));
         options.insert(Self::TIME_MARGIN, UsiOptionEntry::new(UsiOptionValue::spin(500, 0, i64::MAX)));
         const MAX_HASH_MB: usize = 0x200_0000;
@@ -532,6 +551,42 @@ mod fv_scale_option_tests {
         assert_eq!(opts.get_i64(UsiOptions::FV_SCALE), 28);
 
         crate::evaluate::nnue::network::set_fv_scale(16);
+    }
+}
+
+#[cfg(test)]
+mod time_management_option_tests {
+    use super::*;
+
+    #[test]
+    fn advertises_behavior_named_time_options() {
+        let opts = UsiOptions::new();
+        let advertised = opts.to_usi_string();
+        for expected in [
+            "option name Move_Overhead type spin default 200 min 0 max 10000",
+            "option name Timeout_Safety_Margin type spin default 1200 min 0 max 60000",
+            "option name Minimum_Thinking_Time type spin default 1000 min 0 max 60000",
+            "option name Opening_Time_Weight type spin default 100 min 10 max 1000",
+        ] {
+            assert!(
+                advertised.contains(expected),
+                "missing advertised option line: {expected}\n{advertised}"
+            );
+        }
+        // The old apery name is gone, and no time-loss is ever called a "flag".
+        assert!(
+            !advertised.contains("Slow_Mover"),
+            "Slow_Mover must be renamed to Opening_Time_Weight"
+        );
+        assert!(
+            !advertised.to_lowercase().contains("flag"),
+            "no option string may use 'flag' wording (a time-loss is a timeout)"
+        );
+
+        assert_eq!(opts.get_i64(UsiOptions::MOVE_OVERHEAD), 200);
+        assert_eq!(opts.get_i64(UsiOptions::TIMEOUT_SAFETY_MARGIN), 1200);
+        assert_eq!(opts.get_i64(UsiOptions::MINIMUM_THINKING_TIME), 1000);
+        assert_eq!(opts.get_i64(UsiOptions::OPENING_TIME_WEIGHT), 100);
     }
 }
 
