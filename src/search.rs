@@ -1,5 +1,3 @@
-#[cfg(feature = "kppt")]
-use crate::evaluate::kppt::*;
 #[cfg(feature = "nnue")]
 use crate::evaluate::nnue;
 use crate::movegen::*;
@@ -152,8 +150,6 @@ pub struct Stack {
     pub excluded_move: Option<Move>,
     pub killers: [Option<Move>; 2],
     pub static_eval: Value,
-    #[cfg(feature = "kppt")]
-    pub static_eval_raw: EvalSum,
     pub stat_score: i32,
     pub move_count: i32,
     pub in_check: bool,
@@ -173,8 +169,6 @@ impl Stack {
             excluded_move: None,
             killers: [None, None],
             static_eval: Value::ZERO,
-            #[cfg(feature = "kppt")]
-            static_eval_raw: EvalSum::new(),
             stat_score: 0,
             move_count: 0,
             in_check: false,

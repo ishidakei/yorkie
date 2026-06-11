@@ -4,7 +4,7 @@
 # for simplicity we are compiling and testing everything on the Ubuntu environment only.
 # For multi-OS testing see the `cross.yml` workflow.
 #
-# The eval features `kppt`, `material`, and `nnue` are mutually exclusive (they hit a
+# The eval features `material` and `nnue` are mutually exclusive (they hit a
 # `compile_error!` together in `src/evaluate/mod.rs`), so `--all-features` can never
 # compile. Each job therefore builds/lints/tests one feature at a time via a matrix.
 # `nnue` is `x86_64`-only, which is satisfied by `ubuntu-latest`.
@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        feature: [kppt, material, nnue]
+        feature: [material, nnue]
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -53,7 +53,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        feature: [kppt, material, nnue]
+        feature: [material, nnue]
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -71,7 +71,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        feature: [kppt, material, nnue]
+        feature: [material, nnue]
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4

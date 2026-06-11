@@ -1,6 +1,4 @@
 use crate::bitboard::*;
-#[cfg(feature = "kppt")]
-use crate::evaluate::kppt::*;
 use crate::file_to_vec::*;
 use crate::huffman_code::*;
 use crate::movegen::*;
@@ -130,16 +128,8 @@ pub fn generate_teachers(args: &[&str]) -> Result<()> {
             let mut rng = rand::thread_rng();
             let mut thread_pool = ThreadPool::new();
             let mut tt = TranspositionTable::new();
-            #[cfg(feature = "kppt")]
-            let mut ehash = EvalHash::new(); // todo: All threads use same ehash.
             let mut reductions = Reductions::new();
-            thread_pool.set(
-                1,
-                &mut tt,
-                #[cfg(feature = "kppt")]
-                &mut ehash,
-                &mut reductions,
-            );
+            thread_pool.set(1, &mut tt, &mut reductions);
             let mut is_ready = false;
             let usi_options = {
                 let mut u = UsiOptions::new();
@@ -147,8 +137,6 @@ pub fn generate_teachers(args: &[&str]) -> Result<()> {
                     (UsiOptions::MULTI_PV, "1"),
                     (UsiOptions::THREADS, "1"),
                     (UsiOptions::USI_HASH, "1024"),
-                    #[cfg(feature = "kppt")]
-                    (UsiOptions::EVAL_HASH, "256"),
                     (UsiOptions::BOOK_ENABLE, "false"),
                 ]
                 .iter()
@@ -158,8 +146,6 @@ pub fn generate_teachers(args: &[&str]) -> Result<()> {
                         &mut u,
                         &mut thread_pool,
                         &mut tt,
-                        #[cfg(feature = "kppt")]
-                        &mut ehash,
                         &mut reductions,
                         &mut is_ready,
                     );

@@ -195,27 +195,15 @@ mod tests {
 
     #[test]
     fn test_cluster_index() {
-        #[cfg(feature = "kppt")]
-        use crate::evaluate::kppt::*;
         use crate::search::*;
         std::thread::Builder::new()
             .stack_size(crate::stack_size::STACK_SIZE)
             .spawn(|| {
                 let mut thread_pool = ThreadPool::new();
                 let mut tt = TranspositionTable::new();
-                #[cfg(feature = "kppt")]
-                let mut ehash = EvalHash::new();
                 let mut reductions = Reductions::new();
-                thread_pool.set(
-                    1,
-                    &mut tt,
-                    #[cfg(feature = "kppt")]
-                    &mut ehash,
-                    &mut reductions,
-                );
+                thread_pool.set(1, &mut tt, &mut reductions);
                 tt.resize(1, &mut thread_pool);
-                #[cfg(feature = "kppt")]
-                ehash.resize(1, &mut thread_pool);
 
                 // If key is all 1 bits, index is max.
                 let key = Key(0xffff_ffff_ffff_ffff);
@@ -229,27 +217,15 @@ mod tests {
 
     #[test]
     fn test_probe() {
-        #[cfg(feature = "kppt")]
-        use crate::evaluate::kppt::*;
         use crate::search::*;
         std::thread::Builder::new()
             .stack_size(crate::stack_size::STACK_SIZE)
             .spawn(|| {
                 let mut thread_pool = ThreadPool::new();
                 let mut tt = TranspositionTable::new();
-                #[cfg(feature = "kppt")]
-                let mut ehash = EvalHash::new();
                 let mut reductions = Reductions::new();
-                thread_pool.set(
-                    1,
-                    &mut tt,
-                    #[cfg(feature = "kppt")]
-                    &mut ehash,
-                    &mut reductions,
-                );
+                thread_pool.set(1, &mut tt, &mut reductions);
                 tt.resize(1, &mut thread_pool);
-                #[cfg(feature = "kppt")]
-                ehash.resize(1, &mut thread_pool);
                 let pv = false;
                 let gen8 = tt.generation8;
 

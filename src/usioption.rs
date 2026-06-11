@@ -1,5 +1,3 @@
-#[cfg(feature = "kppt")]
-use crate::evaluate::kppt::*;
 use crate::search::*;
 use crate::thread::*;
 use crate::tt::*;
@@ -89,8 +87,6 @@ impl UsiOptions {
     pub const BYOYOMI_MARGIN: &'static str = "Byoyomi_Margin";
     const CLEAR_HASH: &'static str = "Clear_Hash";
     pub const EVAL_DIR: &'static str = "Eval_Dir";
-    #[cfg(feature = "kppt")]
-    pub const EVAL_HASH: &'static str = "Eval_Hash";
     #[cfg(feature = "nnue")]
     pub const FV_SCALE: &'static str = "FV_SCALE";
     pub const MINIMUM_THINKING_TIME: &'static str = "Minimum_Thinking_Time";
@@ -131,18 +127,11 @@ impl UsiOptions {
             UsiOptionEntry::new(UsiOptionValue::spin(500, 0, i64::MAX)),
         );
         options.insert(Self::CLEAR_HASH, UsiOptionEntry::new(UsiOptionValue::Button));
-        #[cfg(feature = "kppt")]
-        const EVAL_DIR_DEFAULT: &str = "eval/20190617";
         #[cfg(feature = "nnue")]
         const EVAL_DIR_DEFAULT: &str = "eval/nnue";
         #[cfg(feature = "material")]
         const EVAL_DIR_DEFAULT: &str = "";
         options.insert(Self::EVAL_DIR, UsiOptionEntry::new(UsiOptionValue::string(EVAL_DIR_DEFAULT)));
-        #[cfg(feature = "kppt")]
-        options.insert(
-            Self::EVAL_HASH,
-            UsiOptionEntry::new(UsiOptionValue::spin(256, 1, 1024 * 1024)),
-        );
         // .nnue files do not carry the post-accumulator divisor; default 16
         #[cfg(feature = "nnue")]
         options.insert(Self::FV_SCALE, UsiOptionEntry::new(UsiOptionValue::spin(16, 1, 128)));
@@ -204,7 +193,6 @@ impl UsiOptions {
         value: &str,
         thread_pool: &mut ThreadPool,
         tt: &mut TranspositionTable,
-        #[cfg(feature = "kppt")] ehash: &mut EvalHash,
         reductions: &mut Reductions,
         is_ready: &mut bool,
     ) {
@@ -214,16 +202,7 @@ impl UsiOptions {
             println!("{}", Self::fixed_warning(key));
             return;
         }
-        self.set_internal_unchecked(
-            key,
-            value,
-            thread_pool,
-            tt,
-            #[cfg(feature = "kppt")]
-            ehash,
-            reductions,
-            is_ready,
-        );
+        self.set_internal_unchecked(key, value, thread_pool, tt, reductions, is_ready);
     }
 
     fn set_internal_unchecked(
@@ -232,7 +211,6 @@ impl UsiOptions {
         value: &str,
         thread_pool: &mut ThreadPool,
         tt: &mut TranspositionTable,
-        #[cfg(feature = "kppt")] ehash: &mut EvalHash,
         reductions: &mut Reductions,
         is_ready: &mut bool,
     ) {
@@ -258,15 +236,7 @@ impl UsiOptions {
                     let n = std::cmp::max(n, *min);
                     *current = n;
                     match key {
-                        #[cfg(feature = "kppt")]
-                        Self::EVAL_HASH => ehash.resize(n as usize, thread_pool),
-                        Self::THREADS => thread_pool.set(
-                            n as usize,
-                            tt,
-                            #[cfg(feature = "kppt")]
-                            ehash,
-                            reductions,
-                        ),
+                        Self::THREADS => thread_pool.set(n as usize, tt, reductions),
                         Self::USI_HASH => tt.resize(n as usize, thread_pool),
                         #[cfg(feature = "nnue")]
                         Self::FV_SCALE => crate::evaluate::nnue::network::set_fv_scale(n as i32),
@@ -304,7 +274,6 @@ impl UsiOptions {
         path: &std::path::Path,
         thread_pool: &mut ThreadPool,
         tt: &mut TranspositionTable,
-        #[cfg(feature = "kppt")] ehash: &mut EvalHash,
         reductions: &mut Reductions,
         is_ready: &mut bool,
     ) -> Vec<String> {
@@ -372,16 +341,7 @@ impl UsiOptions {
                 _ => raw_value.clone(),
             };
 
-            self.set_internal_unchecked(
-                &name,
-                &value_to_apply,
-                thread_pool,
-                tt,
-                #[cfg(feature = "kppt")]
-                ehash,
-                reductions,
-                is_ready,
-            );
+            self.set_internal_unchecked(&name, &value_to_apply, thread_pool, tt, reductions, is_ready);
             self.mark_fixed(&name);
 
             lines.push(format!(
@@ -597,8 +557,6 @@ mod fixed_flag_tests {
     fn set_multi_pv_via_usi(opts: &mut UsiOptions, value: &str) {
         let mut thread_pool = ThreadPool::new();
         let mut tt = TranspositionTable::new();
-        #[cfg(feature = "kppt")]
-        let mut ehash = EvalHash::new();
         let mut reductions = Reductions::new();
         let mut is_ready = true;
         opts.set(
@@ -606,8 +564,6 @@ mod fixed_flag_tests {
             value,
             &mut thread_pool,
             &mut tt,
-            #[cfg(feature = "kppt")]
-            &mut ehash,
             &mut reductions,
             &mut is_ready,
         );
@@ -668,26 +624,14 @@ mod eval_options_tests {
     fn read_eval_options(opts: &mut UsiOptions, path: &Path) -> Vec<String> {
         let mut thread_pool = ThreadPool::new();
         let mut tt = TranspositionTable::new();
-        #[cfg(feature = "kppt")]
-        let mut ehash = EvalHash::new();
         let mut reductions = Reductions::new();
         let mut is_ready = true;
-        opts.read_eval_options(
-            path,
-            &mut thread_pool,
-            &mut tt,
-            #[cfg(feature = "kppt")]
-            &mut ehash,
-            &mut reductions,
-            &mut is_ready,
-        )
+        opts.read_eval_options(path, &mut thread_pool, &mut tt, &mut reductions, &mut is_ready)
     }
 
     fn set_multi_pv_via_usi(opts: &mut UsiOptions, value: &str) {
         let mut thread_pool = ThreadPool::new();
         let mut tt = TranspositionTable::new();
-        #[cfg(feature = "kppt")]
-        let mut ehash = EvalHash::new();
         let mut reductions = Reductions::new();
         let mut is_ready = true;
         opts.set(
@@ -695,8 +639,6 @@ mod eval_options_tests {
             value,
             &mut thread_pool,
             &mut tt,
-            #[cfg(feature = "kppt")]
-            &mut ehash,
             &mut reductions,
             &mut is_ready,
         );

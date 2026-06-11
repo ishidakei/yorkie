@@ -1,6 +1,4 @@
 use crate::book::*;
-#[cfg(feature = "kppt")]
-use crate::evaluate::kppt::*;
 #[cfg(feature = "material")]
 use crate::evaluate::material::*;
 #[cfg(feature = "nnue")]
@@ -106,7 +104,6 @@ fn isready(
     usi_options: &mut UsiOptions,
     thread_pool: &mut ThreadPool,
     tt: &mut TranspositionTable,
-    #[cfg(feature = "kppt")] ehash: &mut EvalHash,
     reductions: &mut Reductions,
 ) {
     fn isready_impl(
@@ -114,26 +111,17 @@ fn isready(
         usi_options: &mut UsiOptions,
         thread_pool: &mut ThreadPool,
         tt: &mut TranspositionTable,
-        #[cfg(feature = "kppt")] ehash: &mut EvalHash,
         reductions: &mut Reductions,
     ) -> Result<()> {
         if *is_ready {
             return Ok(());
         }
         // Apply eval_options.txt before any evaluator initialisation so its
-        // overrides reach the upcoming nn.bin / load_evaluate_files calls.
+        // overrides reach the upcoming nn.bin load.
         let eval_dir = usi_options.get_string(UsiOptions::EVAL_DIR);
         if !eval_dir.is_empty() {
             let path = format!("{}/eval_options.txt", eval_dir);
-            let lines = usi_options.read_eval_options(
-                std::path::Path::new(&path),
-                thread_pool,
-                tt,
-                #[cfg(feature = "kppt")]
-                ehash,
-                reductions,
-                is_ready,
-            );
+            let lines = usi_options.read_eval_options(std::path::Path::new(&path), thread_pool, tt, reductions, is_ready);
             for line in lines {
                 println!("{}", line);
             }
@@ -146,8 +134,6 @@ fn isready(
                 println!("{}", line);
             }
         }
-        #[cfg(feature = "kppt")]
-        load_evaluate_files(&usi_options.get_string(UsiOptions::EVAL_DIR))?;
         if usi_options.get_bool(UsiOptions::BOOK_ENABLE) {
             let file_name = usi_options.get_filename(UsiOptions::BOOK_FILE);
             let book_options = BookOptions::from_usi_options(usi_options);
@@ -156,20 +142,10 @@ fn isready(
             thread_pool.book = Some(book);
         }
         tt.resize(usi_options.get_i64(UsiOptions::USI_HASH) as usize, thread_pool);
-        #[cfg(feature = "kppt")]
-        ehash.resize(usi_options.get_i64(UsiOptions::EVAL_HASH) as usize, thread_pool);
         *is_ready = true;
         Ok(())
     }
-    match isready_impl(
-        is_ready,
-        usi_options,
-        thread_pool,
-        tt,
-        #[cfg(feature = "kppt")]
-        ehash,
-        reductions,
-    ) {
+    match isready_impl(is_ready, usi_options, thread_pool, tt, reductions) {
         Ok(()) => println!("readyok"),
         Err(e) => println!("info {}", e),
     }
@@ -288,7 +264,6 @@ pub fn setoption(
     usi_options: &mut UsiOptions,
     thread_pool: &mut ThreadPool,
     tt: &mut TranspositionTable,
-    #[cfg(feature = "kppt")] ehash: &mut EvalHash,
     reductions: &mut Reductions,
     is_ready: &mut bool,
 ) {
@@ -297,7 +272,6 @@ pub fn setoption(
         usi_options: &mut UsiOptions,
         thread_pool: &mut ThreadPool,
         tt: &mut TranspositionTable,
-        #[cfg(feature = "kppt")] ehash: &mut EvalHash,
         reductions: &mut Reductions,
         is_ready: &mut bool,
     ) -> Result<()> {
@@ -315,16 +289,7 @@ pub fn setoption(
                 }
                 let name = args[1];
                 let value = args[3];
-                usi_options.set(
-                    name,
-                    value,
-                    thread_pool,
-                    tt,
-                    #[cfg(feature = "kppt")]
-                    ehash,
-                    reductions,
-                    is_ready,
-                );
+                usi_options.set(name, value, thread_pool, tt, reductions, is_ready);
             }
             _ => {
                 return Err(anyhow!(
@@ -336,16 +301,7 @@ pub fn setoption(
         Ok(())
     }
 
-    if let Err(e) = setoption_impl(
-        args,
-        usi_options,
-        thread_pool,
-        tt,
-        #[cfg(feature = "kppt")]
-        ehash,
-        reductions,
-        is_ready,
-    ) {
+    if let Err(e) = setoption_impl(args, usi_options, thread_pool, tt, reductions, is_ready) {
         println!("info {}", e);
     }
 }
@@ -582,17 +538,9 @@ fn csa_record_to_sfen(csa: &[u8]) -> Result<String> {
 
 pub fn cmd_loop() {
     let mut tt = TranspositionTable::new();
-    #[cfg(feature = "kppt")]
-    let mut ehash = EvalHash::new();
     let mut reductions = Reductions::new();
     let mut thread_pool = ThreadPool::new();
-    thread_pool.set(
-        1,
-        &mut tt,
-        #[cfg(feature = "kppt")]
-        &mut ehash,
-        &mut reductions,
-    );
+    thread_pool.set(1, &mut tt, &mut reductions);
     let mut usi_options = UsiOptions::new();
     let mut pos = Position::new();
     let mut is_ready = false;
@@ -631,15 +579,7 @@ pub fn cmd_loop() {
                 }
             }
             "isready" => {
-                isready(
-                    &mut is_ready,
-                    &mut usi_options,
-                    &mut thread_pool,
-                    &mut tt,
-                    #[cfg(feature = "kppt")]
-                    &mut ehash,
-                    &mut reductions,
-                );
+                isready(&mut is_ready, &mut usi_options, &mut thread_pool, &mut tt, &mut reductions);
             }
             "ponderhit" => {
                 thread_pool.ponder.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -650,8 +590,6 @@ pub fn cmd_loop() {
                 &mut usi_options,
                 &mut thread_pool,
                 &mut tt,
-                #[cfg(feature = "kppt")]
-                &mut ehash,
                 &mut reductions,
                 &mut is_ready,
             ),
@@ -691,16 +629,6 @@ pub fn cmd_loop() {
             "read_hcp" => read_hcp(&args[1..]),
             "read_sfen_and_output_hcp" => read_sfen_and_output_hcp(&args[1..]),
             "wait" => thread_pool.wait_for_search_finished(),
-            "write_eval" => {
-                if is_ready {
-                    #[cfg(feature = "kppt")]
-                    if let Err(e) = write_evaluate_files() {
-                        println!("info {}", e);
-                    }
-                } else {
-                    println!(r#"info error. "isready" command is needed in advance."#);
-                }
-            }
             _ => println!("info unknown command: {}", cmd),
         }
         if std::env::args().len() > 1 || token == "quit" {

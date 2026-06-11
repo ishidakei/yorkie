@@ -1,6 +1,4 @@
 use crate::book::*;
-#[cfg(feature = "kppt")]
-use crate::evaluate::kppt::*;
 #[cfg(feature = "material")]
 use crate::evaluate::material::*;
 #[cfg(feature = "nnue")]
@@ -47,8 +45,6 @@ struct Thread {
     limits: LimitsType, // Clone from ThreadPool for fast access.
     tt: *mut TranspositionTable,
     timeman: Arc<Mutex<TimeManagement>>, // shold I use pointer for speedup?
-    #[cfg(feature = "kppt")]
-    ehash: *mut EvalHash,
     reductions: *mut Reductions,
     usi_options: UsiOptions,
     best_move_changes: Arc<AtomicU64>,
@@ -73,7 +69,7 @@ struct Thread {
     nodess: Vec<Arc<AtomicI64>>,
 }
 
-unsafe impl std::marker::Send for Thread {} // for Thread::tt and Thread::ehash
+unsafe impl std::marker::Send for Thread {} // for Thread::tt
 
 struct ThreadPoolBase {
     threads: Vec<Arc<Mutex<Thread>>>,
@@ -392,12 +388,7 @@ impl Thread {
                 Repetition::Not => {
                     if self.stop.load(Ordering::Relaxed) || get_stack(stack, 0).ply >= MAX_PLY {
                         return if get_stack(stack, 0).ply >= MAX_PLY && !get_stack(stack, 0).in_check {
-                            evaluate(
-                                &mut self.position,
-                                stack,
-                                #[cfg(feature = "kppt")]
-                                self.ehash,
-                            )
+                            evaluate(&mut self.position, stack)
                         } else {
                             value_draw(self.nodes.load(Ordering::Relaxed))
                         };
@@ -573,12 +564,7 @@ impl Thread {
         let pure_static_eval = if root_node {
             evaluate_at_root(&self.position, stack)
         } else {
-            evaluate(
-                &mut self.position,
-                stack,
-                #[cfg(feature = "kppt")]
-                self.ehash,
-            )
+            evaluate(&mut self.position, stack)
         };
         let improving;
         // Step 6
@@ -674,11 +660,6 @@ impl Thread {
                 get_stack_mut(stack, 0).continuation_history = self.continuation_history[0][0].sentinel();
 
                 self.position.do_null_move();
-                #[cfg(feature = "kppt")]
-                {
-                    // key is wrong. but it's no problem.
-                    get_stack_mut(stack, 1).static_eval_raw = get_stack(stack, 0).static_eval_raw;
-                }
                 let mut null_value = -self.search::<NonPvType>(&mut stack[1..], -beta, -beta + Value(1), depth - r, !cut_node);
                 self.position.undo_null_move();
 
@@ -750,8 +731,6 @@ impl Thread {
                         );
                         #[cfg(not(feature = "nnue"))]
                         self.position.do_move(m, gives_check);
-                        #[cfg(feature = "kppt")]
-                        get_stack_mut(stack, 1).static_eval_raw.set_not_evaluated();
                         let mut value =
                             -self.qsearch::<NonPvType>(&mut stack[1..], -prob_cut_beta, -prob_cut_beta + Value(1), Depth::ZERO);
                         if value >= prob_cut_beta {
@@ -989,9 +968,6 @@ impl Thread {
             );
             #[cfg(not(feature = "nnue"))]
             self.position.do_move(m, gives_check);
-
-            #[cfg(feature = "kppt")]
-            get_stack_mut(stack, 1).static_eval_raw.set_not_evaluated();
 
             // Step 16
             let (do_full_depth_search, did_lmr) = if depth.0 >= 3
@@ -1270,12 +1246,7 @@ impl Thread {
                 best_value = tte.eval();
                 get_stack_mut(stack, 0).static_eval = best_value;
                 if best_value == Value::NONE {
-                    best_value = evaluate(
-                        &mut self.position,
-                        stack,
-                        #[cfg(feature = "kppt")]
-                        self.ehash,
-                    );
+                    best_value = evaluate(&mut self.position, stack);
                     get_stack_mut(stack, 0).static_eval = best_value;
                 }
                 if tt_value != Value::NONE
@@ -1289,12 +1260,7 @@ impl Thread {
                 }
             } else {
                 best_value = if get_stack(stack, -1).current_move.non_zero_unwrap_unchecked() != Move::NULL {
-                    evaluate(
-                        &mut self.position,
-                        stack,
-                        #[cfg(feature = "kppt")]
-                        self.ehash,
-                    )
+                    evaluate(&mut self.position, stack)
                 } else {
                     -get_stack(stack, -1).static_eval
                 };
@@ -1342,12 +1308,7 @@ impl Thread {
             depth,
         );
 
-        evaluate(
-            &mut self.position,
-            stack,
-            #[cfg(feature = "kppt")]
-            self.ehash,
-        ); // for difference calculation
+        evaluate(&mut self.position, stack); // for difference calculation
         while let Some(m) = mp.next_move(&self.position) {
             debug_assert!(m != Move::NULL);
 
@@ -1411,8 +1372,6 @@ impl Thread {
             );
             #[cfg(not(feature = "nnue"))]
             self.position.do_move(m, gives_check);
-            #[cfg(feature = "kppt")]
-            get_stack_mut(stack, 1).static_eval_raw.set_not_evaluated();
             let value = -self.qsearch::<NT>(&mut stack[1..], -beta, -alpha, depth - Depth::ONE_PLY);
             self.position.undo_move(m);
 
@@ -1655,13 +1614,7 @@ impl ThreadPool {
         *main_thread.best_previous_score.lock().unwrap() = Value::INFINITE;
         main_thread.previous_time_reduction = 1.0;
     }
-    pub fn set(
-        &mut self,
-        requested: usize,
-        tt: &mut TranspositionTable,
-        #[cfg(feature = "kppt")] ehash: &mut EvalHash,
-        reductions: &mut Reductions,
-    ) {
+    pub fn set(&mut self, requested: usize, tt: &mut TranspositionTable, reductions: &mut Reductions) {
         if let Some(handle) = self.handle.take() {
             handle.join().unwrap();
             self.thread_pool_base.lock().unwrap().threads.clear();
@@ -1695,8 +1648,6 @@ impl ThreadPool {
                     limits: self.limits.clone(),
                     tt,
                     timeman: self.timeman.clone(),
-                    #[cfg(feature = "kppt")]
-                    ehash,
                     reductions,
                     usi_options: UsiOptions::new(),
                     best_move_changes: self.best_move_changess[i].clone(),
@@ -1966,34 +1917,7 @@ mod tests {
             .spawn(|| {
                 let mut thread_pool = ThreadPool::new();
                 let mut tt = TranspositionTable::new();
-                #[cfg(feature = "kppt")]
-                let usi_options = UsiOptions::new();
-                #[cfg(feature = "kppt")]
-                let mut ehash = EvalHash::new();
                 tt.resize(16, &mut thread_pool);
-                #[cfg(feature = "kppt")]
-                ehash.resize(16, &mut thread_pool);
-                #[cfg(feature = "kppt")]
-                if load_evaluate_files(&usi_options.get_string(UsiOptions::EVAL_DIR)).is_ok() {
-                    let limits = {
-                        let mut limits = LimitsType::new();
-                        limits.depth = Some(1);
-                        limits.start_time = Some(std::time::Instant::now());
-                        limits
-                    };
-                    let mut reductions = Reductions::new();
-                    thread_pool.set(
-                        3,
-                        &mut tt,
-                        #[cfg(feature = "kppt")]
-                        &mut ehash,
-                        &mut reductions,
-                    );
-                    let ponder_mode = false;
-                    let hide_all_output = false;
-                    thread_pool.start_thinking(&Position::new(), &mut tt, limits, &usi_options, ponder_mode, hide_all_output);
-                    thread_pool.wait_for_search_finished();
-                };
                 // No evaluation funciton binaries.
                 // We want to do "cargo test" without evaluation function binaries.
                 // Then we do nothing and pass this test.
