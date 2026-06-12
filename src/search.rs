@@ -273,6 +273,11 @@ pub fn value_draw(nodes: i64) -> Value {
     Value::DRAW + Value(2 * (nodes as i32 & 1) - 1)
 }
 
+/// Canonical drawn-game score (repetition draws and the `Max_Moves_To_Draw` horizon).
+pub fn draw_value() -> Value {
+    Value::DRAW
+}
+
 pub fn update_continuation_histories(stack: &mut [Stack], pc: Piece, to: Square, bonus: i32) {
     for i in [2i64, 3, 5, 7] {
         if get_stack(stack, -1).in_check && i > 3 {

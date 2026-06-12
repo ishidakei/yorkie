@@ -43,6 +43,8 @@ struct Thread {
     capture_history: CapturePieceToHistory,
     continuation_history: [[ContinuationHistory; StatsType::NUM]; InCheckType::NUM],
     limits: LimitsType, // Clone from ThreadPool for fast access.
+    // Game-ply draw horizon (maximum-moves rule); snapshot per search, 0 = unlimited = i32::MAX.
+    max_moves_to_draw: i32,
     tt: *mut TranspositionTable,
     timeman: Arc<Mutex<TimeManagement>>, // shold I use pointer for speedup?
     reductions: *mut Reductions,
@@ -112,6 +114,10 @@ impl Thread {
         });
     }
     fn iterative_deepening_loop(&mut self) {
+        self.max_moves_to_draw = match self.usi_options.get_i64(UsiOptions::MAX_MOVES_TO_DRAW) {
+            0 => i32::MAX, // 0 = unlimited
+            limit => limit as i32,
+        };
         let mut stack: [Stack; MAX_PLY as usize + 10] = std::array::from_fn(|_| Stack::new());
         let mut best_value = -Value::INFINITE;
         let mut last_best_move = None;
@@ -393,8 +399,13 @@ impl Thread {
                             value_draw(self.nodes.load(Ordering::Relaxed))
                         };
                     }
+                    // Maximum-moves rule: past the limit is a draw. After the repetition match so a
+                    // perpetual check completing at the boundary stays an illegal-move loss.
+                    if self.position.ply() > self.max_moves_to_draw {
+                        return draw_value();
+                    }
                 }
-                Repetition::Draw => return Value::DRAW,
+                Repetition::Draw => return draw_value(),
                 Repetition::Win => return Value::mate_in(get_stack(stack, 0).ply),
                 Repetition::Lose => return Value::mated_in(get_stack(stack, 0).ply),
                 Repetition::Superior => {
@@ -1193,6 +1204,10 @@ impl Thread {
         if get_stack_mut(stack, 0).ply >= MAX_PLY {
             return Value::DRAW;
         }
+        // Maximum-moves rule: past the limit is a draw, returned before the TT probe and 1-ply-mate check.
+        if self.position.ply() > self.max_moves_to_draw {
+            return draw_value();
+        }
 
         debug_assert!(0 <= get_stack(stack, 0).ply && get_stack(stack, 0).ply < MAX_PLY);
 
@@ -1646,6 +1661,7 @@ impl ThreadPool {
                         [ContinuationHistory::new(), ContinuationHistory::new()],
                     ],
                     limits: self.limits.clone(),
+                    max_moves_to_draw: i32::MAX,
                     tt,
                     timeman: self.timeman.clone(),
                     reductions,
@@ -1926,5 +1942,132 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    // Search-behavior tests need an eval without binaries, so material build only.
+    #[cfg(feature = "material")]
+    mod max_moves_to_draw_tests {
+        use super::super::*;
+
+        /// Deterministic single-thread fixed-depth search on a big-stack thread; returns best root move and node count.
+        fn run_search(sfen: &str, max_moves_to_draw: &str, depth: u32) -> (RootMove, i64) {
+            let sfen = sfen.to_string();
+            let max_moves_to_draw = max_moves_to_draw.to_string();
+            std::thread::Builder::new()
+                .stack_size(crate::stack_size::STACK_SIZE)
+                .spawn(move || run_search_impl(&sfen, &max_moves_to_draw, depth))
+                .unwrap()
+                .join()
+                .unwrap()
+        }
+
+        fn run_search_impl(sfen: &str, max_moves_to_draw: &str, depth: u32) -> (RootMove, i64) {
+            let mut reductions = Reductions::new();
+            let mut thread_pool = ThreadPool::new();
+            let mut tt = TranspositionTable::new();
+            thread_pool.set(1, &mut tt, &mut reductions);
+            tt.resize(16, &mut thread_pool);
+            let mut usi_options = UsiOptions::new();
+            let mut is_ready = true;
+            usi_options.set(
+                UsiOptions::MAX_MOVES_TO_DRAW,
+                max_moves_to_draw,
+                &mut thread_pool,
+                &mut tt,
+                &mut reductions,
+                &mut is_ready,
+            );
+            let pos = Position::new_from_sfen(sfen).unwrap();
+            let mut limits = LimitsType::new();
+            limits.depth = Some(depth);
+            limits.start_time = Some(std::time::Instant::now());
+            thread_pool.start_thinking(&pos, &mut tt, limits, &usi_options, false, true);
+            thread_pool.wait_for_search_finished();
+            let best = thread_pool
+                .last_best_root_move
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("search must produce a best root move");
+            (best, thread_pool.nodes_searched())
+        }
+
+        // Black to move, gold in hand: G*5b is mate.
+        const MATE_IN_ONE_SFEN_BODY: &str = "4k4/9/4P4/9/9/9/9/9/4K4 b G";
+
+        #[test]
+        fn win_before_horizon_is_preferred() {
+            // Mate inside the horizon (ply 15, limit 16): must be scored as mate, not draw.
+            let sfen = format!("{} 15", MATE_IN_ONE_SFEN_BODY);
+            let (best, _) = run_search(&sfen, "16", 6);
+            assert!(
+                best.score >= Value::MATE_IN_MAX_PLY,
+                "mate inside the horizon must keep its mate score; got {}",
+                best.score.0
+            );
+            let pos = Position::new_from_sfen(&sfen).unwrap();
+            let mate_move = Move::new_from_usi_str("G*5b", &pos).unwrap();
+            assert_eq!(best.pv[0], mate_move, "the mating move must head the pv");
+        }
+
+        #[test]
+        fn mate_beyond_horizon_scores_as_draw() {
+            // Mate lands beyond the horizon (limit 14): must score as a draw, not a win.
+            let sfen = format!("{} 15", MATE_IN_ONE_SFEN_BODY);
+            let (best, _) = run_search(&sfen, "14", 6);
+            assert_eq!(
+                best.score,
+                Value::DRAW,
+                "a mate that lands beyond the horizon is a draw; got {}",
+                best.score.0
+            );
+
+            // Root already past the limit (game ply 17 > 16): every move scores as a draw.
+            let sfen = format!("{} 17", MATE_IN_ONE_SFEN_BODY);
+            let (best, _) = run_search(&sfen, "16", 6);
+            assert_eq!(
+                best.score,
+                Value::DRAW,
+                "past the limit everything is a draw; got {}",
+                best.score.0
+            );
+        }
+
+        // White to move, mated by R*1b as soon as black gets to move.
+        const LOSING_SIDE_SFEN_BODY: &str = "6G1k/9/p7G/9/9/9/9/9/4K4 w R";
+
+        #[test]
+        fn losing_side_steers_toward_the_horizon() {
+            // White's move is move 16 = the limit, so black's mate lands beyond the horizon: a draw.
+            let sfen = format!("{} 16", LOSING_SIDE_SFEN_BODY);
+            let (best, _) = run_search(&sfen, "16", 6);
+            assert_eq!(
+                best.score,
+                Value::DRAW,
+                "the losing side reaches the horizon and saves the draw; got {}",
+                best.score.0
+            );
+
+            // Sanity check of the same position without a limit: white is simply mated.
+            let (best, _) = run_search(&sfen, "0", 6);
+            assert!(
+                best.score <= Value::MATED_IN_MAX_PLY,
+                "without a horizon the losing side is mated; got {}",
+                best.score.0
+            );
+        }
+
+        #[test]
+        fn zero_means_unlimited_and_changes_nothing() {
+            // 0 = unlimited: away from any limit the search is identical node for node.
+            let startpos = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/9/1B5R1/LNSGKGSNL b - 1";
+            let (best_unlimited, nodes_unlimited) = run_search(startpos, "0", 6);
+            for limit in ["512", "100000"] {
+                let (best, nodes) = run_search(startpos, limit, 6);
+                assert_eq!(best.score, best_unlimited.score, "limit {limit}: score must not change");
+                assert_eq!(best.pv[0], best_unlimited.pv[0], "limit {limit}: bestmove must not change");
+                assert_eq!(nodes, nodes_unlimited, "limit {limit}: node count must not change");
+            }
+        }
     }
 }

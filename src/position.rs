@@ -2609,6 +2609,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_ply_counts_pre_played_moves() {
+        // After N pre-played moves the game ply is N + 1 (the move about to be played).
+        let mut pos = Position::new();
+        assert_eq!(pos.ply(), 1);
+        for (i, usi) in ["7g7f", "3c3d", "8h2b+", "3a2b"].iter().enumerate() {
+            let m = Move::new_from_usi_str(usi, &pos).unwrap();
+            let gives_check = pos.gives_check(m);
+            pos.do_move(m, gives_check);
+            assert_eq!(pos.ply(), i as i32 + 2);
+        }
+    }
+
+    #[test]
     fn test_position_set() {
         let sfens = [
             "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",

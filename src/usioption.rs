@@ -89,6 +89,7 @@ impl UsiOptions {
     pub const EVAL_DIR: &'static str = "Eval_Dir";
     #[cfg(feature = "nnue")]
     pub const FV_SCALE: &'static str = "FV_SCALE";
+    pub const MAX_MOVES_TO_DRAW: &'static str = "Max_Moves_To_Draw";
     pub const MINIMUM_THINKING_TIME: &'static str = "Minimum_Thinking_Time";
     pub const MOVE_OVERHEAD: &'static str = "Move_Overhead";
     pub const MULTI_PV: &'static str = "MultiPV";
@@ -136,6 +137,13 @@ impl UsiOptions {
         // .nnue files do not carry the post-accumulator divisor; default 16
         #[cfg(feature = "nnue")]
         options.insert(Self::FV_SCALE, UsiOptionEntry::new(UsiOptionValue::spin(16, 1, 128)));
+        // Maximum-moves rule (game-ply draw horizon): a search node whose game ply exceeds this
+        // limit scores as the canonical draw, so a conclusion is only credited through the final
+        // move. 0 = unlimited. Default 512 = the tournament rule this engine targets.
+        options.insert(
+            Self::MAX_MOVES_TO_DRAW,
+            UsiOptionEntry::new(UsiOptionValue::spin(512, 0, 100000)),
+        );
         options.insert(Self::MULTI_PV, UsiOptionEntry::new(UsiOptionValue::spin(1, 1, 500)));
         // Time-management options (see `timeman::compute`). Per-move round-trip overhead (ms).
         options.insert(Self::MOVE_OVERHEAD, UsiOptionEntry::new(UsiOptionValue::spin(200, 0, 10000)));
@@ -556,6 +564,23 @@ mod time_management_option_tests {
         assert_eq!(opts.get_i64(UsiOptions::TIMEOUT_SAFETY_MARGIN), 1200);
         assert_eq!(opts.get_i64(UsiOptions::MINIMUM_THINKING_TIME), 1000);
         assert_eq!(opts.get_i64(UsiOptions::OPENING_TIME_WEIGHT), 100);
+    }
+}
+
+#[cfg(test)]
+mod max_moves_to_draw_option_tests {
+    use super::*;
+
+    #[test]
+    fn advertises_max_moves_to_draw() {
+        let opts = UsiOptions::new();
+        let advertised = opts.to_usi_string();
+        let expected = "option name Max_Moves_To_Draw type spin default 512 min 0 max 100000";
+        assert!(
+            advertised.contains(expected),
+            "missing advertised option line: {expected}\n{advertised}"
+        );
+        assert_eq!(opts.get_i64(UsiOptions::MAX_MOVES_TO_DRAW), 512);
     }
 }
 
