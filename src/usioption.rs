@@ -94,7 +94,6 @@ impl UsiOptions {
     pub const MULTI_PV: &'static str = "MultiPV";
     pub const OPENING_TIME_WEIGHT: &'static str = "Opening_Time_Weight";
     pub const THREADS: &'static str = "Threads";
-    pub const TIME_MARGIN: &'static str = "Time_Margin";
     pub const TIMEOUT_SAFETY_MARGIN: &'static str = "Timeout_Safety_Margin";
     pub const USI_HASH: &'static str = "USI_Hash";
     pub const USI_PONDER: &'static str = "USI_Ponder";
@@ -122,6 +121,8 @@ impl UsiOptions {
         );
         options.insert(Self::FLIPPED_BOOK, UsiOptionEntry::new(UsiOptionValue::check(true)));
         options.insert(Self::BOOK_ON_THE_FLY, UsiOptionEntry::new(UsiOptionValue::check(false)));
+        // Transmission reserve per byoyomi period (ms): the pure-byoyomi path bypasses the time
+        // manager, so this is its one margin.
         options.insert(
             Self::BYOYOMI_MARGIN,
             UsiOptionEntry::new(UsiOptionValue::spin(500, 0, i64::MAX)),
@@ -154,7 +155,6 @@ impl UsiOptions {
             UsiOptionEntry::new(UsiOptionValue::spin(100, 10, 1000)),
         );
         options.insert(Self::THREADS, UsiOptionEntry::new(UsiOptionValue::spin(1, 1, 8192)));
-        options.insert(Self::TIME_MARGIN, UsiOptionEntry::new(UsiOptionValue::spin(500, 0, i64::MAX)));
         const MAX_HASH_MB: usize = 0x200_0000;
         options.insert(
             Self::USI_HASH,
@@ -537,6 +537,15 @@ mod time_management_option_tests {
         assert!(
             !advertised.contains("Slow_Mover"),
             "Slow_Mover must be renamed to Opening_Time_Weight"
+        );
+        // Time_Margin is retired: Move_Overhead + Timeout_Safety_Margin own the main-clock reserve.
+        assert!(
+            !advertised.contains("Time_Margin"),
+            "Time_Margin must not be advertised: Move_Overhead + Timeout_Safety_Margin own its role"
+        );
+        assert!(
+            advertised.contains("option name Byoyomi_Margin type spin default 500"),
+            "Byoyomi_Margin must remain for the pure-byoyomi path"
         );
         assert!(
             !advertised.to_lowercase().contains("flag"),

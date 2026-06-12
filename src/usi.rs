@@ -18,13 +18,9 @@ use crate::usioption::*;
 use anyhow::{Context, Result, anyhow};
 use std::io::prelude::*;
 
-fn go(
-    thread_pool: &mut ThreadPool,
-    tt: &mut TranspositionTable,
-    usi_options: &UsiOptions,
-    pos: &Position,
-    args: &[&str],
-) -> Result<()> {
+/// Parse the argument list of a USI `go` command into search limits and whether `ponder` was set.
+/// Kept separate from [`go`] so the margin behaviour is unit-testable.
+fn parse_go_limits(usi_options: &UsiOptions, args: &[&str]) -> Result<(LimitsType, bool)> {
     let mut limits = LimitsType::new();
     limits.start_time = Some(std::time::Instant::now());
     let mut iter = args.iter();
@@ -39,19 +35,9 @@ fn go(
     while let Some(&limit_type) = iter.next() {
         match limit_type {
             "btime" | "wtime" => {
-                // Margin responsibility split (no physical delay is counted twice): `Time_Margin`
-                // is a one-time conservative haircut on the *reported main clock*, applied here at
-                // parse time before the time manager sees it. The per-move `Move_Overhead` and the
-                // near-deadline `Timeout_Safety_Margin` act later inside `timeman::compute`'s caps;
-                // `Byoyomi_Margin` is the analogous haircut on the byoyomi/movetime path below.
                 let color = if limit_type == "btime" { Color::BLACK } else { Color::WHITE };
-                let n = next_num(limit_type, &mut iter)?;
-                let time_margin = usi_options.get_i64(UsiOptions::TIME_MARGIN) as u64;
-                limits.time[color.0 as usize] = if time_margin <= n {
-                    std::time::Duration::from_millis(n - time_margin)
-                } else {
-                    std::time::Duration::from_millis(0)
-                };
+                let n: u64 = next_num(limit_type, &mut iter)?;
+                limits.time[color.0 as usize] = std::time::Duration::from_millis(n);
             }
             "binc" | "winc" => {
                 let color = if limit_type == "binc" { Color::BLACK } else { Color::WHITE };
@@ -59,13 +45,13 @@ fn go(
                 limits.inc[color.0 as usize] = std::time::Duration::from_millis(n);
             }
             "byoyomi" | "movetime" => {
-                let n = next_num(limit_type, &mut iter)?;
-                let byoyomi_margin = usi_options.get_i64(UsiOptions::BYOYOMI_MARGIN) as u64;
-                limits.movetime = if byoyomi_margin <= n {
-                    Some(std::time::Duration::from_millis(n - byoyomi_margin))
+                let n: u64 = next_num(limit_type, &mut iter)?;
+                let margin = if limit_type == "byoyomi" {
+                    usi_options.get_i64(UsiOptions::BYOYOMI_MARGIN) as u64
                 } else {
-                    Some(std::time::Duration::from_millis(0))
+                    0
                 };
+                limits.movetime = Some(std::time::Duration::from_millis(n.saturating_sub(margin)));
             }
             "depth" => {
                 let n = next_num(limit_type, &mut iter)?;
@@ -94,6 +80,17 @@ fn go(
             invalid_token => return Err(anyhow!("invalid token: {}", invalid_token)),
         }
     }
+    Ok((limits, ponder_mode))
+}
+
+fn go(
+    thread_pool: &mut ThreadPool,
+    tt: &mut TranspositionTable,
+    usi_options: &UsiOptions,
+    pos: &Position,
+    args: &[&str],
+) -> Result<()> {
+    let (limits, ponder_mode) = parse_go_limits(usi_options, args)?;
     let hide_all_output = false;
     thread_pool.start_thinking(pos, tt, limits, usi_options, ponder_mode, hide_all_output);
     Ok(())
@@ -634,6 +631,58 @@ pub fn cmd_loop() {
         if std::env::args().len() > 1 || token == "quit" {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod parse_go_limits_tests {
+    use super::*;
+
+    // The reported main clock must reach the time manager untrimmed (no parse-time haircut).
+    #[test]
+    fn fischer_clock_arrives_untrimmed() {
+        let opts = UsiOptions::new();
+        let (limits, ponder) =
+            parse_go_limits(&opts, &["btime", "120000", "wtime", "118000", "binc", "2000", "winc", "2000"]).unwrap();
+        assert_eq!(limits.time[Color::BLACK.0 as usize].as_millis(), 120_000);
+        assert_eq!(limits.time[Color::WHITE.0 as usize].as_millis(), 118_000);
+        assert_eq!(limits.inc[Color::BLACK.0 as usize].as_millis(), 2_000);
+        assert_eq!(limits.inc[Color::WHITE.0 as usize].as_millis(), 2_000);
+        assert!(limits.movetime.is_none(), "no byoyomi token must mean no movetime cap");
+        assert!(
+            limits.use_time_management(),
+            "the Fischer line must take the time-managed path"
+        );
+        assert!(!ponder);
+    }
+
+    // The byoyomi path bypasses the time manager, so Byoyomi_Margin is its one margin.
+    #[test]
+    fn byoyomi_is_margined() {
+        let opts = UsiOptions::new();
+        let (limits, _) = parse_go_limits(&opts, &["btime", "0", "wtime", "0", "byoyomi", "10000"]).unwrap();
+        assert_eq!(limits.movetime.unwrap().as_millis(), 9_500);
+        assert!(!limits.use_time_management());
+
+        // A period shorter than the margin clamps to zero instead of underflowing.
+        let (limits, _) = parse_go_limits(&opts, &["byoyomi", "300"]).unwrap();
+        assert_eq!(limits.movetime.unwrap().as_millis(), 0);
+    }
+
+    // `movetime` is a GUI-fixed think time, not a clock deadline: honoured exactly, no margin.
+    #[test]
+    fn movetime_is_exact() {
+        let opts = UsiOptions::new();
+        let (limits, _) = parse_go_limits(&opts, &["movetime", "5000"]).unwrap();
+        assert_eq!(limits.movetime.unwrap().as_millis(), 5_000);
+    }
+
+    #[test]
+    fn rejects_bad_tokens() {
+        let opts = UsiOptions::new();
+        assert!(parse_go_limits(&opts, &["btime"]).is_err(), "missing number");
+        assert!(parse_go_limits(&opts, &["btime", "abc"]).is_err(), "non-numeric");
+        assert!(parse_go_limits(&opts, &["unknown_token"]).is_err(), "unknown token");
     }
 }
 

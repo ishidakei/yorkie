@@ -203,6 +203,22 @@ mod tests {
         );
     }
 
+    // At shipped defaults the only low-time reserve is Move_Overhead + Timeout_Safety_Margin.
+    #[test]
+    fn effective_reserve_is_overhead_plus_safety_margin_at_defaults() {
+        const DEFAULT_OVERHEAD: i64 = 200;
+        const DEFAULT_SAFETY_MARGIN: i64 = 1_200;
+        for &reported in &[2_000i64, 3_000, 5_000] {
+            let (opt, max) = TimeManagement::compute(reported, 2_000, 40, DEFAULT_OVERHEAD, 100, DEFAULT_SAFETY_MARGIN, 1_000);
+            assert_eq!(
+                max as i64,
+                reported - (DEFAULT_OVERHEAD + DEFAULT_SAFETY_MARGIN),
+                "reported={reported}: the only reserve must be Move_Overhead + Timeout_Safety_Margin"
+            );
+            assert!(opt <= max);
+        }
+    }
+
     // Opening_Time_Weight scales allocated time (larger weight -> larger optimum).
     #[test]
     fn opening_time_weight_is_monotonic() {
