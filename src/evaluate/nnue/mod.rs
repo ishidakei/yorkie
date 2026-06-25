@@ -1,8 +1,8 @@
-//! NNUE evaluation function (SFNNwoP1536).
-//!
-//! Derived from YaneuraOu (https://github.com/yaneurao/YaneuraOu).
+//! NNUE evaluation function (SFNNwoP1536), derived from YaneuraOu
+//! (https://github.com/yaneurao/YaneuraOu).
 #![allow(dead_code)]
 
+pub mod aligned;
 pub mod bucket;
 pub mod features;
 pub mod loader;
@@ -19,6 +19,9 @@ pub use types::{Accumulator, FEATURE_LIST_CAPACITY, FeatureIndex, FeatureList, H
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+
+#[cfg(test)]
+use aligned::Aligned64;
 
 use crate::position::*;
 use crate::search::{Stack, get_stack_mut};
@@ -139,8 +142,8 @@ pub(crate) fn make_placeholder_network(sha256: [u8; 32]) -> NnueNetwork {
             hash: 0,
             arch_id: "placeholder".to_string(),
         },
-        ft_biases: Vec::<i16>::new().into_boxed_slice(),
-        ft_weights: Vec::<i16>::new().into_boxed_slice(),
+        ft_biases: Aligned64::zeroed(0),
+        ft_weights: Aligned64::zeroed(0),
         stacks: Vec::new(),
         sha256,
     }

@@ -1,13 +1,13 @@
 use static_assertions::const_assert;
 use thiserror::Error;
 
+use super::aligned::Aligned64;
+
 pub const HIDDEN_SIZE: usize = 1_536;
 pub const NUM_FEATURES: usize = 73_305;
 pub const LAYER_STACKS: usize = 9;
 
-// fc_0 produces HIDDEN1_DIMS + 1 = 16 outputs; the 16th feeds only the
-// post-fc_2 shortcut. The first 15 feed both ClippedReLU and SqrClippedReLU,
-// whose 30-wide concat is fc_1's input.
+// fc_0 has 16 outputs; the 16th feeds only the post-fc_2 shortcut, the first 15 feed both activations.
 pub const HIDDEN1_DIMS: usize = 15;
 pub const HIDDEN2_DIMS: usize = 32;
 
@@ -26,8 +26,7 @@ pub const FC_2_PADDED_INPUT_DIMS: usize = 32;
 // NUM_FEATURES = 73_305 > u16::MAX, so u16 cannot index the full space.
 pub type FeatureIndex = u32;
 
-// A legal Shogi position always has 40 piece slots (board ∪ hand); 48 gives
-// slack for diagnostic over-approximations.
+// A legal position has 40 piece slots; 48 gives slack.
 pub const FEATURE_LIST_CAPACITY: usize = 48;
 
 const_assert!(FEATURE_LIST_CAPACITY >= 40);
@@ -61,19 +60,19 @@ pub struct NetHeader {
 
 #[derive(Debug)]
 pub struct NetworkStack {
-    pub fc_0_biases: Box<[i32]>,
-    pub fc_0_weights: Box<[i8]>,
-    pub fc_1_biases: Box<[i32]>,
-    pub fc_1_weights: Box<[i8]>,
-    pub fc_2_biases: Box<[i32]>,
-    pub fc_2_weights: Box<[i8]>,
+    pub fc_0_biases: Aligned64<i32>,
+    pub fc_0_weights: Aligned64<i8>,
+    pub fc_1_biases: Aligned64<i32>,
+    pub fc_1_weights: Aligned64<i8>,
+    pub fc_2_biases: Aligned64<i32>,
+    pub fc_2_weights: Aligned64<i8>,
 }
 
 #[derive(Debug)]
 pub struct NnueNetwork {
     pub header: NetHeader,
-    pub ft_biases: Box<[i16]>,
-    pub ft_weights: Box<[i16]>,
+    pub ft_biases: Aligned64<i16>,
+    pub ft_weights: Aligned64<i16>,
     pub stacks: Vec<NetworkStack>,
     pub sha256: [u8; 32],
 }

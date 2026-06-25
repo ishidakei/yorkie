@@ -83,8 +83,7 @@ fn per_layer_flow(transformed: &[u8; FC_0_INPUT_DIMS], stack: &NetworkStack) -> 
         FC_0_PADDED_INPUT_DIMS,
     );
 
-    // Both activations run on the first HIDDEN1_DIMS (= 15) outputs;
-    // fc_0_out[HIDDEN1_DIMS] is routed only to the post-fc_2 shortcut.
+    // Both activations use the first HIDDEN1_DIMS outputs; fc_0_out[HIDDEN1_DIMS] feeds only the shortcut.
     let mut ac_0 = [0u8; HIDDEN1_DIMS];
     post_ft_kernel::clipped_relu(&fc_0_out[..HIDDEN1_DIMS], &mut ac_0);
     let mut ac_sqr_0 = [0u8; HIDDEN1_DIMS];
@@ -118,13 +117,13 @@ fn per_layer_flow(transformed: &[u8; FC_0_INPUT_DIMS], stack: &NetworkStack) -> 
         FC_2_PADDED_INPUT_DIMS,
     );
 
-    // SFNNwoP1536 post-fc_2 shortcut: fc_0_out[HIDDEN1_DIMS] is raw (pre-ReLU)
-    // and can be negative.
+    // post-fc_2 shortcut: fc_0_out[HIDDEN1_DIMS] is raw (pre-ReLU) and can be negative.
     fc_2_out[0].wrapping_add(fc_0_out[HIDDEN1_DIMS])
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::aligned::Aligned64;
     use super::super::types::{
         FC_0_OUTPUT_DIMS, FC_0_PADDED_INPUT_DIMS, FC_1_OUTPUT_DIMS, FC_1_PADDED_INPUT_DIMS, FC_2_OUTPUT_DIMS,
         FC_2_PADDED_INPUT_DIMS, HIDDEN_SIZE, HIDDEN1_DIMS, NetHeader, NetworkStack,
@@ -138,8 +137,8 @@ mod tests {
                 hash: 0,
                 arch_id: "synthetic".to_string(),
             },
-            ft_biases: Vec::<i16>::new().into_boxed_slice(),
-            ft_weights: Vec::<i16>::new().into_boxed_slice(),
+            ft_biases: Aligned64::zeroed(0),
+            ft_weights: Aligned64::zeroed(0),
             stacks: vec![stack],
             sha256: [0u8; 32],
         }
@@ -147,12 +146,12 @@ mod tests {
 
     fn zero_stack() -> NetworkStack {
         NetworkStack {
-            fc_0_biases: vec![0i32; FC_0_OUTPUT_DIMS].into_boxed_slice(),
-            fc_0_weights: vec![0i8; FC_0_OUTPUT_DIMS * FC_0_PADDED_INPUT_DIMS].into_boxed_slice(),
-            fc_1_biases: vec![0i32; FC_1_OUTPUT_DIMS].into_boxed_slice(),
-            fc_1_weights: vec![0i8; FC_1_OUTPUT_DIMS * FC_1_PADDED_INPUT_DIMS].into_boxed_slice(),
-            fc_2_biases: vec![0i32; FC_2_OUTPUT_DIMS].into_boxed_slice(),
-            fc_2_weights: vec![0i8; FC_2_OUTPUT_DIMS * FC_2_PADDED_INPUT_DIMS].into_boxed_slice(),
+            fc_0_biases: Aligned64::zeroed(FC_0_OUTPUT_DIMS),
+            fc_0_weights: Aligned64::zeroed(FC_0_OUTPUT_DIMS * FC_0_PADDED_INPUT_DIMS),
+            fc_1_biases: Aligned64::zeroed(FC_1_OUTPUT_DIMS),
+            fc_1_weights: Aligned64::zeroed(FC_1_OUTPUT_DIMS * FC_1_PADDED_INPUT_DIMS),
+            fc_2_biases: Aligned64::zeroed(FC_2_OUTPUT_DIMS),
+            fc_2_weights: Aligned64::zeroed(FC_2_OUTPUT_DIMS * FC_2_PADDED_INPUT_DIMS),
         }
     }
 
@@ -173,8 +172,8 @@ mod tests {
                 hash: 0,
                 arch_id: "synthetic".to_string(),
             },
-            ft_biases: Vec::<i16>::new().into_boxed_slice(),
-            ft_weights: Vec::<i16>::new().into_boxed_slice(),
+            ft_biases: Aligned64::zeroed(0),
+            ft_weights: Aligned64::zeroed(0),
             stacks,
             sha256: [0u8; 32],
         };
@@ -196,9 +195,7 @@ mod tests {
 
         let mut stack = zero_stack();
 
-        // EWM lane 0: transformed[0] = clamp(200,0,254)*clamp(100,0,254) >> 9 = 39.
-        // fc_0_out[0]  = 50 + 3*39  = 167
-        // fc_0_out[15] = 100 + 4*39 = 256  (post-fc_2 shortcut)
+        // EWM lane 0 → transformed[0]=39; fc_0_out[0]=167, fc_0_out[15]=256 (shortcut).
         stack.fc_0_biases[0] = 50;
         stack.fc_0_weights[0] = 3;
         stack.fc_0_biases[HIDDEN1_DIMS] = 100;

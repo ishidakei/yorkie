@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use super::aligned::Aligned64;
 use super::types::{
     FC_0_OUTPUT_DIMS, FC_0_PADDED_INPUT_DIMS, FC_1_OUTPUT_DIMS, FC_1_PADDED_INPUT_DIMS, FC_2_OUTPUT_DIMS, FC_2_PADDED_INPUT_DIMS,
     HIDDEN_SIZE, LAYER_STACKS, NUM_FEATURES, NetHeader, NetworkStack, NnueError, NnueNetwork,
@@ -100,7 +101,7 @@ fn read_header(reader: &mut ByteReader) -> Result<NetHeader, NnueError> {
     Ok(NetHeader { version, hash, arch_id })
 }
 
-fn read_leb128_i16_block(reader: &mut ByteReader, count: usize) -> Result<Box<[i16]>, NnueError> {
+fn read_leb128_i16_block(reader: &mut ByteReader, count: usize) -> Result<Aligned64<i16>, NnueError> {
     let magic = reader.read_slice(LEB128_MAGIC.len())?;
     if magic != LEB128_MAGIC {
         return Err(NnueError::InvalidFormat {
@@ -112,8 +113,7 @@ fn read_leb128_i16_block(reader: &mut ByteReader, count: usize) -> Result<Box<[i
         });
     }
     let bytes_left = reader.read_u32_le()? as usize;
-    // Worst-case signed-LEB128 encoding of an i16 is 3 bytes; rejecting
-    // anything larger bounds the allocation against malformed inputs.
+    // Worst-case signed-LEB128 for an i16 is 3 bytes; bounds the allocation against bad input.
     let upper_bound = count.saturating_mul(3);
     if bytes_left > upper_bound {
         return Err(NnueError::InvalidFormat {
@@ -125,7 +125,7 @@ fn read_leb128_i16_block(reader: &mut ByteReader, count: usize) -> Result<Box<[i
     }
     let payload = reader.read_slice(bytes_left)?;
     let mut pos = 0usize;
-    let mut out = vec![0i16; count].into_boxed_slice();
+    let mut out = Aligned64::<i16>::zeroed(count);
     for slot in out.iter_mut() {
         let v = read_signed_leb128(payload, &mut pos)?;
         if !(i16::MIN as i64..=i16::MAX as i64).contains(&v) {
@@ -143,7 +143,7 @@ fn read_leb128_i16_block(reader: &mut ByteReader, count: usize) -> Result<Box<[i
     Ok(out)
 }
 
-fn scale_ft_i16_x2(mut values: Box<[i16]>) -> Result<Box<[i16]>, NnueError> {
+fn scale_ft_i16_x2(mut values: Aligned64<i16>) -> Result<Aligned64<i16>, NnueError> {
     for slot in values.iter_mut() {
         let scaled = (*slot as i32) * 2;
         if !(i16::MIN as i32..=i16::MAX as i32).contains(&scaled) {
@@ -206,9 +206,9 @@ fn read_network_block(reader: &mut ByteReader, dims: &Dims) -> Result<NetworkSta
     })
 }
 
-fn read_i32_slice(reader: &mut ByteReader, count: usize) -> Result<Box<[i32]>, NnueError> {
+fn read_i32_slice(reader: &mut ByteReader, count: usize) -> Result<Aligned64<i32>, NnueError> {
     let bytes = reader.read_slice(count * 4)?;
-    let mut out = vec![0i32; count].into_boxed_slice();
+    let mut out = Aligned64::<i32>::zeroed(count);
     for (i, slot) in out.iter_mut().enumerate() {
         let chunk = &bytes[i * 4..i * 4 + 4];
         *slot = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
@@ -216,9 +216,9 @@ fn read_i32_slice(reader: &mut ByteReader, count: usize) -> Result<Box<[i32]>, N
     Ok(out)
 }
 
-fn read_i8_slice(reader: &mut ByteReader, count: usize) -> Result<Box<[i8]>, NnueError> {
+fn read_i8_slice(reader: &mut ByteReader, count: usize) -> Result<Aligned64<i8>, NnueError> {
     let bytes = reader.read_slice(count)?;
-    let mut out = vec![0i8; count].into_boxed_slice();
+    let mut out = Aligned64::<i8>::zeroed(count);
     for (i, slot) in out.iter_mut().enumerate() {
         *slot = bytes[i] as i8;
     }
@@ -484,8 +484,7 @@ mod tests {
     fn encode_signed_leb128(out: &mut Vec<u8>, mut value: i64) {
         loop {
             let byte = (value as u8) & 0x7F;
-            // Arithmetic shift on i64 preserves the sign bit, which signed
-            // LEB128 uses to decide whether the byte is the last one.
+            // Arithmetic shift preserves the sign bit that signed LEB128 uses to end the byte stream.
             value >>= 7;
             let sign_bit = byte & 0x40;
             if (value == 0 && sign_bit == 0) || (value == -1 && sign_bit != 0) {
@@ -530,6 +529,30 @@ mod tests {
         fc_2_output: 1,
         fc_2_padded_input: 2,
     };
+
+    // Regression guard for the 64-byte alignment of a real network's buffers.
+    // Needs a real nn.bin, so it is `#[ignore]`d; run with NNUE_ALIGN_NET set.
+    #[test]
+    #[ignore = "needs a real nn.bin via NNUE_ALIGN_NET"]
+    fn real_network_buffers_are_64_byte_aligned() {
+        let path = std::env::var("NNUE_ALIGN_NET").expect("set NNUE_ALIGN_NET to a real nn.bin path");
+        let net = load_network(Path::new(&path)).expect("load real network");
+
+        fn check(name: &str, ptr: *const u8) {
+            assert_eq!(ptr as usize % 64, 0, "{name} base pointer is not 64-byte aligned");
+        }
+
+        check("ft_weights", net.ft_weights.as_ptr() as *const u8);
+        check("ft_biases", net.ft_biases.as_ptr() as *const u8);
+        for (i, stack) in net.stacks.iter().enumerate() {
+            check(&format!("stack[{i}].fc_0_weights"), stack.fc_0_weights.as_ptr() as *const u8);
+            check(&format!("stack[{i}].fc_0_biases"), stack.fc_0_biases.as_ptr() as *const u8);
+            check(&format!("stack[{i}].fc_1_weights"), stack.fc_1_weights.as_ptr() as *const u8);
+            check(&format!("stack[{i}].fc_1_biases"), stack.fc_1_biases.as_ptr() as *const u8);
+            check(&format!("stack[{i}].fc_2_weights"), stack.fc_2_weights.as_ptr() as *const u8);
+            check(&format!("stack[{i}].fc_2_biases"), stack.fc_2_biases.as_ptr() as *const u8);
+        }
+    }
 
     #[test]
     fn valid_header_round_trips() {
