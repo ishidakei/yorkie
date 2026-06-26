@@ -31,6 +31,11 @@ mod sfen;
 pub mod stack_size;
 mod thread;
 mod timeman;
+/// Compile-time tournament consts from `build.rs` (config TOML); present only under the `tournament` feature.
+#[cfg(feature = "tournament")]
+mod tournament {
+    include!(concat!(env!("OUT_DIR"), "/tournament_consts.rs"));
+}
 mod tt;
 mod types;
 pub mod usi;

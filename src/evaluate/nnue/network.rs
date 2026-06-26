@@ -20,6 +20,14 @@ pub fn set_fv_scale(value: i32) {
     FV_SCALE.store(value, Ordering::Relaxed);
 }
 
+/// FV_SCALE applied by [`forward`]: under `tournament` the compile-time const (constant-folds), else the runtime global.
+#[cfg(feature = "tournament")]
+#[inline]
+fn current_fv_scale() -> i32 {
+    crate::tournament::FV_SCALE
+}
+
+#[cfg(not(feature = "tournament"))]
 #[inline]
 fn current_fv_scale() -> i32 {
     FV_SCALE.load(Ordering::Relaxed)
@@ -258,6 +266,8 @@ mod tests {
         assert_eq!(c, d);
     }
 
+    // The runtime FV_SCALE global steers `forward` only when the tournament feature is off.
+    #[cfg(not(feature = "tournament"))]
     #[test]
     fn set_fv_scale_changes_forward_divisor() {
         let _guard = super::super::TEST_MUTEX.lock().expect("TEST_MUTEX poisoned");
@@ -289,5 +299,41 @@ mod tests {
         }
 
         set_fv_scale(16);
+    }
+
+    // Under `tournament`, `forward` divides by the compile-time const, not the runtime global (unaffected by set_fv_scale).
+    #[cfg(feature = "tournament")]
+    #[test]
+    fn forward_uses_compile_time_fv_scale_const() {
+        // `const` context: this only compiles if FV_SCALE is genuinely a compile-time const.
+        const _: i32 = crate::tournament::FV_SCALE;
+        assert_eq!(crate::tournament::FV_SCALE, 16, "v1 tournament config bakes FV_SCALE = 16");
+
+        let _guard = super::super::TEST_MUTEX.lock().expect("TEST_MUTEX poisoned");
+
+        let mut stack = zero_stack();
+        // Same wiring as classic_chain_…: post-shortcut score is 1_256.
+        stack.fc_0_biases[0] = 50;
+        stack.fc_0_weights[0] = 3;
+        stack.fc_0_biases[HIDDEN1_DIMS] = 100;
+        stack.fc_0_weights[HIDDEN1_DIMS * FC_0_PADDED_INPUT_DIMS] = 4;
+        stack.fc_1_biases[0] = 30;
+        stack.fc_1_weights[15] = 7;
+        stack.fc_2_biases[0] = 1_000;
+
+        let net = empty_network_with_stack(stack);
+
+        let mut acc = Accumulator::zeroed();
+        acc.us[0] = 200;
+        acc.us[768] = 100;
+        acc.computed = true;
+
+        // 1_256 / 16 = 78 — even after set_fv_scale tries (and fails) to change the divisor.
+        set_fv_scale(1);
+        assert_eq!(
+            forward(&acc, &net, Color::BLACK, 0),
+            Value(78),
+            "tournament build must ignore the runtime global and divide by the const FV_SCALE",
+        );
     }
 }

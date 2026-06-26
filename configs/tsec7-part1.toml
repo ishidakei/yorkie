@@ -1,0 +1,9 @@
+# Tournament build constants — 7th Denryu-sen TSEC, part 1.
+# Read by build.rs under the `tournament` feature; startup-fixed, in-game-invariant values only
+# (machine-dependent options like Threads/USI_Hash/Eval_Dir stay runtime). v1 = current option defaults.
+
+# NNUE evaluation scale (eval hot path). Matches the FV_SCALE USI option default.
+fv_scale = 16
+
+# Maximum-moves draw horizon in game plies (per-node rule check). Matches the Max_Moves_To_Draw USI default; rule-fixed.
+max_moves_to_draw = 512

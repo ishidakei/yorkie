@@ -114,10 +114,18 @@ impl Thread {
         });
     }
     fn iterative_deepening_loop(&mut self) {
-        self.max_moves_to_draw = match self.usi_options.get_i64(UsiOptions::MAX_MOVES_TO_DRAW) {
-            0 => i32::MAX, // 0 = unlimited
-            limit => limit as i32,
-        };
+        // Under `tournament` this snapshot is the compile-time const from build.rs (folds constant); else the runtime USI option.
+        #[cfg(feature = "tournament")]
+        {
+            self.max_moves_to_draw = crate::tournament::MAX_MOVES_TO_DRAW;
+        }
+        #[cfg(not(feature = "tournament"))]
+        {
+            self.max_moves_to_draw = match self.usi_options.get_i64(UsiOptions::MAX_MOVES_TO_DRAW) {
+                0 => i32::MAX, // 0 = unlimited
+                limit => limit as i32,
+            };
+        }
         let mut stack: [Stack; MAX_PLY as usize + 10] = std::array::from_fn(|_| Stack::new());
         let mut best_value = -Value::INFINITE;
         let mut last_best_move = None;
@@ -399,8 +407,7 @@ impl Thread {
                             value_draw(self.nodes.load(Ordering::Relaxed))
                         };
                     }
-                    // Maximum-moves rule: past the limit is a draw. After the repetition match so a
-                    // perpetual check completing at the boundary stays an illegal-move loss.
+                    // Maximum-moves rule: past the limit is a draw; checked after repetition so a boundary perpetual check stays a loss.
                     if self.position.ply() > self.max_moves_to_draw {
                         return draw_value();
                     }
@@ -1944,8 +1951,9 @@ mod tests {
             .unwrap();
     }
 
-    // Search-behavior tests need an eval without binaries, so material build only.
-    #[cfg(feature = "material")]
+    // Search-behavior tests need an eval without binaries (material) and the runtime horizon
+    // (not tournament, where the horizon is a compile-time const).
+    #[cfg(all(feature = "material", not(feature = "tournament")))]
     mod max_moves_to_draw_tests {
         use super::super::*;
 
@@ -2068,6 +2076,21 @@ mod tests {
                 assert_eq!(best.pv[0], best_unlimited.pv[0], "limit {limit}: bestmove must not change");
                 assert_eq!(nodes, nodes_unlimited, "limit {limit}: node count must not change");
             }
+        }
+    }
+
+    // Tournament build: draw-horizon snapshot is the compile-time const from build.rs, not the runtime USI option.
+    #[cfg(feature = "tournament")]
+    mod tournament_const_tests {
+        #[test]
+        fn max_moves_to_draw_const_is_fixed() {
+            // `const` context: compiles only if this is a genuine compile-time const.
+            const _: i32 = crate::tournament::MAX_MOVES_TO_DRAW;
+            assert_eq!(
+                crate::tournament::MAX_MOVES_TO_DRAW,
+                512,
+                "v1 tournament config bakes Max_Moves_To_Draw = 512",
+            );
         }
     }
 }

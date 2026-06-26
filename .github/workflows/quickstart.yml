@@ -13,6 +13,10 @@ on: [push, pull_request]
 
 name: Quickstart
 
+# Tournament config TOML: required by the `nnue,tournament` matrix entries, ignored by the other jobs.
+env:
+  YORKIE_TOURNAMENT_CONFIG: configs/tsec7-part1.toml
+
 jobs:
   fmt:
     name: Format
@@ -35,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        feature: [material, nnue]
+        feature: [material, nnue, "nnue,tournament"]
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -53,7 +57,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        feature: [material, nnue]
+        feature: [material, nnue, "nnue,tournament"]
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -71,7 +75,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        feature: [material, nnue]
+        feature: [material, nnue, "nnue,tournament"]
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4

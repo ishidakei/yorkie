@@ -22,6 +22,11 @@ static_assertions = "1.1.0"
 thiserror = "1.0.61"
 tsumeshogi-solver = { tag = "0.5.2", git = "https://github.com/sugyan/tsumeshogi-solver.git" }
 
+# Build-only: parse configs/<event>.toml in build.rs to emit compile-time consts for the
+# tournament build. Not linked into the engine binary; runtime behavior is unaffected.
+[build-dependencies]
+toml = "0.8"
+
 [profile.release]
 lto = true
 
@@ -29,3 +34,9 @@ lto = true
 default = ["nnue"]
 material = []
 nnue = []
+# Additive tournament build (composes with an eval feature, e.g. `nnue,tournament`).
+# When enabled, build.rs bakes startup-fixed values from the config TOML named by the
+# `YORKIE_TOURNAMENT_CONFIG` env var (e.g. configs/tsec7-part1.toml) into compile-time
+# consts that hot paths read instead of the runtime USI options. Off by default so
+# development and per-run value sweeps keep the runtime options.
+tournament = []
