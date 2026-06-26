@@ -42,6 +42,12 @@ impl<T: Copy> Aligned64<T> {
         Self { ptr, len }
     }
 
+    /// Wraps externally-owned memory as a non-owning `Aligned64` view (for an NNUE replica in a node-bound `mmap` arena); `ptr` must be 64-aligned/non-null and the value must be leaked, never dropped.
+    #[cfg(feature = "numa")]
+    pub(crate) unsafe fn from_borrowed_raw(ptr: NonNull<T>, len: usize) -> Self {
+        Self { ptr, len }
+    }
+
     /// Copies `src` into a fresh 64-byte-aligned buffer of the same length.
     pub fn from_slice(src: &[T]) -> Self {
         let mut buf = Self::zeroed(src.len());

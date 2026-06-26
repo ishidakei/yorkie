@@ -7,6 +7,8 @@ pub mod bucket;
 pub mod features;
 pub mod loader;
 pub mod network;
+#[cfg(feature = "numa")]
+pub mod numa;
 pub mod simd;
 pub mod transformer;
 pub mod types;
@@ -34,7 +36,32 @@ struct LoadedNetwork {
 
 static NETWORK: RwLock<Option<LoadedNetwork>> = RwLock::new(None);
 
+// Node-local NNUE replica for this worker (`numa` feature), set at `worker()` entry; the eval hot path reads it instead of the shared `Arc`+`RwLock`. Null = fall back to global `NETWORK`.
+#[cfg(feature = "numa")]
+thread_local! {
+    static LOCAL_NET: std::cell::Cell<*const NnueNetwork> = const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// Points this worker at the node-local replica for `node`, else the shared global. Called at `worker()` entry.
+#[cfg(feature = "numa")]
+pub fn set_local_replica_for_node(node: u32) {
+    let ptr = numa::replica_for_node(node).map_or(std::ptr::null(), |net| net as *const NnueNetwork);
+    LOCAL_NET.with(|c| c.set(ptr));
+}
+
+/// The current thread's node-local replica, if one is set (`numa` feature).
+#[cfg(feature = "numa")]
+fn local_replica() -> Option<&'static NnueNetwork> {
+    let ptr = LOCAL_NET.with(|c| c.get());
+    // SAFETY: `ptr` is null or a `&'static` replica leaked by `numa::build_replicas` (read-only, process-lifetime).
+    if ptr.is_null() { None } else { Some(unsafe { &*ptr }) }
+}
+
 pub fn evaluate(pos: &mut Position, stack: &mut [Stack]) -> Value {
+    #[cfg(feature = "numa")]
+    if let Some(net) = local_replica() {
+        return evaluate_with(net, pos, stack);
+    }
     let net_arc = match current_network() {
         Some(n) => n,
         None => {
@@ -42,8 +69,10 @@ pub fn evaluate(pos: &mut Position, stack: &mut [Stack]) -> Value {
             return Value::ZERO;
         }
     };
-    let net: &NnueNetwork = &net_arc;
+    evaluate_with(&net_arc, pos, stack)
+}
 
+fn evaluate_with(net: &NnueNetwork, pos: &mut Position, stack: &mut [Stack]) -> Value {
     let stm = pos.side_to_move();
     let bucket = bucket::select(pos);
     let slot = get_stack_mut(stack, 0);
@@ -55,6 +84,10 @@ pub fn evaluate(pos: &mut Position, stack: &mut [Stack]) -> Value {
 }
 
 pub fn evaluate_at_root(pos: &Position, stack: &mut [Stack]) -> Value {
+    #[cfg(feature = "numa")]
+    if let Some(net) = local_replica() {
+        return evaluate_at_root_with(net, pos, stack);
+    }
     let net_arc = match current_network() {
         Some(n) => n,
         None => {
@@ -62,8 +95,10 @@ pub fn evaluate_at_root(pos: &Position, stack: &mut [Stack]) -> Value {
             return Value::ZERO;
         }
     };
-    let net: &NnueNetwork = &net_arc;
+    evaluate_at_root_with(&net_arc, pos, stack)
+}
 
+fn evaluate_at_root_with(net: &NnueNetwork, pos: &Position, stack: &mut [Stack]) -> Value {
     let stm = pos.side_to_move();
     let bucket = bucket::select(pos);
     let slot = get_stack_mut(stack, 0);
@@ -101,6 +136,9 @@ pub fn loaded_sha256_hex() -> Option<String> {
 
 pub fn load_network_from_path(path: &Path) -> Result<(), NnueError> {
     let net = Arc::new(loader::load_network(path)?);
+    // Build node-local replicas before publishing the global, so workers see a ready table at `isready`.
+    #[cfg(feature = "numa")]
+    numa::build_replicas(&net);
     let mut slot = NETWORK.write().expect("nnue::NETWORK write lock poisoned");
     *slot = Some(LoadedNetwork {
         net,
@@ -132,6 +170,16 @@ pub(crate) fn set_loaded_for_test(net: Arc<NnueNetwork>, path: PathBuf) {
 pub(crate) fn clear_loaded_for_test() {
     let mut slot = NETWORK.write().expect("nnue::NETWORK write lock poisoned");
     *slot = None;
+}
+
+#[cfg(all(test, feature = "numa"))]
+pub(crate) fn set_local_replica_for_test(net: &'static NnueNetwork) {
+    LOCAL_NET.with(|c| c.set(net as *const NnueNetwork));
+}
+
+#[cfg(all(test, feature = "numa"))]
+pub(crate) fn clear_local_replica_for_test() {
+    LOCAL_NET.with(|c| c.set(std::ptr::null()));
 }
 
 #[cfg(test)]
@@ -214,6 +262,31 @@ mod tests {
             let v2 = evaluate(&mut pos, &mut stack_b);
             assert_eq!(v1, v2, "nnue::evaluate must be deterministic for identical (pos, net)");
 
+            clear_loaded_for_test();
+        });
+    }
+
+    // With `numa` on, eval must read the TLS replica not global `NETWORK`: the global is cleared, so a completed eval proves the TLS replica was used.
+    #[cfg(feature = "numa")]
+    #[test]
+    fn evaluate_reads_thread_local_replica_not_global() {
+        use crate::search::CURRENT_STACK_INDEX;
+        test_fixtures::run_with_large_stack(|| {
+            let _guard = TEST_MUTEX.lock().expect("TEST_MUTEX poisoned");
+            clear_loaded_for_test(); // global is empty on purpose
+            set_local_replica_for_test(test_fixtures::synthetic_net());
+            assert!(local_replica().is_some(), "TLS replica pointer must be set");
+
+            let mut pos = Position::new();
+            let mut stack: Vec<Stack> = (0..CURRENT_STACK_INDEX + 2).map(|_| Stack::new()).collect();
+
+            let root = evaluate_at_root(&pos, &mut stack);
+            let leaf = evaluate(&mut pos, &mut stack);
+            // Same (pos, net) ⇒ root refresh and leaf forward agree, and repeat is stable.
+            assert_eq!(root, leaf, "root and leaf eval must agree for the replica network");
+            assert_eq!(leaf, evaluate(&mut pos, &mut stack), "replica eval must be deterministic");
+
+            clear_local_replica_for_test();
             clear_loaded_for_test();
         });
     }

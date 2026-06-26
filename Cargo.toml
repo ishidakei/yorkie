@@ -8,9 +8,14 @@ rust-version = "1.96.0"
 [dependencies]
 anyhow = "1.0.86"
 arrayvec = "0.7.4"
+# NUMA-only deps (pulled in solely by the additive `numa` feature; not built by the
+# default / `material` / `nnue` / `kppt` builds). `core_affinity` wraps
+# `sched_setaffinity` (#13); `libc` provides `mmap`/`mbind`/`madvise` (#12).
+core_affinity = { version = "0.8", optional = true }
 custom_derive = "0.1.7"
 derive_more = "0.99.18"
 enum_derive = "0.1.7"
+libc = { version = "0.2", optional = true }
 num = "0.4.3"
 once_cell = "1.19.0"
 rand = "0.8.5"
@@ -40,3 +45,9 @@ nnue = []
 # consts that hot paths read instead of the runtime USI options. Off by default so
 # development and per-run value sweeps keep the runtime options.
 tournament = []
+# Additive NUMA build (Linux-only; composes with an eval feature, e.g. `nnue,numa`).
+# When enabled the engine (a) pins each search worker thread to a CPU core
+# compact-by-node and (b) gives each thread a node-local replica of the NNUE network,
+# read on the eval hot path instead of the shared global. Off by default = today's
+# behavior exactly. Pulls in `core_affinity` + `libc` only when enabled.
+numa = ["dep:core_affinity", "dep:libc"]

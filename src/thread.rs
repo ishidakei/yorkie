@@ -1806,6 +1806,14 @@ impl ThreadPool {
                         let timeman_cloned = timeman_cloned.clone();
                         let worker = move || {
                             let mut th = thread_cloned.lock().unwrap();
+                            // NUMA: pin this worker to its compact-by-node core and select that node's NNUE replica (feature off = no pinning, shared global). Must run on the worker's own OS thread.
+                            #[cfg(feature = "numa")]
+                            {
+                                let assignment = crate::numa::assignment_for_idx(th.idx);
+                                crate::numa::pin_current_thread(assignment.cpu);
+                                #[cfg(feature = "nnue")]
+                                crate::evaluate::nnue::set_local_replica_for_node(assignment.node);
+                            }
                             th.best_move_changes.store(0, Ordering::Relaxed);
                             th.limits = limits_cloned;
                             th.nodes = nodes_cloned;
@@ -2063,6 +2071,17 @@ mod tests {
                 "without a horizon the losing side is mated; got {}",
                 best.score.0
             );
+        }
+
+        // `numa` OFF/ON invariance: a single-thread fixed-depth search on the start position must give the same bestmove and node count either way (the feature only pins and picks a replica). Literals captured on the OFF build.
+        #[test]
+        fn numa_off_on_search_is_invariant_at_threads_1() {
+            let startpos = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/9/1B5R1/LNSGKGSNL b - 1";
+            let (best, nodes) = run_search(startpos, "0", 6);
+            let pos = Position::new_from_sfen(startpos).unwrap();
+            let expected_best = Move::new_from_usi_str("2h4h", &pos).unwrap();
+            assert_eq!(best.pv[0], expected_best, "single-thread bestmove must be NUMA-invariant");
+            assert_eq!(nodes, 1610, "single-thread node count must be NUMA-invariant");
         }
 
         #[test]

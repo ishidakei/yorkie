@@ -24,6 +24,9 @@ mod learn;
 mod movegen;
 mod movepick;
 mod movetypes;
+/// NUMA topology + CPU-affinity support (Linux-only, `numa` feature); off = no module, pins nothing.
+#[cfg(feature = "numa")]
+mod numa;
 mod piecevalue;
 mod position;
 mod search;
