@@ -134,6 +134,8 @@ pub fn generate_teachers(args: &[&str]) -> Result<()> {
             let usi_options = {
                 let mut u = UsiOptions::new();
                 [
+                    // MultiPV is removed under `tournament`, so the explicit `MultiPV = 1` is dropped there.
+                    #[cfg(not(feature = "tournament"))]
                     (UsiOptions::MULTI_PV, "1"),
                     (UsiOptions::THREADS, "1"),
                     (UsiOptions::USI_HASH, "1024"),

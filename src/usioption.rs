@@ -93,6 +93,8 @@ impl UsiOptions {
     pub const DRAW_CONTEMPT: &'static str = "Draw_Contempt";
     pub const MINIMUM_THINKING_TIME: &'static str = "Minimum_Thinking_Time";
     pub const MOVE_OVERHEAD: &'static str = "Move_Overhead";
+    // MultiPV exists only without the `tournament` feature; a tournament build emits a single PV.
+    #[cfg(not(feature = "tournament"))]
     pub const MULTI_PV: &'static str = "MultiPV";
     pub const OPENING_TIME_WEIGHT: &'static str = "Opening_Time_Weight";
     pub const THREADS: &'static str = "Threads";
@@ -147,6 +149,8 @@ impl UsiOptions {
         );
         // Per-side draw contempt (Value units): draw scores `-Draw_Contempt` for Black, `+` for White; 0 = neutral.
         options.insert(Self::DRAW_CONTEMPT, UsiOptionEntry::new(UsiOptionValue::spin(0, -2000, 2000)));
+        // MultiPV: not registered under `tournament` (the root search emits a single PV there).
+        #[cfg(not(feature = "tournament"))]
         options.insert(Self::MULTI_PV, UsiOptionEntry::new(UsiOptionValue::spin(1, 1, 500)));
         // Time-management options (see `timeman::compute`). Per-move round-trip overhead (ms).
         options.insert(Self::MOVE_OVERHEAD, UsiOptionEntry::new(UsiOptionValue::spin(200, 0, 10000)));
@@ -601,6 +605,37 @@ mod max_moves_to_draw_option_tests {
 }
 
 #[cfg(test)]
+mod multi_pv_advertisement_tests {
+    use super::*;
+
+    // Without `tournament`, MultiPV stays advertised so analysis can request multiple PVs.
+    #[cfg(not(feature = "tournament"))]
+    #[test]
+    fn advertises_multi_pv() {
+        let opts = UsiOptions::new();
+        let advertised = opts.to_usi_string();
+        assert!(
+            advertised.contains("option name MultiPV type spin default 1 min 1 max 500"),
+            "expected MultiPV advertised at default 1 / [1, 500]; got:\n{advertised}"
+        );
+        assert_eq!(opts.get_i64(UsiOptions::MULTI_PV), 1);
+    }
+
+    // Under `tournament` MultiPV is removed: neither registered nor advertised.
+    #[cfg(feature = "tournament")]
+    #[test]
+    fn tournament_build_does_not_advertise_multi_pv() {
+        let opts = UsiOptions::new();
+        let advertised = opts.to_usi_string();
+        assert!(
+            !advertised.contains("MultiPV"),
+            "tournament build must not advertise MultiPV; got:\n{advertised}"
+        );
+    }
+}
+
+// Exercise the generic fixed-flag machinery through `MultiPV`, which is absent under `tournament`.
+#[cfg(all(test, not(feature = "tournament")))]
 mod fixed_flag_tests {
     use super::*;
 
@@ -679,6 +714,8 @@ mod eval_options_tests {
         opts.read_eval_options(path, &mut thread_pool, &mut tt, &mut reductions, &mut is_ready)
     }
 
+    // `MultiPV` is the representative option these tests drive; absent under `tournament`, so the cases below are gated off.
+    #[cfg(not(feature = "tournament"))]
     fn set_multi_pv_via_usi(opts: &mut UsiOptions, value: &str) {
         let mut thread_pool = ThreadPool::new();
         let mut tt = TranspositionTable::new();
@@ -703,6 +740,7 @@ mod eval_options_tests {
         assert!(lines.is_empty(), "missing file must emit no info-strings; got {lines:?}");
     }
 
+    #[cfg(not(feature = "tournament"))]
     #[test]
     fn simplified_form_applies_and_emits_canonical_lines() {
         let tmp = TempFile::with("MultiPV 4\n", "simplified");
@@ -718,6 +756,7 @@ mod eval_options_tests {
         assert_eq!(opts.get_i64(UsiOptions::MULTI_PV), 4);
     }
 
+    #[cfg(not(feature = "tournament"))]
     #[test]
     fn equals_form_normalises_to_simplified() {
         let tmp = TempFile::with("MultiPV=4\n", "equals");
@@ -727,6 +766,7 @@ mod eval_options_tests {
         assert_eq!(opts.get_i64(UsiOptions::MULTI_PV), 4);
     }
 
+    #[cfg(not(feature = "tournament"))]
     #[test]
     fn full_usi_form_picks_default_value() {
         let tmp = TempFile::with("option name MultiPV type spin default 4 min 1 max 500\n", "fullusi");
@@ -736,6 +776,7 @@ mod eval_options_tests {
         assert_eq!(opts.get_i64(UsiOptions::MULTI_PV), 4);
     }
 
+    #[cfg(not(feature = "tournament"))]
     #[test]
     fn unknown_option_emits_error_and_continues() {
         let tmp = TempFile::with("BOGUS_OPTION 99\nMultiPV 4\n", "unknown");
@@ -754,6 +795,7 @@ mod eval_options_tests {
         );
     }
 
+    #[cfg(not(feature = "tournament"))]
     #[test]
     fn comments_and_blanks_are_skipped() {
         let tmp = TempFile::with("\n   \n# comment\n   # indented comment\nMultiPV 4\n", "comments");
@@ -763,6 +805,7 @@ mod eval_options_tests {
         assert_eq!(opts.get_i64(UsiOptions::MULTI_PV), 4);
     }
 
+    #[cfg(not(feature = "tournament"))]
     #[test]
     fn out_of_range_spin_clamps_in_emitted_line() {
         let tmp = TempFile::with("MultiPV 9999\n", "clamp");
@@ -772,6 +815,7 @@ mod eval_options_tests {
         assert_eq!(opts.get_i64(UsiOptions::MULTI_PV), 500);
     }
 
+    #[cfg(not(feature = "tournament"))]
     #[test]
     fn successful_override_flips_fixed_flag() {
         let tmp = TempFile::with("MultiPV 4\n", "pinned");

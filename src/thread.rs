@@ -41,6 +41,8 @@ impl InCheckType {
 
 struct Thread {
     idx: usize,
+    // Root PV index advanced by the multi-PV loop; non-tournament only (tournament folds `pv_idx` to const 0).
+    #[cfg(not(feature = "tournament"))]
     pv_idx: usize,
     tt_hit_average: u64,
     sel_depth: i32,
@@ -157,6 +159,19 @@ impl Thread {
         self.draw_contempt
     }
 
+    /// Index of the root PV being searched; tournament folds this to const `0`, else the runtime `pv_idx` field.
+    #[cfg(feature = "tournament")]
+    #[inline]
+    fn pv_idx(&self) -> usize {
+        0
+    }
+
+    #[cfg(not(feature = "tournament"))]
+    #[inline]
+    fn pv_idx(&self) -> usize {
+        self.pv_idx
+    }
+
     fn iterative_deepening_loop(&mut self) {
         // Snapshot the draw horizon once per search from the runtime USI option (0 = unlimited = i32::MAX);
         // tournament build reads a compile-time const instead, so there is no field to populate.
@@ -201,7 +216,11 @@ impl Thread {
 
         self.low_ply_history.keep_data_from_previous_search();
 
+        // Number of root PVs to search: the `MultiPV` option clamped to legal-move count, or a single PV under `tournament`.
+        #[cfg(not(feature = "tournament"))]
         let multi_pv = std::cmp::min(self.usi_options.get_i64(UsiOptions::MULTI_PV) as usize, self.root_moves.len());
+        #[cfg(feature = "tournament")]
+        let multi_pv = 1usize;
         self.tt_hit_average = TT_HIT_AVERAGE_WINDOW * TT_HIT_AVERAGE_RESOLUTION / 2;
 
         let mut search_again_counter = 0;
@@ -234,15 +253,27 @@ impl Thread {
                 rm.previous_score = rm.score;
             }
 
-            self.pv_idx = 0;
+            #[cfg(not(feature = "tournament"))]
+            {
+                self.pv_idx = 0;
+            }
 
             if !self.increase_depth.load(Ordering::Relaxed) {
                 search_again_counter += 1;
             }
-            while self.pv_idx < multi_pv && !self.stop.load(Ordering::Relaxed) {
+            // Root PV search: loops `pv_idx` over the `multi_pv` best moves; under `tournament` it runs once (single PV) and the trailing break collapses the loop (hence the `never_loop` allow).
+            #[cfg_attr(feature = "tournament", allow(clippy::never_loop))]
+            loop {
+                if self.stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                #[cfg(not(feature = "tournament"))]
+                if self.pv_idx >= multi_pv {
+                    break;
+                }
                 self.sel_depth = 0;
                 if self.root_depth >= Depth(4) {
-                    let previous_score = self.root_moves[self.pv_idx].previous_score;
+                    let previous_score = self.root_moves[self.pv_idx()].previous_score;
                     delta = Value(17);
                     alpha = std::cmp::max(previous_score - delta, -Value::INFINITE);
                     beta = std::cmp::min(previous_score + delta, Value::INFINITE);
@@ -255,7 +286,8 @@ impl Thread {
                         self.root_depth - Depth(failed_high_count + search_again_counter),
                     );
                     best_value = self.search::<RootType>(&mut stack, alpha, beta, adjusted_depth, false);
-                    self.root_moves[self.pv_idx..].sort_by(|x, y| y.cmp(x));
+                    let pv_idx = self.pv_idx();
+                    self.root_moves[pv_idx..].sort_by(|x, y| y.cmp(x));
                     if self.stop.load(Ordering::Relaxed) {
                         break;
                     }
@@ -294,11 +326,12 @@ impl Thread {
                     debug_assert!(-Value::INFINITE <= alpha && beta <= Value::INFINITE);
                 }
 
-                self.root_moves[0..=self.pv_idx].sort_by(|x, y| y.cmp(x));
+                let pv_idx = self.pv_idx();
+                self.root_moves[0..=pv_idx].sort_by(|x, y| y.cmp(x));
 
                 if self.is_main()
                     && (self.stop.load(Ordering::Relaxed)
-                        || self.pv_idx + 1 == multi_pv
+                        || self.pv_idx() + 1 == multi_pv
                         || self.timeman.lock().unwrap().elapsed() > 3000)
                     && (self.root_depth < Depth(10)
                         || last_info_time.is_none()
@@ -313,7 +346,12 @@ impl Thread {
                     }
                 }
 
-                self.pv_idx += 1;
+                #[cfg(not(feature = "tournament"))]
+                {
+                    self.pv_idx += 1;
+                }
+                #[cfg(feature = "tournament")]
+                break;
             }
 
             if !self.stop.load(Ordering::Relaxed) {
@@ -512,7 +550,7 @@ impl Thread {
             Value::NONE
         };
         let tt_move = if root_node {
-            Some(self.root_moves[self.pv_idx].pv[0])
+            Some(self.root_moves[self.pv_idx()].pv[0])
         } else if get_stack(stack, 0).tt_hit {
             tte.mv(&self.position)
         } else {
@@ -901,7 +939,7 @@ impl Thread {
                 continue;
             }
 
-            if root_node && !self.root_moves.iter().skip(self.pv_idx).any(|x| x.pv[0] == m) {
+            if root_node && !self.root_moves.iter().skip(self.pv_idx()).any(|x| x.pv[0] == m) {
                 continue;
             }
 
@@ -1214,7 +1252,7 @@ impl Thread {
             get_stack_mut(stack, 0).tt_pv = get_stack(stack, 0).tt_pv && get_stack(stack, 1).tt_pv;
         }
 
-        if excluded_move.is_none() && !(root_node && self.pv_idx != 0) {
+        if excluded_move.is_none() && !(root_node && self.pv_idx() != 0) {
             tte.save(
                 key,
                 value_to_tt(best_value, get_stack(stack, 0).ply),
@@ -1613,23 +1651,34 @@ impl Thread {
             if v == -Value::INFINITE {
                 v = Value::ZERO;
             }
+            let bound = if v >= beta {
+                "lowerbound "
+            } else if v <= alpha {
+                "upperbound "
+            } else {
+                ""
+            };
+            let pv = rm.pv.iter().map(|m| m.to_usi_string()).collect::<Vec<_>>().join(" ");
+            let nps = nodes_searched * 1000 / elapsed_millis;
+            // The tournament build emits a single PV and drops the `multipv` token entirely.
+            #[cfg(not(feature = "tournament"))]
             let line = format!(
                 "info depth {depth} seldepth {seldepth} multipv {multipv} score {score} {bound}nodes {nodes} nps {nps} time {time} pv {pv}",
                 depth = d.0,
                 seldepth = rm.sel_depth,
                 multipv = i + 1,
                 score = v.to_usi(),
-                bound = if v >= beta {
-                    "lowerbound "
-                } else if v <= alpha {
-                    "upperbound "
-                } else {
-                    ""
-                },
                 nodes = nodes_searched,
-                nps = nodes_searched * 1000 / elapsed_millis,
                 time = elapsed_millis,
-                pv = rm.pv.iter().map(|m| m.to_usi_string()).collect::<Vec<_>>().join(" ")
+            );
+            #[cfg(feature = "tournament")]
+            let line = format!(
+                "info depth {depth} seldepth {seldepth} score {score} {bound}nodes {nodes} nps {nps} time {time} pv {pv}",
+                depth = d.0,
+                seldepth = rm.sel_depth,
+                score = v.to_usi(),
+                nodes = nodes_searched,
+                time = elapsed_millis,
             );
             Some(line)
         };
@@ -1693,6 +1742,7 @@ impl ThreadPool {
             .map(|i| {
                 Arc::new(Mutex::new(Thread {
                     idx: i,
+                    #[cfg(not(feature = "tournament"))]
                     pv_idx: 0,
                     tt_hit_average: 0,
                     sel_depth: 0,
@@ -1711,8 +1761,7 @@ impl ThreadPool {
                         [ContinuationHistory::new(), ContinuationHistory::new()],
                     ],
                     limits: self.limits.clone(),
-                    // Non-tournament only: the tournament build has no such field (the accessor
-                    // returns the compile-time const). Gate the initializer to match the field.
+                    // Non-tournament only: gate the initializer to match the field (tournament reads the const accessor).
                     #[cfg(not(feature = "tournament"))]
                     max_moves_to_draw: i32::MAX,
                     // Re-snapshotted per search in iterative_deepening_loop; 0 = no contempt.
@@ -1896,7 +1945,11 @@ impl ThreadPool {
                         handle.join().unwrap();
                     }
 
+                    // Single PV under `tournament` (MultiPV removed); otherwise the clamped option.
+                    #[cfg(not(feature = "tournament"))]
                     let multi_pv = std::cmp::min(usi_options_cloned.get_i64(UsiOptions::MULTI_PV) as usize, root_moves.len());
+                    #[cfg(feature = "tournament")]
+                    let multi_pv = 1usize;
                     let best_thread = if multi_pv == 1 && limits.depth.is_none() && !root_moves.is_empty() {
                         let mut votes = std::collections::BTreeMap::new();
                         let min_score: Value = thread_pool_base_cloned
@@ -2209,16 +2262,12 @@ mod tests {
             use super::super::*;
             // `const` context: compiles only if this is a genuine compile-time const.
             const _: bool = crate::tournament::USI_PONDER;
-            // Value check via the accessor (a fn call, so not a constant-value assertion); under
-            // `tournament` it returns the baked const regardless of the argument.
+            // Value check via the accessor (a fn call); under `tournament` it returns the baked const.
             let opts = UsiOptions::new();
             assert!(usi_ponder(&opts), "v1 tournament config bakes USI_Ponder = true");
         }
 
-        // The bestmove path reads `usi_ponder`, which under `tournament` returns the baked const and
-        // ignores the runtime option: flipping the option away from the const does not change it.
-        // Runs on a big-stack thread because `ThreadPool::set` builds the large `Thread` struct on
-        // the stack (same as the search tests above).
+        // `usi_ponder` under `tournament` returns the baked const and ignores the runtime option. Big-stack thread because `ThreadPool::set` builds the large `Thread` struct on the stack.
         #[test]
         fn usi_ponder_accessor_ignores_runtime_option() {
             use super::super::*;
@@ -2247,6 +2296,50 @@ mod tests {
                     assert!(
                         usi_ponder(&usi_options),
                         "the tournament accessor must return the baked USI_PONDER const, ignoring the runtime option",
+                    );
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+        }
+    }
+
+    // Tournament build: single PV, so the info line carries no `multipv` token. `pv_info_to_usi_string` needs no eval network, so this runs in the `nnue,tournament` CI row. Big-stack thread for `ThreadPool::set`.
+    #[cfg(feature = "tournament")]
+    mod tournament_single_pv_tests {
+        use super::super::*;
+
+        #[test]
+        fn single_pv_info_has_no_multipv_token() {
+            std::thread::Builder::new()
+                .stack_size(crate::stack_size::STACK_SIZE)
+                .spawn(|| {
+                    let mut reductions = Reductions::new();
+                    let mut thread_pool = ThreadPool::new();
+                    let mut tt = TranspositionTable::new();
+                    thread_pool.set(1, &mut tt, &mut reductions);
+
+                    // Two legal root moves, yet the single-PV emitter must print exactly one PV line and no `multipv` token.
+                    let pos = Position::new_from_sfen("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1").unwrap();
+                    let root_moves = ["7g7f", "2g2f"]
+                        .iter()
+                        .map(|s| RootMove::new(Move::new_from_usi_str(s, &pos).unwrap()))
+                        .collect::<Vec<_>>();
+
+                    let pool_base = thread_pool.thread_pool_base.lock().unwrap();
+                    let mut th = pool_base.threads[0].lock().unwrap();
+                    th.root_moves = root_moves;
+                    th.limits.start_time = Some(std::time::Instant::now());
+
+                    let info = th.pv_info_to_usi_string(0, 1, Depth(5), -Value::INFINITE, Value::INFINITE, false);
+                    assert!(
+                        !info.contains("multipv"),
+                        "tournament info output must not carry a `multipv` token; got:\n{info}"
+                    );
+                    assert_eq!(
+                        info.lines().count(),
+                        1,
+                        "the single-PV root search must emit exactly one PV line; got:\n{info}"
                     );
                 })
                 .unwrap()
