@@ -1,9 +1,10 @@
-# Tournament build constants — 7th Denryu-sen TSEC, part 1.
-# Read by build.rs under the `tournament` feature; startup-fixed, in-game-invariant values only
-# (machine-dependent options like Threads/USI_Hash/Eval_Dir stay runtime). v1 = current option defaults.
+# Tournament build constants — 7th Denryu-sen TSEC, part 1. Read by build.rs under `tournament`; startup-fixed values only (machine-dependent options stay runtime).
 
 # NNUE evaluation scale (eval hot path). Matches the FV_SCALE USI option default.
 fv_scale = 16
 
 # Maximum-moves draw horizon in game plies (per-node rule check). Matches the Max_Moves_To_Draw USI default; rule-fixed.
 max_moves_to_draw = 512
+
+# Transposition-table size in BYTES, baked as a compile-time const; TT cluster count is derived from it (USI_Hash has no effect on TT size). Placeholder 256 MiB; must be a multiple of the 32-byte TtCluster (even cluster count, asserted in tt.rs).
+tt_bytes = 268435456

@@ -44,6 +44,8 @@ struct Thread {
     continuation_history: [[ContinuationHistory; StatsType::NUM]; InCheckType::NUM],
     limits: LimitsType, // Clone from ThreadPool for fast access.
     // Game-ply draw horizon (maximum-moves rule); snapshot per search, 0 = unlimited = i32::MAX.
+    // Non-tournament only: under `tournament` the horizon is a compile-time const.
+    #[cfg(not(feature = "tournament"))]
     max_moves_to_draw: i32,
     tt: *mut TranspositionTable,
     timeman: Arc<Mutex<TimeManagement>>, // shold I use pointer for speedup?
@@ -113,12 +115,22 @@ impl Thread {
             })
         });
     }
+    /// Game-ply draw horizon (maximum-moves rule); tournament build folds a compile-time const, else the per-search `Max_Moves_To_Draw` snapshot.
+    #[cfg(feature = "tournament")]
+    #[inline]
+    fn max_moves_to_draw(&self) -> i32 {
+        crate::tournament::MAX_MOVES_TO_DRAW
+    }
+
+    #[cfg(not(feature = "tournament"))]
+    #[inline]
+    fn max_moves_to_draw(&self) -> i32 {
+        self.max_moves_to_draw
+    }
+
     fn iterative_deepening_loop(&mut self) {
-        // Under `tournament` this snapshot is the compile-time const from build.rs (folds constant); else the runtime USI option.
-        #[cfg(feature = "tournament")]
-        {
-            self.max_moves_to_draw = crate::tournament::MAX_MOVES_TO_DRAW;
-        }
+        // Snapshot the draw horizon once per search from the runtime USI option (0 = unlimited = i32::MAX);
+        // tournament build reads a compile-time const instead, so there is no field to populate.
         #[cfg(not(feature = "tournament"))]
         {
             self.max_moves_to_draw = match self.usi_options.get_i64(UsiOptions::MAX_MOVES_TO_DRAW) {
@@ -408,7 +420,7 @@ impl Thread {
                         };
                     }
                     // Maximum-moves rule: past the limit is a draw; checked after repetition so a boundary perpetual check stays a loss.
-                    if self.position.ply() > self.max_moves_to_draw {
+                    if self.position.ply() > self.max_moves_to_draw() {
                         return draw_value();
                     }
                 }
@@ -1212,7 +1224,7 @@ impl Thread {
             return Value::DRAW;
         }
         // Maximum-moves rule: past the limit is a draw, returned before the TT probe and 1-ply-mate check.
-        if self.position.ply() > self.max_moves_to_draw {
+        if self.position.ply() > self.max_moves_to_draw() {
             return draw_value();
         }
 
@@ -1668,6 +1680,9 @@ impl ThreadPool {
                         [ContinuationHistory::new(), ContinuationHistory::new()],
                     ],
                     limits: self.limits.clone(),
+                    // Non-tournament only: the tournament build has no such field (the accessor
+                    // returns the compile-time const). Gate the initializer to match the field.
+                    #[cfg(not(feature = "tournament"))]
                     max_moves_to_draw: i32::MAX,
                     tt,
                     timeman: self.timeman.clone(),

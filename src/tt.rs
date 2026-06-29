@@ -109,8 +109,20 @@ impl TtCluster {
     }
 }
 
+// Tournament build: TT cluster count is a compile-time const derived from the baked `TT_BYTES`, dropping the per-probe field load; indexing (see `cluster_index`) is unchanged.
+#[cfg(feature = "tournament")]
+const TT_CLUSTER_COUNT: usize = crate::tournament::TT_BYTES / std::mem::size_of::<TtCluster>();
+// Multiply-high indexing packs the side-to-move into the low bit, so the cluster count must be even; enforce it at compile time.
+#[cfg(feature = "tournament")]
+const _: () = assert!(
+    TT_CLUSTER_COUNT & 1 == 0,
+    "tournament tt_bytes must yield an even TT cluster count"
+);
+
 pub struct TranspositionTable {
     table: Vec<TtCluster>,
+    // Non-tournament: runtime cluster count (USI_Hash-driven), read on every probe; tournament folds the compile-time const instead.
+    #[cfg(not(feature = "tournament"))]
     cluster_count: usize,
     generation8: u8,
 }
@@ -119,18 +131,29 @@ impl TranspositionTable {
     pub fn new() -> TranspositionTable {
         TranspositionTable {
             table: vec![],
+            #[cfg(not(feature = "tournament"))]
             cluster_count: 0,
             generation8: 0,
         }
     }
     pub fn resize(&mut self, mega_byte_size: usize, thread_pool: &mut ThreadPool) {
         thread_pool.wait_for_search_finished();
-        self.cluster_count = mega_byte_size * 1024 * 1024 / std::mem::size_of::<TtCluster>();
-        debug_assert!(self.cluster_count & 1 == 0);
+        // Tournament build ignores `mega_byte_size` (USI_Hash) and uses the compile-time `TT_CLUSTER_COUNT`; non-tournament sizes from USI_Hash.
+        #[cfg(feature = "tournament")]
+        let cluster_count = {
+            let _ = mega_byte_size;
+            TT_CLUSTER_COUNT
+        };
+        #[cfg(not(feature = "tournament"))]
+        let cluster_count = {
+            self.cluster_count = mega_byte_size * 1024 * 1024 / std::mem::size_of::<TtCluster>();
+            debug_assert!(self.cluster_count & 1 == 0);
+            self.cluster_count
+        };
         // self.table can be very large and takes much time to clear, so parallelize self.clear().
         self.table.clear();
         self.table.shrink_to_fit();
-        self.table = (0..self.cluster_count).into_par_iter().map(|_| TtCluster::new()).collect();
+        self.table = (0..cluster_count).into_par_iter().map(|_| TtCluster::new()).collect();
     }
     // parallel zero clearing.
     pub fn clear(&mut self) {
@@ -145,8 +168,13 @@ impl TranspositionTable {
         fn mul_hi64(l: u64, r: u64) -> u64 {
             ((u128::from(l) * u128::from(r)) >> 64) as u64
         }
-        let index = mul_hi64(key.excluded_turn().0, self.cluster_count as u64); // [0, self.cluster_count / 2 - 1]
-        ((index << 1) | key.turn_bit()) as usize // [0, self.cluster_count - 1]
+        // Stockfish-style multiply-high (NOT masking). Operand is the compile-time const (tournament) or the runtime field; the arithmetic is identical.
+        #[cfg(feature = "tournament")]
+        let cluster_count = TT_CLUSTER_COUNT;
+        #[cfg(not(feature = "tournament"))]
+        let cluster_count = self.cluster_count;
+        let index = mul_hi64(key.excluded_turn().0, cluster_count as u64); // [0, cluster_count / 2 - 1]
+        ((index << 1) | key.turn_bit()) as usize // [0, cluster_count - 1]
     }
     fn get_mut_cluster(&mut self, index: usize) -> &mut TtCluster {
         debug_assert!(index < self.table.len());
@@ -193,6 +221,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<[TtCluster; 4]>(), 128);
     }
 
+    // Runtime-sizing test: asserts against the runtime `cluster_count` field, absent in the tournament build (covered by `tournament_tests`).
+    #[cfg(not(feature = "tournament"))]
     #[test]
     fn test_cluster_index() {
         use crate::search::*;
@@ -215,6 +245,8 @@ mod tests {
             .unwrap();
     }
 
+    // Runtime-sizing test: runs non-tournament only (`resize(1)` would allocate the full fixed-size table under `tournament`).
+    #[cfg(not(feature = "tournament"))]
     #[test]
     fn test_probe() {
         use crate::search::*;
@@ -299,5 +331,60 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    // Tournament build: prove `TT_CLUSTER_COUNT` is a genuine compile-time even const and that the indexing arithmetic is unchanged.
+    #[cfg(feature = "tournament")]
+    mod tournament_tests {
+        use super::*;
+
+        #[test]
+        fn cluster_count_const_is_compile_time_and_even() {
+            // `const` contexts: compile only if `TT_CLUSTER_COUNT` is a genuine compile-time const.
+            const _: usize = TT_CLUSTER_COUNT;
+            const _: () = assert!(TT_CLUSTER_COUNT & 1 == 0);
+            assert_ne!(TT_CLUSTER_COUNT, 0, "a tournament TT must hold at least one cluster");
+            assert_eq!(
+                TT_CLUSTER_COUNT & 1,
+                0,
+                "multiply-high indexing requires an even cluster count"
+            );
+            // v1 placeholder: 256 MiB / 32-byte clusters.
+            assert_eq!(
+                TT_CLUSTER_COUNT,
+                256 * 1024 * 1024 / std::mem::size_of::<TtCluster>(),
+                "v1 tournament config bakes tt_bytes = 256 MiB",
+            );
+        }
+
+        #[test]
+        fn cluster_index_matches_runtime_formula() {
+            // Independent reference: the pre-const arithmetic; `cluster_index` (reading the const) must agree with it.
+            fn reference_index(key: Key, cluster_count: usize) -> usize {
+                fn mul_hi64(l: u64, r: u64) -> u64 {
+                    ((u128::from(l) * u128::from(r)) >> 64) as u64
+                }
+                let index = mul_hi64(key.excluded_turn().0, cluster_count as u64);
+                ((index << 1) | key.turn_bit()) as usize
+            }
+
+            // `cluster_index` reads only the const, not the table, so no allocation is needed.
+            let tt = TranspositionTable::new();
+            for raw in [
+                0x0000_0000_0000_0000u64,
+                0x0000_0000_0000_0001,
+                0x0123_4567_89ab_cdef,
+                0xdead_beef_0000_0001,
+                0xffff_ffff_ffff_ffff,
+            ] {
+                let key = Key(raw);
+                let got = tt.cluster_index(key);
+                assert_eq!(got, reference_index(key, TT_CLUSTER_COUNT), "key {raw:#018x}");
+                assert!(got < TT_CLUSTER_COUNT, "index must stay within the const-sized table");
+            }
+
+            // All-ones key selects the last cluster, matching the runtime test's invariant.
+            assert_eq!(tt.cluster_index(Key(0xffff_ffff_ffff_ffff)), TT_CLUSTER_COUNT - 1);
+        }
     }
 }
