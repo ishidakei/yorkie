@@ -18,6 +18,19 @@ use crate::usioption::*;
 use anyhow::{Context, Result, anyhow};
 use std::io::prelude::*;
 
+/// `Byoyomi_Margin` (ms) subtracted off a `byoyomi` period; tournament build bakes a compile-time const.
+#[cfg(feature = "tournament")]
+#[inline]
+fn byoyomi_margin(_usi_options: &UsiOptions) -> i64 {
+    crate::tournament::BYOYOMI_MARGIN
+}
+
+#[cfg(not(feature = "tournament"))]
+#[inline]
+fn byoyomi_margin(usi_options: &UsiOptions) -> i64 {
+    usi_options.get_i64(UsiOptions::BYOYOMI_MARGIN)
+}
+
 /// Parse the argument list of a USI `go` command into search limits and whether `ponder` was set.
 /// Kept separate from [`go`] so the margin behaviour is unit-testable.
 fn parse_go_limits(usi_options: &UsiOptions, args: &[&str]) -> Result<(LimitsType, bool)> {
@@ -47,7 +60,7 @@ fn parse_go_limits(usi_options: &UsiOptions, args: &[&str]) -> Result<(LimitsTyp
             "byoyomi" | "movetime" => {
                 let n: u64 = next_num(limit_type, &mut iter)?;
                 let margin = if limit_type == "byoyomi" {
-                    usi_options.get_i64(UsiOptions::BYOYOMI_MARGIN) as u64
+                    byoyomi_margin(usi_options) as u64
                 } else {
                     0
                 };
@@ -683,6 +696,28 @@ mod parse_go_limits_tests {
         assert!(parse_go_limits(&opts, &["btime"]).is_err(), "missing number");
         assert!(parse_go_limits(&opts, &["btime", "abc"]).is_err(), "non-numeric");
         assert!(parse_go_limits(&opts, &["unknown_token"]).is_err(), "unknown token");
+    }
+}
+
+// Tournament build: the byoyomi margin subtracted during `go` parsing is the compile-time const
+// baked by build.rs, not the runtime USI option.
+#[cfg(all(test, feature = "tournament"))]
+mod tournament_const_tests {
+    use super::*;
+
+    #[test]
+    fn byoyomi_margin_const_is_fixed() {
+        // `const` context: compiles only if this is a genuine compile-time const.
+        const BYOYOMI_MARGIN: i64 = crate::tournament::BYOYOMI_MARGIN;
+        assert_eq!(BYOYOMI_MARGIN, 500, "v1 tournament config bakes Byoyomi_Margin = 500");
+    }
+
+    // The accessor resolves to the baked const under `tournament`; the `UsiOptions` argument is
+    // ignored, so the byoyomi period is margined by the const regardless of the runtime option.
+    #[test]
+    fn byoyomi_margin_accessor_returns_const() {
+        let opts = UsiOptions::new();
+        assert_eq!(byoyomi_margin(&opts), crate::tournament::BYOYOMI_MARGIN);
     }
 }
 

@@ -16,6 +16,19 @@ use crate::usioption::*;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// `USI_Ponder` (bool): whether to emit a `ponder` move after `bestmove`; tournament build folds the const, else the runtime USI option.
+#[cfg(feature = "tournament")]
+#[inline]
+fn usi_ponder(_usi_options: &UsiOptions) -> bool {
+    crate::tournament::USI_PONDER
+}
+
+#[cfg(not(feature = "tournament"))]
+#[inline]
+fn usi_ponder(usi_options: &UsiOptions) -> bool {
+    usi_options.get_bool(UsiOptions::USI_PONDER)
+}
+
 pub struct StatsType;
 impl StatsType {
     pub const NUM: usize = 2;
@@ -1946,7 +1959,7 @@ impl ThreadPool {
                             )
                         );
                         let mut s = format!("bestmove {}", best_thread.root_moves[0].pv[0].to_usi_string(),);
-                        if usi_options_cloned.get_bool(UsiOptions::USI_PONDER) && best_thread.root_moves[0].pv.len() >= 2 {
+                        if usi_ponder(&usi_options_cloned) && best_thread.root_moves[0].pv.len() >= 2 {
                             s += &format!(" ponder {}", best_thread.root_moves[0].pv[1].to_usi_string());
                         }
                         println!("{}", s);
@@ -2189,6 +2202,56 @@ mod tests {
                 300,
                 "v1 tournament config bakes draw_contempt = 300",
             );
+        }
+
+        #[test]
+        fn usi_ponder_const_is_fixed() {
+            use super::super::*;
+            // `const` context: compiles only if this is a genuine compile-time const.
+            const _: bool = crate::tournament::USI_PONDER;
+            // Value check via the accessor (a fn call, so not a constant-value assertion); under
+            // `tournament` it returns the baked const regardless of the argument.
+            let opts = UsiOptions::new();
+            assert!(usi_ponder(&opts), "v1 tournament config bakes USI_Ponder = true");
+        }
+
+        // The bestmove path reads `usi_ponder`, which under `tournament` returns the baked const and
+        // ignores the runtime option: flipping the option away from the const does not change it.
+        // Runs on a big-stack thread because `ThreadPool::set` builds the large `Thread` struct on
+        // the stack (same as the search tests above).
+        #[test]
+        fn usi_ponder_accessor_ignores_runtime_option() {
+            use super::super::*;
+            std::thread::Builder::new()
+                .stack_size(crate::stack_size::STACK_SIZE)
+                .spawn(|| {
+                    let mut reductions = Reductions::new();
+                    let mut thread_pool = ThreadPool::new();
+                    let mut tt = TranspositionTable::new();
+                    thread_pool.set(1, &mut tt, &mut reductions);
+                    let mut usi_options = UsiOptions::new();
+                    let mut is_ready = true;
+                    // Flip the runtime option to the opposite of the baked const (true -> false).
+                    usi_options.set(
+                        UsiOptions::USI_PONDER,
+                        "false",
+                        &mut thread_pool,
+                        &mut tt,
+                        &mut reductions,
+                        &mut is_ready,
+                    );
+                    assert!(
+                        !usi_options.get_bool(UsiOptions::USI_PONDER),
+                        "runtime option must now be false"
+                    );
+                    assert!(
+                        usi_ponder(&usi_options),
+                        "the tournament accessor must return the baked USI_PONDER const, ignoring the runtime option",
+                    );
+                })
+                .unwrap()
+                .join()
+                .unwrap();
         }
     }
 }

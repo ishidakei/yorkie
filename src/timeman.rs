@@ -2,6 +2,61 @@ use crate::search::*;
 use crate::types::*;
 use crate::usioption::*;
 
+// Think-start time-management inputs, read once per `init`. Tournament build folds compile-time
+// consts baked by `build.rs`, else the runtime USI options.
+
+/// `Move_Overhead` (ms): per-move communication/round-trip overhead used by `compute`.
+#[cfg(feature = "tournament")]
+#[inline]
+fn move_overhead(_usi_options: &UsiOptions) -> i64 {
+    crate::tournament::MOVE_OVERHEAD
+}
+
+#[cfg(not(feature = "tournament"))]
+#[inline]
+fn move_overhead(usi_options: &UsiOptions) -> i64 {
+    usi_options.get_i64(UsiOptions::MOVE_OVERHEAD)
+}
+
+/// `Opening_Time_Weight` (percent): opening time-allocation weight used by `compute`.
+#[cfg(feature = "tournament")]
+#[inline]
+fn opening_time_weight(_usi_options: &UsiOptions) -> i64 {
+    crate::tournament::OPENING_TIME_WEIGHT
+}
+
+#[cfg(not(feature = "tournament"))]
+#[inline]
+fn opening_time_weight(usi_options: &UsiOptions) -> i64 {
+    usi_options.get_i64(UsiOptions::OPENING_TIME_WEIGHT)
+}
+
+/// `Timeout_Safety_Margin` (ms): near-deadline cushion used by the low-time cap in `compute`.
+#[cfg(feature = "tournament")]
+#[inline]
+fn timeout_safety_margin(_usi_options: &UsiOptions) -> i64 {
+    crate::tournament::TIMEOUT_SAFETY_MARGIN
+}
+
+#[cfg(not(feature = "tournament"))]
+#[inline]
+fn timeout_safety_margin(usi_options: &UsiOptions) -> i64 {
+    usi_options.get_i64(UsiOptions::TIMEOUT_SAFETY_MARGIN)
+}
+
+/// `Minimum_Thinking_Time` (ms): floor on the committed `optimum` think time in `compute`.
+#[cfg(feature = "tournament")]
+#[inline]
+fn minimum_thinking_time(_usi_options: &UsiOptions) -> i64 {
+    crate::tournament::MINIMUM_THINKING_TIME
+}
+
+#[cfg(not(feature = "tournament"))]
+#[inline]
+fn minimum_thinking_time(usi_options: &UsiOptions) -> i64 {
+    usi_options.get_i64(UsiOptions::MINIMUM_THINKING_TIME)
+}
+
 #[derive(Clone)]
 pub struct TimeManagement {
     start_time: Option<std::time::Instant>,
@@ -22,10 +77,11 @@ impl TimeManagement {
 
     pub fn init(&mut self, usi_optoins: &UsiOptions, limits: &mut LimitsType, us: Color, ply: i32) {
         self.start_time = limits.start_time;
-        let move_overhead = usi_optoins.get_i64(UsiOptions::MOVE_OVERHEAD);
-        let opening_time_weight = usi_optoins.get_i64(UsiOptions::OPENING_TIME_WEIGHT);
-        let timeout_safety_margin = usi_optoins.get_i64(UsiOptions::TIMEOUT_SAFETY_MARGIN);
-        let minimum_thinking_time = usi_optoins.get_i64(UsiOptions::MINIMUM_THINKING_TIME);
+        // Read the time-management inputs once via the coexistence accessors (USI options, or consts under `tournament`).
+        let move_overhead = move_overhead(usi_optoins);
+        let opening_time_weight = opening_time_weight(usi_optoins);
+        let timeout_safety_margin = timeout_safety_margin(usi_optoins);
+        let minimum_thinking_time = minimum_thinking_time(usi_optoins);
         let our_time = limits.time[us.0 as usize].as_millis() as i64;
         let our_inc = limits.inc[us.0 as usize].as_millis() as i64;
         let (optimum, maximum) = Self::compute(
@@ -61,8 +117,7 @@ impl TimeManagement {
         let optimum = opt_scale * time_left as f64;
         let maximum = (0.8 * our_time as f64 - move_overhead as f64).min(max_scale * optimum);
 
-        // In the low-time regime, cap a single move to keep `move_overhead + timeout_safety_margin`
-        // in reserve so it can never run the clock down to a timeout (Fischer / sudden death only).
+        // Low-time regime: keep `move_overhead + timeout_safety_margin` in reserve so a move can never self-timeout.
         let maximum = if our_time < 5 * timeout_safety_margin {
             let safe_cap = (our_time - (move_overhead + timeout_safety_margin)).max(Self::MAXIMUM_FLOOR_MILLI) as f64;
             maximum.min(safe_cap)
@@ -228,5 +283,43 @@ mod tests {
             opt_200 > opt_100,
             "larger Opening_Time_Weight should raise optimum: {opt_200} !> {opt_100}"
         );
+    }
+}
+
+// Tournament build: the think-start time-management inputs are the compile-time consts baked by build.rs, not runtime USI options.
+#[cfg(all(test, feature = "tournament"))]
+mod tournament_const_tests {
+    use super::*;
+
+    #[test]
+    fn time_management_consts_are_fixed() {
+        // `const` context: each compiles only if it is a genuine compile-time const.
+        const MOVE_OVERHEAD: i64 = crate::tournament::MOVE_OVERHEAD;
+        const TIMEOUT_SAFETY_MARGIN: i64 = crate::tournament::TIMEOUT_SAFETY_MARGIN;
+        const MINIMUM_THINKING_TIME: i64 = crate::tournament::MINIMUM_THINKING_TIME;
+        const OPENING_TIME_WEIGHT: i64 = crate::tournament::OPENING_TIME_WEIGHT;
+        assert_eq!(MOVE_OVERHEAD, 200, "v1 tournament config bakes Move_Overhead = 200");
+        assert_eq!(
+            TIMEOUT_SAFETY_MARGIN, 1_200,
+            "v1 tournament config bakes Timeout_Safety_Margin = 1200"
+        );
+        assert_eq!(
+            MINIMUM_THINKING_TIME, 1_000,
+            "v1 tournament config bakes Minimum_Thinking_Time = 1000"
+        );
+        assert_eq!(
+            OPENING_TIME_WEIGHT, 100,
+            "v1 tournament config bakes Opening_Time_Weight = 100"
+        );
+    }
+
+    // The accessors resolve to the baked const under `tournament`; the `UsiOptions` argument is ignored.
+    #[test]
+    fn accessors_return_baked_consts() {
+        let opts = UsiOptions::new();
+        assert_eq!(move_overhead(&opts), crate::tournament::MOVE_OVERHEAD);
+        assert_eq!(opening_time_weight(&opts), crate::tournament::OPENING_TIME_WEIGHT);
+        assert_eq!(timeout_safety_margin(&opts), crate::tournament::TIMEOUT_SAFETY_MARGIN);
+        assert_eq!(minimum_thinking_time(&opts), crate::tournament::MINIMUM_THINKING_TIME);
     }
 }

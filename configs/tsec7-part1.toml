@@ -11,3 +11,23 @@ draw_contempt = 300
 
 # Transposition-table size in BYTES, baked as a compile-time const; TT cluster count is derived from it (USI_Hash has no effect on TT size). Placeholder 256 MiB; must be a multiple of the 32-byte TtCluster (even cluster count, asserted in tt.rs).
 tt_bytes = 268435456
+
+# Time-management options, read once at think-start. Placeholders equal to current USI option defaults.
+
+# Per-move round-trip overhead in ms, applied inside timeman::compute. Matches Move_Overhead USI default.
+move_overhead = 200
+
+# Near-deadline safety cushion in ms (low-time cap in timeman::compute). Matches Timeout_Safety_Margin USI default.
+timeout_safety_margin = 1200
+
+# Floor on the committed (optimum) think time in ms. Matches Minimum_Thinking_Time USI default.
+minimum_thinking_time = 1000
+
+# Opening time-allocation weight as a percent (100 = neutral). Matches Opening_Time_Weight USI default.
+opening_time_weight = 100
+
+# Byoyomi safety margin in ms, subtracted off the byoyomi period (bypasses the time manager). Matches Byoyomi_Margin USI default.
+byoyomi_margin = 500
+
+# Whether to emit a USI `ponder` move after `bestmove`. Matches the USI_Ponder USI option default.
+usi_ponder = true
