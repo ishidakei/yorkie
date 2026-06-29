@@ -83,6 +83,8 @@ impl UsiOptions {
     pub const BOOK_DEPTH_LIMIT: &'static str = "BookDepthLimit";
     pub const BOOK_EVAL_DIFF: &'static str = "BookEvalDiff";
     pub const FLIPPED_BOOK: &'static str = "FlippedBook";
+    // BookOnTheFly is absent under `tournament` (the whole book is read into memory there).
+    #[cfg(not(feature = "tournament"))]
     pub const BOOK_ON_THE_FLY: &'static str = "BookOnTheFly";
     pub const BYOYOMI_MARGIN: &'static str = "Byoyomi_Margin";
     const CLEAR_HASH: &'static str = "Clear_Hash";
@@ -107,9 +109,14 @@ impl UsiOptions {
 
         // The following are all options.
         options.insert(Self::BOOK_ENABLE, UsiOptionEntry::new(UsiOptionValue::check(false)));
+        // Default opening-book path (normally overridden via eval_options.txt/setoption).
+        #[cfg(not(feature = "tournament"))]
+        const BOOK_FILE_DEFAULT: &str = "book/20191216/book.json";
+        #[cfg(feature = "tournament")]
+        const BOOK_FILE_DEFAULT: &str = "book/standard_book.db";
         options.insert(
             Self::BOOK_FILE,
-            UsiOptionEntry::new(UsiOptionValue::filename("book/20191216/book.json")),
+            UsiOptionEntry::new(UsiOptionValue::filename(BOOK_FILE_DEFAULT)),
         );
         // YaneuraOu-compatible opening-book probe options, snapshotted into `BookOptions`.
         const SPIN_MAX: i64 = i32::MAX as i64;
@@ -124,9 +131,10 @@ impl UsiOptions {
             UsiOptionEntry::new(UsiOptionValue::spin(30, 0, SPIN_MAX)),
         );
         options.insert(Self::FLIPPED_BOOK, UsiOptionEntry::new(UsiOptionValue::check(true)));
+        // BookOnTheFly: not registered under `tournament` (the book is fully read into memory there).
+        #[cfg(not(feature = "tournament"))]
         options.insert(Self::BOOK_ON_THE_FLY, UsiOptionEntry::new(UsiOptionValue::check(false)));
-        // Transmission reserve per byoyomi period (ms): the pure-byoyomi path bypasses the time
-        // manager, so this is its one margin.
+        // Transmission reserve per byoyomi period (ms): the pure-byoyomi path's one margin.
         options.insert(
             Self::BYOYOMI_MARGIN,
             UsiOptionEntry::new(UsiOptionValue::spin(500, 0, i64::MAX)),
@@ -140,9 +148,7 @@ impl UsiOptions {
         // .nnue files do not carry the post-accumulator divisor; default 16
         #[cfg(feature = "nnue")]
         options.insert(Self::FV_SCALE, UsiOptionEntry::new(UsiOptionValue::spin(16, 1, 128)));
-        // Maximum-moves rule (game-ply draw horizon): a search node whose game ply exceeds this
-        // limit scores as the canonical draw, so a conclusion is only credited through the final
-        // move. 0 = unlimited. Default 512 = the tournament rule this engine targets.
+        // Maximum-moves rule (game-ply draw horizon): plies past this limit score as a draw. 0 = unlimited.
         options.insert(
             Self::MAX_MOVES_TO_DRAW,
             UsiOptionEntry::new(UsiOptionValue::spin(512, 0, 100000)),
@@ -601,6 +607,36 @@ mod max_moves_to_draw_option_tests {
         );
         // Default 0 keeps a draw neutral (turn-independent), matching the historical behavior.
         assert_eq!(opts.get_i64(UsiOptions::DRAW_CONTEMPT), 0);
+    }
+}
+
+#[cfg(test)]
+mod book_option_advertisement_tests {
+    use super::*;
+
+    // Without `tournament`, BookOnTheFly stays advertised so a large book can be streamed from disk.
+    #[cfg(not(feature = "tournament"))]
+    #[test]
+    fn advertises_book_on_the_fly() {
+        let opts = UsiOptions::new();
+        let advertised = opts.to_usi_string();
+        assert!(
+            advertised.contains("option name BookOnTheFly type check default false"),
+            "expected BookOnTheFly advertised at default false; got:\n{advertised}"
+        );
+        assert!(!opts.get_bool(UsiOptions::BOOK_ON_THE_FLY));
+    }
+
+    // Under `tournament` the on-the-fly reader is removed: the option is neither registered nor advertised.
+    #[cfg(feature = "tournament")]
+    #[test]
+    fn tournament_build_does_not_advertise_book_on_the_fly() {
+        let opts = UsiOptions::new();
+        let advertised = opts.to_usi_string();
+        assert!(
+            !advertised.contains("BookOnTheFly"),
+            "tournament build must not advertise BookOnTheFly; got:\n{advertised}"
+        );
     }
 }
 

@@ -6,8 +6,14 @@ use crate::movetypes::*;
 use crate::position::*;
 use rand::prelude::*;
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::io::{BufRead, BufReader};
+// `Read`/`Seek`/`SeekFrom` and `PathBuf` are only used by the streaming on-the-fly reader, which is
+// removed under `tournament`.
+#[cfg(not(feature = "tournament"))]
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+#[cfg(not(feature = "tournament"))]
+use std::path::PathBuf;
 
 /// Marker that identifies the YaneuraOu book format (first non-blank line).
 pub const HEADER_MARKER: &str = "#YANEURAOU-DB2016";
@@ -177,6 +183,7 @@ impl MemBook {
 }
 
 /// A located `sfen` block: its body and the byte offset where its move entries begin.
+#[cfg(not(feature = "tournament"))]
 #[derive(Debug)]
 struct SfenHit {
     body: String,
@@ -184,6 +191,7 @@ struct SfenHit {
 }
 
 /// First `sfen` line at or after byte `p` (a partial line straddling `p` is skipped); `Ok(None)` at EOF.
+#[cfg(not(feature = "tournament"))]
 fn first_sfen_from(file: &mut std::fs::File, p: u64) -> std::io::Result<Option<SfenHit>> {
     // If `p` isn't at a line boundary, discard the straddling partial line.
     let discard_partial = if p == 0 {
@@ -218,6 +226,7 @@ fn first_sfen_from(file: &mut std::fs::File, p: u64) -> std::io::Result<Option<S
 }
 
 /// Reads one block's move entries starting at `moves_start`, plus the next `sfen` block if any.
+#[cfg(not(feature = "tournament"))]
 fn read_block_moves(file: &mut std::fs::File, moves_start: u64) -> std::io::Result<(Vec<MoveEntry>, Option<SfenHit>)> {
     file.seek(SeekFrom::Start(moves_start))?;
     let mut reader = BufReader::new(&mut *file);
@@ -252,6 +261,7 @@ fn read_block_moves(file: &mut std::fs::File, moves_start: u64) -> std::io::Resu
 }
 
 /// Binary-searches the SFEN-sorted file for the first block whose ply-less key is `>= target`.
+#[cfg(not(feature = "tournament"))]
 fn lower_bound(file: &mut std::fs::File, file_size: u64, target: &str) -> std::io::Result<Option<SfenHit>> {
     let mut s = 0u64;
     let mut e = file_size;
@@ -272,12 +282,14 @@ fn lower_bound(file: &mut std::fs::File, file_size: u64, target: &str) -> std::i
 }
 
 /// On-the-fly YaneuraOu book: binary-searches the SFEN-sorted file on disk instead of loading it.
+#[cfg(not(feature = "tournament"))]
 #[derive(Debug)]
 struct OnTheFlyBook {
     path: PathBuf,
     file_size: u64,
 }
 
+#[cfg(not(feature = "tournament"))]
 impl OnTheFlyBook {
     /// Opens the book and validates only its header line; the body is never scanned.
     fn open(path: &Path) -> Result<OnTheFlyBook, BookError> {
@@ -341,16 +353,25 @@ pub struct YaneuraouBook {
 #[derive(Debug)]
 enum Inner {
     Mem(MemBook),
+    #[cfg(not(feature = "tournament"))]
     OnTheFly(OnTheFlyBook),
 }
 
 impl YaneuraouBook {
     /// Loads a book from `path`; when `on_the_fly`, binary-searches the file on disk instead of loading it.
+    #[cfg_attr(feature = "tournament", allow(unused_variables))]
     pub fn from_path<P: AsRef<Path>>(path: P, on_the_fly: bool) -> Result<YaneuraouBook, BookError> {
         let path = path.as_ref();
+        #[cfg(not(feature = "tournament"))]
         let inner = if on_the_fly {
             Inner::OnTheFly(OnTheFlyBook::open(path)?)
         } else {
+            let file = std::fs::File::open(path)?;
+            let map = parse_lines(BufReader::new(file).lines())?;
+            Inner::Mem(MemBook { map })
+        };
+        #[cfg(feature = "tournament")]
+        let inner = {
             let file = std::fs::File::open(path)?;
             let map = parse_lines(BufReader::new(file).lines())?;
             Inner::Mem(MemBook { map })
@@ -361,6 +382,7 @@ impl YaneuraouBook {
     fn candidates(&self, sfen: &str, ignore_ply: bool) -> Option<Vec<MoveEntry>> {
         match &self.inner {
             Inner::Mem(b) => b.candidates(sfen, ignore_ply),
+            #[cfg(not(feature = "tournament"))]
             Inner::OnTheFly(b) => b.candidates(sfen, ignore_ply),
         }
     }
@@ -496,6 +518,10 @@ fn mirror_board(board: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `super::*` re-exports `PathBuf` only without `tournament` (it is gated there); the test
+    // helpers need it in both builds.
+    #[cfg(feature = "tournament")]
+    use std::path::PathBuf;
 
     const HEADER: &str = "#YANEURAOU-DB2016 1.00";
     const START_SFEN: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
@@ -696,8 +722,9 @@ mod tests {
         });
     }
 
-    // ----- on-the-fly parity -----
+    // ----- on-the-fly parity (removed under `tournament`) -----
 
+    #[cfg(not(feature = "tournament"))]
     #[test]
     fn on_the_fly_matches_in_memory_candidates() {
         let content = format!("{HEADER}\nsfen {START_SFEN}\n7g7f 3c3d 50 32 100\n2g2f none 40 32 60\n6i7h none 5 8 10\n");
@@ -722,6 +749,7 @@ mod tests {
         assert_eq!(a, b, "on-the-fly candidate set must equal the in-memory set");
     }
 
+    #[cfg(not(feature = "tournament"))]
     #[test]
     fn on_the_fly_probe_returns_legal_move() {
         run(|| {
@@ -750,6 +778,7 @@ mod tests {
     }
 
     /// Dumps a position's candidate moves as sorted `(best, value, depth, num)` tuples, or `None`.
+    #[cfg(not(feature = "tournament"))]
     fn dump_candidates(book: &YaneuraouBook, sfen: &str, ignore_ply: bool) -> Option<Vec<(String, i32, i32, u64)>> {
         book.candidates(sfen, ignore_ply).map(|v| {
             let mut t: Vec<_> = v.into_iter().map(|e| (e.best, e.value, e.depth, e.num)).collect();
@@ -758,6 +787,7 @@ mod tests {
         })
     }
 
+    #[cfg(not(feature = "tournament"))]
     #[test]
     fn on_the_fly_binary_search_matches_in_memory_across_blocks() {
         // Four positions in ascending SFEN order; the on-disk binary search must find any of them,
@@ -789,6 +819,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "tournament"))]
     #[test]
     fn on_the_fly_ignore_book_ply_gathers_adjacent_ply_blocks() {
         // Same ply-less key at ply 1 and ply 7, adjacent and ascending in the file.
@@ -809,6 +840,7 @@ mod tests {
         assert_eq!(dump_candidates(&otf, query, true).unwrap().len(), 2);
     }
 
+    #[cfg(not(feature = "tournament"))]
     #[test]
     fn on_the_fly_probes_first_and_last_fixture_blocks() {
         run(|| {
@@ -825,6 +857,7 @@ mod tests {
         });
     }
 
+    #[cfg(not(feature = "tournament"))]
     #[test]
     fn on_the_fly_missing_header_errors() {
         let tmp = TempBook::with("sfen 9/9/9/9/9/9/9/9/9 b - 1\n7g7f none 0 1 1\n", "otf-noheader");

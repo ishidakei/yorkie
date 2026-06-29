@@ -1,9 +1,12 @@
 //! Opening book support. [`Book::from_file`] auto-detects the YaneuraOu or legacy JSON backend
-//! by a short content sniff (not the file extension).
+//! by a short content sniff (not the file extension). Under `tournament` the JSON and on-the-fly
+//! backends are removed: the YaneuraOu marker is required and the book is loaded fully in memory.
 
+#[cfg(not(feature = "tournament"))]
 mod json;
 mod yaneuraou;
 
+#[cfg(not(feature = "tournament"))]
 pub use self::json::JsonBook;
 pub use self::yaneuraou::YaneuraouBook;
 
@@ -31,6 +34,8 @@ pub struct BookOptions {
     /// On a primary miss, retry against the horizontally mirrored position.
     pub flipped_book: bool,
     /// Stream a large book from disk instead of materializing all move payloads in memory.
+    /// Removed under `tournament` (the book is always fully loaded into memory there).
+    #[cfg(not(feature = "tournament"))]
     pub book_on_the_fly: bool,
 }
 
@@ -43,37 +48,52 @@ impl BookOptions {
             book_depth_limit: options.get_i64(UsiOptions::BOOK_DEPTH_LIMIT) as i32,
             book_eval_diff: options.get_i64(UsiOptions::BOOK_EVAL_DIFF) as i32,
             flipped_book: options.get_bool(UsiOptions::FLIPPED_BOOK),
+            #[cfg(not(feature = "tournament"))]
             book_on_the_fly: options.get_bool(UsiOptions::BOOK_ON_THE_FLY),
         }
     }
 }
 
-/// A loaded opening book: either the legacy JSON backend or the YaneuraOu backend.
+/// A loaded opening book: either the legacy JSON backend or the YaneuraOu backend. Under
+/// `tournament` only the YaneuraOu backend exists.
 pub enum Book {
+    #[cfg(not(feature = "tournament"))]
     Json(JsonBook),
     Yaneuraou(YaneuraouBook),
 }
 
 impl Book {
     /// Loads an opening book from `path`, auto-detecting the format by content.
+    #[cfg_attr(feature = "tournament", allow(unused_variables))]
     pub fn from_file<P>(path: P, options: &BookOptions) -> Result<Book>
     where
         P: AsRef<Path>,
     {
         let path = path.as_ref();
         if sniff_is_yaneuraou(path)? {
+            #[cfg(not(feature = "tournament"))]
             let book = YaneuraouBook::from_path(path, options.book_on_the_fly)?;
+            #[cfg(feature = "tournament")]
+            let book = YaneuraouBook::from_path(path, false)?;
             Ok(Book::Yaneuraou(book))
         } else {
-            let file = std::fs::File::open(path)?;
-            let book = JsonBook::from_reader(std::io::BufReader::new(file))?;
-            Ok(Book::Json(book))
+            #[cfg(not(feature = "tournament"))]
+            {
+                let file = std::fs::File::open(path)?;
+                let book = JsonBook::from_reader(std::io::BufReader::new(file))?;
+                Ok(Book::Json(book))
+            }
+            #[cfg(feature = "tournament")]
+            {
+                anyhow::bail!("not a YaneuraOu-format book: {}", path.display())
+            }
         }
     }
 
     /// Probes the book for a move in `pos`; the `options` filters apply only to the YaneuraOu backend.
     pub fn probe(&self, pos: &Position, options: &BookOptions, rng: &mut ThreadRng) -> Option<Move> {
         match self {
+            #[cfg(not(feature = "tournament"))]
             Book::Json(book) => book.probe(pos, rng),
             Book::Yaneuraou(book) => book.probe(pos, options, rng),
         }
@@ -104,6 +124,7 @@ impl BookOptions {
             book_depth_limit: 0,
             book_eval_diff: i32::MAX,
             flipped_book: false,
+            #[cfg(not(feature = "tournament"))]
             book_on_the_fly: false,
         }
     }
@@ -159,6 +180,8 @@ mod tests {
         });
     }
 
+    // Without `tournament`, JSON content selects the JSON backend via content sniffing.
+    #[cfg(not(feature = "tournament"))]
     #[test]
     fn from_file_detects_json_by_content() {
         run(|| {
@@ -168,11 +191,25 @@ mod tests {
         });
     }
 
+    // Under `tournament` the JSON backend is gone, so JSON content is no longer a valid book: with
+    // no YaneuraOu marker, `from_file` errors instead of falling back to a JSON parse.
+    #[cfg(feature = "tournament")]
+    #[test]
+    fn from_file_rejects_json_content_under_tournament() {
+        run(|| {
+            let tmp = TempBook::with(r#"{"some/sfen b - 1":{"7g7f":{"value":1,"win":1,"lose":1}}}"#, "reject-json");
+            assert!(
+                Book::from_file(&tmp.path, &BookOptions::for_test()).is_err(),
+                "JSON content must be rejected when the JSON backend is removed"
+            );
+        });
+    }
+
     #[test]
     fn from_file_unknown_format_errors() {
         run(|| {
             let tmp = TempBook::with("this is not a book at all\n", "unknown");
-            // Sniff falls through to the JSON backend, which fails to parse the garbage.
+            // Non-marker content errors in both builds (JSON parse failure, or missing YaneuraOu marker).
             assert!(Book::from_file(&tmp.path, &BookOptions::for_test()).is_err());
         });
     }
