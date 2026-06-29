@@ -273,9 +273,14 @@ pub fn value_draw(nodes: i64) -> Value {
     Value::DRAW + Value(2 * (nodes as i32 & 1) - 1)
 }
 
-/// Canonical drawn-game score (repetition draws and the `Max_Moves_To_Draw` horizon).
-pub fn draw_value() -> Value {
-    Value::DRAW
+/// Canonical drawn-game score (repetition draws and the `Max_Moves_To_Draw` horizon), biased
+/// per side by `contempt` in `Value` units (0 = neutral): Black `-contempt`, White `+contempt`.
+pub fn draw_value(contempt: i32, side: Color) -> Value {
+    if side == Color::BLACK {
+        Value(-contempt)
+    } else {
+        Value(contempt)
+    }
 }
 
 pub fn update_continuation_histories(stack: &mut [Stack], pc: Piece, to: Square, bonus: i32) {
@@ -420,6 +425,49 @@ impl Mate {
                 println!("checkmate none");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod draw_value_tests {
+    use super::*;
+
+    // A drawn game's score flips sign by side: Black scores -contempt (avoid), White +contempt (accept); exact negatives under negamax.
+    #[test]
+    fn draw_value_sign_flips_by_side() {
+        let contempt = 300;
+        assert_eq!(
+            draw_value(contempt, Color::BLACK),
+            Value(-contempt),
+            "Black to move: draw is bad"
+        );
+        assert_eq!(
+            draw_value(contempt, Color::WHITE),
+            Value(contempt),
+            "White to move: draw is good"
+        );
+        assert_eq!(
+            draw_value(contempt, Color::BLACK),
+            -draw_value(contempt, Color::WHITE),
+            "the two side values must be exact negatives",
+        );
+    }
+
+    // Zero contempt: both sides score a draw as the neutral `Value::DRAW` (historical behavior).
+    #[test]
+    fn zero_contempt_is_neutral_draw_for_both_sides() {
+        assert_eq!(draw_value(0, Color::BLACK), Value::DRAW);
+        assert_eq!(draw_value(0, Color::WHITE), Value::DRAW);
+    }
+
+    // The tournament-const path: the magnitude baked by build.rs (C = 300) flips sign by side.
+    #[cfg(feature = "tournament")]
+    #[test]
+    fn tournament_const_draw_value_flips_by_side() {
+        const C: i32 = crate::tournament::DRAW_CONTEMPT;
+        assert_eq!(C, 300, "v1 tournament config bakes draw_contempt = 300");
+        assert_eq!(draw_value(C, Color::BLACK), Value(-300));
+        assert_eq!(draw_value(C, Color::WHITE), Value(300));
     }
 }
 

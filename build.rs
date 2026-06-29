@@ -40,6 +40,7 @@ fn generate_tournament_consts(config_path: &str) -> String {
     // TOML key -> generated const; i32 for eval/search hot-path types, except `tt_bytes` (usize, feeds the TT cluster-count computation).
     let fv_scale = required_i32(&table, "fv_scale", config_path);
     let max_moves_to_draw = required_i32(&table, "max_moves_to_draw", config_path);
+    let draw_contempt = required_i32(&table, "draw_contempt", config_path);
     let tt_bytes = required_usize(&table, "tt_bytes", config_path);
 
     format!(
@@ -48,6 +49,9 @@ fn generate_tournament_consts(config_path: &str) -> String {
          pub const FV_SCALE: i32 = {fv_scale};\n\
          /// Maximum-moves draw horizon (game plies) baked from the tournament config.\n\
          pub const MAX_MOVES_TO_DRAW: i32 = {max_moves_to_draw};\n\
+         /// Per-side draw contempt (Value units) baked from the tournament config; Black to\n\
+         /// move scores a draw as -DRAW_CONTEMPT, White as +DRAW_CONTEMPT.\n\
+         pub const DRAW_CONTEMPT: i32 = {draw_contempt};\n\
          /// Transposition-table size in BYTES baked from the tournament config; the TT cluster\n\
          /// count is derived from this at compile time (see `tt.rs`).\n\
          pub const TT_BYTES: usize = {tt_bytes};\n",

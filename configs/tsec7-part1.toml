@@ -6,5 +6,8 @@ fv_scale = 16
 # Maximum-moves draw horizon in game plies (per-node rule check). Matches the Max_Moves_To_Draw USI default; rule-fixed.
 max_moves_to_draw = 512
 
+# Per-side draw contempt in Value units: Black scores a draw as -draw_contempt, White as +draw_contempt (event scores draws asymmetrically). Non-tournament Draw_Contempt USI defaults to 0.
+draw_contempt = 300
+
 # Transposition-table size in BYTES, baked as a compile-time const; TT cluster count is derived from it (USI_Hash has no effect on TT size). Placeholder 256 MiB; must be a multiple of the 32-byte TtCluster (even cluster count, asserted in tt.rs).
 tt_bytes = 268435456

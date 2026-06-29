@@ -47,6 +47,9 @@ struct Thread {
     // Non-tournament only: under `tournament` the horizon is a compile-time const.
     #[cfg(not(feature = "tournament"))]
     max_moves_to_draw: i32,
+    // Per-side draw contempt (Value units), snapshot of Draw_Contempt once per search for a plain field read.
+    #[cfg(not(feature = "tournament"))]
+    draw_contempt: i32,
     tt: *mut TranspositionTable,
     timeman: Arc<Mutex<TimeManagement>>, // shold I use pointer for speedup?
     reductions: *mut Reductions,
@@ -128,6 +131,19 @@ impl Thread {
         self.max_moves_to_draw
     }
 
+    /// Per-side draw contempt (`Value` units) for [`crate::search::draw_value`]; tournament build folds the const, else the per-search `Draw_Contempt` snapshot.
+    #[cfg(feature = "tournament")]
+    #[inline]
+    fn draw_contempt(&self) -> i32 {
+        crate::tournament::DRAW_CONTEMPT
+    }
+
+    #[cfg(not(feature = "tournament"))]
+    #[inline]
+    fn draw_contempt(&self) -> i32 {
+        self.draw_contempt
+    }
+
     fn iterative_deepening_loop(&mut self) {
         // Snapshot the draw horizon once per search from the runtime USI option (0 = unlimited = i32::MAX);
         // tournament build reads a compile-time const instead, so there is no field to populate.
@@ -137,6 +153,8 @@ impl Thread {
                 0 => i32::MAX, // 0 = unlimited
                 limit => limit as i32,
             };
+            // Per-side draw contempt; default 0 keeps a draw neutral (today's behavior).
+            self.draw_contempt = self.usi_options.get_i64(UsiOptions::DRAW_CONTEMPT) as i32;
         }
         let mut stack: [Stack; MAX_PLY as usize + 10] = std::array::from_fn(|_| Stack::new());
         let mut best_value = -Value::INFINITE;
@@ -421,10 +439,10 @@ impl Thread {
                     }
                     // Maximum-moves rule: past the limit is a draw; checked after repetition so a boundary perpetual check stays a loss.
                     if self.position.ply() > self.max_moves_to_draw() {
-                        return draw_value();
+                        return draw_value(self.draw_contempt(), self.position.side_to_move());
                     }
                 }
-                Repetition::Draw => return draw_value(),
+                Repetition::Draw => return draw_value(self.draw_contempt(), self.position.side_to_move()),
                 Repetition::Win => return Value::mate_in(get_stack(stack, 0).ply),
                 Repetition::Lose => return Value::mated_in(get_stack(stack, 0).ply),
                 Repetition::Superior => {
@@ -1225,7 +1243,7 @@ impl Thread {
         }
         // Maximum-moves rule: past the limit is a draw, returned before the TT probe and 1-ply-mate check.
         if self.position.ply() > self.max_moves_to_draw() {
-            return draw_value();
+            return draw_value(self.draw_contempt(), self.position.side_to_move());
         }
 
         debug_assert!(0 <= get_stack(stack, 0).ply && get_stack(stack, 0).ply < MAX_PLY);
@@ -1684,6 +1702,9 @@ impl ThreadPool {
                     // returns the compile-time const). Gate the initializer to match the field.
                     #[cfg(not(feature = "tournament"))]
                     max_moves_to_draw: i32::MAX,
+                    // Re-snapshotted per search in iterative_deepening_loop; 0 = no contempt.
+                    #[cfg(not(feature = "tournament"))]
+                    draw_contempt: 0,
                     tt,
                     timeman: self.timeman.clone(),
                     reductions,
@@ -1982,17 +2003,22 @@ mod tests {
 
         /// Deterministic single-thread fixed-depth search on a big-stack thread; returns best root move and node count.
         fn run_search(sfen: &str, max_moves_to_draw: &str, depth: u32) -> (RootMove, i64) {
+            run_search_with_contempt(sfen, max_moves_to_draw, "0", depth)
+        }
+
+        fn run_search_with_contempt(sfen: &str, max_moves_to_draw: &str, draw_contempt: &str, depth: u32) -> (RootMove, i64) {
             let sfen = sfen.to_string();
             let max_moves_to_draw = max_moves_to_draw.to_string();
+            let draw_contempt = draw_contempt.to_string();
             std::thread::Builder::new()
                 .stack_size(crate::stack_size::STACK_SIZE)
-                .spawn(move || run_search_impl(&sfen, &max_moves_to_draw, depth))
+                .spawn(move || run_search_impl(&sfen, &max_moves_to_draw, &draw_contempt, depth))
                 .unwrap()
                 .join()
                 .unwrap()
         }
 
-        fn run_search_impl(sfen: &str, max_moves_to_draw: &str, depth: u32) -> (RootMove, i64) {
+        fn run_search_impl(sfen: &str, max_moves_to_draw: &str, draw_contempt: &str, depth: u32) -> (RootMove, i64) {
             let mut reductions = Reductions::new();
             let mut thread_pool = ThreadPool::new();
             let mut tt = TranspositionTable::new();
@@ -2003,6 +2029,14 @@ mod tests {
             usi_options.set(
                 UsiOptions::MAX_MOVES_TO_DRAW,
                 max_moves_to_draw,
+                &mut thread_pool,
+                &mut tt,
+                &mut reductions,
+                &mut is_ready,
+            );
+            usi_options.set(
+                UsiOptions::DRAW_CONTEMPT,
+                draw_contempt,
                 &mut thread_pool,
                 &mut tt,
                 &mut reductions,
@@ -2060,6 +2094,25 @@ mod tests {
                 best.score,
                 Value::DRAW,
                 "past the limit everything is a draw; got {}",
+                best.score.0
+            );
+
+            // Non-zero Draw_Contempt: Black to move at the root scores the horizon draw as `-contempt`.
+            const C: i32 = 300;
+            let expected = draw_value(C, Color::BLACK);
+            assert_eq!(expected, Value(-C), "Black to move: a draw is bad");
+            let sfen = format!("{} 15", MATE_IN_ONE_SFEN_BODY);
+            let (best, _) = run_search_with_contempt(&sfen, "14", "300", 6);
+            assert_eq!(
+                best.score, expected,
+                "a beyond-horizon draw must carry Black's draw contempt; got {}",
+                best.score.0
+            );
+            let sfen = format!("{} 17", MATE_IN_ONE_SFEN_BODY);
+            let (best, _) = run_search_with_contempt(&sfen, "16", "300", 6);
+            assert_eq!(
+                best.score, expected,
+                "past the limit every move is a draw at Black's contempt; got {}",
                 best.score.0
             );
         }
@@ -2124,6 +2177,17 @@ mod tests {
                 crate::tournament::MAX_MOVES_TO_DRAW,
                 512,
                 "v1 tournament config bakes Max_Moves_To_Draw = 512",
+            );
+        }
+
+        #[test]
+        fn draw_contempt_const_is_fixed() {
+            // `const` context: compiles only if this is a genuine compile-time const.
+            const _: i32 = crate::tournament::DRAW_CONTEMPT;
+            assert_eq!(
+                crate::tournament::DRAW_CONTEMPT,
+                300,
+                "v1 tournament config bakes draw_contempt = 300",
             );
         }
     }

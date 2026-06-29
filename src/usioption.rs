@@ -90,6 +90,7 @@ impl UsiOptions {
     #[cfg(feature = "nnue")]
     pub const FV_SCALE: &'static str = "FV_SCALE";
     pub const MAX_MOVES_TO_DRAW: &'static str = "Max_Moves_To_Draw";
+    pub const DRAW_CONTEMPT: &'static str = "Draw_Contempt";
     pub const MINIMUM_THINKING_TIME: &'static str = "Minimum_Thinking_Time";
     pub const MOVE_OVERHEAD: &'static str = "Move_Overhead";
     pub const MULTI_PV: &'static str = "MultiPV";
@@ -144,6 +145,8 @@ impl UsiOptions {
             Self::MAX_MOVES_TO_DRAW,
             UsiOptionEntry::new(UsiOptionValue::spin(512, 0, 100000)),
         );
+        // Per-side draw contempt (Value units): draw scores `-Draw_Contempt` for Black, `+` for White; 0 = neutral.
+        options.insert(Self::DRAW_CONTEMPT, UsiOptionEntry::new(UsiOptionValue::spin(0, -2000, 2000)));
         options.insert(Self::MULTI_PV, UsiOptionEntry::new(UsiOptionValue::spin(1, 1, 500)));
         // Time-management options (see `timeman::compute`). Per-move round-trip overhead (ms).
         options.insert(Self::MOVE_OVERHEAD, UsiOptionEntry::new(UsiOptionValue::spin(200, 0, 10000)));
@@ -581,6 +584,19 @@ mod max_moves_to_draw_option_tests {
             "missing advertised option line: {expected}\n{advertised}"
         );
         assert_eq!(opts.get_i64(UsiOptions::MAX_MOVES_TO_DRAW), 512);
+    }
+
+    #[test]
+    fn advertises_draw_contempt_default_zero() {
+        let opts = UsiOptions::new();
+        let advertised = opts.to_usi_string();
+        let expected = "option name Draw_Contempt type spin default 0 min -2000 max 2000";
+        assert!(
+            advertised.contains(expected),
+            "missing advertised option line: {expected}\n{advertised}"
+        );
+        // Default 0 keeps a draw neutral (turn-independent), matching the historical behavior.
+        assert_eq!(opts.get_i64(UsiOptions::DRAW_CONTEMPT), 0);
     }
 }
 
