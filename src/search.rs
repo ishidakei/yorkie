@@ -391,10 +391,12 @@ impl Perft {
     }
 }
 
+#[cfg(feature = "mate")]
 pub struct Mate {
     position: Position,
 }
 
+#[cfg(feature = "mate")]
 impl Mate {
     pub fn new(pos: &Position) -> Self {
         Self {

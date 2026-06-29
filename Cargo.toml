@@ -25,7 +25,10 @@ serde = { version = "1.0.203", features = ["derive"] }
 serde_json = "1.0.117"
 static_assertions = "1.1.0"
 thiserror = "1.0.61"
-tsumeshogi-solver = { tag = "0.5.2", git = "https://github.com/sugyan/tsumeshogi-solver.git" }
+# Mate-search-only dep (pulled in solely by the `mate` feature; not built by tournament
+# builds, which use `--no-default-features` without `mate`). Implements the USI `go mate`
+# analysis query; never reached during normal play.
+tsumeshogi-solver = { tag = "0.5.2", git = "https://github.com/sugyan/tsumeshogi-solver.git", optional = true }
 
 # Build-only: parse configs/<event>.toml in build.rs to emit compile-time consts for the
 # tournament build. Not linked into the engine binary; runtime behavior is unaffected.
@@ -36,9 +39,15 @@ toml = "0.8"
 lto = true
 
 [features]
-default = ["nnue"]
+default = ["nnue", "mate"]
 material = []
 nnue = []
+# USI `go mate` mate-search support. Owns the optional `tsumeshogi-solver` dependency and
+# all the mate-search code. In `default` so the standard dev build keeps mate, but NOT
+# enabled for tournament builds (built with `--no-default-features`), so the tournament
+# binary never links the solver. A build without `mate` answers `go mate` with
+# `checkmate notimplemented` per the USI spec.
+mate = ["dep:tsumeshogi-solver"]
 # Additive tournament build (composes with an eval feature, e.g. `nnue,tournament`).
 # When enabled, build.rs bakes startup-fixed values from the config TOML named by the
 # `YORKIE_TOURNAMENT_CONFIG` env var (e.g. configs/tsec7-part1.toml) into compile-time

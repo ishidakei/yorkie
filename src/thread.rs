@@ -1810,7 +1810,16 @@ impl ThreadPool {
             Perft::new(pos).go(perft);
             return;
         } else if let Some(mate) = limits.mate {
-            Mate::new(pos).go(mate);
+            #[cfg(feature = "mate")]
+            {
+                Mate::new(pos).go(mate);
+            }
+            // Without the `mate` feature, answer `go mate` with `checkmate notimplemented` per the USI spec.
+            #[cfg(not(feature = "mate"))]
+            {
+                let _ = mate;
+                println!("checkmate notimplemented");
+            }
             return;
         }
         self.wait_for_search_finished();

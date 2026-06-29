@@ -12,6 +12,12 @@ extern crate derive_more;
 extern crate enum_derive;
 #[macro_use]
 extern crate static_assertions;
+// Guard: the tournament build must never link the `tsumeshogi-solver` mate dependency (owned by `mate`).
+#[cfg(all(feature = "tournament", feature = "mate"))]
+compile_error!(
+    "features `tournament` and `mate` are mutually exclusive — the tournament build must not link the mate-search solver"
+);
+
 mod authors;
 mod bitboard;
 mod book;
