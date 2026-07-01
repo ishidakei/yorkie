@@ -49,9 +49,9 @@ pub fn set_local_replica_for_node(node: u32) {
     LOCAL_NET.with(|c| c.set(ptr));
 }
 
-/// The current thread's node-local replica, if one is set (`numa` feature).
+/// The current thread's node-local replica if set (`numa`); `pub(crate)` so the search's incremental path uses the same replica as full-eval.
 #[cfg(feature = "numa")]
-fn local_replica() -> Option<&'static NnueNetwork> {
+pub(crate) fn local_replica() -> Option<&'static NnueNetwork> {
     let ptr = LOCAL_NET.with(|c| c.get());
     // SAFETY: `ptr` is null or a `&'static` replica leaked by `numa::build_replicas` (read-only, process-lifetime).
     if ptr.is_null() { None } else { Some(unsafe { &*ptr }) }
@@ -285,6 +285,54 @@ mod tests {
             // Same (pos, net) ⇒ root refresh and leaf forward agree, and repeat is stable.
             assert_eq!(root, leaf, "root and leaf eval must agree for the replica network");
             assert_eq!(leaf, evaluate(&mut pos, &mut stack), "replica eval must be deterministic");
+
+            clear_local_replica_for_test();
+            clear_loaded_for_test();
+        });
+    }
+
+    // Incremental-path companion: global cleared, only the TLS replica set, so driving moves through `local_replica()` proves the incremental accumulator runs off the node-local replica and matches a fresh refresh.
+    #[cfg(feature = "numa")]
+    #[test]
+    fn incremental_path_reads_thread_local_replica_not_global() {
+        use crate::movetypes::Move;
+        use crate::search::do_move_with_accumulator;
+        test_fixtures::run_with_large_stack(|| {
+            let _guard = TEST_MUTEX.lock().expect("TEST_MUTEX poisoned");
+            clear_loaded_for_test(); // global is empty on purpose
+            set_local_replica_for_test(test_fixtures::synthetic_net());
+
+            // The incremental path takes its net from the node-local replica, as `iterative_deepening_loop` resolves `nnue_net_ptr`.
+            let net = local_replica().expect("TLS replica pointer must be set");
+
+            let mut pos = Position::new();
+            let mut stack: Vec<Stack> = (0..10).map(|_| Stack::new()).collect();
+            transformer::refresh(&mut stack[0].accumulator, net, &pos);
+
+            let usi_moves = ["7g7f", "3c3d", "2g2f", "8c8d"];
+            for (ply, usi) in usi_moves.iter().enumerate() {
+                let mv = Move::new_from_usi_str(usi, &pos).expect("legal move");
+                let gives_check = pos.gives_check(mv);
+                do_move_with_accumulator(&mut stack, ply, &mut pos, mv, gives_check, net);
+                assert!(
+                    stack[ply + 1].accumulator.computed,
+                    "incremental update must mark the slot computed"
+                );
+            }
+
+            // Same replica net ⇒ the incrementally-maintained accumulator equals a fresh refresh.
+            let mut expected = Accumulator::zeroed();
+            transformer::refresh(&mut expected, net, &pos);
+            assert_eq!(
+                stack[usi_moves.len()].accumulator.us,
+                expected.us,
+                "incremental `.us` must match fresh refresh"
+            );
+            assert_eq!(
+                stack[usi_moves.len()].accumulator.them,
+                expected.them,
+                "incremental `.them` must match fresh refresh"
+            );
 
             clear_local_replica_for_test();
             clear_loaded_for_test();

@@ -73,10 +73,12 @@ struct Thread {
     best_move_changess: Vec<Arc<AtomicU64>>,
 
     nodes: Arc<AtomicI64>,
-    // Cached for the duration of one search so descent sites avoid re-locking
-    // the process-wide RwLock. Populated in iterative_deepening_loop.
+    // Cached per search so descent sites avoid re-locking the process-wide RwLock; populated in iterative_deepening_loop.
     #[cfg(feature = "nnue")]
     nnue_network: Option<Arc<nnue::types::NnueNetwork>>,
+    // Under `numa`, the incremental accumulator path's NNUE weights: the same node-local replica the full-eval path uses (raw pointer for a disjoint-field read alongside `&mut self.position`); set once per search in `iterative_deepening_loop`, null until then.
+    #[cfg(all(feature = "nnue", feature = "numa"))]
+    nnue_net_ptr: *const nnue::types::NnueNetwork,
     // following variables are shared one object that ThreadPool has.
     best_previous_score: Arc<Mutex<Value>>,
     iter_values: Arc<Mutex<[Value; 4]>>,
@@ -228,6 +230,12 @@ impl Thread {
         #[cfg(feature = "nnue")]
         {
             self.nnue_network = Some(current_network().expect("nnue network must be loaded before iterative_deepening_loop"));
+            // Under `numa`, point the incremental path at the same node-local replica the eval hot path uses, falling back to the shared Arc's inner pointer (kept alive by `nnue_network`) when this node has no replica.
+            #[cfg(feature = "numa")]
+            {
+                self.nnue_net_ptr =
+                    nnue::local_replica().map_or_else(|| Arc::as_ptr(self.nnue_network.as_ref().unwrap()), |r| r as *const _);
+            }
         }
 
         evaluate_at_root(&self.position, &mut stack);
@@ -820,14 +828,14 @@ impl Thread {
 
                         let gives_check = self.position.gives_check(m);
                         #[cfg(feature = "nnue")]
-                        do_move_with_accumulator(
-                            stack,
-                            CURRENT_STACK_INDEX,
-                            &mut self.position,
-                            m,
-                            gives_check,
-                            self.nnue_network.as_ref().expect("nnue network must be loaded before search"),
-                        );
+                        {
+                            // SAFETY (numa): `nnue_net_ptr` points at process-lifetime read-only replica weights (kept alive by `nnue_network`); the deref isn't tied to `&self`, so it coexists with the `&mut self.position` borrow.
+                            #[cfg(feature = "numa")]
+                            let net_ref = unsafe { &*self.nnue_net_ptr };
+                            #[cfg(not(feature = "numa"))]
+                            let net_ref = self.nnue_network.as_ref().expect("nnue network must be loaded before search");
+                            do_move_with_accumulator(stack, CURRENT_STACK_INDEX, &mut self.position, m, gives_check, net_ref);
+                        }
                         #[cfg(not(feature = "nnue"))]
                         self.position.do_move(m, gives_check);
                         let mut value =
@@ -1057,14 +1065,14 @@ impl Thread {
 
             // Step 15
             #[cfg(feature = "nnue")]
-            do_move_with_accumulator(
-                stack,
-                CURRENT_STACK_INDEX,
-                &mut self.position,
-                m,
-                gives_check,
-                self.nnue_network.as_ref().expect("nnue network must be loaded before search"),
-            );
+            {
+                // SAFETY (numa): `nnue_net_ptr` points at process-lifetime read-only replica weights (kept alive by `nnue_network`); the deref isn't tied to `&self`, so it coexists with the `&mut self.position` borrow.
+                #[cfg(feature = "numa")]
+                let net_ref = unsafe { &*self.nnue_net_ptr };
+                #[cfg(not(feature = "numa"))]
+                let net_ref = self.nnue_network.as_ref().expect("nnue network must be loaded before search");
+                do_move_with_accumulator(stack, CURRENT_STACK_INDEX, &mut self.position, m, gives_check, net_ref);
+            }
             #[cfg(not(feature = "nnue"))]
             self.position.do_move(m, gives_check);
 
@@ -1465,14 +1473,14 @@ impl Thread {
             }
 
             #[cfg(feature = "nnue")]
-            do_move_with_accumulator(
-                stack,
-                CURRENT_STACK_INDEX,
-                &mut self.position,
-                m,
-                gives_check,
-                self.nnue_network.as_ref().expect("nnue network must be loaded before search"),
-            );
+            {
+                // SAFETY (numa): `nnue_net_ptr` points at process-lifetime read-only replica weights (kept alive by `nnue_network`); the deref isn't tied to `&self`, so it coexists with the `&mut self.position` borrow.
+                #[cfg(feature = "numa")]
+                let net_ref = unsafe { &*self.nnue_net_ptr };
+                #[cfg(not(feature = "numa"))]
+                let net_ref = self.nnue_network.as_ref().expect("nnue network must be loaded before search");
+                do_move_with_accumulator(stack, CURRENT_STACK_INDEX, &mut self.position, m, gives_check, net_ref);
+            }
             #[cfg(not(feature = "nnue"))]
             self.position.do_move(m, gives_check);
             let value = -self.qsearch::<NT>(&mut stack[1..], -beta, -alpha, depth - Depth::ONE_PLY);
@@ -1776,6 +1784,9 @@ impl ThreadPool {
                     nodes: self.nodess[i].clone(),
                     #[cfg(feature = "nnue")]
                     nnue_network: None,
+                    // Set per search in iterative_deepening_loop, once the worker is pinned and its node-local replica is known; null until then.
+                    #[cfg(all(feature = "nnue", feature = "numa"))]
+                    nnue_net_ptr: std::ptr::null(),
                     best_previous_score: self.best_previous_score.clone(),
                     iter_values: self.iter_values.clone(),
                     increase_depth: self.increase_depth.clone(),
