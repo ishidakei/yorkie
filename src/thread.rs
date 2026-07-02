@@ -48,6 +48,8 @@ struct Thread {
     sel_depth: i32,
     null_move_pruning_min_ply: i32,
     null_move_pruning_color: Color,
+    // The engine's own game side (set per search in start_thinking, ponder-aware): its mates are flat, mates against it stay graded. Pinning to color, not root side, keeps TT entries consistent across ponder and normal searches.
+    engine_color: Color,
     position: Position,
     root_moves: RootMoves,
     root_depth: Depth,
@@ -378,6 +380,15 @@ impl Thread {
                 self.stop.store(true, Ordering::Relaxed);
             }
 
+            // Flat-win termination: a proven flat win is the global maximum, so stop rather than spend more time (but `go infinite` keeps searching, and while pondering defer via stop_on_ponderhit).
+            if best_value == Value::MATE_FLAT && self.limits.infinite.is_none() && !self.stop.load(Ordering::Relaxed) {
+                if self.ponder.load(Ordering::Relaxed) {
+                    self.stop_on_ponderhit.store(true, Ordering::Relaxed);
+                } else {
+                    self.stop.store(true, Ordering::Relaxed);
+                }
+            }
+
             if !self.is_main() {
                 continue;
             }
@@ -502,8 +513,21 @@ impl Thread {
                     }
                 }
                 Repetition::Draw => return draw_value(self.draw_contempt(), self.position.side_to_move()),
-                Repetition::Win => return Value::mate_in(get_stack(stack, 0).ply),
-                Repetition::Lose => return Value::mated_in(get_stack(stack, 0).ply),
+                // Perpetual-check outcomes are immediate here (within the horizon): flat when the engine's side wins, graded when it loses.
+                Repetition::Win => {
+                    return if us == self.engine_color {
+                        Value::MATE_FLAT
+                    } else {
+                        Value::mate_in(get_stack(stack, 0).ply)
+                    };
+                }
+                Repetition::Lose => {
+                    return if us == self.engine_color {
+                        Value::mated_in(get_stack(stack, 0).ply)
+                    } else {
+                        Value::MATED_FLAT
+                    };
+                }
                 Repetition::Superior => {
                     if get_stack(stack, 0).ply != 2 {
                         return Value::MATE_IN_MAX_PLY;
@@ -516,9 +540,12 @@ impl Thread {
                 }
             }
 
-            // Step 3
-            alpha = std::cmp::max(Value::mated_in(get_stack(stack, 0).ply), alpha);
-            beta = std::cmp::min(Value::mate_in(get_stack(stack, 0).ply + 1), beta);
+            // Step 3: mate-distance pruning, split by side because only the graded direction has a distance to clamp (the flat win/loss already gives the cutoff).
+            if us == self.engine_color {
+                alpha = std::cmp::max(Value::mated_in(get_stack(stack, 0).ply), alpha);
+            } else {
+                beta = std::cmp::min(Value::mate_in(get_stack(stack, 0).ply + 1), beta);
+            }
             if alpha >= beta {
                 return alpha;
             }
@@ -632,7 +659,12 @@ impl Thread {
 
         // Step 5
         if self.position.is_entering_king_win() {
-            best_value = Value::mate_in(get_stack(stack, 0).ply);
+            // The declaration win is at this node, within the horizon: flat for the engine's side, graded for the opponent.
+            best_value = if us == self.engine_color {
+                Value::MATE_FLAT
+            } else {
+                Value::mate_in(get_stack(stack, 0).ply)
+            };
             if tt_move.is_none() || tt_move.non_zero_unwrap_unchecked() != Move::WIN {
                 get_stack_mut(stack, 0).static_eval = best_value; // is this necessary?
                 tte.save(
@@ -651,9 +683,15 @@ impl Thread {
 
         if !root_node
             && !get_stack(stack, 0).in_check
+            // A 1-ply mate lands on game ply ply() + 1, so at the boundary (ply() == limit) it is past the horizon and scores a draw, not a mate.
+            && self.position.ply() < self.max_moves_to_draw()
             && let Some(mate_move) = self.position.mate_move_in_1ply()
         {
-            best_value = Value::mate_in(get_stack(stack, 0).ply);
+            best_value = if us == self.engine_color {
+                Value::MATE_FLAT
+            } else {
+                Value::mate_in(get_stack(stack, 0).ply)
+            };
             get_stack_mut(stack, 0).static_eval = best_value; // is this necessary?
             tte.save(
                 key,
@@ -1225,10 +1263,13 @@ impl Thread {
         );
 
         if move_count == 0 {
+            // Mated at this node, within the horizon: graded when the engine's side is mated, flat when the opponent is.
             best_value = if excluded_move.is_some() {
                 alpha
-            } else {
+            } else if us == self.engine_color {
                 Value::mated_in(get_stack(stack, 0).ply)
+            } else {
+                Value::MATED_FLAT
             };
         } else if let Some(best_move) = best_move {
             self.update_all_stats(
@@ -1350,8 +1391,15 @@ impl Thread {
             futility_base = -Value::INFINITE;
             best_value = -Value::INFINITE;
         } else {
-            if let Some(_mate_move) = self.position.mate_move_in_1ply() {
-                return Value::mate_in(get_stack(stack, 0).ply);
+            // Same horizon boundary as the main-search shortcut: at ply() == limit the 1-ply mate is past the horizon, a draw.
+            if self.position.ply() < self.max_moves_to_draw()
+                && let Some(_mate_move) = self.position.mate_move_in_1ply()
+            {
+                return if self.position.side_to_move() == self.engine_color {
+                    Value::MATE_FLAT
+                } else {
+                    Value::mate_in(get_stack(stack, 0).ply)
+                };
             }
             if get_stack(stack, 0).tt_hit {
                 best_value = tte.eval();
@@ -1515,7 +1563,12 @@ impl Thread {
                 },
                 0
             );
-            return Value::mated_in(get_stack(stack, 0).ply);
+            // Mated at this node, within the horizon: graded for the engine's side, flat when the opponent is mated.
+            return if self.position.side_to_move() == self.engine_color {
+                Value::mated_in(get_stack(stack, 0).ply)
+            } else {
+                Value::MATED_FLAT
+            };
         }
 
         tte.save(
@@ -1756,6 +1809,8 @@ impl ThreadPool {
                     sel_depth: 0,
                     null_move_pruning_min_ply: 0,
                     null_move_pruning_color: Color::BLACK,
+                    // Re-populated per search in start_thinking (ponder-aware).
+                    engine_color: Color::BLACK,
                     position: Position::new(),
                     root_moves: RootMoves::new(),
                     root_depth: Depth::ZERO,
@@ -1837,6 +1892,12 @@ impl ThreadPool {
         self.stop.store(false, Ordering::Relaxed);
         self.stop_on_ponderhit.store(false, Ordering::Relaxed);
         self.ponder.store(ponder_mode, Ordering::Relaxed);
+        // The engine's own game side, inverted while pondering; mate flattening (see Thread::engine_color) is relative to this.
+        let engine_color = if ponder_mode {
+            pos.side_to_move().inverse()
+        } else {
+            pos.side_to_move()
+        };
         self.hide_all_output.store(hide_all_output, Ordering::Relaxed);
         self.timeman
             .lock()
@@ -1933,6 +1994,7 @@ impl ThreadPool {
                                 crate::evaluate::nnue::set_local_replica_for_node(assignment.node);
                             }
                             th.best_move_changes.store(0, Ordering::Relaxed);
+                            th.engine_color = engine_color;
                             th.limits = limits_cloned;
                             th.nodes = nodes_cloned;
                             th.root_depth = Depth::ZERO;
@@ -2151,9 +2213,10 @@ mod tests {
             // Mate inside the horizon (ply 15, limit 16): must be scored as mate, not draw.
             let sfen = format!("{} 15", MATE_IN_ONE_SFEN_BODY);
             let (best, _) = run_search(&sfen, "16", 6);
-            assert!(
-                best.score >= Value::MATE_IN_MAX_PLY,
-                "mate inside the horizon must keep its mate score; got {}",
+            assert_eq!(
+                best.score,
+                Value::MATE_FLAT,
+                "a mate inside the horizon for the engine's own side scores the flat win; got {}",
                 best.score.0
             );
             let pos = Position::new_from_sfen(&sfen).unwrap();
@@ -2223,6 +2286,93 @@ mod tests {
             assert!(
                 best.score <= Value::MATED_IN_MAX_PLY,
                 "without a horizon the losing side is mated; got {}",
+                best.score.0
+            );
+        }
+
+        // A mate for the engine's own side scores the flat Value::MATE_FLAT (no ply gradient); a mate against it keeps the graded -MATE + ply.
+
+        #[test]
+        fn engine_mate_scores_flat_and_bestmove_mates() {
+            let sfen = format!("{} 1", MATE_IN_ONE_SFEN_BODY);
+            let (best, _) = run_search(&sfen, "0", 6);
+            assert_eq!(
+                best.score,
+                Value::MATE_FLAT,
+                "the engine's own forced mate must score the flat win value; got {}",
+                best.score.0
+            );
+            let pos = Position::new_from_sfen(&sfen).unwrap();
+            let mate_move = Move::new_from_usi_str("G*5b", &pos).unwrap();
+            assert_eq!(best.pv[0], mate_move, "bestmove must still be a mating move");
+        }
+
+        // Once the flat win is proven the iterative-deepening loop stops, so a higher depth limit must not change the node count.
+        #[test]
+        fn proven_flat_win_terminates_iterative_deepening() {
+            let sfen = format!("{} 1", MATE_IN_ONE_SFEN_BODY);
+            let (best6, nodes6) = run_search(&sfen, "0", 6);
+            let (best20, nodes20) = run_search(&sfen, "0", 20);
+            assert_eq!(best6.score, Value::MATE_FLAT);
+            assert_eq!(best20.score, Value::MATE_FLAT);
+            assert_eq!(
+                nodes6, nodes20,
+                "after the mate is proven the search must stop, so a higher depth limit adds no nodes"
+            );
+        }
+
+        // The losing engine keeps the graded score and must prefer the longer resistance (a spite check) over the immediate loss.
+        #[test]
+        fn losing_side_keeps_gradient_and_prefers_longer_resistance() {
+            // Immediate loss: the only move is the pawn push, then R*1b mates.
+            let immediate = format!("{} 1", LOSING_SIDE_SFEN_BODY);
+            let (best_immediate, _) = run_search(&immediate, "0", 6);
+            assert!(
+                best_immediate.score <= Value::MATED_IN_MAX_PLY && Value::MATED_FLAT < best_immediate.score,
+                "a mate against the engine must stay in the graded range, not flat; got {}",
+                best_immediate.score.0
+            );
+
+            // Same position plus a knight in hand: the spite check N*4g delays the mate by two plies.
+            let delayed = "6G1k/9/p7G/9/9/9/9/9/4K4 w Rn 1";
+            let (best_delayed, _) = run_search(delayed, "0", 6);
+            assert!(
+                best_delayed.score <= Value::MATED_IN_MAX_PLY && Value::MATED_FLAT < best_delayed.score,
+                "the delayed loss must also stay in the graded range; got {}",
+                best_delayed.score.0
+            );
+            assert!(
+                best_delayed.score > best_immediate.score,
+                "the graded score must reward the longer resistance ({} vs {})",
+                best_delayed.score.0,
+                best_immediate.score.0
+            );
+            let pos = Position::new_from_sfen(delayed).unwrap();
+            let spite_check = Move::new_from_usi_str("N*4g", &pos).unwrap();
+            assert_eq!(
+                best_delayed.pv[0], spite_check,
+                "the losing engine must pick the delaying spite check"
+            );
+        }
+
+        // The 1-ply-mate shortcut must not claim a mate landing past the horizon (game ply == limit, so the mate would land on limit + 1, a draw).
+        #[test]
+        fn one_ply_mate_exactly_at_horizon_boundary_is_a_draw() {
+            // At limit 15, after the forced 9c9d the black node sits at the boundary (ply 15): its R*1b "mate" would land on ply 16, so everything is a draw.
+            let sfen = format!("{} 14", LOSING_SIDE_SFEN_BODY);
+            let (best, _) = run_search(&sfen, "15", 6);
+            assert_eq!(
+                best.score,
+                Value::DRAW,
+                "a 1-ply mate landing past the horizon must not be claimed; got {}",
+                best.score.0
+            );
+
+            // One more move of room (limit 16) and the same mate counts again.
+            let (best, _) = run_search(&sfen, "16", 6);
+            assert!(
+                best.score <= Value::MATED_IN_MAX_PLY,
+                "with the mate inside the horizon the losing side is mated again; got {}",
                 best.score.0
             );
         }

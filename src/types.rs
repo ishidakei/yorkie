@@ -723,11 +723,20 @@ impl Value {
     pub const MATED: Value = Value(-Value::MATE_VAL);
     pub const MATE_IN_MAX_PLY: Value = Value(Value::MATE_VAL - MAX_PLY);
     pub const MATED_IN_MAX_PLY: Value = Value(-Value::MATE_VAL + MAX_PLY);
-    pub const INFINITE: Value = Value(32601);
-    pub const NONE: Value = Value(32602);
+    /// Flat "proven mate for the engine's own side" score; sits above the graded mate range for an immediate beta cutoff and carries no ply distance.
+    pub const MATE_FLAT: Value = Value(Value::MATE_VAL + 1);
+    /// Negamax mirror of [`Value::MATE_FLAT`]: "the side to move is mated, flat".
+    pub const MATED_FLAT: Value = Value(-(Value::MATE_VAL + 1));
+    pub const INFINITE: Value = Value(32602);
+    pub const NONE: Value = Value(32603);
 
     pub fn to_usi(self) -> String {
-        if Value::MATED_IN_MAX_PLY < self && self < Value::MATE_IN_MAX_PLY {
+        // Flat proven-mate scores carry no distance, so emit the sign-only USI mate score.
+        if self == Value::MATE_FLAT {
+            "mate +".to_string()
+        } else if self == Value::MATED_FLAT {
+            "mate -".to_string()
+        } else if Value::MATED_IN_MAX_PLY < self && self < Value::MATE_IN_MAX_PLY {
             format!("cp {}", self.0 * 100 / PAWN_VALUE)
         } else {
             format!(
@@ -1218,6 +1227,27 @@ mod tests {
     fn test_color_inverse() {
         assert_eq!(Color::BLACK.inverse(), Color::WHITE);
         assert_eq!(Color::WHITE.inverse(), Color::BLACK);
+    }
+
+    // The flat value must dominate every graded mate score, stay inside INFINITE/NONE, and mirror under negamax.
+    #[test]
+    fn test_flat_mate_value_ordering() {
+        assert!(Value::MATE < Value::MATE_FLAT);
+        assert!(Value::MATE_FLAT < Value::INFINITE);
+        assert!(Value::INFINITE < Value::NONE);
+        assert_eq!(-Value::MATE_FLAT, Value::MATED_FLAT);
+        assert!(Value::MATED_FLAT < Value::MATED);
+        assert!(-Value::INFINITE < Value::MATED_FLAT);
+    }
+
+    // Flat values render as sign-only USI mate notation; graded and centipawn scores keep their rendering.
+    #[test]
+    fn test_to_usi_flat_and_graded() {
+        assert_eq!(Value::MATE_FLAT.to_usi(), "mate +");
+        assert_eq!(Value::MATED_FLAT.to_usi(), "mate -");
+        assert_eq!(Value::mate_in(3).to_usi(), "mate 4");
+        assert_eq!(Value::mated_in(3).to_usi(), "mate -3");
+        assert_eq!(Value::ZERO.to_usi(), "cp 0");
     }
 
     #[test]

@@ -249,6 +249,8 @@ pub fn get_stack_mut(stack: &mut [Stack], i: i64) -> &mut Stack {
 pub fn value_from_tt(v: Value, ply: i32) -> Value {
     match v {
         Value::NONE => Value::NONE,
+        // Flat proven-mate scores carry no distance, so bypass ply re-basing (must precede the graded range checks).
+        Value::MATE_FLAT | Value::MATED_FLAT => v,
         v if v >= Value::MATE_IN_MAX_PLY => v - Value(ply),
         v if v <= Value::MATED_IN_MAX_PLY => v + Value(ply),
         v => v,
@@ -258,8 +260,11 @@ pub fn value_from_tt(v: Value, ply: i32) -> Value {
 pub fn value_to_tt(v: Value, ply: i32) -> Value {
     debug_assert!(v != Value::NONE);
     match v {
-        v if v >= Value::MATE_IN_MAX_PLY => v + Value(ply),
-        v if v <= Value::MATED_IN_MAX_PLY => v - Value(ply),
+        // Flat proven-mate scores are stored as-is (see value_from_tt).
+        Value::MATE_FLAT | Value::MATED_FLAT => v,
+        // Clamp: Superior/Inferior sentinel bounds have no mate distance, so ply re-basing could otherwise push a graded value onto the flat values, fabricating a "proven mate".
+        v if v >= Value::MATE_IN_MAX_PLY => std::cmp::min(v + Value(ply), Value::MATE),
+        v if v <= Value::MATED_IN_MAX_PLY => std::cmp::max(v - Value(ply), Value::MATED),
         v => v,
     }
 }
@@ -425,6 +430,70 @@ impl Mate {
             }
             Err(_) => {
                 println!("checkmate none");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tt_value_tests {
+    use super::*;
+
+    // Flat scores must pass through the TT helpers unchanged at any ply, both directions and composed.
+    #[test]
+    fn flat_values_round_trip_without_ply_correction() {
+        for ply in [0, 1, 2, 17, 100, MAX_PLY - 1] {
+            assert_eq!(value_to_tt(Value::MATE_FLAT, ply), Value::MATE_FLAT, "to_tt at ply {ply}");
+            assert_eq!(value_to_tt(Value::MATED_FLAT, ply), Value::MATED_FLAT, "to_tt at ply {ply}");
+            assert_eq!(value_from_tt(Value::MATE_FLAT, ply), Value::MATE_FLAT, "from_tt at ply {ply}");
+            assert_eq!(
+                value_from_tt(Value::MATED_FLAT, ply),
+                Value::MATED_FLAT,
+                "from_tt at ply {ply}"
+            );
+            assert_eq!(
+                value_from_tt(value_to_tt(Value::MATE_FLAT, ply), ply),
+                Value::MATE_FLAT,
+                "round trip at ply {ply}"
+            );
+            assert_eq!(
+                value_from_tt(value_to_tt(Value::MATED_FLAT, ply), ply),
+                Value::MATED_FLAT,
+                "round trip at ply {ply}"
+            );
+        }
+    }
+
+    // Graded (losing-side) mate scores keep the classic ply re-basing.
+    #[test]
+    fn graded_values_keep_ply_correction() {
+        let ply = 5;
+        assert_eq!(value_to_tt(Value::mate_in(12), ply), Value::mate_in(12 - ply));
+        assert_eq!(value_to_tt(Value::mated_in(12), ply), Value::mated_in(12 - ply));
+        assert_eq!(value_from_tt(Value::mate_in(12 - ply), ply), Value::mate_in(12));
+        assert_eq!(value_from_tt(Value::mated_in(12 - ply), ply), Value::mated_in(12));
+        // Non-mate scores and NONE are untouched.
+        assert_eq!(value_to_tt(Value(123), ply), Value(123));
+        assert_eq!(value_from_tt(Value(-123), ply), Value(-123));
+        assert_eq!(value_from_tt(Value::NONE, ply), Value::NONE);
+    }
+
+    // Regression: a graded-band value must never be stored as a flat value (without the clamp, value_to_tt(32581, 20) == MATE_FLAT, a fabricated "proven mate").
+    #[test]
+    fn graded_values_can_never_be_stored_as_flat() {
+        for ply in 0..MAX_PLY {
+            let mut cases = vec![Value::MATE_IN_MAX_PLY, Value::MATE - Value(1), Value::MATE];
+            if ply > 0 {
+                // Pre-clamp this landed exactly on MATE_FLAT (v + ply == 32601).
+                cases.push(Value::MATE_FLAT - Value(ply));
+            }
+            for v in cases {
+                let stored = value_to_tt(v, ply);
+                assert!(stored <= Value::MATE, "stored {} from v {} ply {ply}", stored.0, v.0);
+                assert_ne!(stored, Value::MATE_FLAT);
+                let stored = value_to_tt(-v, ply);
+                assert!(Value::MATED <= stored, "stored {} from v {} ply {ply}", stored.0, -v.0);
+                assert_ne!(stored, Value::MATED_FLAT);
             }
         }
     }
