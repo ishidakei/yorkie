@@ -717,11 +717,16 @@ mod fixed_flag_tests {
 #[cfg(test)]
 mod eval_options_tests {
     use super::*;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
+    #[cfg(any(not(feature = "tournament"), feature = "nnue"))]
+    use std::path::PathBuf;
 
+    // No user under `material,tournament` (all users are MultiPV or FV_SCALE tests); gate the helper to match and stay dead-code-clean.
+    #[cfg(any(not(feature = "tournament"), feature = "nnue"))]
     struct TempFile {
         path: PathBuf,
     }
+    #[cfg(any(not(feature = "tournament"), feature = "nnue"))]
     impl TempFile {
         fn with(content: &str, tag: &str) -> Self {
             let nanos = std::time::SystemTime::now()
@@ -736,6 +741,7 @@ mod eval_options_tests {
             &self.path
         }
     }
+    #[cfg(any(not(feature = "tournament"), feature = "nnue"))]
     impl Drop for TempFile {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.path);

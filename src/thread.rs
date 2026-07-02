@@ -91,6 +91,8 @@ struct Thread {
     stop_on_ponderhit: Arc<AtomicBool>,
     ponder: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    // Non-tournament only: guards the in-search info output (tournament compiles it out; bestmove stays guarded by `ThreadPool::hide_all_output`).
+    #[cfg(not(feature = "tournament"))]
     hide_all_output: Arc<AtomicBool>,
     nodess: Vec<Arc<AtomicI64>>,
 }
@@ -197,6 +199,8 @@ impl Thread {
         let mut beta = Value::INFINITE;
         let mut time_reduction = 1.0;
         let mut total_best_move_changes = 0.0f64;
+        // Non-tournament only: paces the in-search info output (tournament compiles it out).
+        #[cfg(not(feature = "tournament"))]
         let mut last_info_time: Option<std::time::Instant> = None;
         let mut iter_index = 0;
         for item in stack.iter_mut().take(CURRENT_STACK_INDEX) {
@@ -223,8 +227,6 @@ impl Thread {
         // Number of root PVs to search: the `MultiPV` option clamped to legal-move count, or a single PV under `tournament`.
         #[cfg(not(feature = "tournament"))]
         let multi_pv = std::cmp::min(self.usi_options.get_i64(UsiOptions::MULTI_PV) as usize, self.root_moves.len());
-        #[cfg(feature = "tournament")]
-        let multi_pv = 1usize;
         self.tt_hit_average = TT_HIT_AVERAGE_WINDOW * TT_HIT_AVERAGE_RESOLUTION / 2;
 
         let mut search_again_counter = 0;
@@ -301,6 +303,8 @@ impl Thread {
                     if self.stop.load(Ordering::Relaxed) {
                         break;
                     }
+                    // In-search info output on an aspiration fail high/low; tournament compiles it out.
+                    #[cfg(not(feature = "tournament"))]
                     if self.is_main()
                         && multi_pv == 1
                         && (best_value <= alpha || beta <= best_value)
@@ -339,6 +343,8 @@ impl Thread {
                 let pv_idx = self.pv_idx();
                 self.root_moves[0..=pv_idx].sort_by(|x, y| y.cmp(x));
 
+                // Per-iteration PV info output; tournament compiles it out.
+                #[cfg(not(feature = "tournament"))]
                 if self.is_main()
                     && (self.stop.load(Ordering::Relaxed)
                         || self.pv_idx() + 1 == multi_pv
@@ -1689,6 +1695,8 @@ impl Thread {
                 .update(get_stack(stack, 0).ply, m, stat_bonus(depth - Depth(7)));
         }
     }
+    // Only off-`tournament` and for tests: tournament emits no search info.
+    #[cfg(any(not(feature = "tournament"), test))]
     fn pv_info_to_usi_string(
         &self,
         nodes_searched: i64,
@@ -1755,6 +1763,15 @@ impl Thread {
         }
         lines.join("\n")
     }
+}
+
+/// The benchmark build's one search info line (cumulative nodes/nps/time), printed once before `bestmove` for NPS tooling.
+#[cfg(all(feature = "tournament", feature = "emit-nps"))]
+fn bench_nps_info_string(nodes_searched: i64, elapsed_millis: i64) -> String {
+    format!(
+        "info nodes {nodes_searched} nps {nps} time {elapsed_millis}",
+        nps = nodes_searched * 1000 / elapsed_millis,
+    )
 }
 
 impl ThreadPool {
@@ -1850,6 +1867,7 @@ impl ThreadPool {
                     stop_on_ponderhit: self.stop_on_ponderhit.clone(),
                     ponder: self.ponder.clone(),
                     stop: self.stop.clone(),
+                    #[cfg(not(feature = "tournament"))]
                     hide_all_output: self.hide_all_output.clone(),
                     nodess: vec![],
                 }))
@@ -2074,6 +2092,8 @@ impl ThreadPool {
 
                     *previous_score_cloned.lock().unwrap() = best_thread.lock().unwrap().root_moves[0].score;
 
+                    // Snapshot before the `best_thread` lock: `best_thread` is usually `threads[0]` and `Mutex` isn't reentrant, so locking it inside would self-deadlock.
+                    #[cfg(any(not(feature = "tournament"), feature = "emit-nps"))]
                     let nodes_searched = thread_pool_base_cloned.lock().unwrap().threads[0]
                         .lock()
                         .unwrap()
@@ -2081,7 +2101,8 @@ impl ThreadPool {
                     if let Ok(best_thread) = best_thread.lock()
                         && !hide_all_output_cloned.load(Ordering::Relaxed)
                     {
-                        // Always send again PV info.
+                        // Always send again PV info; tournament compiles this out.
+                        #[cfg(not(feature = "tournament"))]
                         println!(
                             "{}",
                             best_thread.pv_info_to_usi_string(
@@ -2093,6 +2114,13 @@ impl ThreadPool {
                                 true,
                             )
                         );
+                        // The benchmark build's single emission point, just before `bestmove`; only with `emit-nps` on top of `tournament`.
+                        #[cfg(all(feature = "tournament", feature = "emit-nps"))]
+                        {
+                            // "+ 1": avoid dividing by 0, like pv_info_to_usi_string.
+                            let elapsed_millis = limits.start_time.unwrap().elapsed().as_millis() as i64 + 1;
+                            println!("{}", bench_nps_info_string(nodes_searched, elapsed_millis));
+                        }
                         let mut s = format!("bestmove {}", best_thread.root_moves[0].pv[0].to_usi_string(),);
                         if usi_ponder(&usi_options_cloned) && best_thread.root_moves[0].pv.len() >= 2 {
                             s += &format!(" ponder {}", best_thread.root_moves[0].pv[1].to_usi_string());
@@ -2515,6 +2543,30 @@ mod tests {
                 .unwrap()
                 .join()
                 .unwrap();
+        }
+    }
+
+    // Benchmark build (`tournament,emit-nps`): the search-end line must carry the `nps <integer>` token and no PV payload.
+    #[cfg(all(feature = "tournament", feature = "emit-nps"))]
+    mod emit_nps_tests {
+        use super::super::*;
+
+        #[test]
+        fn bench_nps_line_carries_the_nps_token_and_no_pv() {
+            let line = bench_nps_info_string(1_234_567, 1001);
+            assert_eq!(line, "info nodes 1234567 nps 1233333 time 1001");
+
+            // The exact token shape benchmark tooling greps for.
+            let re = regex::Regex::new(r"\bnps\s+(\d+)\b").unwrap();
+            let caps = re
+                .captures(&line)
+                .expect("the bench line must carry an `nps <integer>` token");
+            assert_eq!(caps[1].parse::<i64>().unwrap(), 1_234_567 * 1000 / 1001);
+
+            assert!(
+                !line.contains("depth") && !line.contains("pv") && !line.contains("score"),
+                "the bench line must stay minimal (no PV/depth/score payload); got: {line}"
+            );
         }
     }
 }

@@ -13,7 +13,7 @@ on: [push, pull_request]
 
 name: Quickstart
 
-# Tournament config TOML: required by the `nnue,tournament` matrix entries, ignored by the other jobs.
+# Tournament config TOML: required by the tournament matrix entries, ignored by the other jobs.
 # YORKIE_NUMA_RESERVE: 0 keeps the whole core set assignable on the small `numa`-job runners.
 env:
   YORKIE_TOURNAMENT_CONFIG: configs/tsec7-part1.toml
@@ -41,7 +41,18 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        feature: [material, nnue, "nnue,mate", "nnue,tournament", "material,numa", "nnue,numa"]
+        feature:
+          [
+            material,
+            nnue,
+            "nnue,mate",
+            "nnue,tournament",
+            "nnue,tournament,emit-nps",
+            "material,tournament",
+            "material,tournament,emit-nps",
+            "material,numa",
+            "nnue,numa",
+          ]
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -59,7 +70,18 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        feature: [material, nnue, "nnue,mate", "nnue,tournament", "material,numa", "nnue,numa"]
+        feature:
+          [
+            material,
+            nnue,
+            "nnue,mate",
+            "nnue,tournament",
+            "nnue,tournament,emit-nps",
+            "material,tournament",
+            "material,tournament,emit-nps",
+            "material,numa",
+            "nnue,numa",
+          ]
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -77,7 +99,18 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        feature: [material, nnue, "nnue,mate", "nnue,tournament", "material,numa", "nnue,numa"]
+        feature:
+          [
+            material,
+            nnue,
+            "nnue,mate",
+            "nnue,tournament",
+            "nnue,tournament,emit-nps",
+            "material,tournament",
+            "material,tournament,emit-nps",
+            "material,numa",
+            "nnue,numa",
+          ]
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4

@@ -63,6 +63,15 @@ mate = ["dep:tsumeshogi-solver"]
 # consts that hot paths read instead of the runtime USI options. Off by default so
 # development and per-run value sweeps keep the runtime options.
 tournament = []
+# Additive benchmark-output build (only meaningful on top of `tournament`, e.g.
+# `nnue,tournament,emit-nps`). The tournament build compiles out all search info output
+# (bestmove-only); this feature compiles back in ONE minimal info line per search —
+# `info nodes <N> nps <N> time <MS>`, printed at search end just before `bestmove` — so
+# NPS benchmark tooling can read throughput from stdout. Compile-time only (no USI
+# option, no env var): with the feature off the emission point does not exist in the
+# binary. Off by default; without `tournament` it has no effect (the normal build already
+# prints full search info).
+emit-nps = []
 # Additive NUMA build (Linux-only; composes with an eval feature, e.g. `nnue,numa`).
 # When enabled the engine (a) pins each search worker thread to a CPU core
 # compact-by-node and (b) gives each thread a node-local replica of the NNUE network,
