@@ -93,6 +93,9 @@ impl NodeArena {
             return None;
         }
         let base = base as *mut u8;
+        // SAFETY: base/len from the successful mmap. Best-effort THP hint issued before the arena
+        // is faulted, so the NNUE weights fault in as 2 MiB hugepages (fewer dTLB misses).
+        unsafe { libc::madvise(base as *mut libc::c_void, len, libc::MADV_HUGEPAGE) };
         // SAFETY: `base`/`len` from the successful `mmap`; binding is best-effort, return ignored.
         let _bound = unsafe { mbind_region(base, len, node) };
         Some(NodeArena { base, len, used: 0 })

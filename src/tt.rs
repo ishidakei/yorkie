@@ -3,6 +3,9 @@ use crate::position::*;
 use crate::thread::*;
 use crate::types::*;
 use rayon::prelude::*;
+use std::ops::{Deref, DerefMut};
+#[cfg(target_os = "linux")]
+use std::ptr::NonNull;
 
 #[derive(Clone, Copy)]
 pub struct TtEntry {
@@ -109,7 +112,110 @@ impl TtCluster {
     }
 }
 
-// Tournament build: TT cluster count is a compile-time const derived from the baked `TT_BYTES`, dropping the per-probe field load; indexing (see `cluster_index`) is unchanged.
+// Backing store for the TT clusters. On Linux, mmap + madvise(MADV_HUGEPAGE) *before* faulting so pages come in as 2 MiB hugepages (random probes thrash the dTLB otherwise; khugepaged won't collapse a multi-GiB TT mid-search). Deref to `[TtCluster]` keeps probe sites unchanged; `Heap` is the non-Linux / mmap-failure fallback.
+enum TtStorage {
+    // Anonymous mmap (hugepage-hinted before faulting); `len` is the cluster count. Page-aligned base satisfies `align(32)`.
+    #[cfg(target_os = "linux")]
+    Mmap {
+        ptr: NonNull<TtCluster>,
+        len: usize,
+    },
+    Heap(Vec<TtCluster>),
+}
+
+impl TtStorage {
+    // Allocate `cluster_count` zeroed clusters, faulted in parallel: hugepage-hinted mmap on Linux, heap `Vec` otherwise.
+    fn new(cluster_count: usize) -> Self {
+        #[cfg(target_os = "linux")]
+        if let Some(storage) = Self::new_mmap(cluster_count) {
+            return storage;
+        }
+        // Fallback (non-Linux / mmap failed): parallel collect faults the buffer in as 4 KiB pages.
+        Self::Heap((0..cluster_count).into_par_iter().map(|_| TtCluster::new()).collect())
+    }
+
+    // Linux hugepage-hinted alloc: mmap → madvise(MADV_HUGEPAGE) → parallel fault-in as 2 MiB pages. `None` (caller falls back to `Heap`) on empty request or mmap failure.
+    #[cfg(target_os = "linux")]
+    fn new_mmap(cluster_count: usize) -> Option<Self> {
+        let len = cluster_count.checked_mul(std::mem::size_of::<TtCluster>())?;
+        if len == 0 {
+            return None; // let the Heap path own the empty table
+        }
+        // SAFETY: standard anonymous private mapping request; mmap returns MAP_FAILED (not null) on error.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return None;
+        }
+        // Best-effort THP hint issued BEFORE faulting, so the parallel init installs 2 MiB hugepages directly (failure is harmless — falls back to 4 KiB).
+        // SAFETY: `base`/`len` describe the live mapping just returned by `mmap`.
+        unsafe {
+            libc::madvise(base, len, libc::MADV_HUGEPAGE);
+        }
+        let ptr = match NonNull::new(base as *mut TtCluster) {
+            Some(ptr) => ptr,
+            None => {
+                // Unreachable in practice (a successful mmap is non-null), but stay sound.
+                // SAFETY: `base`/`len` are the live mapping from `mmap` above.
+                unsafe {
+                    libc::munmap(base, len);
+                }
+                return None;
+            }
+        };
+        // Fault the mapping in (parallel), writing zeroed clusters to trigger the 2 MiB fault-ins; anonymous mmap memory is already zeroed, so the slice is a valid `[TtCluster]`.
+        // SAFETY: `ptr` points at `cluster_count` consecutive, writable, zero-initialized `TtCluster`s.
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), cluster_count) };
+        slice.par_iter_mut().for_each(|c| *c = TtCluster::new());
+        Some(Self::Mmap { ptr, len: cluster_count })
+    }
+}
+
+impl Deref for TtStorage {
+    type Target = [TtCluster];
+    fn deref(&self) -> &[TtCluster] {
+        match self {
+            #[cfg(target_os = "linux")]
+            // SAFETY: the mapping holds `len` initialized `TtCluster`s for as long as `self` lives.
+            TtStorage::Mmap { ptr, len } => unsafe { std::slice::from_raw_parts(ptr.as_ptr(), *len) },
+            TtStorage::Heap(v) => v,
+        }
+    }
+}
+
+impl DerefMut for TtStorage {
+    fn deref_mut(&mut self) -> &mut [TtCluster] {
+        match self {
+            #[cfg(target_os = "linux")]
+            // SAFETY: the mapping holds `len` initialized `TtCluster`s; `&mut self` gives exclusive access for its lifetime.
+            TtStorage::Mmap { ptr, len } => unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), *len) },
+            TtStorage::Heap(v) => v,
+        }
+    }
+}
+
+impl Drop for TtStorage {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let TtStorage::Mmap { ptr, len } = self {
+            let bytes = *len * std::mem::size_of::<TtCluster>();
+            // SAFETY: `ptr`/`bytes` are the exact base/length from `mmap` in `new_mmap`; sole owner, dropped once.
+            unsafe {
+                libc::munmap(ptr.as_ptr() as *mut libc::c_void, bytes);
+            }
+        }
+    }
+}
+
+// Tournament build: TT size is a compile-time const from the baked `TT_BYTES`, not a runtime field, dropping the per-probe field load (indexing arithmetic unchanged).
 #[cfg(feature = "tournament")]
 const TT_CLUSTER_COUNT: usize = crate::tournament::TT_BYTES / std::mem::size_of::<TtCluster>();
 // Multiply-high indexing packs the side-to-move into the low bit, so the cluster count must be even; enforce it at compile time.
@@ -120,7 +226,7 @@ const _: () = assert!(
 );
 
 pub struct TranspositionTable {
-    table: Vec<TtCluster>,
+    table: TtStorage,
     // Non-tournament: runtime cluster count (USI_Hash-driven), read on every probe; tournament folds the compile-time const instead.
     #[cfg(not(feature = "tournament"))]
     cluster_count: usize,
@@ -130,7 +236,7 @@ pub struct TranspositionTable {
 impl TranspositionTable {
     pub fn new() -> TranspositionTable {
         TranspositionTable {
-            table: vec![],
+            table: TtStorage::Heap(vec![]),
             #[cfg(not(feature = "tournament"))]
             cluster_count: 0,
             generation8: 0,
@@ -150,10 +256,9 @@ impl TranspositionTable {
             debug_assert!(self.cluster_count & 1 == 0);
             self.cluster_count
         };
-        // self.table can be very large and takes much time to clear, so parallelize self.clear().
-        self.table.clear();
-        self.table.shrink_to_fit();
-        self.table = (0..cluster_count).into_par_iter().map(|_| TtCluster::new()).collect();
+        // Free the old backing before allocating the new one, so peak memory is max(old, new) not old + new.
+        self.table = TtStorage::Heap(vec![]);
+        self.table = TtStorage::new(cluster_count);
     }
     // parallel zero clearing.
     pub fn clear(&mut self) {

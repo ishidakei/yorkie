@@ -8,14 +8,14 @@ rust-version = "1.96.0"
 [dependencies]
 anyhow = "1.0.86"
 arrayvec = "0.7.4"
-# NUMA-only deps (pulled in solely by the additive `numa` feature; not built by the
-# default / `material` / `nnue` / `kppt` builds). `core_affinity` wraps
-# `sched_setaffinity` (#13); `libc` provides `mmap`/`mbind`/`madvise` (#12).
+# `core_affinity` wraps `sched_setaffinity` (#13); pulled in solely by the additive `numa`
+# feature (not built by the default / `material` / `nnue` builds). The raw-syscall crate
+# `libc` (used for `mmap`/`madvise`/`mbind`) is declared unconditionally for Linux below —
+# both the default TT hugepage backing and the `numa` code depend on it.
 core_affinity = { version = "0.8", optional = true }
 custom_derive = "0.1.7"
 derive_more = "0.99.18"
 enum_derive = "0.1.7"
-libc = { version = "0.2", optional = true }
 mimalloc = "0.1.52"
 num = "0.4.3"
 once_cell = "1.19.0"
@@ -30,6 +30,14 @@ thiserror = "1.0.61"
 # builds, which use `--no-default-features` without `mate`). Implements the USI `go mate`
 # analysis query; never reached during normal play.
 tsumeshogi-solver = { tag = "0.5.2", git = "https://github.com/sugyan/tsumeshogi-solver.git", optional = true }
+
+# Linux-only, unconditional: `libc` gives the raw `mmap`/`madvise`/`munmap` (and, for `numa`,
+# `mbind`) syscalls. The default TT storage uses it to back the cluster array with a
+# hugepage-hinted anonymous mapping (2 MiB THP for a large USI_Hash), with a heap fallback on
+# non-Linux where this section is absent. Kept out of `[dependencies]`/features so it is always
+# available on Linux (including the plain `nnue` build) without being enabled anywhere else.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 # Build-only: parse configs/<event>.toml in build.rs to emit compile-time consts for the
 # tournament build. Not linked into the engine binary; runtime behavior is unaffected.
@@ -59,5 +67,6 @@ tournament = []
 # When enabled the engine (a) pins each search worker thread to a CPU core
 # compact-by-node and (b) gives each thread a node-local replica of the NNUE network,
 # read on the eval hot path instead of the shared global. Off by default = today's
-# behavior exactly. Pulls in `core_affinity` + `libc` only when enabled.
-numa = ["dep:core_affinity", "dep:libc"]
+# behavior exactly. Pulls in `core_affinity` when enabled; `libc` is already an
+# unconditional Linux dependency (see the target section above), so it needs no `dep:`.
+numa = ["dep:core_affinity"]
