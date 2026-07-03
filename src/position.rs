@@ -1518,6 +1518,43 @@ impl Position {
         }
         false
     }
+    // The Zobrist key the position will have after `do_move(m, _)`, computed incrementally
+    // without mutating anything. Used to software-prefetch the child's TT cluster before the
+    // move is actually made (see `TranspositionTable::prefetch`). Mirrors `do_move`'s key
+    // updates exactly; covered by the `test_key_after` parity test below — a wrong key here
+    // cannot corrupt the search (a prefetch is only a hint) but would silently waste it.
+    pub fn key_after(&self, m: Move) -> Key {
+        let mut board_key = self.board_key() ^ Zobrist::COLOR;
+        let mut hand_key = self.hand_key();
+        let us = self.side_to_move();
+        let to = m.to();
+        if m.is_drop() {
+            let pt_to = PieceType::new(m.piece_dropped());
+            // `do_move` XORs with the hand count before the drop removes the piece.
+            hand_key ^= Zobrist::get_hand(pt_to, self.hand(us).num(pt_to), us);
+            board_key ^= Zobrist::get_field(pt_to, to, us);
+        } else {
+            let from = m.from();
+            let pc_from = self.piece_on(from);
+            let pt_from = PieceType::new(pc_from);
+            if m.is_capture(self) {
+                let them = us.inverse();
+                let pt_captured = PieceType::new(self.piece_on(to));
+                let pt_captured_demoted = pt_captured.to_demote_if_possible();
+                board_key ^= Zobrist::get_field(pt_captured, to, them);
+                // `do_move` XORs with the hand count after the capture adds the piece.
+                hand_key ^= Zobrist::get_hand(pt_captured_demoted, self.hand(us).num(pt_captured_demoted) + 1, us);
+            }
+            let pt_to = if m.is_promotion() {
+                PieceType::new(pc_from.to_promote())
+            } else {
+                pt_from
+            };
+            board_key ^= Zobrist::get_field(pt_from, from, us);
+            board_key ^= Zobrist::get_field(pt_to, to, us);
+        }
+        board_key ^ hand_key
+    }
     pub fn do_move(&mut self, m: Move, gives_check: bool) {
         debug_assert!(self.is_ok());
         (*self.nodes).fetch_add(1, Ordering::Relaxed);
@@ -2925,6 +2962,68 @@ mod tests {
                 pos.do_move(m, gives_check);
                 assert!(pos.is_repetition() == Repetition::Not);
             }
+        }
+    }
+
+    // `key_after(m)` must predict the post-`do_move(m, _)` key exactly for every legal move.
+    // A mismatch cannot corrupt the search (the prefetch it feeds is only a cache hint) but
+    // would silently waste the prefetch. Check every legal move at every ply of a full game
+    // (covering captures, drops, promotions and king moves), plus a hand-heavy endgame
+    // position and an in-check position.
+    #[test]
+    fn test_key_after() {
+        std::thread::Builder::new()
+            .stack_size(crate::stack_size::STACK_SIZE)
+            .spawn(test_key_after_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+    fn test_key_after_impl() {
+        use crate::movegen::*;
+        fn assert_key_after_matches_do_move(pos: &mut Position) {
+            let mut mlist = MoveList::new();
+            mlist.generate::<LegalAllType>(pos, 0);
+            let sfen = pos.to_sfen();
+            for ext_move in mlist.slice(0).iter() {
+                let m = ext_move.mv;
+                let key_after = pos.key_after(m);
+                let gives_check = pos.gives_check(m);
+                pos.do_move(m, gives_check);
+                assert_eq!(key_after.0, pos.key().0, "sfen: {sfen}, move: {}", m.to_usi_string());
+                pos.undo_move(m);
+            }
+        }
+
+        // The same game as `test_position_do_move`: every ply is a fresh diverse position.
+        let (sfen, moves) = (
+            "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
+            vec![
+                "7g7f", "3c3d", "2g2f", "5c5d", "5g5f", "2b8h+", "7i8h", "B*5g", "B*5c", "8b5b", "5c8f+", "5a6b", "3i4h",
+                "5g2d+", "8h7g", "5d5e", "2f2e", "2d3e", "5f5e", "5b5e", "P*5g", "7a7b", "7g6f", "5e5a", "3g3f", "3e4d", "2e2d",
+                "2c2d", "2h2d", "3a3b", "5i6h", "6b7a", "4g4f", "P*5f", "5g5f", "5a5f", "4i5h", "P*2c", "2d2g", "5f5h+", "6i5h",
+                "G*8h", "8i7g", "8h9i", "7g6e", "L*5a", "P*5e", "5a5e", "5h4g", "P*5f", "P*5h", "9i9h", "2g2h", "4a5b", "R*3a",
+            ],
+        );
+        let mut pos = Position::new_from_sfen(sfen).unwrap();
+        assert_key_after_matches_do_move(&mut pos);
+        for move_str in moves {
+            let m = Move::new_from_usi_str(move_str, &pos).unwrap();
+            let gives_check = pos.gives_check(m);
+            pos.do_move(m, gives_check);
+            assert_key_after_matches_do_move(&mut pos);
+        }
+
+        let extra_sfens = [
+            // Hand-heavy position: many drop moves, including repeated counts of one piece type.
+            "k8/5+R3/3b1l3/4s4/5pg1+r/4GP3/5LN2/9/K4L3 b 2P2p 1",
+            // Side to move is in check (lance on 5b checks the king on 5a): only evasions
+            // (king moves and the capture) are legal.
+            "4k4/4L4/9/9/9/9/9/9/4K4 w - 1",
+        ];
+        for sfen in extra_sfens.iter() {
+            let mut pos = Position::new_from_sfen(sfen).unwrap();
+            assert_key_after_matches_do_move(&mut pos);
         }
     }
 

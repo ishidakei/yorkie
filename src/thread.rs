@@ -1108,6 +1108,12 @@ impl Thread {
             .get_mut(piece_moved_after_move, to);
 
             // Step 15
+            // Prefetch the child's TT cluster before the move is made, so the DRAM fetch
+            // overlaps the position update (including the NNUE accumulator refresh) and the
+            // child node's early steps ahead of its Step-4 probe.
+            // SAFETY: `self.tt` points at the process-lifetime shared TT; `prefetch` takes
+            // `&self` and only issues a cache hint.
+            unsafe { (*self.tt).prefetch(self.position.key_after(m)) };
             #[cfg(feature = "nnue")]
             {
                 // SAFETY (numa): `nnue_net_ptr` points at process-lifetime read-only replica weights (kept alive by `nnue_network`); the deref isn't tied to `&self`, so it coexists with the `&mut self.position` borrow.
@@ -1526,6 +1532,12 @@ impl Thread {
                 continue;
             }
 
+            // Prefetch the child's TT cluster before the move is made, so the DRAM fetch
+            // overlaps the position update (including the NNUE accumulator refresh) and the
+            // child node's early steps ahead of its probe.
+            // SAFETY: `self.tt` points at the process-lifetime shared TT; `prefetch` takes
+            // `&self` and only issues a cache hint.
+            unsafe { (*self.tt).prefetch(self.position.key_after(m)) };
             #[cfg(feature = "nnue")]
             {
                 // SAFETY (numa): `nnue_net_ptr` points at process-lifetime read-only replica weights (kept alive by `nnue_network`); the deref isn't tied to `&self`, so it coexists with the `&mut self.position` borrow.

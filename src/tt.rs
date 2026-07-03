@@ -285,6 +285,21 @@ impl TranspositionTable {
         debug_assert!(index < self.table.len());
         unsafe { self.table.get_unchecked_mut(index) }
     }
+    // Software-prefetch the cluster `key` maps to so a later `probe(key)` hits cache, not DRAM; issued for the child key before `do_move`. `&self` since threads call it through the shared `*mut TranspositionTable` and a prefetch reads no data.
+    #[inline]
+    pub fn prefetch(&self, key: Key) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let index = self.cluster_index(key);
+            debug_assert!(index < self.table.len());
+            // SAFETY: `cluster_index` returns an in-bounds index for the live table.
+            let ptr = unsafe { self.table.get_unchecked(index) } as *const TtCluster;
+            // SAFETY: `_mm_prefetch` is a pure cache hint (cannot fault, reads no data); SSE is baseline on x86_64.
+            unsafe { std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr as *const i8) };
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = key;
+    }
     pub fn probe(&mut self, key: Key) -> (&mut TtEntry, bool) {
         let generation8 = self.generation8;
         let key16 = key.excluded_turn().0 as u16;
