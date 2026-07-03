@@ -7,11 +7,6 @@ use std::sync::RwLock;
 use super::aligned::Aligned64;
 use super::types::{NetworkStack, NnueNetwork};
 
-// `set_mempolicy(2)` numbers; not re-exported by `libc`, so spell them out.
-const MPOL_BIND: libc::c_int = 2;
-const MPOL_MF_STRICT: libc::c_uint = 1;
-const MPOL_MF_MOVE: libc::c_uint = 2;
-
 /// Cache-line / SIMD alignment for NNUE buffers (matches `aligned::ALIGN`; `mmap` base is page-aligned).
 const ALIGN: usize = 64;
 
@@ -96,8 +91,8 @@ impl NodeArena {
         // SAFETY: base/len from the successful mmap. Best-effort THP hint issued before the arena
         // is faulted, so the NNUE weights fault in as 2 MiB hugepages (fewer dTLB misses).
         unsafe { libc::madvise(base as *mut libc::c_void, len, libc::MADV_HUGEPAGE) };
-        // SAFETY: `base`/`len` from the successful `mmap`; binding is best-effort, return ignored.
-        let _bound = unsafe { mbind_region(base, len, node) };
+        // SAFETY: `base`/`len` from the successful `mmap`; best-effort strict binding pins the replica to its node.
+        let _bound = unsafe { crate::numa::mbind_region(base, len, node, true) };
         Some(NodeArena { base, len, used: 0 })
     }
 
@@ -118,28 +113,6 @@ impl NodeArena {
         // SAFETY: `base`/`len` describe the live mapping.
         unsafe { libc::madvise(self.base as *mut libc::c_void, self.len, libc::MADV_WILLNEED) };
     }
-}
-
-/// Binds `[addr, addr+len)` to `node` (strict, move faulted pages); returns whether `mbind` succeeded.
-unsafe fn mbind_region(addr: *mut u8, len: usize, node: u32) -> bool {
-    // Node bitmask with a single bit set; `maxnode` counts the bits the kernel scans.
-    let words = (node as usize / 64) + 1;
-    let mut mask = vec![0u64; words];
-    mask[node as usize / 64] = 1u64 << (node as usize % 64);
-    let maxnode = (words * 64) as libc::c_ulong;
-    // SAFETY: arguments match the `mbind(2)` ABI; `mask` lives across the call.
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_mbind,
-            addr as *mut libc::c_void,
-            len as libc::c_ulong,
-            MPOL_BIND,
-            mask.as_ptr() as *const libc::c_ulong,
-            maxnode,
-            MPOL_MF_STRICT | MPOL_MF_MOVE,
-        )
-    };
-    ret == 0
 }
 
 /// Copies `src` into the arena and returns a non-owning [`Aligned64`] view (empty uses an owned sentinel).

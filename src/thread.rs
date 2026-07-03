@@ -78,7 +78,7 @@ struct Thread {
     // Cached per search so descent sites avoid re-locking the process-wide RwLock; populated in iterative_deepening_loop.
     #[cfg(feature = "nnue")]
     nnue_network: Option<Arc<nnue::types::NnueNetwork>>,
-    // Under `numa`, the incremental accumulator path's NNUE weights: the same node-local replica the full-eval path uses (raw pointer for a disjoint-field read alongside `&mut self.position`); set once per search in `iterative_deepening_loop`, null until then.
+    // Node-local NNUE replica for the incremental path (raw pointer for a disjoint-field read alongside `&mut self.position`); set per search in `iterative_deepening_loop`, null until then.
     #[cfg(all(feature = "nnue", feature = "numa"))]
     nnue_net_ptr: *const nnue::types::NnueNetwork,
     // following variables are shared one object that ThreadPool has.
@@ -234,7 +234,7 @@ impl Thread {
         #[cfg(feature = "nnue")]
         {
             self.nnue_network = Some(current_network().expect("nnue network must be loaded before iterative_deepening_loop"));
-            // Under `numa`, point the incremental path at the same node-local replica the eval hot path uses, falling back to the shared Arc's inner pointer (kept alive by `nnue_network`) when this node has no replica.
+            // Point the incremental path at this node's replica, else the shared Arc's inner pointer (kept alive by `nnue_network`).
             #[cfg(feature = "numa")]
             {
                 self.nnue_net_ptr =
@@ -873,7 +873,7 @@ impl Thread {
                         let gives_check = self.position.gives_check(m);
                         #[cfg(feature = "nnue")]
                         {
-                            // SAFETY (numa): `nnue_net_ptr` points at process-lifetime read-only replica weights (kept alive by `nnue_network`); the deref isn't tied to `&self`, so it coexists with the `&mut self.position` borrow.
+                            // SAFETY (numa): `nnue_net_ptr` points at process-lifetime replica weights (kept alive by `nnue_network`); deref isn't tied to `&self`, so it coexists with the `&mut self.position` borrow.
                             #[cfg(feature = "numa")]
                             let net_ref = unsafe { &*self.nnue_net_ptr };
                             #[cfg(not(feature = "numa"))]
@@ -1856,7 +1856,7 @@ impl ThreadPool {
                     nodes: self.nodess[i].clone(),
                     #[cfg(feature = "nnue")]
                     nnue_network: None,
-                    // Set per search in iterative_deepening_loop, once the worker is pinned and its node-local replica is known; null until then.
+                    // Set per search in iterative_deepening_loop; null until then.
                     #[cfg(all(feature = "nnue", feature = "numa"))]
                     nnue_net_ptr: std::ptr::null(),
                     best_previous_score: self.best_previous_score.clone(),
@@ -1873,6 +1873,15 @@ impl ThreadPool {
                 }))
             })
             .collect();
+        // NUMA: migrate each Thread struct onto its worker's node. Its ~51 MB of history tables are already faulted on this USI thread and a later worker-side policy cannot move them, so bind+migrate here using the same `assignment_for_idx` mapping the pin uses. Best-effort.
+        #[cfg(feature = "numa")]
+        for (i, th) in self.thread_pool_base.lock().unwrap().threads.iter().enumerate() {
+            let node = crate::numa::assignment_for_idx(i).node;
+            let addr = Arc::as_ptr(th) as *mut u8;
+            let len = std::mem::size_of::<Mutex<Thread>>();
+            // SAFETY: `addr`/`len` describe the live `Mutex<Thread>` payload of an Arc we hold.
+            unsafe { crate::numa::mbind_region(addr, len, node, false) };
+        }
         // Main thread has other thread's nodes.
         self.thread_pool_base.lock().unwrap().threads[0]
             .lock()
@@ -2008,6 +2017,18 @@ impl ThreadPool {
                             {
                                 let assignment = crate::numa::assignment_for_idx(th.idx);
                                 crate::numa::pin_current_thread(assignment.cpu);
+                                // Prefer the pinned core's node for everything this worker
+                                // first-touches from here on (its OS thread stack, per-search
+                                // allocations): pinning alone leaves the inherited task policy in
+                                // place, which under an interleaving launcher would scatter this
+                                // thread-private memory across all nodes. MPOL_PREFERRED, not BIND,
+                                // so allocation falls back to other nodes when this one is full.
+                                // For idx 0 this closure runs inline on the search-master thread
+                                // and the policy is deliberately left in place afterwards: past the
+                                // search that thread only joins helpers and prints bestmove, then
+                                // exits. The USI thread never changes policy, so the TT (allocated
+                                // and resized there) keeps following the process default.
+                                crate::numa::prefer_node_for_current_thread(assignment.node);
                                 #[cfg(feature = "nnue")]
                                 crate::evaluate::nnue::set_local_replica_for_node(assignment.node);
                             }

@@ -1,7 +1,14 @@
 //! NUMA topology discovery and CPU-affinity pinning (Linux-only, `numa` feature).
 //! Compact-by-node core assignment per worker index; topology cached from `/sys`, `YORKIE_NUMA_RESERVE` cores held back for the OS.
+//! Memory placement layers: process default (TT follows the launcher), explicit per-node `mbind` for pre-faulted memory (NNUE replicas, `Thread` structs), and per-worker `set_mempolicy(MPOL_PREFERRED)`. All syscalls best-effort.
 
 use std::sync::OnceLock;
+
+// `set_mempolicy(2)` / `mbind(2)` numbers; not re-exported by `libc`, so spell them out.
+const MPOL_PREFERRED: libc::c_int = 1;
+const MPOL_BIND: libc::c_int = 2;
+const MPOL_MF_STRICT: libc::c_uint = 1;
+const MPOL_MF_MOVE: libc::c_uint = 2;
 
 /// Cores held back from the assignable pool for the OS (overridable via `YORKIE_NUMA_RESERVE`).
 pub const DEFAULT_RESERVE: usize = 2;
@@ -150,6 +157,62 @@ pub fn pin_current_thread(cpu: usize) -> bool {
     core_affinity::set_for_current(core_affinity::CoreId { id: cpu })
 }
 
+/// Node bitmask with only `node`'s bit set, plus the `maxnode` bit count the kernel scans.
+fn node_mask(node: u32) -> (Vec<u64>, libc::c_ulong) {
+    let words = (node as usize / 64) + 1;
+    let mut mask = vec![0u64; words];
+    mask[node as usize / 64] = 1u64 << (node as usize % 64);
+    let maxnode = (words * 64) as libc::c_ulong;
+    (mask, maxnode)
+}
+
+/// Rounds `[addr, addr + len)` outward to `page` boundaries (edge pages may cover neighbouring bytes).
+fn page_span(addr: usize, len: usize, page: usize) -> (usize, usize) {
+    let start = addr & !(page - 1);
+    let end = addr + len;
+    (start, (end - start + page - 1) & !(page - 1))
+}
+
+/// Sets the calling thread's task policy to prefer `node` for first-touch (`MPOL_PREFERRED`, best-effort). Worker threads only — USI/master keep the inherited policy so the TT stays on the launcher's.
+pub fn prefer_node_for_current_thread(node: u32) -> bool {
+    let (mask, maxnode) = node_mask(node);
+    // SAFETY: arguments match the `set_mempolicy(2)` ABI; `mask` lives across the call.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_set_mempolicy,
+            MPOL_PREFERRED,
+            mask.as_ptr() as *const libc::c_ulong,
+            maxnode,
+        )
+    };
+    ret == 0
+}
+
+/// Binds `[addr, addr + len)` to `node` (`MPOL_BIND` + `MPOL_MF_MOVE`; adds `MPOL_MF_STRICT` when `strict`), outward-rounded to pages; best-effort.
+pub unsafe fn mbind_region(addr: *mut u8, len: usize, node: u32, strict: bool) -> bool {
+    if len == 0 {
+        return false;
+    }
+    // SAFETY: `sysconf` is a plain libc call with a valid argument.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as usize;
+    let (start, span) = page_span(addr as usize, len, page);
+    let (mask, maxnode) = node_mask(node);
+    let flags = if strict { MPOL_MF_STRICT | MPOL_MF_MOVE } else { MPOL_MF_MOVE };
+    // SAFETY: arguments match the `mbind(2)` ABI; `mask` lives across the call.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_mbind,
+            start as *mut libc::c_void,
+            span as libc::c_ulong,
+            MPOL_BIND,
+            mask.as_ptr() as *const libc::c_ulong,
+            maxnode,
+            flags,
+        )
+    };
+    ret == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +258,51 @@ mod tests {
         let wrapped = assignment_for_idx(usize::MAX);
         assert!(node_ids().contains(&a0.node));
         assert!(node_ids().contains(&wrapped.node));
+    }
+
+    #[test]
+    fn node_mask_sets_exactly_the_node_bit() {
+        // First word.
+        assert_eq!(node_mask(0), (vec![1u64], 64));
+        assert_eq!(node_mask(5), (vec![1u64 << 5], 64));
+        assert_eq!(node_mask(63), (vec![1u64 << 63], 64));
+        // Word boundary: node 64 is bit 0 of the second word.
+        assert_eq!(node_mask(64), (vec![0, 1u64], 128));
+        assert_eq!(node_mask(65), (vec![0, 1u64 << 1], 128));
+    }
+
+    #[test]
+    fn page_span_rounds_outward_to_page_boundaries() {
+        const PAGE: usize = 4096;
+        // Already aligned: unchanged start, len rounded up.
+        assert_eq!(page_span(PAGE, PAGE, PAGE), (PAGE, PAGE));
+        assert_eq!(page_span(PAGE, 1, PAGE), (PAGE, PAGE));
+        // Unaligned start: rounded down, span still covers the last byte.
+        assert_eq!(page_span(PAGE + 10, 100, PAGE), (PAGE, PAGE));
+        // Range straddling a boundary grows to cover both pages.
+        assert_eq!(page_span(PAGE - 6, 10, PAGE), (0, 2 * PAGE));
+        assert_eq!(page_span(PAGE + PAGE - 1, 2, PAGE), (PAGE, 2 * PAGE));
+    }
+
+    // Best-effort wrappers: assert only that the calls are well-formed (no crash/UB); either outcome is valid.
+    #[test]
+    fn prefer_node_for_current_thread_is_best_effort() {
+        // Scratch thread so the test runner's own task policy is left untouched.
+        std::thread::spawn(|| {
+            let node = node_ids()[0];
+            let _ = prefer_node_for_current_thread(node);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn mbind_region_accepts_an_unaligned_heap_range() {
+        let node = node_ids()[0];
+        let buf = vec![0u8; 3 * 4096];
+        // Unaligned interior range exercises the helper's page rounding.
+        // SAFETY: the range lies inside the live `buf` allocation owned by this test.
+        let _ = unsafe { mbind_region(buf.as_ptr().add(100) as *mut u8, 200, node, false) };
+        drop(buf);
     }
 }
