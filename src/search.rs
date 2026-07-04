@@ -236,6 +236,39 @@ pub fn do_move_with_accumulator(
     }
 }
 
+// Null-move counterpart of `do_move_with_accumulator`: a null move changes nothing the accumulator depends on, so the parent slot's values are exactly the child's.
+#[cfg(feature = "nnue")]
+pub fn do_null_move_with_accumulator(stack: &mut [Stack], ply: usize, pos: &mut Position, net: &nnue::types::NnueNetwork) {
+    debug_assert!(ply + 1 < stack.len());
+
+    pos.do_null_move();
+
+    if stack[ply].accumulator.computed {
+        let (before, after) = stack.split_at_mut(ply + 1);
+        after[0].accumulator.us = before[ply].accumulator.us;
+        after[0].accumulator.them = before[ply].accumulator.them;
+        after[0].accumulator.computed = true;
+
+        #[cfg(debug_assertions)]
+        {
+            let mut tmp = nnue::types::Accumulator::zeroed();
+            nnue::transformer::refresh(&mut tmp, net, pos);
+            debug_assert_eq!(
+                tmp.us,
+                stack[ply + 1].accumulator.us,
+                "nnue: null-move `.us` copy differs from fresh refresh"
+            );
+            debug_assert_eq!(
+                tmp.them,
+                stack[ply + 1].accumulator.them,
+                "nnue: null-move `.them` copy differs from fresh refresh"
+            );
+        }
+    } else {
+        nnue::transformer::refresh(&mut stack[ply + 1].accumulator, net, pos);
+    }
+}
+
 pub fn get_stack(stack: &[Stack], i: i64) -> &Stack {
     debug_assert!(((CURRENT_STACK_INDEX as i64 + i) as usize) < stack.len());
     unsafe { stack.get_unchecked((CURRENT_STACK_INDEX as i64 + i) as usize) }
@@ -589,6 +622,56 @@ mod nnue_tests {
             nnue::transformer::refresh(&mut expected, net, &pos);
             assert_eq!(stack[1].accumulator.us, expected.us);
             assert_eq!(stack[1].accumulator.them, expected.them);
+        });
+    }
+
+    #[test]
+    fn do_null_move_with_accumulator_matches_fresh_refresh() {
+        run_with_large_stack(|| {
+            let net = synthetic_net();
+            let mut pos = Position::new();
+            let mut stack: Vec<Stack> = (0..10).map(|_| Stack::new()).collect();
+            nnue::transformer::refresh(&mut stack[0].accumulator, net, &pos);
+
+            // Reach a mid-line position incrementally, then null-move from it.
+            let usi_moves = ["7g7f", "3c3d"];
+            for (ply, usi) in usi_moves.iter().enumerate() {
+                let mv = Move::new_from_usi_str(usi, &pos).expect("legal move");
+                let gives_check = pos.gives_check(mv);
+                do_move_with_accumulator(&mut stack, ply, &mut pos, mv, gives_check, net);
+            }
+
+            let ply = usi_moves.len();
+            do_null_move_with_accumulator(&mut stack, ply, &mut pos, net);
+
+            // A null move changes no pieces, so the child accumulator equals a fresh refresh of the unchanged position, both perspectives.
+            let mut expected = Accumulator::zeroed();
+            nnue::transformer::refresh(&mut expected, net, &pos);
+            assert!(stack[ply + 1].accumulator.computed);
+            assert_eq!(stack[ply + 1].accumulator.us, expected.us);
+            assert_eq!(stack[ply + 1].accumulator.them, expected.them);
+
+            pos.undo_null_move();
+        });
+    }
+
+    #[test]
+    fn do_null_move_with_accumulator_refreshes_when_prev_not_computed() {
+        run_with_large_stack(|| {
+            let net = synthetic_net();
+            let mut pos = Position::new();
+            let mut stack: Vec<Stack> = (0..4).map(|_| Stack::new()).collect();
+            // stack[0].accumulator.computed is false: no refresh call.
+
+            do_null_move_with_accumulator(&mut stack, 0, &mut pos, net);
+
+            let mut expected = Accumulator::zeroed();
+            nnue::transformer::refresh(&mut expected, net, &pos);
+            assert!(stack[1].accumulator.computed);
+            assert_eq!(stack[1].accumulator.us, expected.us);
+            assert_eq!(stack[1].accumulator.them, expected.them);
+
+            pos.undo_null_move();
         });
     }
 

@@ -802,6 +802,16 @@ impl Thread {
                 get_stack_mut(stack, 0).current_move = Some(Move::NULL);
                 get_stack_mut(stack, 0).continuation_history = self.continuation_history[0][0].sentinel();
 
+                #[cfg(feature = "nnue")]
+                {
+                    // SAFETY (numa): `nnue_net_ptr` points at process-lifetime read-only replica weights (kept alive by `nnue_network`); the deref isn't tied to `&self`, so it coexists with the `&mut self.position` borrow.
+                    #[cfg(feature = "numa")]
+                    let net_ref = unsafe { &*self.nnue_net_ptr };
+                    #[cfg(not(feature = "numa"))]
+                    let net_ref = self.nnue_network.as_ref().expect("nnue network must be loaded before search");
+                    do_null_move_with_accumulator(stack, CURRENT_STACK_INDEX, &mut self.position, net_ref);
+                }
+                #[cfg(not(feature = "nnue"))]
                 self.position.do_null_move();
                 let mut null_value = -self.search::<NonPvType>(&mut stack[1..], -beta, -beta + Value(1), depth - r, !cut_node);
                 self.position.undo_null_move();
