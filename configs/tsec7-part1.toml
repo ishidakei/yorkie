@@ -1,4 +1,5 @@
 # Tournament build constants — 7th Denryu-sen TSEC, part 1. Read by build.rs under `tournament`; startup-fixed values only (machine-dependent options stay runtime).
+# Production config — CI builds/tests from configs/ci.toml and only `cargo check`s this one (the baked TT would not fit a runner).
 
 # NNUE evaluation scale (eval hot path). Matches the FV_SCALE USI option default.
 fv_scale = 16
@@ -9,8 +10,9 @@ max_moves_to_draw = 512
 # Per-side draw contempt in Value units: Black scores a draw as -draw_contempt, White as +draw_contempt (event scores draws asymmetrically). Non-tournament Draw_Contempt USI defaults to 0.
 draw_contempt = 300
 
-# Transposition-table size in BYTES, baked as a compile-time const; TT cluster count is derived from it (USI_Hash has no effect on TT size). Placeholder 256 MiB; must be a multiple of the 32-byte TtCluster (even cluster count, asserted in tt.rs).
-tt_bytes = 268435456
+# Transposition-table size in BYTES, baked as a compile-time const; TT cluster count is derived from it (USI_Hash has no effect on TT size). Must be a multiple of the 32-byte TtCluster (even cluster count, asserted in tt.rs).
+# Production value 288 GiB = 75% of the part-1 c8a.metal-48xl's 384 GiB; even cluster count, multiple of 2 MiB for hugepages.
+tt_bytes = 309237645312
 
 # Time-management options, read once at think-start. Placeholders equal to current USI option defaults.
 

@@ -469,11 +469,11 @@ mod tests {
                 0,
                 "multiply-high indexing requires an even cluster count"
             );
-            // v1 placeholder: 256 MiB / 32-byte clusters.
+            // Pins the CI config (configs/ci.toml): 256 MiB / 32-byte clusters. Production configs bake a far larger TT and get a compile-only `cargo check` in CI instead.
             assert_eq!(
                 TT_CLUSTER_COUNT,
                 256 * 1024 * 1024 / std::mem::size_of::<TtCluster>(),
-                "v1 tournament config bakes tt_bytes = 256 MiB",
+                "the CI tournament config (configs/ci.toml) bakes tt_bytes = 256 MiB",
             );
         }
 

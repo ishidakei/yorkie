@@ -13,10 +13,10 @@ on: [push, pull_request]
 
 name: Quickstart
 
-# Tournament config TOML: required by the tournament matrix entries, ignored by the other jobs.
+# Tournament config TOML: the matrix uses configs/ci.toml (small TT); the production config gets a compile-only proof in check-production-config below.
 # YORKIE_NUMA_RESERVE: 0 keeps the whole core set assignable on the small `numa`-job runners.
 env:
-  YORKIE_TOURNAMENT_CONFIG: configs/tsec7-part1.toml
+  YORKIE_TOURNAMENT_CONFIG: configs/ci.toml
   YORKIE_NUMA_RESERVE: 0
 
 jobs:
@@ -64,6 +64,22 @@ jobs:
 
       - name: Run cargo check
         run: cargo check --all-targets --no-default-features --features ${{ matrix.feature }}
+
+  # Compile-only proof for the production tournament config (configs/tsec7-part1.toml): `cargo check` never allocates its huge baked TT, but a `cargo test` here would — never add one.
+  check-production-config:
+    name: Check production tournament config
+    runs-on: ubuntu-latest
+    env:
+      YORKIE_TOURNAMENT_CONFIG: configs/tsec7-part1.toml
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run cargo check (production config)
+        run: cargo check --all-targets --no-default-features --features nnue,tournament
 
   test:
     name: Test Suite
