@@ -192,33 +192,63 @@ pub fn do_move_with_accumulator(
 ) {
     debug_assert!(ply + 1 < stack.len());
 
-    let must_refresh = !stack[ply].accumulator.computed
-        || nnue::features::requires_full_refresh(pos, mv, Color::BLACK)
-        || nnue::features::requires_full_refresh(pos, mv, Color::WHITE);
-
-    if must_refresh {
+    // Path C: no computed parent to diff against — full refresh of both perspectives.
+    if !stack[ply].accumulator.computed {
         pos.do_move(mv, gives_check);
         nnue::transformer::refresh(&mut stack[ply + 1].accumulator, net, pos);
         return;
     }
 
-    // feature_diff needs the pre-move position; collect before do_move.
-    let (removed_black, added_black) = nnue::features::feature_diff(pos, mv, Color::BLACK);
-    let (removed_white, added_white) = nnue::features::feature_diff(pos, mv, Color::WHITE);
+    let refresh_black = nnue::features::requires_full_refresh(pos, mv, Color::BLACK);
+    let refresh_white = nnue::features::requires_full_refresh(pos, mv, Color::WHITE);
 
-    pos.do_move(mv, gives_check);
+    // Path B: exactly one perspective's own king moves (requires_full_refresh is
+    // per-perspective and at most one side's king moves per move). Only that
+    // perspective's features are king-relative-invalidated; the other perspective
+    // keeps the cheap incremental diff.
+    if refresh_black || refresh_white {
+        let moving = if refresh_black { Color::BLACK } else { Color::WHITE };
+        // feature_diff needs the pre-move position; collect before do_move. Its
+        // internal do_move/undo_move probe counts one visited node, but the
+        // pre-split code ran no probe on king moves — subtract the increment so
+        // `nodes_searched` (USI `nodes`/`nps`) stays identical. (Path A keeps its
+        // two counted probes, also identical to the pre-split code.)
+        let (removed_other, added_other) = nnue::features::feature_diff(pos, mv, moving.inverse());
+        pos.subtract_probe_node();
 
-    let (before, after) = stack.split_at_mut(ply + 1);
-    nnue::transformer::update_on_move(
-        &before[ply].accumulator,
-        &mut after[0].accumulator,
-        net,
-        &removed_black,
-        &added_black,
-        &removed_white,
-        &added_white,
-    );
+        pos.do_move(mv, gives_check);
 
+        let (before, after) = stack.split_at_mut(ply + 1);
+        nnue::transformer::update_on_king_move(
+            &before[ply].accumulator,
+            &mut after[0].accumulator,
+            net,
+            pos,
+            moving,
+            &removed_other,
+            &added_other,
+        );
+    } else {
+        // Path A: no king move — incremental diff for both perspectives.
+        // feature_diff needs the pre-move position; collect before do_move.
+        let (removed_black, added_black) = nnue::features::feature_diff(pos, mv, Color::BLACK);
+        let (removed_white, added_white) = nnue::features::feature_diff(pos, mv, Color::WHITE);
+
+        pos.do_move(mv, gives_check);
+
+        let (before, after) = stack.split_at_mut(ply + 1);
+        nnue::transformer::update_on_move(
+            &before[ply].accumulator,
+            &mut after[0].accumulator,
+            net,
+            &removed_black,
+            &added_black,
+            &removed_white,
+            &added_white,
+        );
+    }
+
+    // Cross-checks both incremental paths (A and B) against a fresh rebuild.
     #[cfg(debug_assertions)]
     {
         let mut tmp = nnue::types::Accumulator::zeroed();
@@ -581,45 +611,136 @@ mod nnue_tests {
     use crate::evaluate::nnue::test_fixtures::{run_with_large_stack, synthetic_net};
     use crate::evaluate::nnue::{self, types::Accumulator};
 
-    #[test]
-    fn do_move_with_accumulator_matches_fresh_refresh() {
-        run_with_large_stack(|| {
-            let net = synthetic_net();
-            let mut pos = Position::new();
-            let mut stack: Vec<Stack> = (0..10).map(|_| Stack::new()).collect();
+    // Plays `usi_moves` through `do_move_with_accumulator` and asserts every child
+    // accumulator is bit-identical to a fresh refresh of its post-move position, for
+    // both perspectives.
+    fn assert_move_sequence_matches_refresh(mut pos: Position, usi_moves: &[&str]) {
+        let net = synthetic_net();
+        let mut stack: Vec<Stack> = (0..usi_moves.len() + 2).map(|_| Stack::new()).collect();
+        nnue::transformer::refresh(&mut stack[0].accumulator, net, &pos);
 
-            nnue::transformer::refresh(&mut stack[0].accumulator, net, &pos);
-
-            let usi_moves = ["7g7f", "3c3d", "2g2f", "8c8d"];
-            for (ply, usi) in usi_moves.iter().enumerate() {
-                let mv = Move::new_from_usi_str(usi, &pos).expect("legal move");
-                let gives_check = pos.gives_check(mv);
-                do_move_with_accumulator(&mut stack, ply, &mut pos, mv, gives_check, net);
-                assert!(stack[ply + 1].accumulator.computed);
-            }
+        for (ply, usi) in usi_moves.iter().enumerate() {
+            let mv = Move::new_from_usi_str(usi, &pos).expect("legal move");
+            let gives_check = pos.gives_check(mv);
+            do_move_with_accumulator(&mut stack, ply, &mut pos, mv, gives_check, net);
+            assert!(stack[ply + 1].accumulator.computed);
 
             let mut expected = Accumulator::zeroed();
             nnue::transformer::refresh(&mut expected, net, &pos);
-            assert_eq!(stack[usi_moves.len()].accumulator.us, expected.us);
-            assert_eq!(stack[usi_moves.len()].accumulator.them, expected.them);
+            assert_eq!(
+                stack[ply + 1].accumulator.us,
+                expected.us,
+                "move {usi}: `.us` != fresh refresh"
+            );
+            assert_eq!(
+                stack[ply + 1].accumulator.them,
+                expected.them,
+                "move {usi}: `.them` != fresh refresh"
+            );
+        }
+    }
+
+    fn bare_kings() -> Position {
+        Position::new_from_sfen("4k4/9/9/9/9/9/9/9/4K4 b - 1").expect("valid sfen")
+    }
+
+    // Mixes non-king moves (Path A) and king moves by both sides (Path B) in one line.
+    #[test]
+    fn do_move_with_accumulator_matches_fresh_refresh() {
+        run_with_large_stack(|| {
+            let moves = ["7g7f", "3c3d", "5i5h", "5a5b", "2g2f", "8c8d"];
+            assert_move_sequence_matches_refresh(Position::new(), &moves);
         });
     }
 
     #[test]
-    fn do_move_with_accumulator_refreshes_on_king_move() {
+    fn quiet_king_move_matches_fresh_refresh() {
         run_with_large_stack(|| {
-            let net = synthetic_net();
-            let mut pos = Position::new_from_sfen("4k4/9/9/9/9/9/9/9/4K4 b - 1").expect("valid sfen");
-            let mut stack: Vec<Stack> = (0..4).map(|_| Stack::new()).collect();
-            nnue::transformer::refresh(&mut stack[0].accumulator, net, &pos);
-
+            let pos = bare_kings();
             let mv = Move::new_from_usi_str("5i5h", &pos).expect("legal king move");
             assert!(nnue::features::requires_full_refresh(&pos, mv, Color::BLACK));
+            assert!(!nnue::features::requires_full_refresh(&pos, mv, Color::WHITE));
+            assert_move_sequence_matches_refresh(pos, &["5i5h"]);
+        });
+    }
+
+    // The black king captures the checking pawn: the moving perspective is fully
+    // rebuilt while the white perspective's diff also covers the capture (own pawn
+    // off the board, enemy hand pawn added).
+    #[test]
+    fn king_capture_matches_fresh_refresh() {
+        run_with_large_stack(|| {
+            let pos = Position::new_from_sfen("4k4/9/9/9/9/9/9/4p4/4K4 b - 1").expect("valid sfen");
+            let mv = Move::new_from_usi_str("5i5h", &pos).expect("legal king capture");
+            assert!(nnue::features::requires_full_refresh(&pos, mv, Color::BLACK));
+            assert_move_sequence_matches_refresh(pos, &["5i5h"]);
+        });
+    }
+
+    // Own-king moves across the file 5 <-> 6 boundary flip the moving perspective's
+    // mirror flag (features are mirrored when the own king is on files 6-9).
+    #[test]
+    fn king_move_across_mirror_boundary_matches_fresh_refresh() {
+        run_with_large_stack(|| {
+            assert_move_sequence_matches_refresh(bare_kings(), &["5i6i", "5a4a", "6i5i", "4a5a"]);
+        });
+    }
+
+    #[test]
+    fn consecutive_king_moves_by_both_sides_match_fresh_refresh() {
+        run_with_large_stack(|| {
+            assert_move_sequence_matches_refresh(bare_kings(), &["5i5h", "5a5b", "5h5g", "5b5c"]);
+        });
+    }
+
+    // Node accounting must be indistinguishable from the pre-split code, keeping
+    // USI `nodes`/`nps` identical: a king move nets +1 (its single feature_diff
+    // probe is compensated), a quiet move nets +3 (two counted feature_diff
+    // probes plus the real do_move, exactly as before the split).
+    #[test]
+    fn node_count_matches_pre_split_paths() {
+        run_with_large_stack(|| {
+            let net = synthetic_net();
+
+            let mut pos = bare_kings();
+            let mut stack: Vec<Stack> = (0..4).map(|_| Stack::new()).collect();
+            nnue::transformer::refresh(&mut stack[0].accumulator, net, &pos);
+            let before = pos.nodes_searched();
+            let mv = Move::new_from_usi_str("5i5h", &pos).expect("legal king move");
+            let gives_check = pos.gives_check(mv);
+            do_move_with_accumulator(&mut stack, 0, &mut pos, mv, gives_check, net);
+            assert_eq!(pos.nodes_searched() - before, 1, "king move: only the real do_move may count");
+
+            let mut pos = Position::new();
+            let mut stack: Vec<Stack> = (0..4).map(|_| Stack::new()).collect();
+            nnue::transformer::refresh(&mut stack[0].accumulator, net, &pos);
+            let before = pos.nodes_searched();
+            let mv = Move::new_from_usi_str("7g7f", &pos).expect("legal move");
+            let gives_check = pos.gives_check(mv);
+            do_move_with_accumulator(&mut stack, 0, &mut pos, mv, gives_check, net);
+            assert_eq!(
+                pos.nodes_searched() - before,
+                3,
+                "quiet move: real do_move plus two counted probes"
+            );
+        });
+    }
+
+    #[test]
+    fn king_move_with_uncomputed_parent_forces_refresh() {
+        run_with_large_stack(|| {
+            let net = synthetic_net();
+            let mut pos = bare_kings();
+            let mut stack: Vec<Stack> = (0..4).map(|_| Stack::new()).collect();
+            // stack[0].accumulator.computed is false: no refresh call.
+
+            let mv = Move::new_from_usi_str("5i5h", &pos).expect("legal king move");
             let gives_check = pos.gives_check(mv);
             do_move_with_accumulator(&mut stack, 0, &mut pos, mv, gives_check, net);
 
             let mut expected = Accumulator::zeroed();
             nnue::transformer::refresh(&mut expected, net, &pos);
+            assert!(stack[1].accumulator.computed);
             assert_eq!(stack[1].accumulator.us, expected.us);
             assert_eq!(stack[1].accumulator.them, expected.them);
         });

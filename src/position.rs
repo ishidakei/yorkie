@@ -1484,6 +1484,12 @@ impl Position {
     pub fn nodes_searched(&self) -> i64 {
         (*self.nodes).load(Ordering::Relaxed)
     }
+    /// Removes one `do_move` increment from the visited-node counter, for callers
+    /// that probe a move with a `do_move`/`undo_move` pair that is not part of the
+    /// search and must not be observable in `nodes_searched`.
+    pub fn subtract_probe_node(&self) {
+        (*self.nodes).fetch_sub(1, Ordering::Relaxed);
+    }
     pub fn is_pinned_illegal(&self, color_of_king: Color, from: Square, to: Square) -> bool {
         (unsafe { (*self.st().check_info.as_ptr()).blockers_for_king(color_of_king).is_set(from) })
             && !is_aligned_and_sq2_is_not_between_sq0_and_sq1(from, to, self.king_square(color_of_king))
