@@ -261,7 +261,7 @@ fn select_next_refutation(
     for &mv in list {
         *current_index += 1;
         if let Some(m) = mv
-            && m != tt_move.non_zero_unwrap_unchecked()
+            && Some(m) != tt_move
             && !m.is_capture(pos)
             && pos.pseudo_legal::<SearchingType>(m)
         {
@@ -283,7 +283,7 @@ fn select_best_good_capture(
         let m = pick_best(&mut ext_moves[*current_index..ext_moves_size]);
         let score = ext_moves[*current_index].score;
         *current_index += 1;
-        if m != tt_move.non_zero_unwrap_unchecked() {
+        if Some(m) != tt_move {
             if pos.see_ge(m, Value(-69 * score / 1024)) {
                 return Some(m);
             } else {
@@ -304,11 +304,7 @@ fn select_next_quiet(
     for ext_move in list {
         *current_index += 1;
         let m = ext_move.mv;
-        if m != tt_move.non_zero_unwrap_unchecked()
-            && m != refutations[0].non_zero_unwrap_unchecked()
-            && m != refutations[1].non_zero_unwrap_unchecked()
-            && m != refutations[2].non_zero_unwrap_unchecked()
-        {
+        if Some(m) != tt_move && Some(m) != refutations[0] && Some(m) != refutations[1] && Some(m) != refutations[2] {
             return Some(m);
         }
     }
@@ -319,7 +315,7 @@ fn select_next_bad_capture(list: &[ExtMove], current_index: &mut usize, tt_move:
     for ext_move in list {
         *current_index += 1;
         let m = ext_move.mv;
-        if m != tt_move.non_zero_unwrap_unchecked() {
+        if Some(m) != tt_move {
             return Some(m);
         }
     }
@@ -330,7 +326,7 @@ fn select_best_evasion(list: &mut [ExtMove], current_index: &mut usize, tt_move:
     for i in 0..list.len() {
         let m = pick_best(&mut list[i..]);
         *current_index += 1;
-        if m != tt_move.non_zero_unwrap_unchecked() {
+        if Some(m) != tt_move {
             return Some(m);
         }
     }
@@ -341,7 +337,7 @@ fn select_best_qcapture(list: &mut [ExtMove], current_index: &mut usize, tt_move
     for i in 0..list.len() {
         let m = pick_best(&mut list[i..]);
         *current_index += 1;
-        if m != tt_move.non_zero_unwrap_unchecked() {
+        if Some(m) != tt_move {
             return Some(m);
         }
     }
@@ -352,7 +348,7 @@ fn select_best_qrecapture(list: &mut [ExtMove], current_index: &mut usize, tt_mo
     for i in 0..list.len() {
         let m = pick_best(&mut list[i..]);
         *current_index += 1;
-        if m != tt_move.non_zero_unwrap_unchecked() {
+        if Some(m) != tt_move {
             return Some(m);
         }
     }
@@ -369,7 +365,7 @@ fn select_best_probcut(
     for i in 0..list.len() {
         let m = pick_best(&mut list[i..]);
         *current_index += 1;
-        if m != tt_move.non_zero_unwrap_unchecked() && pos.see_ge(m, threshold) {
+        if Some(m) != tt_move && pos.see_ge(m, threshold) {
             return Some(m);
         }
     }

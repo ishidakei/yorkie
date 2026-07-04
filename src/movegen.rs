@@ -1206,4 +1206,28 @@ mod tests {
         assert!(Some(Move::new_unpromote(Square::SQ11, Square::SQ12, Piece::W_PAWN)).is_normal_move());
         assert!(Some(Move::new_drop(Piece::B_PAWN, Square::SQ12)).is_normal_move());
     }
+
+    // `Move::is_normal` must match the sentinel comparison on every reachable encoding, including TT-truncated 16-bit moves.
+    #[test]
+    fn test_move_is_normal_reachable_encodings() {
+        assert!(!Move::NULL.is_normal());
+        assert!(!Move::WIN.is_normal());
+        assert!(!Move::RESIGN.is_normal());
+
+        let pos = Position::new();
+        let mut mlist = MoveList::new();
+        mlist.generate_all::<NonEvasionsType>(&pos, 0);
+        assert!(mlist.size > 0);
+        for ext_move in mlist.slice(0) {
+            let m = ext_move.mv;
+            assert!(m.is_normal(), "generated move must be normal: {}", m.to_usi_string());
+            // The TT stores only the low 16 bits; the moved-piece field is lost.
+            let truncated = Move(std::num::NonZeroU32::new(m.0.get() & 0xffff).unwrap());
+            assert!(
+                truncated.is_normal(),
+                "TT-truncated move must stay normal: {}",
+                m.to_usi_string()
+            );
+        }
+    }
 }

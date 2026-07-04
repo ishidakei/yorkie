@@ -199,6 +199,14 @@ impl Move {
     pub fn is_drop(self) -> bool {
         (self.0.get() & Move::DROP_FLAG) != 0
     }
+    // A real move vs the NULL/WIN/RESIGN sentinels: only sentinels have low 9 bits (to+flags) equal to the bits above (from+moved piece).
+    #[inline]
+    pub fn is_normal(self) -> bool {
+        let val = self.0.get();
+        let ret = (val & 0x1ff) != (val >> 9);
+        debug_assert_eq!(ret, self != Move::NULL && self != Move::WIN && self != Move::RESIGN);
+        ret
+    }
     pub fn is_promotion(self) -> bool {
         (self.0.get() & Move::PROMOTE_FLAG) != 0
     }
@@ -254,30 +262,14 @@ impl Move {
     }
 }
 
-pub trait NonZeroUnwrapUnchecked {
-    fn non_zero_unwrap_unchecked(self) -> Move;
-}
-
-impl NonZeroUnwrapUnchecked for Option<Move> {
-    #[inline]
-    fn non_zero_unwrap_unchecked(self) -> Move {
-        unsafe { std::mem::transmute::<Option<Move>, Move>(self) }
-    }
-}
-
 pub trait IsNormalMove {
     fn is_normal_move(&self) -> bool;
 }
 
 impl IsNormalMove for Option<Move> {
+    #[inline]
     fn is_normal_move(&self) -> bool {
-        let val = self.non_zero_unwrap_unchecked().0.get();
-        let ret = (val & 0x1ff) != (val >> 9);
-        debug_assert_eq!(
-            ret,
-            self.is_some() && self.unwrap() != Move::NULL && self.unwrap() != Move::WIN && self.unwrap() != Move::RESIGN
-        );
-        ret
+        self.is_some_and(Move::is_normal)
     }
 }
 

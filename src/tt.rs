@@ -31,7 +31,7 @@ impl TtEntry {
     pub fn mv(&self, pos: &Position) -> Option<Move> {
         // This can be illegal move.
         let m = Move(std::num::NonZeroU32::new(u32::from(self.mv16))?);
-        let m = if !Some(m).is_normal_move() || m.is_drop() {
+        let m = if !m.is_normal() || m.is_drop() {
             m
         } else {
             Move(unsafe {
