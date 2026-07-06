@@ -41,6 +41,8 @@ pub struct LimitsType {
     pub mate: Option<u64>,
     pub perft: Option<u32>,
     pub infinite: Option<()>, // Is bool more appropriate?
+    // Non-tournament only: the `go nodes` limit (tournament parses and ignores it).
+    #[cfg(not(feature = "tournament"))]
     pub nodes: Option<u64>,
     pub start_time: Option<std::time::Instant>,
 }
@@ -56,17 +58,17 @@ impl LimitsType {
             mate: None,
             perft: None,
             infinite: None,
+            #[cfg(not(feature = "tournament"))]
             nodes: None,
             start_time: None,
         }
     }
     pub fn use_time_management(&self) -> bool {
-        self.mate.is_none()
-            && self.movetime.is_none()
-            && self.depth.is_none()
-            && self.nodes.is_none()
-            && self.perft.is_none()
-            && self.infinite.is_none()
+        #[cfg(not(feature = "tournament"))]
+        if self.nodes.is_some() {
+            return false;
+        }
+        self.mate.is_none() && self.movetime.is_none() && self.depth.is_none() && self.perft.is_none() && self.infinite.is_none()
     }
 }
 
@@ -214,6 +216,7 @@ pub fn do_move_with_accumulator(
         // `nodes_searched` (USI `nodes`/`nps`) stays identical. (Path A keeps its
         // two counted probes, also identical to the pre-split code.)
         let (removed_other, added_other) = nnue::features::feature_diff(pos, mv, moving.inverse());
+        #[cfg(any(not(feature = "tournament"), feature = "emit-nps"))]
         pos.subtract_probe_node();
 
         pos.do_move(mv, gives_check);
@@ -337,10 +340,6 @@ pub fn stat_bonus(depth: Depth) -> i32 {
     if d > 14 { 73 } else { 6 * d * d + 229 * d - 215 }
 }
 
-pub fn value_draw(nodes: i64) -> Value {
-    Value::DRAW + Value(2 * (nodes as i32 & 1) - 1)
-}
-
 /// Canonical drawn-game score (repetition draws and the `Max_Moves_To_Draw` horizon), biased
 /// per side by `contempt` in `Value` units (0 = neutral): Black `-contempt`, White `+contempt`.
 pub fn draw_value(contempt: i32, side: Color) -> Value {
@@ -412,7 +411,6 @@ impl Perft {
         let timeins2 = std::time::Instant::now();
         let timedur = timeins2 - timeins1;
         let timedur_nanos = std::cmp::max(timedur.as_nanos(), 1);
-        let moved_nodes = self.position.nodes_searched();
         println!();
         println!("Time duration: {:?}", timedur);
         println!(
@@ -420,11 +418,16 @@ impl Perft {
             searched_nodes,
             (searched_nodes as u128) * 1_000_000_000 / timedur_nanos
         );
-        println!(
-            "(Moved: {} nodes : {} nps)",
-            moved_nodes,
-            (moved_nodes as u128) * 1_000_000_000 / timedur_nanos
-        );
+        // The visited-node counter is compiled out of the production tournament build.
+        #[cfg(any(not(feature = "tournament"), feature = "emit-nps"))]
+        {
+            let moved_nodes = self.position.nodes_searched();
+            println!(
+                "(Moved: {} nodes : {} nps)",
+                moved_nodes,
+                (moved_nodes as u128) * 1_000_000_000 / timedur_nanos
+            );
+        }
     }
     // perft() is our utility to verify move generation. All the leaf nodes up
     // to the given depth are generated and counted, and the sum is returned.
@@ -697,6 +700,8 @@ mod nnue_tests {
     // USI `nodes`/`nps` identical: a king move nets +1 (its single feature_diff
     // probe is compensated), a quiet move nets +3 (two counted feature_diff
     // probes plus the real do_move, exactly as before the split).
+    // Counting builds only: the production tournament build has no node counter.
+    #[cfg(any(not(feature = "tournament"), feature = "emit-nps"))]
     #[test]
     fn node_count_matches_pre_split_paths() {
         run_with_large_stack(|| {

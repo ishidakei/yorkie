@@ -74,7 +74,6 @@ struct Thread {
     best_move_changes: Arc<AtomicU64>,
     best_move_changess: Vec<Arc<AtomicU64>>,
 
-    nodes: Arc<AtomicI64>,
     // Cached per search so descent sites avoid re-locking the process-wide RwLock; populated in iterative_deepening_loop.
     #[cfg(feature = "nnue")]
     nnue_network: Option<Arc<nnue::types::NnueNetwork>>,
@@ -94,6 +93,8 @@ struct Thread {
     // Non-tournament only: guards the in-search info output (tournament compiles it out; bestmove stays guarded by `ThreadPool::hide_all_output`).
     #[cfg(not(feature = "tournament"))]
     hide_all_output: Arc<AtomicBool>,
+    // Counting builds only: per-thread counters for the main thread's `nodes_searched` sum.
+    #[cfg(any(not(feature = "tournament"), feature = "emit-nps"))]
     nodess: Vec<Arc<AtomicI64>>,
 }
 
@@ -510,7 +511,7 @@ impl Thread {
                         return if get_stack(stack, 0).ply >= MAX_PLY && !get_stack(stack, 0).in_check {
                             evaluate(&mut self.position, stack)
                         } else {
-                            value_draw(self.nodes.load(Ordering::Relaxed))
+                            Value::DRAW
                         };
                     }
                     // Maximum-moves rule: past the limit is a draw; checked after repetition so a boundary perpetual check stays a loss.
@@ -727,7 +728,7 @@ impl Thread {
                     get_stack_mut(stack, 0).static_eval = eval;
                 }
                 if eval == Value::NONE {
-                    eval = value_draw(self.nodes.load(Ordering::Relaxed));
+                    eval = Value::DRAW;
                 }
                 if tt_value != Value::NONE
                     && if tt_value > eval {
@@ -1609,6 +1610,7 @@ impl Thread {
 
         best_value
     }
+    #[cfg(any(not(feature = "tournament"), feature = "emit-nps"))]
     fn nodes_searched(&self) -> i64 {
         debug_assert!(self.is_main());
         self.nodess.iter().fold(0, |sum, nodes| sum + nodes.load(Ordering::Relaxed))
@@ -1618,10 +1620,18 @@ impl Thread {
         if self.calls_count > 0 {
             return;
         }
-        self.calls_count = match self.limits.nodes {
-            Some(nodes) => std::cmp::min(1024, nodes / 1024) as i32,
-            None => 1024,
-        };
+        // A `go nodes` limit shortens the polling interval; tournament ignores the limit.
+        #[cfg(not(feature = "tournament"))]
+        {
+            self.calls_count = match self.limits.nodes {
+                Some(nodes) => std::cmp::min(1024, nodes / 1024) as i32,
+                None => 1024,
+            };
+        }
+        #[cfg(feature = "tournament")]
+        {
+            self.calls_count = 1024;
+        }
 
         if self.ponder.load(Ordering::Relaxed) {
             return;
@@ -1629,11 +1639,15 @@ impl Thread {
 
         let elapsed = self.limits.start_time.unwrap().elapsed();
 
+        #[cfg(not(feature = "tournament"))]
+        let node_limit_reached = self.limits.nodes.is_some() && self.nodes_searched() >= self.limits.nodes.unwrap() as i64;
+        #[cfg(feature = "tournament")]
+        let node_limit_reached = false;
         if (self.limits.use_time_management()
             && (elapsed.as_millis() as i64 > self.timeman.lock().unwrap().maximum_millis() - 10
                 || self.stop_on_ponderhit.load(Ordering::Relaxed)))
             || (self.limits.movetime.is_some() && elapsed >= self.limits.movetime.unwrap())
-            || (self.limits.nodes.is_some() && self.nodes_searched() >= self.limits.nodes.unwrap() as i64)
+            || node_limit_reached
         {
             self.stop.store(true, Ordering::Relaxed);
         }
@@ -1865,7 +1879,6 @@ impl ThreadPool {
                     usi_options: UsiOptions::new(),
                     best_move_changes: self.best_move_changess[i].clone(),
                     best_move_changess: self.best_move_changess.clone(),
-                    nodes: self.nodess[i].clone(),
                     #[cfg(feature = "nnue")]
                     nnue_network: None,
                     // Set per search in iterative_deepening_loop; null until then.
@@ -1881,6 +1894,7 @@ impl ThreadPool {
                     stop: self.stop.clone(),
                     #[cfg(not(feature = "tournament"))]
                     hide_all_output: self.hide_all_output.clone(),
+                    #[cfg(any(not(feature = "tournament"), feature = "emit-nps"))]
                     nodess: vec![],
                 }))
             })
@@ -1894,7 +1908,8 @@ impl ThreadPool {
             // SAFETY: `addr`/`len` describe the live `Mutex<Thread>` payload of an Arc we hold.
             unsafe { crate::numa::mbind_region(addr, len, node, false) };
         }
-        // Main thread has other thread's nodes.
+        // Main thread has other thread's nodes (counting builds only).
+        #[cfg(any(not(feature = "tournament"), feature = "emit-nps"))]
         self.thread_pool_base.lock().unwrap().threads[0]
             .lock()
             .unwrap()
@@ -2015,8 +2030,8 @@ impl ThreadPool {
                         .rev()
                     {
                         let nodes_cloned = nodess_cloned[i].clone();
-                        let pos = Position::new_from_position(&pos, nodes_cloned.clone());
                         nodes_cloned.store(0, Ordering::Relaxed);
+                        let pos = Position::new_from_position(&pos, nodes_cloned);
                         let root_moves_cloned = root_moves.clone();
                         let thread_cloned = thread.clone();
                         let limits_cloned = limits.clone();
@@ -2047,7 +2062,6 @@ impl ThreadPool {
                             th.best_move_changes.store(0, Ordering::Relaxed);
                             th.engine_color = engine_color;
                             th.limits = limits_cloned;
-                            th.nodes = nodes_cloned;
                             th.root_depth = Depth::ZERO;
                             th.root_moves = root_moves_cloned;
                             th.position = pos;
@@ -2170,6 +2184,7 @@ impl ThreadPool {
             handle.join().unwrap();
         }
     }
+    #[cfg(any(not(feature = "tournament"), feature = "emit-nps"))]
     #[allow(dead_code)]
     fn nodes_searched(&self) -> i64 {
         self.nodess.iter().fold(0, |sum, nodes| sum + nodes.load(Ordering::Relaxed))

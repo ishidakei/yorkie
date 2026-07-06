@@ -10,7 +10,9 @@ use rand::prelude::*;
 use rand::{Rng, SeedableRng};
 use std::convert::TryFrom;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::AtomicI64;
+#[cfg(any(not(feature = "tournament"), feature = "emit-nps"))]
+use std::sync::atomic::Ordering;
 
 pub trait IsSearchingTrait {
     const IS_SEARCHING: bool;
@@ -830,6 +832,8 @@ impl PositionBase {
 pub struct Position {
     pub base: PositionBase,
     states: Vec<StateInfo>,
+    // Visited-node counter; compiled out of the production tournament build (no per-node atomic RMW).
+    #[cfg(any(not(feature = "tournament"), feature = "emit-nps"))]
     nodes: Arc<AtomicI64>,
 }
 
@@ -846,6 +850,7 @@ impl Position {
         let mut pos = Position {
             base,
             states: Vec::new(),
+            #[cfg(any(not(feature = "tournament"), feature = "emit-nps"))]
             nodes: Arc::new(AtomicI64::new(0)),
         };
         pos.init_states_and_push(state);
@@ -858,16 +863,21 @@ impl Position {
         let mut pos = Position {
             base,
             states: Vec::new(),
+            #[cfg(any(not(feature = "tournament"), feature = "emit-nps"))]
             nodes: Arc::new(AtomicI64::new(0)),
         };
         pos.init_states_and_push(state);
         debug_assert!(pos.is_ok());
         Ok(pos)
     }
+    /// The counter handle is accepted in every build; the production tournament build drops it.
     pub fn new_from_position(pos: &Position, nodes: Arc<AtomicI64>) -> Position {
+        #[cfg(all(feature = "tournament", not(feature = "emit-nps")))]
+        let _ = nodes;
         let mut p = Position {
             base: pos.base.clone(),
             states: pos.states.clone(),
+            #[cfg(any(not(feature = "tournament"), feature = "emit-nps"))]
             nodes,
         };
         p.reserve_states();
@@ -1480,13 +1490,14 @@ impl Position {
     pub fn in_check(&self) -> bool {
         self.checkers().to_bool()
     }
-    #[allow(dead_code)]
+    #[cfg(any(not(feature = "tournament"), feature = "emit-nps"))]
     pub fn nodes_searched(&self) -> i64 {
         (*self.nodes).load(Ordering::Relaxed)
     }
     /// Removes one `do_move` increment from the visited-node counter, for callers
     /// that probe a move with a `do_move`/`undo_move` pair that is not part of the
     /// search and must not be observable in `nodes_searched`.
+    #[cfg(any(not(feature = "tournament"), feature = "emit-nps"))]
     pub fn subtract_probe_node(&self) {
         (*self.nodes).fetch_sub(1, Ordering::Relaxed);
     }
@@ -1563,6 +1574,7 @@ impl Position {
     }
     pub fn do_move(&mut self, m: Move, gives_check: bool) {
         debug_assert!(self.is_ok());
+        #[cfg(any(not(feature = "tournament"), feature = "emit-nps"))]
         (*self.nodes).fetch_add(1, Ordering::Relaxed);
         let mut board_key = self.board_key() ^ Zobrist::COLOR;
         let mut hand_key = self.hand_key();

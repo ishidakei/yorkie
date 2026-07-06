@@ -72,8 +72,14 @@ fn parse_go_limits(usi_options: &UsiOptions, args: &[&str]) -> Result<(LimitsTyp
             }
             "infinite" => limits.infinite = Some(()),
             "nodes" => {
-                let n = next_num(limit_type, &mut iter)?;
-                limits.nodes = Some(n);
+                // Always consumed so the command still parses; tournament ignores the limit.
+                let n: u64 = next_num(limit_type, &mut iter)?;
+                #[cfg(not(feature = "tournament"))]
+                {
+                    limits.nodes = Some(n);
+                }
+                #[cfg(feature = "tournament")]
+                let _ = n;
             }
             "ponder" => {
                 ponder_mode = true;
