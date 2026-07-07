@@ -1,0 +1,8 @@
+# Tournament (production) build, one command. Event-agnostic by design: the event is
+# chosen only by the caller's YORKIE_TOURNAMENT_CONFIG=configs/<event>.toml (build.rs
+# fails loudly without it). The native-CPU flag is scoped to the alias via --config so a
+# plain `cargo build` is unaffected. String aliases are whitespace-split with no shell
+# quoting, so the --config value must stay space-free and unquoted.
+[alias]
+tournament = """build --release --no-default-features --features nnue,tournament,numa \
+--config build.rustflags=["-C","target-cpu=native"]"""

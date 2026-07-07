@@ -31,3 +31,29 @@ The scripts only provision and build the engine. The runtime assets (the NNUE ne
 YaneuraOu-format opening book) are not downloaded, generated, or wired up by them — they are
 located at runtime through USI options (`Eval_Dir` for the network directory, `Book_File` for
 the book) when the engine starts.
+
+### Tournament (production) build
+
+A tournament binary is built with one command, naming the event config TOML:
+
+```sh
+YORKIE_TOURNAMENT_CONFIG=configs/tsec7-part1.toml cargo tournament
+```
+
+The `tournament` alias (defined in `.cargo/config.toml`) expands to a release build with
+features `nnue,tournament,numa` and `-C target-cpu=native`. The startup-fixed values from
+the named config TOML are baked in as compile-time consts, search info output is compiled
+out (the engine prints `bestmove` only), and MultiPV, the JSON book backend, and the mate
+solver are excluded from the binary.
+
+The event is chosen by the TOML path alone — the alias has no default. Running
+`cargo tournament` without `YORKIE_TOURNAMENT_CONFIG` fails at build time with
+`` the `tournament` feature requires YORKIE_TOURNAMENT_CONFIG=configs/<event>.toml ``.
+
+**Memory warning**: `configs/tsec7-part1.toml` bakes a transposition table of roughly
+288 GiB, sized for a 384 GiB-class host. On smaller machines, write your own
+`configs/<event>.toml` (see `configs/ci.toml` for a minimal example) and point
+`YORKIE_TOURNAMENT_CONFIG` at it.
+
+Note: a real `RUSTFLAGS` environment variable set by the caller overrides the alias's
+`build.rustflags`, replacing `-C target-cpu=native`.
