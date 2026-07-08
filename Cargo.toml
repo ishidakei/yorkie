@@ -1,6 +1,6 @@
 [package]
 name = "yorkie"
-version = "0.0.1"
+version = "2.0.0"
 authors = ["Kei Ishida <ishida.kei@gmail.com>"]
 edition = "2024"
 rust-version = "1.96.0"
