@@ -115,7 +115,13 @@ pub(crate) fn alloc_zeroed_large(min_bytes: usize) -> (NonNull<u8>, Layout) {
         None => handle_alloc_error(layout),
     };
 
-    #[cfg(target_os = "linux")]
+    // `not(miri)`: miri rejects `madvise` with any advice beyond MADV_NORMAL /
+    // RANDOM / SEQUENTIAL / WILLNEED, which would abort every miri test that
+    // allocates here — i.e. most of Storage and Evaluation. The hint is purely a
+    // kernel paging policy and has no observable effect on the returned block, so
+    // dropping it under miri leaves the allocation, the aliasing and the drop path
+    // (the parts the UB gate exists to check) fully covered.
+    #[cfg(all(target_os = "linux", not(miri)))]
     {
         // SAFETY: `ptr`/`size` describe the live allocation just returned.
         // `madvise` only adjusts kernel paging policy for that range; it neither
@@ -350,6 +356,12 @@ mod tests {
         assert_eq!(rounded_size(2 * LARGE_PAGE_ALIGN), 2 * LARGE_PAGE_ALIGN);
     }
 
+    // `miri, ignore`: the last two lengths are ~1 M and ~2 M elements, and the
+    // all-zero assertion walks every one of them — 638 s under miri, measured.
+    // The alignment and round-up logic it checks is covered under miri by
+    // `empty_array_is_valid_and_aligned`, `array_is_mutable_in_place` and
+    // `rounded_size_rounds_up_to_alignment`, which use small lengths.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn array_is_aligned_zeroed_and_correct_length() {
         // A length that does not divide the alignment (exercises the round-up)

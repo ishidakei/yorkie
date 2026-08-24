@@ -13,4 +13,5 @@ yorkie-state = { path = "../yorkie-state" }
 yorkie-storage = { path = "../yorkie-storage" }
 
 [dev-dependencies]
+proptest = "~1.11"
 serde_json = "~1.0"

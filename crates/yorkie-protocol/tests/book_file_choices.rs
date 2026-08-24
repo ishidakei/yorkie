@@ -57,6 +57,7 @@ fn session_for(dir: &str, choice: &str) -> String {
     )
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn the_advertised_choice_list_is_the_expected_ybb_set() {
     assert_eq!(
@@ -76,6 +77,7 @@ fn the_advertised_choice_list_is_the_expected_ybb_set() {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn every_advertised_choice_is_accepted_by_setoption() {
     // A combo rejects any value outside its list with an `option … rejected:`
@@ -93,6 +95,7 @@ fn every_advertised_choice_is_accepted_by_setoption() {
     }
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn every_advertised_book_choice_loads_from_book_dir() {
     for (i, choice) in advertised_choices().iter().enumerate() {
@@ -146,6 +149,7 @@ fn every_advertised_book_choice_loads_from_book_dir() {
     }
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn every_advertised_book_choice_drives_its_priority_series() {
     // The advertised names must work with the Multiple Book enumeration too:

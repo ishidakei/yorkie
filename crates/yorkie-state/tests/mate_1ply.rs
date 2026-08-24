@@ -102,6 +102,7 @@ fn assert_is_mate(pos: &Position, m: Move, ctx: &str) {
     after.undo_move(m, undo);
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn mate_1ply_is_sound_and_deterministic_over_fixture_playouts() {
     const MIN_PLIES: usize = 60;

@@ -224,6 +224,7 @@ fn assert_fixture(fixture: &Fixture, net: &yorkie_eval::NnueNetwork, tt: &mut Tr
     }
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn depth3_search_matches_reference_fixtures() {
     let path = nn_bin_path();

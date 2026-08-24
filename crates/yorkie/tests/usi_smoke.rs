@@ -4,6 +4,7 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn handshake_round_trip_via_spawned_binary() {
     let exe = env!("CARGO_BIN_EXE_yorkie");

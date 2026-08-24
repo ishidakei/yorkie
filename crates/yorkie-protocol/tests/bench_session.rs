@@ -41,6 +41,7 @@ fn bench_summary_positions(out: &str) -> u64 {
 // Syntax variants (hermetic — no network, so each position resigns).
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn bare_bench_runs_the_four_default_positions() {
     // No network loaded → each of the four default positions resigns instantly,
@@ -65,6 +66,7 @@ fn bare_bench_runs_the_four_default_positions() {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn garbage_argument_fails_loudly_without_panicking() {
     // A non-integer TT size is a loud parse error, not a panic and not a search.
@@ -79,6 +81,7 @@ fn garbage_argument_fails_loudly_without_panicking() {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn unsupported_limit_type_fails_loudly() {
     // `perft` / `eval` are out of NPS-bench scope; they are reported, not run.
@@ -89,6 +92,7 @@ fn unsupported_limit_type_fails_loudly() {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn current_source_benches_the_set_position() {
     // `current` benches exactly one position (the session position). With no
@@ -123,6 +127,7 @@ fn bench_session(evaldir: &str, bench_line: &str) -> String {
     drive(&input)
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn two_runs_in_one_process_report_identical_nodes() {
     let dir = TempDir::new("bench-determinism-1proc");
@@ -160,6 +165,7 @@ fn two_runs_in_one_process_report_identical_nodes() {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn two_process_launches_report_identical_nodes() {
     let dir = TempDir::new("bench-determinism-2proc");
@@ -184,6 +190,7 @@ fn two_process_launches_report_identical_nodes() {
 // A threads=2 bench completes and reports a summary (no determinism).
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn threads_two_bench_completes_and_reports() {
     let dir = TempDir::new("bench-threads2");

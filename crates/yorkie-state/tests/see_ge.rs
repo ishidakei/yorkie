@@ -420,6 +420,7 @@ fn is_capture(board: &Board, m: Move) -> bool {
 /// monotonicity check (`see_ge(v)` implies `see_ge(v')` for all `v' <= v`).
 const THRESHOLDS: [i32; 9] = [-3000, -900, -90, -1, 0, 1, 90, 900, 3000];
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn see_ge_is_deterministic_and_panic_free_on_fixture_playouts() {
     const MIN_PLIES: usize = 40;

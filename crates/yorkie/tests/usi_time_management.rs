@@ -177,6 +177,7 @@ impl Engine {
     }
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn go_depth_2_and_3_match_fixtures_via_binary() {
     let Some(mut eng) = Engine::start() else {
@@ -236,6 +237,7 @@ fn go_depth_2_and_3_match_fixtures_via_binary() {
     eng.quit();
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn threads_cycle_single_thread_matches_fixture_multi_thread_is_legal() {
     // The Lazy-SMP re-scope of the Threads-cycle gate. Cycling `setoption name
@@ -285,6 +287,7 @@ fn threads_cycle_single_thread_matches_fixture_multi_thread_is_legal() {
 /// Multi-thread session smoke tests, all at `Threads=2`.
 /// Each drives the spawned binary; each asserts exactly one *legal* bestmove and
 /// prompt termination (the search results are nondeterministic under Lazy SMP).
+#[cfg_attr(miri, ignore)]
 #[test]
 fn threads2_go_movetime_and_depth_and_infinite_and_fischer() {
     let Some(mut eng) = Engine::start() else {
@@ -386,6 +389,7 @@ fn assert_legal_move_after(setup: &[String], best: &str) {
     assert!(legal.contains(&mv), "bestmove {best:?} is not legal");
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn go_infinite_then_stop_yields_one_prompt_bestmove() {
     let Some(mut eng) = Engine::start() else {
@@ -421,6 +425,7 @@ fn go_infinite_then_stop_yields_one_prompt_bestmove() {
     eng.quit();
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn go_movetime_returns_within_a_generous_bound() {
     let Some(mut eng) = Engine::start() else {
@@ -449,6 +454,7 @@ fn go_movetime_returns_within_a_generous_bound() {
     eng.quit();
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn fischer_mini_game_makes_every_deadline_with_one_bestmove_each() {
     let Some(mut eng) = Engine::start() else {
@@ -510,6 +516,7 @@ fn fischer_mini_game_makes_every_deadline_with_one_bestmove_each() {
     eng.quit();
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn byoyomi_mini_game_makes_every_deadline_with_one_bestmove_each() {
     let Some(mut eng) = Engine::start() else {

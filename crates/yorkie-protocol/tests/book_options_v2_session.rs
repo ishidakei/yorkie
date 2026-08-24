@@ -57,6 +57,7 @@ fn v2_prefix(dir: &str) -> String {
 // The handshake surface.
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn v2_profile_handshake_surface() {
     let dir = TempDir::new("v2-handshake");
@@ -127,6 +128,7 @@ fn v2_profile_handshake_surface() {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn absent_profile_file_keeps_the_v1_surface() {
     let dir = TempDir::new("v2-absent");
@@ -140,6 +142,7 @@ fn absent_profile_file_keeps_the_v1_surface() {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn a_v1_profile_file_keeps_the_v1_surface() {
     let dir = TempDir::new("v2-explicit-v1");
@@ -152,6 +155,7 @@ fn a_v1_profile_file_keeps_the_v1_surface() {
 // The eval-diff option name follows the root side to move.
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn v2_black_root_filters_with_the_black_eval_diff() {
     let dir = TempDir::new("v2-eval-black");
@@ -212,6 +216,7 @@ fn v2_black_root_filters_with_the_black_eval_diff() {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn v2_white_root_filters_with_the_white_eval_diff() {
     let dir = TempDir::new("v2-eval-white");
@@ -275,6 +280,7 @@ fn v2_white_root_filters_with_the_white_eval_diff() {
 // The depth-floor option name follows the root side to move.
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn v2_depth_floor_follows_the_root_side_to_move() {
     let dir = TempDir::new("v2-depth");
@@ -342,6 +348,7 @@ fn v2_depth_floor_follows_the_root_side_to_move() {
 // V1 behaviour is untouched when no profile file is present.
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn v1_still_uses_the_single_eval_diff_and_depth_limit() {
     let dir = TempDir::new("v1-unchanged");

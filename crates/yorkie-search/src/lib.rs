@@ -383,6 +383,7 @@ mod tests {
     // capture is the only child with three.
     const ONE_CAPTURE_SFEN: &str = "4k4/9/9/4p4/4G4/9/9/9/4K4 b - 1";
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn no_legal_move_returns_none() {
         let net = net_with_ft(patterned_ft());
@@ -394,6 +395,7 @@ mod tests {
         assert!(sink.reports.is_empty());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn one_capture_is_chosen() {
         let p = pos(ONE_CAPTURE_SFEN);
@@ -422,6 +424,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn tie_break_is_first_in_generation_order() {
         // The zero network scores every child 0, so all legal moves tie; the
@@ -437,6 +440,7 @@ mod tests {
         assert_eq!(result.score_cp, 0);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn choice_is_deterministic_across_runs() {
         let p = pos(ONE_CAPTURE_SFEN);
@@ -448,6 +452,7 @@ mod tests {
         assert_eq!(a.nodes, b.nodes);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn greedy_choice_equals_full_refresh_argmax() {
         // Several positions, including drops (hand pieces) and promotion-zone
@@ -472,6 +477,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn emits_one_info_report_with_expected_fields() {
         let p = pos(ONE_CAPTURE_SFEN);

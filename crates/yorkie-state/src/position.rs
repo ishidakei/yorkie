@@ -1553,6 +1553,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn incremental_key_matches_from_scratch_on_random_playouts() {
         const MIN_PLIES: usize = 30;
@@ -1773,6 +1774,7 @@ mod tests {
         assert_eq!(p.pawn_key(), crate::key::NO_PAWNS_SEED);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn key_agrees_with_repetition_equality_on_sennichite() {
         // Along the sennichite perft fixture's move list, every recurrence that
@@ -1889,6 +1891,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn is_repetition_none_before_and_draw_at_sennichite_recurrence() {
         // The sennichite fixture is a four-ply king shuffle: the root recurs
@@ -2224,6 +2227,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn gives_check_matches_stored_history_flag_over_playouts() {
         // The oracle: `Position::gives_check(m)` must equal the post-`do_move`
@@ -2266,6 +2270,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn is_repetition_survives_do_undo_round_trip() {
         // Record is_repetition at every ply on the way down the sennichite
@@ -2363,6 +2368,7 @@ mod tests {
         assert_eq!(a.history, b.history, "{ctx}: history");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn do_undo_round_trip_is_identity_over_playouts() {
         // The playout leg: from every parity fixture, walk a deterministic

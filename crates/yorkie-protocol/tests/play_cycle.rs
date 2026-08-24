@@ -46,6 +46,7 @@ fn is_well_formed_usi_move(s: &str) -> bool {
     true
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn multi_cycle_without_network_survives_and_resigns() {
     let session = "usi\n\
@@ -82,6 +83,7 @@ fn multi_cycle_without_network_survives_and_resigns() {
     }
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn position_then_go_after_sfen_without_network_resigns() {
     let sfen = yorkie_state::STARTPOS_SFEN;
@@ -102,6 +104,7 @@ fn position_then_go_after_sfen_without_network_resigns() {
     assert_eq!(bestmoves, vec!["resign"], "in:\n{out}");
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn usinewgame_between_cycles_without_network_resigns() {
     let session = "usi\n\

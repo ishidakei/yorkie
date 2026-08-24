@@ -1270,6 +1270,7 @@ mod tests {
         MovePicker::new_qsearch(p, tt, SENTINEL_PLANES, false)
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn qsearch_captures_are_ordered_by_victim_value_descending() {
         let p = pos("9/9/9/9/b3R3g/9/4p4/9/K7k b - 1");
@@ -1281,6 +1282,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn qsearch_equal_value_victims_keep_reference_generation_order() {
         let p = pos("9/9/9/2p1p4/2S1G4/9/9/9/K7k b - 1");
@@ -1291,6 +1293,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn qsearch_tt_move_is_yielded_first_and_not_duplicated() {
         let p = pos("9/9/9/9/b3R3g/9/4p4/9/K7k b - 1");
@@ -1307,6 +1310,7 @@ mod tests {
         assert_eq!(order.iter().filter(|s| *s == "5e5g").count(), 1);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn qsearch_not_in_check_yields_only_captures_no_quiet_checks() {
         let p = pos("k8/9/9/9/4R4/9/4p4/9/8K b - 1");
@@ -1316,6 +1320,7 @@ mod tests {
         assert_eq!(order, vec!["5e5g".to_string()]);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn qsearch_generate_all_legal_moves_adds_capture_nonpromotion() {
         // A Black lance on 5d capturing a White pawn on 5b (rank 1, enemy second
@@ -1345,6 +1350,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn qsearch_evasions_are_exactly_the_legal_set_with_captures_first() {
         let p = pos("4r4/5G3/9/9/9/9/9/9/4K3k b - 1");
@@ -1395,6 +1401,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn main_capture_order_is_mvv_with_initial_histories() {
         let p = pos("9/9/9/9/b3R3g/9/4p4/9/K7k b - 1");
@@ -1412,6 +1419,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn main_tt_move_leads_and_is_never_duplicated() {
         let p = pos("9/9/9/9/b3R3g/9/4p4/9/K7k b - 1");
@@ -1425,6 +1433,7 @@ mod tests {
         assert_eq!(order.iter().filter(|s| *s == "5e5g").count(), 1);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn main_emits_every_legal_move_exactly_once_not_in_check() {
         let p =
@@ -1440,6 +1449,7 @@ mod tests {
         assert_eq!(emitted_set, legal_capture_and_quiet_set(&p));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn main_emits_every_legal_move_exactly_once_with_tt() {
         let p =
@@ -1462,6 +1472,7 @@ mod tests {
         assert_eq!(emitted_set, legal_capture_and_quiet_set(&p));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn main_good_bad_capture_split_respects_see_boundary() {
         let p = pos("6rkg/8G/9/9/9/9/9/9/K8 b - 1");
@@ -1500,6 +1511,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn main_skip_quiet_moves_drops_quiets_but_keeps_bad_captures() {
         let p =
@@ -1528,6 +1540,7 @@ mod tests {
         assert_eq!(kept_set, full_caps, "captures must be unaffected by skip");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn main_skip_mid_iteration_still_replays_bad_captures() {
         let p =
@@ -1559,6 +1572,7 @@ mod tests {
         assert_eq!(seen_caps, full_caps, "bad captures must still be replayed");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn main_in_check_emits_exactly_the_legal_evasions() {
         let p = pos("4r4/5G3/9/9/9/9/9/9/4K3k b - 1");
@@ -1575,6 +1589,7 @@ mod tests {
         assert_eq!(format_usi_move(emitted[0]), "4b5a");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn main_quiet_direct_check_bonus_orders_a_checking_move_first() {
         let p = pos("4k4/9/R8/9/9/9/9/9/8K b - 1");
@@ -1615,6 +1630,7 @@ mod tests {
     /// emitted. If `mainHistory` for one quiet is bumped between draining the
     /// captures and entering `QUIET_INIT`, the eager (construction-time) design
     /// would miss it, but the staged design must surface the bumped quiet first.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn quiet_scoring_reads_table_update_made_after_captures() {
         // Rook on 5e: one good capture (the pawn on 5g) then many quiet rook /
@@ -1677,6 +1693,7 @@ mod tests {
     /// the TT move. A `captureHistory` bump applied between constructing the
     /// picker (TT emitted) and the first non-TT `next_move` must reorder the
     /// good captures — the property the eager snapshot could not honour.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn capture_scoring_reads_table_update_made_after_tt() {
         // Two equal-victim captures so the tie-break is decided by captureHistory:
@@ -1741,6 +1758,7 @@ mod tests {
     /// Sanity: the continuation planes are read live. Two sibling quiets whose
     /// only score difference is one continuation plane cell must reorder when
     /// that cell is bumped between construction and `QUIET_INIT`.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn quiet_scoring_reads_live_continuation_plane() {
         let p = pos("9/9/9/9/4R4/9/9/9/K7k b - 1");
@@ -1778,6 +1796,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn illegal_quiet_in_buffer_reorders_the_legal_quiets() {
         // Hand-computed partial-sort tail swap driven purely by a
@@ -2053,6 +2072,7 @@ mod tests {
         },
     ];
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn gate_main_pickers_match_twin_across_histories_and_skip_schedules() {
         // Distinct history profiles: fresh, and several signed fills that push
@@ -2076,6 +2096,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn gate_qsearch_pickers_match_twin() {
         let cases: &[(&str, Option<&str>)] = &[
@@ -2102,6 +2123,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn gate_probcut_pickers_match_twin() {
         let sfens = [

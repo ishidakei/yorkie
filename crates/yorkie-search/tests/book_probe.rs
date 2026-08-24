@@ -69,6 +69,7 @@ fn to_book_moves(moves: &[ExpectedMove]) -> Vec<BookMove> {
 
 const STARTPOS: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn probe_matches_expected_in_both_modes() {
     let path = fixture("tests/fixtures/book/sample.ybb");
@@ -100,6 +101,7 @@ fn probe_matches_expected_in_both_modes() {
     }
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn probe_misses_in_both_modes() {
     let path = fixture("tests/fixtures/book/sample.ybb");
@@ -130,6 +132,7 @@ fn probe_misses_in_both_modes() {
     assert!(on_the_fly.probe(&packed_off, 2, false).unwrap().is_none());
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn truncated_or_corrupt_files_never_panic() {
     let path = fixture("tests/fixtures/book/sample.ybb");

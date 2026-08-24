@@ -14,6 +14,7 @@ fn nn_bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../eval/nn.bin")
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn loads_real_network_if_present() {
     let path = nn_bin_path();

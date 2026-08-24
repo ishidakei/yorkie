@@ -502,6 +502,7 @@ mod tests {
     }
 
     // i32::MIN / MAX witness the i64-squaring path: mullo_epi32 would wrap.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn sqr_clipped_relu_matches_scalar_on_boundary_values() {
         require_avx512bw!();
@@ -645,6 +646,7 @@ mod tests {
         fc_2_out[0].wrapping_add(fc_0_out[HIDDEN1_DIMS])
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn fused_fc_chain_matches_per_layer_flow_for_all_buckets() {
         require_vnni!();

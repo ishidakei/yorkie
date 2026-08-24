@@ -73,6 +73,7 @@ fn assert_fixture_depth(name: &str, depth: u32) {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn perft_parity_default_depths() {
     for name in FIXTURES {

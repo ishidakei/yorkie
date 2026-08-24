@@ -54,6 +54,7 @@ fn legal_moves(p: &Position) -> Vec<Move> {
     moves
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn real_network_self_play_stays_legal_and_exits_cleanly() {
     let dir = eval_dir();

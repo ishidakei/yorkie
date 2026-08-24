@@ -107,6 +107,7 @@ pub fn read_engine_option_profile(path: &Path) -> BookOptionsVersion {
 mod tests {
     use super::*;
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn empty_or_absent_input_is_v1() {
         assert_eq!(parse_engine_option_profile(""), BookOptionsVersion::V1);
@@ -225,6 +226,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn reads_a_real_file() {
         let dir =

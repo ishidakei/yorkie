@@ -533,6 +533,7 @@ mod tests {
 
     // ---- WorkerHistories init/clear under the large-page allocation -------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn worker_histories_new_applies_reference_init_values() {
         // The tables live on the shared huge-page allocator; this pins that the
@@ -618,6 +619,7 @@ mod tests {
 
     // ---- update_continuation_histories ------------------------------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn continuation_histories_writes_expected_cells() {
         // A stack where (ss-1)..(ss-6) all have distinct ok currentMoves and
@@ -659,6 +661,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn continuation_histories_skips_deep_plies_when_in_check() {
         // With the current cell in check, only i <= 2 are updated.
@@ -695,6 +698,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn continuation_histories_skips_null_prev_moves() {
         // A ply whose currentMove is not ok is skipped.
@@ -724,6 +728,7 @@ mod tests {
 
     // ---- update_quiet_histories -------------------------------------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn quiet_histories_hand_computed() {
         let mut hist = WorkerHistories::new();
@@ -774,6 +779,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn quiet_histories_negative_bonus_uses_550_pawn_scale() {
         let mut hist = WorkerHistories::new();
@@ -796,6 +802,7 @@ mod tests {
 
     // ---- update_all_stats -------------------------------------------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn all_stats_capture_best_updates_capture_history() {
         // Black rook on 5e captures a white pawn on 5d. bestMove is a capture,
@@ -838,6 +845,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn all_stats_quiet_best_bumps_best_and_decays_others() {
         // bestMove is a quiet pawn push; one other quiet was searched. The best
@@ -890,6 +898,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn all_stats_non_best_capture_gets_malus() {
         // A non-best capture in capturesSearched gets captureHistory
@@ -935,6 +944,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn all_stats_refutation_penalty_hits_prev_ply_continuation() {
         // prevSq real, (ss-1).moveCount == 1 + ttHit, !priorCapture ⇒ the
@@ -992,6 +1002,7 @@ mod tests {
 
     // ---- update_correction_history ----------------------------------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn correction_history_hand_computed() {
         // A position with a black pawn already on 5d, so that (ss-1)'s move
@@ -1073,6 +1084,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn correction_history_skips_continuation_when_prev_move_not_ok() {
         // With (ss-1).currentMove not ok, only the four channel writes fire.

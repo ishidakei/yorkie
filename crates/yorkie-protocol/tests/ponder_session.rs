@@ -67,6 +67,7 @@ fn assert_legal_after(moves: &[&str], tok: &str) {
 // 1. `go ponder` holds; `stop` releases exactly one bestmove.
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn go_ponder_holds_until_stop() {
     let dir = TempDir::new("ponder-hold-stop");
@@ -101,6 +102,7 @@ fn go_ponder_holds_until_stop() {
 // 2. `go ponder` then `ponderhit`: one bestmove, emitted after the ponderhit.
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn ponderhit_continues_and_emits_one_bestmove() {
     let dir = TempDir::new("ponder-hit");
@@ -142,6 +144,7 @@ fn ponderhit_continues_and_emits_one_bestmove() {
 // 3. `stopOnPonderhit`: tiny clock, ponderhit well after the budget is spent.
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn stop_on_ponderhit_stops_promptly_after_a_late_ponderhit() {
     let dir = TempDir::new("ponder-stoponhit");
@@ -185,6 +188,7 @@ fn stop_on_ponderhit_stops_promptly_after_a_late_ponderhit() {
 //    position, exactly one bestmove (legal in the current position).
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn stochastic_ponder_reissues_on_the_current_position() {
     let dir = TempDir::new("ponder-stochastic");
@@ -223,6 +227,7 @@ fn stochastic_ponder_reissues_on_the_current_position() {
 // 5. `gameover` during `go ponder` still terminates the search.
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn gameover_terminates_a_pondering_search() {
     let dir = TempDir::new("ponder-gameover");

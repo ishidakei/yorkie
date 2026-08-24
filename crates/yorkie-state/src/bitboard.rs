@@ -1613,6 +1613,7 @@ mod tests {
     /// over empty / all-ones / 100_000 deterministic random occupancies. On any
     /// mismatch the test fails outright (do not tune to pass — the algorithm is
     /// wrong).
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn qugiy_slides_equal_ray_walk_oracle() {
         // Deterministic xorshift-128; no `rand` dependency in tests.
@@ -1721,6 +1722,7 @@ mod tests {
     /// The lane-native production slides equal the retained packed-u128 Qugiy
     /// oracle over the structural + pseudo-random corpus (issue Part B.6). This
     /// is independent of the ray-walk oracle above.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn lane_native_equals_packed_qugiy_oracle() {
         for occ in sample_occupancies() {
@@ -1860,6 +1862,7 @@ mod tests {
     /// four-ray oracle and the scalar-`Bitboard256` oracle over the structural
     /// corpus plus a 100k deterministic pseudo-random occupancy gate. Any mismatch
     /// fails outright.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn bishop_matches_four_ray_and_scalar256_oracles() {
         let mut state: u128 = 0xF00D_CAFE_1234_5678_9ABC_DEF0_0FED_CBA9;
@@ -2139,6 +2142,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn aligned_equals_reference_all_triples() {
         // 81^3 ≈ 531k combinations — exhaustive over every king/anchor triple.
@@ -2246,6 +2250,7 @@ mod tests {
         out
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn slider_queries_equal_scalar_walk() {
         let bishop_dirs = [(1, -1), (-1, -1), (1, 1), (-1, 1)];
@@ -2500,6 +2505,7 @@ mod twin {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn every_value_matches_twin() {
         for bits in corpus() {
@@ -2507,6 +2513,7 @@ mod twin {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn set_clear_and_without_index_match_twin() {
         for bits in corpus() {
@@ -2527,6 +2534,7 @@ mod twin {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn binary_ops_match_twin() {
         let c = corpus();
@@ -2559,6 +2567,7 @@ mod twin {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn chained_compositions_match_twin() {
         let c = corpus();

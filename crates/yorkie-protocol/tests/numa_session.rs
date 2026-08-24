@@ -22,6 +22,7 @@ fn drive(input: &str) -> String {
     String::from_utf8(bytes).expect("utf-8")
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn numa_policy_none_emits_both_lines_threads_emits_allocation_only() {
     // `NumaPolicy none` first (both lines), then `Threads value 2` (allocation
@@ -62,6 +63,7 @@ fn numa_policy_none_emits_both_lines_threads_emits_allocation_only() {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn numa_policy_config_line_matches_available_processors_format() {
     // The config line begins with the exact reference prefix and a non-empty

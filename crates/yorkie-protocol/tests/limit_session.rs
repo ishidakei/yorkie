@@ -90,6 +90,7 @@ fn go_and_wait(h: &StreamHarness, position: &str, go: &str, expect_bestmoves: us
 // USI_Hash.
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn usi_hash_small_matches_default_fixed_depth() {
     // A small USI_Hash only changes speed, not a fixed-depth result: the depth-3
@@ -118,6 +119,7 @@ fn usi_hash_small_matches_default_fixed_depth() {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn usi_hash_mid_session_resize_between_gos() {
     // A resize between two go's works and the second search completes. The
@@ -159,6 +161,7 @@ fn usi_hash_mid_session_resize_between_gos() {
 // DepthLimit / NodesLimit.
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn depth_limit_caps_search_and_matches_plain_go_depth() {
     // With DepthLimit 2 and a generous movetime the search stops at depth 2 (no
@@ -206,6 +209,7 @@ fn depth_limit_caps_search_and_matches_plain_go_depth() {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn nodes_limit_matches_go_nodes() {
     // With NodesLimit N (below the position's uncapped node count) the final
@@ -237,6 +241,7 @@ fn nodes_limit_matches_go_nodes() {
 // MaxMovesToDraw.
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn max_moves_to_draw_adjudicates_a_draw_past_the_horizon() {
     // A mate-in-1 position at a high game ply. Unlimited (MaxMovesToDraw 0 =
@@ -287,6 +292,7 @@ fn max_moves_to_draw_adjudicates_a_draw_past_the_horizon() {
 // Gameover (handled exactly like stop).
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn gameover_releases_infinite_search_and_a_fresh_go_works() {
     // `go infinite` then `gameover lose` releases the bestmove exactly as `stop`
@@ -336,6 +342,7 @@ fn gameover_releases_infinite_search_and_a_fresh_go_works() {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn gameover_result_token_is_optional_and_ignored() {
     // A bare `gameover` (no win/lose/draw token) is accepted and releases the

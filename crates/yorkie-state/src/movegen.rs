@@ -1368,6 +1368,7 @@ mod tests {
     /// Deterministic random playouts from each seed; at every ply the in-place
     /// predicate must agree with the clone-and-probe oracle on the pawn-drop-mate
     /// candidate. Gate (a)/(b): parity-fixture playouts + drop-mate-rich seeds.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn legal_drop_matches_clone_probe_oracle_over_playouts() {
         const MIN_PLIES: usize = 40;
@@ -1880,6 +1881,7 @@ mod gate_318 {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn piece_set_matches_scan_over_playouts() {
         const MIN_PLIES: usize = 60;

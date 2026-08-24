@@ -17,6 +17,18 @@
 //! (middle bits kept zero). The side-to-move is OR-ed into cluster-index bit 0,
 //! so fixing `hi` **and** `side` keeps a family of keys in one cluster while the
 //! fragment varies.
+//!
+//! # Why every test here is `#[cfg_attr(miri, ignore)]`
+//!
+//! The addressing model above is what forces it: the smallest table these tests
+//! can address is `resize(1)`, one MiB of `AtomicU64`-backed clusters, and miri
+//! interprets every one of those zeroing writes and probes. Measured on the dev
+//! VM, a single `resize(1)` test costs 10–40 minutes under miri (one took 1256 s,
+//! another had not finished after 2340 s), which is far past what a per-slice
+//! gate can absorb. The TT's unsafe surface — the aligned huge-page allocation,
+//! the cluster pointer arithmetic and the drop path — is still covered under
+//! miri by `tt::alloc_tests` and `large_page::tests` in the crate's unit tests,
+//! which exercise the same code at sizes miri can finish.
 
 use yorkie_storage::{Bound, DEPTH_NONE, TTData, TranspositionTable};
 
@@ -46,6 +58,7 @@ fn store(
     w.write(k, value, pv, bound, depth, mv, eval, generation);
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn store_probe_round_trip_every_field() {
     let mut tt = TranspositionTable::new();
@@ -80,6 +93,7 @@ fn store_probe_round_trip_every_field() {
     assert_eq!(data.move16, 0x0abc);
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn every_bound_and_pv_combination_round_trips() {
     let mut tt = TranspositionTable::new();
@@ -104,6 +118,7 @@ fn every_bound_and_pv_combination_round_trips() {
     }
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn miss_on_wrong_key() {
     let mut tt = TranspositionTable::new();
@@ -137,6 +152,7 @@ fn miss_on_wrong_key() {
     assert!(!found);
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn replacement_evicts_lowest_priority_entry() {
     // Fill one three-entry cluster, all written at generation 0 so every
@@ -174,6 +190,7 @@ fn replacement_evicts_lowest_priority_entry() {
     assert!(tt.probe(key(hi, 4), side).0, "frag 4 should now be present");
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn generation_aging_lowers_replacement_priority() {
     // A deep-but-old entry loses to a shallow-but-fresh one once enough
@@ -221,6 +238,7 @@ fn generation_aging_lowers_replacement_priority() {
     assert!(tt.probe(key(hi, 3), side).0, "fresh entry R should survive");
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn save_preserves_move_when_new_move_absent() {
     // The reference keeps the old move if the incoming move is none (0) and the
@@ -245,6 +263,7 @@ fn save_preserves_move_when_new_move_absent() {
     assert_eq!(data.depth, 12, "depth refreshed");
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn resize_sizes_by_formula_and_clears() {
     let mut tt = TranspositionTable::new();
@@ -270,6 +289,7 @@ fn resize_sizes_by_formula_and_clears() {
     assert_eq!(tt.probe(k, 0).1.value, 7);
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn resize_to_same_size_is_a_no_op() {
     let mut tt = TranspositionTable::new();
@@ -290,6 +310,7 @@ fn resize_to_same_size_is_a_no_op() {
     assert!(tt.probe(k, 0).0);
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn clear_zeroes_entries_and_generation() {
     let mut tt = TranspositionTable::new();
@@ -304,6 +325,7 @@ fn clear_zeroes_entries_and_generation() {
     assert!(!tt.probe(k, 0).0, "clear empties every entry");
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn new_search_wraps_within_five_bits() {
     let mut tt = TranspositionTable::new();
@@ -317,6 +339,7 @@ fn new_search_wraps_within_five_bits() {
     assert_eq!(tt.generation(), 0, "generation wraps at 2^5");
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn determinism_identical_sequences_yield_identical_tables() {
     // Two tables driven by byte-identical operation sequences must end in the
@@ -356,6 +379,7 @@ const EXPECTED_TT_ALIGN: usize = if cfg!(target_os = "linux") {
     4096
 };
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn resized_table_base_pointer_is_page_aligned() {
     let mut tt = TranspositionTable::new();
@@ -373,6 +397,7 @@ fn resized_table_base_pointer_is_page_aligned() {
     }
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn fresh_resize_reads_back_all_misses() {
     // The huge-page allocation is `alloc_zeroed`, so a freshly resized table is
@@ -392,6 +417,7 @@ fn fresh_resize_reads_back_all_misses() {
     }
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn resize_grow_shrink_same_cycles_preserve_semantics() {
     // Walk grow → shrink → same across several sizes; after each *change* the
@@ -420,6 +446,7 @@ fn resize_grow_shrink_same_cycles_preserve_semantics() {
     }
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn many_resizes_do_not_leak_or_corrupt() {
     // Repeatedly reallocate under the new aligned layout; each drop frees with
@@ -440,6 +467,7 @@ fn many_resizes_do_not_leak_or_corrupt() {
 /// TT base address and report its `AnonHugePages` figure, so transparent-
 /// huge-page adoption is visible. Never fails the suite — when THP is
 /// disabled (`AnonHugePages: 0 kB`) it simply reports zero.
+#[cfg_attr(miri, ignore)]
 #[test]
 #[cfg(target_os = "linux")]
 fn thp_uptake_diagnostic_over_64mib() {

@@ -4,6 +4,16 @@
 //! Each fixture is a committed miniature sysfs tree under `tests/fixtures/`; the
 //! injectable [`SysfsOptions::root`] points at one, so no test touches the real
 //! machine topology (except the explicitly Linux-gated smoke test at the end).
+//!
+//! Every test in this file is `#[cfg_attr(miri, ignore)]`: reading a fixture is
+//! still a real `std::fs` call, and miri's isolation rejects it outright
+//! (`unsupported operation: `open` not available when isolation is enabled`).
+//! Lifting isolation with `-Zmiri-disable-isolation` is deliberately not done
+//! here — the repo's miri gate runs with isolation on, for the same reason the
+//! proptest-driven tests are ignored rather than un-isolated (see the project's
+//! CI and quality-gate policy). The parsing and topology logic these fixtures
+//! drive has no unsafe code; the crate's unit tests, which take their sysfs
+//! contents as in-memory strings, keep running under miri.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -35,6 +45,7 @@ fn opts(name: &str, allowed: BTreeSet<CpuIndex>, system_threads: CpuIndex) -> Sy
 
 // -- system-NUMA parse from a fixture sysfs tree --------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn system_numa_two_nodes() {
     let o = opts("two_node_l3", all_cpus(8), 8);
@@ -48,6 +59,7 @@ fn system_numa_two_nodes() {
 
 // -- missing-file fallbacks ----------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn missing_cpulist_falls_back_to_single_node() {
     // node1/cpulist is absent, so detection discards the partial config and
@@ -58,6 +70,7 @@ fn missing_cpulist_falls_back_to_single_node() {
     assert_eq!(cfg.nodes()[0], all_cpus(8));
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn missing_online_falls_back_to_single_node() {
     let o = opts("no_online", all_cpus(4), 4);
@@ -68,6 +81,7 @@ fn missing_online_falls_back_to_single_node() {
 
 // -- affinity filtering: respect vs hardware ------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn respect_affinity_filters_disallowed_cpus() {
     // Only CPUs 0..3 are allowed; node1 (CPUs 4..7) becomes empty and is
@@ -79,6 +93,7 @@ fn respect_affinity_filters_disallowed_cpus() {
     assert!(!cfg.is_custom_affinity());
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn hardware_policy_ignores_affinity_but_marks_custom() {
     // respect_affinity = false: the allowed set is ignored, so both nodes
@@ -93,6 +108,7 @@ fn hardware_policy_ignores_affinity_but_marks_custom() {
 
 // -- L3-aware detection + bundling from a fixture -------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn l3_domains_policy_one_node_per_domain() {
     let o = opts("two_node_l3", all_cpus(8), 8);
@@ -105,6 +121,7 @@ fn l3_domains_policy_one_node_per_domain() {
     assert_eq!(cfg.nodes()[3], set(&[6, 7]));
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn bundled_l3_merges_within_system_node() {
     let o = opts("two_node_l3", all_cpus(8), 8);
@@ -115,6 +132,7 @@ fn bundled_l3_merges_within_system_node() {
     assert_eq!(cfg.nodes()[1], set(&[4, 5, 6, 7]));
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn bundled_l3_below_boundary_does_not_merge() {
     let o = opts("two_node_l3", all_cpus(8), 8);
@@ -123,6 +141,7 @@ fn bundled_l3_below_boundary_does_not_merge() {
     assert_eq!(cfg.num_numa_nodes(), 4);
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn bundled_l3_respects_affinity_filter() {
     // Only node0's CPUs are allowed; the L3 domains on node1 vanish.
@@ -134,6 +153,7 @@ fn bundled_l3_respects_affinity_filter() {
 
 // -- logical -> system NUMA node mapping (replication granularity) --------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn bundled_l3_logical_nodes_map_to_their_system_node() {
     // BundledL3{4} over two_node_l3 bundles each system node's two L3 domains
@@ -146,6 +166,7 @@ fn bundled_l3_logical_nodes_map_to_their_system_node() {
     assert_eq!(cfg.system_node_of_logical(1, &o), 1);
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn l3_bundled_logical_nodes_in_one_system_node_share_discriminator() {
     // BundledL3{2} keeps all four L3 domains as distinct logical nodes, but the
@@ -161,6 +182,7 @@ fn l3_bundled_logical_nodes_in_one_system_node_share_discriminator() {
     assert_eq!(cfg.system_node_of_logical(3, &o), 1);
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn system_nodes_for_binding_resolves_a_whole_assignment() {
     // A four-logical-node config (BundledL3{2}); a binding assignment that puts
@@ -175,6 +197,7 @@ fn system_nodes_for_binding_resolves_a_whole_assignment() {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn unassigned_cpu_falls_back_to_system_node_zero() {
     // A custom logical config whose sole CPU (100) does not appear in the
@@ -187,6 +210,7 @@ fn unassigned_cpu_falls_back_to_system_node_zero() {
 // -- best-effort Linux smoke ----------------------------------------------
 
 #[cfg(target_os = "linux")]
+#[cfg_attr(miri, ignore)]
 #[test]
 fn smoke_from_system_real_sys() {
     // Structure-only assertions: the real /sys parses without error and yields

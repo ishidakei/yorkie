@@ -189,6 +189,7 @@ fn assert_fixture(name: &str, net: &yorkie_eval::NnueNetwork, tt: &mut Transposi
 
 /// All six fixtures gate `bestmove` / `score` / `nodes` hard, as one
 /// inseparable set. Skipped with a notice when `nn.bin` is absent.
+#[cfg_attr(miri, ignore)]
 #[test]
 fn depth5_search_matches_reference_fixtures() {
     let path = nn_bin_path();

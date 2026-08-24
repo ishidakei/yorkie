@@ -10,6 +10,7 @@ fn drive(input: &str) -> String {
     String::from_utf8(bytes).expect("utf-8")
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn full_usi_to_usiok_golden() {
     let out = drive("usi\nquit\n");
@@ -59,6 +60,7 @@ usiok\n";
     assert_eq!(out, expected);
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn isready_without_network_reports_load_failure() {
     // Default EvalDir (`eval`) has no `nn.bin` in the test CWD, so the load
@@ -77,12 +79,14 @@ fn isready_without_network_reports_load_failure() {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn unknown_command_emits_info_string() {
     let out = drive("frobnicate\nquit\n");
     assert_eq!(out, "info string unknown command: frobnicate\n");
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn oversized_line_emits_command_too_long() {
     // 64 KB + 1 byte → TooLong. Followed by a real line so the driver loops past it.
@@ -93,6 +97,7 @@ fn oversized_line_emits_command_too_long() {
     assert_eq!(out, "info string command too long\n");
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn full_handshake_then_setoption_then_quit() {
     let out = drive("usi\nsetoption name USI_Hash value 256\nisready\nquit\n");
@@ -104,6 +109,7 @@ fn full_handshake_then_setoption_then_quit() {
     assert!(!out.contains("readyok"));
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn usinewgame_emits_nothing() {
     let out = drive("usinewgame\nquit\n");

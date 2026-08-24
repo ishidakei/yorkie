@@ -218,6 +218,7 @@ mod tests {
         assert!(err.0.contains("perft"), "message names the type: {err}");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn missing_file_errors() {
         let tokens = ["16", "1", "5", "/no/such/bench/file", "depth"].map(String::from);

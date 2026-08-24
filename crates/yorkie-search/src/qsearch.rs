@@ -3914,6 +3914,7 @@ mod tests {
     /// evaluation point along the real search. Uses the real network (nonzero
     /// weights, so a wrong accumulator would change the eval and trip the check);
     /// skipped when `nn.bin` is absent, exactly like the other real-network tests.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn differential_accumulator_matches_refresh_at_every_eval_site() {
         let path = real_nn_bin();
@@ -3986,6 +3987,7 @@ mod tests {
         assert_eq!(value_draw(4), -1);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn draw_value_table_matches_defaults_and_contempt() {
         let net = zero_net();
@@ -4017,6 +4019,7 @@ mod tests {
         assert_eq!(q.draw_contempt, -1);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn set_draw_value_signs_the_repetition_draw_row_per_side() {
         // `set_draw_value(contempt)` installs the pawn-scaled
@@ -4061,6 +4064,7 @@ mod tests {
 
     const TWO_KINGS: &str = "4k4/9/9/9/9/9/9/9/4K4 b - 1";
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn stand_pat_cutoff_adjusts_and_writes_unsearched_lower_bound() {
         let net = zero_net();
@@ -4120,6 +4124,7 @@ mod tests {
         assert!(!p.see_ge(m, -128), "SEE(-225) must fail a -128 gate");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn futility_first_prune_floors_bestvalue_at_futility_value() {
         // alpha == 418 == futilityBase(328) + PawnValue(90): the first futility
@@ -4134,6 +4139,7 @@ mod tests {
         assert_eq!(out.nodes, 0, "the only capture is futility-pruned");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn futility_see_branch_floors_bestvalue_at_min_alpha_base() {
         // alpha == 200: futilityValue(418) > alpha, but SEE(-225) < alpha -
@@ -4149,6 +4155,7 @@ mod tests {
         assert_eq!(out.nodes, 0);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn see_minus_73_skips_a_losing_capture() {
         // alpha == 0: futility does not prune (futilityValue 418 > 0, SEE clears
@@ -4174,6 +4181,7 @@ mod tests {
     // immediately.
     const THREE_CAPTURES: &str = "6k2/9/9/9/b3R3g/9/4p4/9/K8 b - 1";
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn movecount_prune_drops_the_third_capture() {
         let p = pos(THREE_CAPTURES);
@@ -4195,6 +4203,7 @@ mod tests {
         assert_eq!(out.value, 0);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn prevsq_exemption_lets_a_recapture_past_movecount_pruning() {
         // Same position, but drive qsearch directly with `(ss-1)->currentMove`
@@ -4221,6 +4230,7 @@ mod tests {
         assert_eq!(q.nodes, 3, "the recapture is exempt from moveCount pruning");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn correction_value_is_eval_neutral_on_fresh_tables() {
         // On fresh correction tables (unified channels all 0,
@@ -4281,6 +4291,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn leaf_qsearch_correction_value_reads_live_worker_update() {
         // A leaf `correction_value` read must reflect an update made to the one
@@ -4307,6 +4318,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn leaf_qsearch_value_reflects_worker_correction_update() {
         // End-to-end: a quiet, not-in-check startpos qsearch stand-pats to the
@@ -4352,6 +4364,7 @@ mod tests {
     // escape or capture). The capturing move gives check.
     const CAPTURE_MATE: &str = "k8/p8/G8/9/9/9/9/9/L7K b - 1";
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn givescheck_exemption_searches_a_checking_capture_under_futility() {
         let p = pos(CAPTURE_MATE);
@@ -4393,6 +4406,7 @@ mod tests {
 
     const QUIET_CHECK: &str = "k8/9/9/9/4R4/9/9/9/8K b - 1";
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn quiet_tt_move_is_dropped_by_the_capture_filter() {
         let p = pos(QUIET_CHECK);
@@ -4437,6 +4451,7 @@ mod tests {
     // Black to move and checkmated: a head-gold wall backed by the white king.
     const BLACK_MATED: &str = "4K4/3ggg3/4k4/9/9/9/9/9/9 b - 1";
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn no_evasion_in_check_returns_mated_in_ply() {
         let p = pos(BLACK_MATED);
@@ -4456,6 +4471,7 @@ mod tests {
     // Black to move with a 1-ply gold-drop mate (G*8a).
     const MATE_IN_1: &str = "k8/9/G1N6/9/9/9/9/9/8K b G 1";
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn mate_1ply_short_circuits_with_exact_tt_write() {
         let p = pos(MATE_IN_1);
@@ -4484,6 +4500,7 @@ mod tests {
     // Repetition draws + the ±1 dither.
     // -----------------------------------------------------------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn max_ply_returns_draw_with_dither() {
         let net = zero_net();
@@ -4502,6 +4519,7 @@ mod tests {
         assert_eq!(q.qsearch(&mut p, MAX_PLY, -1, 0), -1 + value_draw(2)); // 0
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn repetition_draw_is_detected_with_dither() {
         let net = zero_net();
@@ -4554,6 +4572,7 @@ mod tests {
     // ReadTT=false ignores hits; determinism.
     // -----------------------------------------------------------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn read_tt_false_ignores_a_cutoff_entry() {
         let net = zero_net();
@@ -4577,6 +4596,7 @@ mod tests {
         assert_eq!(without_tt.value, 0, "ReadTT=false ignores the entry");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn search_is_deterministic_across_runs() {
         let net = zero_net();
@@ -4591,6 +4611,7 @@ mod tests {
 
     // The reference folds EVERY worker's `bestMoveChanges` into `totBestMoveChanges`
     // and zeroes each, on the main thread only (`yaneuraou-search.cpp`).
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn fold_best_move_changes_sums_and_zeroes_every_slot() {
         let net = zero_net();
@@ -4641,6 +4662,7 @@ mod tests {
     // in `check_time`, copies the stamped instant into `tm.ponderhit_time` the
     // moment the ponder flag is seen cleared (the reference `set_ponderhit`
     // ordering, `yaneuraou-search.cpp`).
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn sync_ponderhit_copies_the_stamped_instant_before_the_budget_decision() {
         let net = zero_net();
@@ -4711,6 +4733,7 @@ mod tests {
     // evaluation or do_move, so a synthetic zero network suffices.
     // -----------------------------------------------------------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn run_root_resigns_with_no_legal_move() {
         let net = zero_net();
@@ -4727,6 +4750,7 @@ mod tests {
         assert_eq!(out.nodes, 0);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn run_root_declares_a_nyugyoku_win() {
         let net = zero_net();
@@ -4749,6 +4773,7 @@ mod tests {
     // the driver's job; here the search field is set directly.
     // -----------------------------------------------------------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn qsearch_forced_draw_past_max_moves_to_draw_is_exact() {
         // A quiet, non-repetition position at game_ply 60. With the horizon set
@@ -4771,6 +4796,7 @@ mod tests {
         assert_eq!(out.nodes, 0, "the horizon draw returns before any do_move");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn qsearch_default_horizon_does_not_force_draw() {
         // The same position under the default (unlimited) horizon runs a real
@@ -4790,6 +4816,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn run_root_max_moves_to_draw_suppresses_a_mate() {
         // A gold-drop head mate (`G*8a`) at a high game ply — the White king on
@@ -4838,6 +4865,7 @@ mod tests {
     // static eval is 0.
     // -----------------------------------------------------------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn reductions_table_and_reduction_formula() {
         let net = zero_net();
@@ -4870,6 +4898,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn move_stat_score_capture_and_quiet() {
         let net = zero_net();
@@ -4897,6 +4926,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn razoring_boundary_returns_qsearch_without_do_move() {
         let net = zero_net();
@@ -4922,6 +4952,7 @@ mod tests {
         assert!(not_nodes > 0, "at the boundary razoring must not fire");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn futility_boundary_returns_two_beta_plus_eval_over_three() {
         let net = zero_net();
@@ -4948,6 +4979,7 @@ mod tests {
         assert!(n2 > 0, "at the boundary futility must not fire");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn null_move_boundary_returns_null_value() {
         let net = zero_net();
@@ -5002,6 +5034,7 @@ mod tests {
         assert!(n2 > 0, "at the boundary null move must not fire");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn probcut_returns_value_minus_margin() {
         let net = zero_net();
@@ -5037,6 +5070,7 @@ mod tests {
         assert_eq!(n, 1, "one ProbCut capture is searched");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn fail_low_writes_the_documented_bonuses() {
         let net = zero_net();
@@ -5098,6 +5132,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn interior_smoke_runs_and_leaves_state_balanced() {
         let net = zero_net();
@@ -5184,6 +5219,7 @@ mod tests {
         .sum()
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn torn_tt_move_decode_is_total_over_all_patterns() {
         let positions: Vec<Position> = TORN_ENTRY_SFENS.iter().map(|s| pos(s)).collect();
@@ -5409,6 +5445,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn to_move_widen_chain_totality_and_oracle() {
         for sfen in TORN_ENTRY_SFENS {
@@ -5417,6 +5454,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn to_move_widen_chain_oracle_over_playouts() {
         // Gate 2 requires the legal-move oracle to hold along a deterministic

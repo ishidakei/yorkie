@@ -63,6 +63,7 @@ fn richest_fixture() -> (String, Vec<String>) {
     (sfen, moves)
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn fv_scale_24_divides_raw_output_by_24() {
     let nn_bin = workspace_relative("eval/nn.bin");

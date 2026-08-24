@@ -583,6 +583,7 @@ mod tests {
 
     // Two independently constructed entropy-seeded streams differ (the time /
     // address / counter mix), mirroring the reference's per-process `PRNG()` seed.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn entropy_seeds_differ_across_constructions() {
         let a = Prng::random_seed();
@@ -726,6 +727,7 @@ mod tests {
         std::slice::from_ref(book)
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn eval_diff_zero_keeps_only_the_best_value_move() {
         let book = three_move_book();
@@ -741,6 +743,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn wide_eval_diff_selects_within_the_surviving_set() {
         let book = three_move_book();
@@ -876,6 +879,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn v2_eval_diff_uses_the_white_option_at_a_white_root() {
         let book = three_move_book_white();
@@ -907,6 +911,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn v2_depth_limit_uses_the_side_to_move_option() {
         // Best-move depth is 20 in both books.
@@ -961,6 +966,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn v2_ignores_the_v1_only_filter_values() {
         // A V1-only eval gap / depth floor that would filter everything must have
@@ -1009,6 +1015,7 @@ mod tests {
         Book::from_memory(build_ybb(&recs)).expect("valid ybb")
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn first_hit_wins_and_never_merges_across_books() {
         let books = vec![priority_book_0(), priority_book_1()];
@@ -1142,6 +1149,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn consider_move_count_all_zero_counts_stays_in_set() {
         // `.ybb` has no counts → the all-zero-counts rule weights every move 1.

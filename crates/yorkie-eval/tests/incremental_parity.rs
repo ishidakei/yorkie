@@ -102,6 +102,7 @@ fn retreat(net: &NnueNetwork, pos: &mut Position, frame: Frame, parent: &Accumul
     assert_matches_refresh(net, parent, pos, &format!("{ctx} [after undo]"));
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn incremental_accumulator_matches_refresh_on_fixture_lines() {
     let nn_bin = nn_bin_path();
@@ -192,6 +193,7 @@ impl Rng {
     }
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn incremental_accumulator_matches_refresh_on_random_playouts() {
     let nn_bin = nn_bin_path();

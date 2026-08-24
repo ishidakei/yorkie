@@ -736,6 +736,7 @@ dependencies = [
 name = "yorkie-eval"
 version = "3.0.0"
 dependencies = [
+ "proptest",
  "serde_json",
  "yorkie-state",
  "yorkie-storage",

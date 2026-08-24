@@ -48,6 +48,7 @@ fn book_session_prefix(dir: &str, on_the_fly: bool) -> String {
 // No-book behaviour is invisible.
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn default_no_book_emits_no_book_output_and_searches() {
     let dir = TempDir::new("nobook");
@@ -83,6 +84,7 @@ fn default_no_book_emits_no_book_output_and_searches() {
     assert_eq!(bestmove_lines(&out).len(), 1, "one bestmove:\n{out}");
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn absent_listed_book_falls_back_to_bookless_without_panic() {
     let dir = TempDir::new("absent");
@@ -170,11 +172,13 @@ fn run_book_hits(on_the_fly: bool) {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn book_hits_in_memory_mode() {
     run_book_hits(false);
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn book_hits_on_the_fly_mode() {
     run_book_hits(true);
@@ -184,6 +188,7 @@ fn book_hits_on_the_fly_mode() {
 // Gating options.
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn own_book_off_runs_a_real_search() {
     let dir = TempDir::new("ownbook-off");
@@ -205,6 +210,7 @@ fn own_book_off_runs_a_real_search() {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn wrong_game_ply_misses_then_ignore_book_ply_hits() {
     let dir = TempDir::new("ignore-ply");
@@ -241,6 +247,7 @@ fn wrong_game_ply_misses_then_ignore_book_ply_hits() {
     assert!(out.contains("info depth 0 "), "book hit expected:\n{out}");
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn game_ply_past_book_moves_misses() {
     let dir = TempDir::new("bookmoves");
@@ -261,6 +268,7 @@ fn game_ply_past_book_moves_misses() {
 // FlippedBook (session level; unit-level flip_move is in yorkie-state).
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn flipped_book_hits_the_rotated_startpos() {
     let dir = TempDir::new("flipped");
@@ -300,6 +308,7 @@ fn flipped_book_hits_the_rotated_startpos() {
 // Ponder fallback.
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn ponder_emitted_when_child_is_in_book_and_omitted_at_a_leaf() {
     let dir = TempDir::new("ponder");
@@ -354,6 +363,7 @@ fn ponder_emitted_when_child_is_in_book_and_omitted_at_a_leaf() {
 // Ponder / infinite discipline (no bestmove until stop / ponderhit).
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn go_infinite_book_hit_holds_bestmove_until_stop() {
     let dir = TempDir::new("hold-inf");
@@ -396,6 +406,7 @@ fn go_infinite_book_hit_holds_bestmove_until_stop() {
     assert_eq!(bm[0].split_whitespace().next().unwrap(), "7g7f");
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn go_ponder_book_hit_holds_bestmove_until_ponderhit() {
     let dir = TempDir::new("hold-ponder");
@@ -502,16 +513,19 @@ fn run_priority_series_first_hit(on_the_fly: bool) {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn priority_series_first_hit_in_memory_mode() {
     run_priority_series_first_hit(false);
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn priority_series_first_hit_on_the_fly_mode() {
     run_priority_series_first_hit(true);
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn a_gap_ends_the_series() {
     let dir = TempDir::new("series-gap");
@@ -552,6 +566,7 @@ fn a_gap_ends_the_series() {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn duplicate_extension_prefers_the_primary_and_a_db_slot_fails_loudly() {
     let dir = TempDir::new("series-dup");
@@ -608,6 +623,7 @@ fn duplicate_extension_prefers_the_primary_and_a_db_slot_fails_loudly() {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn no_book_loads_nothing_even_with_numbered_files_present() {
     let dir = TempDir::new("series-nobook");
@@ -641,6 +657,7 @@ fn no_book_loads_nothing_even_with_numbered_files_present() {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn reread_is_skipped_until_the_capture_triple_changes() {
     let dir = TempDir::new("series-reread");

@@ -2236,6 +2236,7 @@ mod tests {
         checked
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn gives_check_matches_oracle_over_random_playouts() {
         const MIN_PLIES: usize = 30;
@@ -2327,6 +2328,7 @@ mod tests {
     /// and along a deterministic playout of at least 30 plies from each.
     /// `is_legal` is exercised only over its contract set (see
     /// [`is_legal_contract_moves`]).
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn cached_check_info_predicates_match_scratch_oracles_over_playouts() {
         const MIN_PLIES: usize = 30;
@@ -3099,6 +3101,7 @@ mod gate_262 {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn gate_set_consistency_and_attack_equivalence_along_playouts() {
         const PLIES: usize = 32;
@@ -3271,6 +3274,7 @@ mod gate_267 {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn generators_emit_byte_identical_sequences_over_playouts() {
         const MIN_PLIES: usize = 30;
@@ -3463,6 +3467,7 @@ mod gate_280 {
         PieceKind::Rook,
     ];
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn drop_emitter_matches_scan_over_playouts() {
         const MIN_PLIES: usize = 40;

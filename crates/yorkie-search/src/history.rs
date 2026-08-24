@@ -698,6 +698,7 @@ mod shared_tests {
     ];
 
     /// Table sizing scales the slot count by `thread_count` for both tables.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn sizing_scales_with_thread_count() {
         for &tc in &[1usize, 2, 4, 8] {
@@ -722,6 +723,7 @@ mod shared_tests {
     }
 
     /// Init values: pawn `-1238`, correction `0`, across distinct slots.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn init_values() {
         let sh = SharedHistories::new(1);
@@ -738,6 +740,7 @@ mod shared_tests {
     /// Mask widening: two pawn keys equal mod `8192` but different mod `16384`
     /// alias at `thread_count == 1` (mask `8191`) and separate at `thread_count
     /// == 2` (mask `16383`).
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn pawn_mask_widens_with_thread_count() {
         let key_a = 0u64;
@@ -768,6 +771,7 @@ mod shared_tests {
     }
 
     /// The same widening for the correction table (`65536` slot base).
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn correction_mask_widens_with_thread_count() {
         let key_a = 0u64;
@@ -797,6 +801,7 @@ mod shared_tests {
     /// Atomicity smoke: two threads hammering the same entry with `<<` terminates
     /// and leaves a value within `[-D, D]` (the reference accepts lost updates but
     /// the gravity bound always holds — `history.h`).
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn concurrent_updates_terminate_within_limit() {
         let sh = Arc::new(SharedHistories::new(2));

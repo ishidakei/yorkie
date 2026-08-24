@@ -557,6 +557,7 @@ mod equivalence {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn optimized_see_ge_matches_reference_on_fixture_playouts() {
         const MIN_PLIES: usize = 60;

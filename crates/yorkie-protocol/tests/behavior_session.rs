@@ -77,6 +77,7 @@ fn last_score_cp(text: &str) -> Option<i64> {
 // DrawValueBlack / DrawValueWhite.
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn draw_value_black_shifts_the_root_side_adjudicated_score() {
     // Black to move at ply 100 with MaxMovesToDraw 50: every child adjudicates a
@@ -131,6 +132,7 @@ fn draw_value_black_shifts_the_root_side_adjudicated_score() {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn draw_value_white_shifts_a_white_to_move_root() {
     // The mirror: White to move at ply 100. DrawValueWhite 500 lifts the reported
@@ -170,6 +172,7 @@ fn draw_value_white_shifts_a_white_to_move_root() {
 // ResignValue.
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn resign_value_resigns_a_lost_position_but_default_plays() {
     // A forced mated-in-2 for the side to move. With ResignValue 100 the real
@@ -237,6 +240,7 @@ fn resign_value_resigns_a_lost_position_but_default_plays() {
 // Go mate.
 // -------------------------------------------------------------------------
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn go_mate_finds_the_mate_and_terminates_on_quiet() {
     // `go mate 5000` on a mate-in-1 replies the mating move within the budget
@@ -277,6 +281,7 @@ fn go_mate_finds_the_mate_and_terminates_on_quiet() {
     assert_ne!(quiet_bm, "win", "quiet go mate must not declare a win");
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn go_mate_infinite_releases_on_stop() {
     // `go mate infinite` has no time bound, so it emits no bestmove until `stop`;
@@ -303,6 +308,7 @@ fn go_mate_infinite_releases_on_stop() {
     h.quit_join();
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn go_mate_threads2_smoke_completes() {
     // A `Threads=2` `go mate` smoke completes with a bestmove (the vote is off
@@ -321,6 +327,7 @@ fn go_mate_threads2_smoke_completes() {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn time_managed_threads2_smoke_completes() {
     // A `Threads=2` time-managed search (a real clock, so `use_time_management`)

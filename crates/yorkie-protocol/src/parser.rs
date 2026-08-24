@@ -570,6 +570,7 @@ mod tests {
         assert_eq!(parse_line(&line), Command::TooLong);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn line_at_max_size_is_parsed_normally() {
         // 64 KB exactly — still parses (becomes Unknown since it's not a command).
