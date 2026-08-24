@@ -1,8 +1,10 @@
-# Tournament (production) build, one command. Event-agnostic by design: the event is
-# chosen only by the caller's YORKIE_TOURNAMENT_CONFIG=configs/<event>.toml (build.rs
-# fails loudly without it). The native-CPU flag is scoped to the alias via --config so a
-# plain `cargo build` is unaffected. String aliases are whitespace-split with no shell
-# quoting, so the --config value must stay space-free and unquoted.
 [alias]
-tournament = """build --release --no-default-features --features nnue,tournament,numa \
---config build.rustflags=["-C","target-cpu=native"]"""
+xtask = "run --quiet -p xtask --"
+
+# Premise: every build of this repo runs on the machine that produced it (dev VM,
+# CI runner) — binaries are never distributed across machines. So compile for the
+# exact host CPU by default; this removes a confound from the NPS analysis (the
+# reference binary is built fully optimized for the host, so the Rust side is too)
+# and needs no manual RUSTFLAGS at bench time. Applies to every profile.
+[build]
+rustflags = ["-C", "target-cpu=native"]

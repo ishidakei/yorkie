@@ -1,0 +1,11 @@
+[package]
+name = "yorkie-state"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "~1.11"
+serde_json = "~1.0"

@@ -1,0 +1,20 @@
+[package]
+name = "yorkie"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# `src/main.rs` is auto-discovered and takes the package name, so the binary is
+# `target/<profile>/yorkie` without an explicit `[[bin]]` override. The `[[test]]`
+# below is NOT auto-discovered — it lives one directory down.
+[[test]]
+name = "parity_perft"
+path = "tests/parity/perft.rs"
+
+[dependencies]
+yorkie-protocol = { path = "../yorkie-protocol" }
+yorkie-state = { path = "../yorkie-state" }
+
+[dev-dependencies]
+serde = { version = "~1.0", features = ["derive"] }
+serde_json = "~1.0"
