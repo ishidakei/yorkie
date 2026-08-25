@@ -11,6 +11,19 @@ edition = "2024"
 # documented in `README.md`. The USI `id name` derives from it (`Yorkie 3.0.0`).
 version = "3.0.0"
 
+# Module-file layout is enforced, not just documented: every member crate opts
+# in with `[lints] workspace = true`, and the gates run clippy with
+# `-D warnings`, so a stray `src/**/mod.rs` fails the build. The lint only sees
+# workspace members, so vendored non-member sources are out of its reach by
+# construction. It also leaves the `tests/<name>/mod.rs` integration-test
+# helper form alone — verified against
+# `crates/yorkie-protocol/tests/common/mod.rs`, which draws no warning while a
+# `src/**/mod.rs` in the same run does — so no `allow` carve-out is needed. If
+# a future clippy tightens that, add `#![allow(clippy::mod_module_files)]` to
+# the test roots rather than dropping the lint.
+[workspace.lints.clippy]
+mod_module_files = "warn"
+
 # Release profile is the standing build for benches, A/B NPS tables, and the
 # eventual tournament binary — bake full optimization in so no manual RUSTFLAGS
 # is ever required. Fat LTO + a single codegen unit trade link time for run-time
