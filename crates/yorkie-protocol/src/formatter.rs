@@ -107,8 +107,8 @@ mod tests {
 
     #[test]
     fn id_name_emits_one_line() {
-        let s = captured(|f| f.id_name("Yorkie 3.0.0").unwrap());
-        assert_eq!(s, "id name Yorkie 3.0.0\n");
+        let s = captured(|f| f.id_name("Yorkie 3.1.0").unwrap());
+        assert_eq!(s, "id name Yorkie 3.1.0\n");
     }
 
     #[test]

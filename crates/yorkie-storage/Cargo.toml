@@ -12,6 +12,14 @@ publish = false
 # the Search layer, which owns both, adapts between them.
 [dependencies]
 
+# The process-wide `#[global_allocator]` (see `src/allocator.rs` for why the
+# declaration lives in this crate rather than in the `yorkie` binary root).
+# Default features only: `secure` is deliberately off, and no mimalloc options
+# are tuned. MIT, crates.io — as is its transitive `libmimalloc-sys`, which
+# builds the vendored C sources and therefore needs a C compiler on the build
+# host.
+mimalloc = "0.1"
+
 # Unix-only: `madvise(MADV_HUGEPAGE)` over the transposition-table allocation
 # (see `src/tt.rs`), mirroring the reference's `aligned_large_pages_alloc`. The
 # call itself is Linux-gated in code; the dependency is `cfg(unix)`-gated so

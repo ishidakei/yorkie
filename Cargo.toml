@@ -6,10 +6,11 @@ members = ["crates/yorkie", "crates/yorkie-eval", "crates/yorkie-numa", "crates/
 edition = "2024"
 # One version for every workspace member. The number is this repository's
 # generation number, matching `CHANGELOG.md`: `2.0.0` was the apery_rust-based
-# generation and `3.0.0` is the current tree (this YaneuraOu Rust port). It does
-# NOT encode the upstream YaneuraOu baseline the port tracks — that stays
-# documented in `README.md`. The USI `id name` derives from it (`Yorkie 3.0.0`).
-version = "3.0.0"
+# generation and the `3.x` generation is the current tree (this YaneuraOu Rust
+# port). It does NOT encode the upstream YaneuraOu baseline the port tracks —
+# that stays documented in `README.md`. The USI `id name` derives from it
+# (`Yorkie 3.1.0`).
+version = "3.1.0"
 
 # Module-file layout is enforced, not just documented: every member crate opts
 # in with `[lints] workspace = true`, and the gates run clippy with

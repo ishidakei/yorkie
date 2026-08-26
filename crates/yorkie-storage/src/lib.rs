@@ -4,7 +4,14 @@
 //! This crate hosts the transposition table ([`tt`]), the `.ybb` opening-book
 //! reader ([`book`]), and the shared huge-page-backed allocator ([`large_page`])
 //! the other layers reuse for their big allocations.
+//!
+//! It also declares the process-wide `#[global_allocator]` ([`allocator`]).
+//! That is a whole-program property rather than a Storage concern as such, but
+//! Storage is the lowest layer the allocation-heavy crates share and it owns
+//! the large-page path the allocator has to keep working — see the [`allocator`]
+//! module docs for the full rationale.
 
+pub mod allocator;
 pub mod arena;
 pub mod book;
 pub mod large_page;

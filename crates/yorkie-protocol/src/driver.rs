@@ -28,9 +28,10 @@ use crate::parser::{Command, GoLimits, MATE_UNLIMITED_MS, PositionSfen, parse_li
 ///
 /// The version part is this repository's generation number (see
 /// `CHANGELOG.md`), not an upstream-tracking number: `2.0.0` was the
-/// apery_rust-based generation and `3.0.0` is the current tree. The upstream
-/// YaneuraOu baseline the port tracks is documented in `README.md` instead.
-pub const ENGINE_NAME: &str = "Yorkie 3.0.0";
+/// apery_rust-based generation and the `3.x` generation is the current tree.
+/// The upstream YaneuraOu baseline the port tracks is documented in `README.md`
+/// instead.
+pub const ENGINE_NAME: &str = "Yorkie 3.1.0";
 pub const ENGINE_AUTHOR: &str = "Kei Ishida <ishida.kei@gmail.com>";
 
 // The transposition table is sized from the `USI_Hash` option (default 1024
