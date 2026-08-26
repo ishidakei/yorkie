@@ -257,10 +257,10 @@ impl Bitboard {
     /// The least set square's raw index (lane-0 tzcnt, else lane-1 tzcnt + 63;
     /// `128` when empty — callers guard with [`Self::is_empty`] first).
     pub(crate) const fn lowest_index(self) -> u32 {
-        if self.p[0] != 0 {
-            self.p[0].trailing_zeros()
-        } else if self.p[1] != 0 {
-            self.p[1].trailing_zeros() + LANE0_SPAN
+        if let Some(i) = self.p[0].lowest_one() {
+            i
+        } else if let Some(i) = self.p[1].lowest_one() {
+            i + LANE0_SPAN
         } else {
             128
         }
@@ -501,15 +501,15 @@ impl Iterator for BitboardIter {
     type Item = Square;
 
     fn next(&mut self) -> Option<Square> {
-        if self.p0 != 0 {
-            let i = self.p0.trailing_zeros();
+        if let Some(i) = self.p0.lowest_one() {
             self.p0 &= self.p0 - 1; // clear the lowest set bit
             return Some(Square::from_index(i as u8).expect("lane-0 bit index < 63"));
         }
-        if self.p1 != 0 {
-            let i = self.p1.trailing_zeros() + LANE0_SPAN;
+        if let Some(i) = self.p1.lowest_one() {
             self.p1 &= self.p1 - 1;
-            return Some(Square::from_index(i as u8).expect("lane-1 bit index < 81"));
+            return Some(
+                Square::from_index((i + LANE0_SPAN) as u8).expect("lane-1 bit index < 81"),
+            );
         }
         None
     }
@@ -1087,8 +1087,13 @@ const fn part(idx: usize) -> usize {
 }
 
 /// Index of the highest set bit (pin `MSB64`). Callers pass `x | 1`, so `x != 0`.
+///
+/// `bit_width()` is `u64::BITS - leading_zeros()`, so this is the old
+/// `63 - x.leading_zeros()` bit for bit — including the underflow on `x == 0`
+/// the callers already exclude — without spelling the lane width out as a
+/// literal.
 const fn msb64(x: u64) -> u32 {
-    63 - x.leading_zeros()
+    x.bit_width() - 1
 }
 
 // -- `const` scalar twins of the lane byte-reverse / unpack, for the compile-
@@ -1564,10 +1569,12 @@ mod tests {
         if blockers == 0 {
             return Bitboard::from_raw(full);
         }
+        // `bit_width() - 1` is `127 - leading_zeros()` for a `u128`, without the
+        // literal width; the `blockers == 0` guard above keeps it in range.
         let first = if ORACLE_DIR_POSITIVE[dir] {
             blockers.trailing_zeros()
         } else {
-            127 - blockers.leading_zeros()
+            blockers.bit_width() - 1
         };
         Bitboard::from_raw(full ^ RAY_BITS[dir][first as usize])
     }
@@ -2424,10 +2431,7 @@ mod twin {
     impl Iterator for TwinIter {
         type Item = Square;
         fn next(&mut self) -> Option<Square> {
-            if self.0 == 0 {
-                return None;
-            }
-            let i = self.0.trailing_zeros();
+            let i = self.0.lowest_one()?;
             self.0 &= self.0 - 1;
             Some(Square::from_index(i as u8).unwrap())
         }

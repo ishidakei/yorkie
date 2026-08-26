@@ -1,3 +1,4 @@
+use core::fmt::NumBuffer;
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -78,17 +79,33 @@ fn to_cp(v: Value) -> Value {
     100 * v / PAWN_VALUE
 }
 
-/// Format a search value the way the reference USI layer does: a mate distance
-/// for decisive scores, else `100 * v / PawnValue` centipawns with C++-style
-/// truncating division (Rust integer division truncates toward zero, matching).
-fn format_score(v: Value) -> String {
+/// Append a search value to `out` the way the reference USI layer formats it: a
+/// mate distance for decisive scores, else `100 * v / PawnValue` centipawns with
+/// C++-style truncating division (Rust integer division truncates toward zero,
+/// matching).
+///
+/// Appending in place — with the one integer field written through a
+/// [`NumBuffer`] — keeps the `info` PV path free of the `String` temporary
+/// [`format_score`] hands back. [`format_score`] itself stays for the two book
+/// call sites that need an owned value.
+fn push_score(out: &mut String, v: Value) {
+    let mut digits = NumBuffer::new();
     if v.abs() >= VALUE_TB_WIN_IN_MAX_PLY {
         let distance = VALUE_MATE - v.abs();
         let mate = if v > 0 { distance } else { -distance };
-        format!("mate {mate}")
+        out.push_str("mate ");
+        out.push_str(mate.format_into(&mut digits));
     } else {
-        format!("cp {}", 100 * v / PAWN_VALUE)
+        out.push_str("cp ");
+        out.push_str((100 * v / PAWN_VALUE).format_into(&mut digits));
     }
+}
+
+/// [`push_score`] into a fresh `String`.
+fn format_score(v: Value) -> String {
+    let mut out = String::new();
+    push_score(&mut out, v);
+    out
 }
 
 /// A loaded evaluation network paired with the `nn.bin` path it came from.
@@ -1705,20 +1722,34 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 /// port-output decision — the fixed-depth comparison session tests rely on a
 /// deterministic `info` line), and always emits `seldepth` / `multipv`. The
 /// `lowerbound` / `upperbound` marker follows the reference's `isExact` gate.
+///
+/// Every integer field is written through a [`NumBuffer`] and appended, so the
+/// only allocation left is the body `String` itself; the earlier shape spent a
+/// `format!` temporary on the score and another on `nodes` every time the line
+/// was emitted. The bytes are unchanged — `tests::pv_info_line_is_byte_exact`
+/// pins the whole wire line for each branch.
 fn write_pv_info<W: Write + ?Sized>(w: &mut W, info: &PvInfo) -> io::Result<()> {
-    let mut body = format!(
-        "depth {} seldepth {} multipv {} score {}",
-        info.depth,
-        info.sel_depth,
-        info.multipv,
-        format_score(info.score),
-    );
+    let mut ply_digits = NumBuffer::new();
+    let mut index_digits = NumBuffer::new();
+    let mut node_digits = NumBuffer::new();
+
+    // Comfortably past the fixed part of the line, so only a long PV regrows.
+    let mut body = String::with_capacity(64);
+    body.push_str("depth ");
+    body.push_str(info.depth.format_into(&mut ply_digits));
+    body.push_str(" seldepth ");
+    body.push_str(info.sel_depth.format_into(&mut ply_digits));
+    body.push_str(" multipv ");
+    body.push_str(info.multipv.format_into(&mut index_digits));
+    body.push_str(" score ");
+    push_score(&mut body, info.score);
     match info.bound {
         PvBound::Lower => body.push_str(" lowerbound"),
         PvBound::Upper => body.push_str(" upperbound"),
         PvBound::Exact => {}
     }
-    body.push_str(&format!(" nodes {}", info.nodes));
+    body.push_str(" nodes ");
+    body.push_str(info.nodes.format_into(&mut node_digits));
     if !info.pv.is_empty() {
         body.push_str(" pv");
         for m in &info.pv {
@@ -3071,6 +3102,85 @@ mod tests {
         driver.run().expect("driver run");
         let bytes = output.lock().expect("output lock").clone();
         String::from_utf8(bytes).expect("utf-8")
+    }
+
+    /// Render one PV line exactly as [`write_pv_info`] would put it on the wire.
+    fn pv_line(info: &PvInfo) -> String {
+        let mut buf = Vec::<u8>::new();
+        write_pv_info(&mut buf, info).expect("write to Vec cannot fail");
+        String::from_utf8(buf).expect("utf-8")
+    }
+
+    fn pv_info_fixture(score: Value, bound: PvBound, pv: &[&str]) -> PvInfo {
+        let pos = Position::startpos();
+        PvInfo {
+            depth: 12,
+            sel_depth: 19,
+            multipv: 2,
+            score,
+            bound,
+            nodes: 1_234_567_890,
+            pv: pv
+                .iter()
+                .map(|s| parse_usi_move(s, &pos).expect("fixture move parses"))
+                .collect(),
+        }
+    }
+
+    /// The `info` PV line is byte-exact. `write_pv_info` assembles it from
+    /// `NumBuffer`-backed digits rather than `format!` temporaries, so pin the
+    /// full wire bytes for every branch of the line (cp / mate, both signs, the
+    /// three bounds, and an empty PV) rather than just the fields' presence.
+    #[test]
+    fn pv_info_line_is_byte_exact() {
+        assert_eq!(
+            pv_line(&pv_info_fixture(90, PvBound::Exact, &["7g7f", "3c3d"])),
+            "info depth 12 seldepth 19 multipv 2 score cp 100 nodes 1234567890 pv 7g7f 3c3d\n"
+        );
+        // Truncating division toward zero, negative side.
+        assert_eq!(
+            pv_line(&pv_info_fixture(-95, PvBound::Lower, &["7g7f"])),
+            "info depth 12 seldepth 19 multipv 2 score cp -105 lowerbound nodes 1234567890 pv 7g7f\n"
+        );
+        assert_eq!(
+            pv_line(&pv_info_fixture(0, PvBound::Upper, &[])),
+            "info depth 12 seldepth 19 multipv 2 score cp 0 upperbound nodes 1234567890\n"
+        );
+        // Decisive scores switch to `mate <distance>`, signed by the side.
+        assert_eq!(
+            pv_line(&pv_info_fixture(VALUE_MATE - 5, PvBound::Exact, &["7g7f"])),
+            "info depth 12 seldepth 19 multipv 2 score mate 5 nodes 1234567890 pv 7g7f\n"
+        );
+        assert_eq!(
+            pv_line(&pv_info_fixture(
+                -(VALUE_MATE - 5),
+                PvBound::Exact,
+                &["7g7f"]
+            )),
+            "info depth 12 seldepth 19 multipv 2 score mate -5 nodes 1234567890 pv 7g7f\n"
+        );
+    }
+
+    /// A drop move and the `depth 0` / `nodes 0` extremes still round-trip
+    /// byte-for-byte (the digit paths that `NumBuffer` now owns).
+    #[test]
+    fn pv_info_line_covers_zero_and_drop_extremes() {
+        let mut info = pv_info_fixture(0, PvBound::Exact, &[]);
+        info.depth = 0;
+        info.sel_depth = 0;
+        info.multipv = 1;
+        info.nodes = 0;
+        assert_eq!(
+            pv_line(&info),
+            "info depth 0 seldepth 0 multipv 1 score cp 0 nodes 0\n"
+        );
+
+        let pos = parse_sfen("4k4/9/9/9/9/9/9/9/4K4 b P 1").expect("sfen parses");
+        info.pv = vec![parse_usi_move("P*5e", &pos).expect("drop parses")];
+        assert_eq!(
+            pv_line(&info),
+            "info depth 0 seldepth 0 multipv 1 score cp 0 nodes 0 pv P*5e\n"
+        );
     }
 
     #[cfg_attr(miri, ignore)]

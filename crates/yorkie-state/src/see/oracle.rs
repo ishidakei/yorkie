@@ -31,10 +31,9 @@ use crate::square::Square;
 /// `super::slider_blockers` go through the typed value.
 fn bits_to_bb(mut bits: u128) -> Bitboard {
     let mut bb = Bitboard::empty();
-    while bits != 0 {
-        let idx = bits.trailing_zeros() as u8;
+    while let Some(idx) = bits.lowest_one() {
         bits &= bits - 1;
-        bb |= Bitboard::from_square(Square::from_index(idx).unwrap());
+        bb |= Bitboard::from_square(Square::from_index(idx as u8).unwrap());
     }
     bb
 }
@@ -221,10 +220,9 @@ fn split_by_color(board: &crate::board::Board, attackers: u128, stm: Color) -> (
     let mut stm_bits: u128 = 0;
     let mut opp_bits: u128 = 0;
     let mut bits = attackers;
-    while bits != 0 {
-        let idx = bits.trailing_zeros() as u8;
+    while let Some(idx) = bits.lowest_one() {
         bits &= bits - 1;
-        let sq = Square::from_index(idx).unwrap();
+        let sq = Square::from_index(idx as u8).unwrap();
         if let Some(piece) = board.get(sq) {
             if piece.color == stm {
                 stm_bits |= 1u128 << idx;
@@ -556,10 +554,9 @@ fn least_valuable_attacker_scan(
     }
     let mut best: Option<(u8, Bucket, Square)> = None;
     let mut bits = stm_attackers;
-    while bits != 0 {
-        let idx = bits.trailing_zeros() as u8;
+    while let Some(idx) = bits.lowest_one() {
         bits &= bits - 1;
-        let sq = Square::from_index(idx).unwrap();
+        let sq = Square::from_index(idx as u8).unwrap();
         let bucket = bucket_of(board.get(sq).expect("attacker square is occupied"));
         let rank = bucket_rank(bucket);
         if best.is_none_or(|(best_rank, _, _)| rank < best_rank) {

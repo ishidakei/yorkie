@@ -25,10 +25,9 @@ use crate::square::Square;
 fn occ_bb(bits: u128) -> Bb {
     let mut bb = Bb::EMPTY;
     let mut b = bits;
-    while b != 0 {
-        let i = b.trailing_zeros() as u8;
+    while let Some(i) = b.lowest_one() {
         b &= b - 1;
-        bb = bb.with(Square::from_index(i).unwrap());
+        bb = bb.with(Square::from_index(i as u8).unwrap());
     }
     bb
 }

@@ -158,8 +158,9 @@ fn bucket_value(b: Bucket) -> i32 {
 ///
 /// Bitboard form: each bucket is an intersection with the board's per-`(colour,
 /// pattern)` piece set ([`Board::pieces_pattern`]), exactly the reference's
-/// `stmAttackers & pieces(<TYPE>)`. `trailing_zeros` picks the lowest square
-/// index within the winning bucket — the reference's `bb.pop()` tie-break.
+/// `stmAttackers & pieces(<TYPE>)`. The iterator's `lowest_one` step picks the
+/// lowest square index within the winning bucket — the reference's `bb.pop()`
+/// tie-break.
 #[inline]
 fn least_valuable_attacker(
     board: &crate::board::Board,
