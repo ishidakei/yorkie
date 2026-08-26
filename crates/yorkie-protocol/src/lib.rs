@@ -5,6 +5,9 @@ pub mod formatter;
 pub mod option_profile;
 pub mod options;
 pub mod parser;
+/// The feature-gated `tt` command family — present only under `usi-extras`.
+#[cfg(feature = "usi-extras")]
+pub mod tt_command;
 
 pub use bench::{BENCH_DEFAULT_POSITIONS, BenchConfig, BenchParseError, parse_bench};
 pub use driver::UsiDriver;
@@ -16,3 +19,5 @@ pub use option_profile::{
 };
 pub use options::{OptionDecl, OptionError, OptionStore, OptionValue};
 pub use parser::{Command, parse_line};
+#[cfg(feature = "usi-extras")]
+pub use tt_command::{TtCommand, TtParseError, TtPosition, TtStoreArgs, parse_tt};

@@ -30,8 +30,6 @@
 //! callee enables — the code is compiled only into a build that already
 //! requires those features of its host, so no `unsafe` escapes the SIMD modules.
 
-use crate::features::FeatureIndex;
-
 // `allow(dead_code)`: both backends are compiled unconditionally so the
 // equivalence tests can compare them, which leaves whichever one this build did
 // not select without a caller outside `cfg(test)`.
@@ -99,8 +97,8 @@ pub const fn active_backend() -> Backend {
     target_feature = "avx512bw"
 ))]
 pub mod transformer_kernel {
-    use super::FeatureIndex;
     use super::avx512;
+    use crate::features::FeatureIndex;
 
     /// Add each active feature's FT weight column into `out`.
     #[inline]

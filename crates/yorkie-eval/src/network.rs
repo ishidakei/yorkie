@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use yorkie_state::{Color, Position, Square};
 
 use crate::features::king_square;
-use crate::simd::{self, post_ft_kernel};
+use crate::simd::post_ft_kernel;
 use crate::transformer::{Accumulator, FT_OUTPUT_DIMS};
 use crate::types::{
     FC_0_INPUT_DIMS, FC_0_OUTPUT_DIMS, FC_0_PADDED_INPUT_DIMS, FC_1_INPUT_DIMS, FC_1_OUTPUT_DIMS,
@@ -167,6 +167,10 @@ pub fn evaluate_with(net: &NnueNetwork, acc: &Accumulator, pos: &Position) -> i3
     target_feature = "avx512vnni"
 ))]
 fn per_layer_flow(transformed: &[u8; FC_0_INPUT_DIMS], stack: &NetworkStack) -> i32 {
+    // Imported here, not at module scope: the fused chain is this arm's only
+    // user, so a top-level `use` would be unused on a non-VNNI build.
+    use crate::simd;
+
     // SAFETY: this arm is compiled only into a build that enables avx512f +
     // avx512bw + avx512vnni — exactly the features `fused_fc_chain`'s
     // `#[target_feature]` attribute names — and such a build only ever runs on a

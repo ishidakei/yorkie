@@ -71,6 +71,13 @@ pub enum Command {
     /// trailing tokens are carried verbatim; [`crate::bench::parse_bench`] gives
     /// them meaning (defaults, limit type, position source).
     Bench(Vec<String>),
+    /// `tt <store|probe|children> …` — the feature-gated transposition-table
+    /// read/write commands (`usi-extras`). Like [`Command::Bench`] the trailing
+    /// tokens are carried verbatim; [`crate::tt_command::parse_tt`] gives them
+    /// meaning. The variant exists only when the feature is on, so the default
+    /// build cannot even name the command.
+    #[cfg(feature = "usi-extras")]
+    Tt(Vec<String>),
     Quit,
     Unknown(String),
     TooLong,
@@ -102,6 +109,12 @@ pub fn parse_line(input: &str) -> Command {
         // The trailing `bench` tokens are preserved verbatim for the semantic
         // parse in `crate::bench` (which fills defaults and validates them).
         "bench" => Command::Bench(parts.map(str::to_string).collect()),
+        // `usi-extras` only. With the feature off this arm does not exist, so
+        // `tt …` falls through to `Command::Unknown` like any other unrecognised
+        // line — the default build's behaviour is byte-identical to before the
+        // command existed.
+        #[cfg(feature = "usi-extras")]
+        "tt" => Command::Tt(parts.map(str::to_string).collect()),
         _ => Command::Unknown(trimmed.to_string()),
     }
 }
@@ -556,6 +569,30 @@ mod tests {
             parse_line("go mate soon"),
             Command::Unknown("go mate soon".to_string())
         );
+    }
+
+    /// Feature off — the default build: `tt` is not a command token at all, so
+    /// it reaches the `Unknown` catch-all exactly like any other stray line.
+    #[cfg(not(feature = "usi-extras"))]
+    #[test]
+    fn tt_is_not_a_command_without_usi_extras() {
+        assert_eq!(
+            parse_line("tt probe startpos"),
+            Command::Unknown("tt probe startpos".to_string())
+        );
+        assert_eq!(parse_line("tt"), Command::Unknown("tt".to_string()));
+    }
+
+    /// Feature on: `tt` splits into verbatim tokens for
+    /// [`crate::tt_command::parse_tt`], mirroring how `bench` is handled.
+    #[cfg(feature = "usi-extras")]
+    #[test]
+    fn parses_tt_tokens_verbatim_with_usi_extras() {
+        assert_eq!(
+            parse_line("tt probe startpos"),
+            Command::Tt(vec!["probe".to_string(), "startpos".to_string()])
+        );
+        assert_eq!(parse_line("tt"), Command::Tt(Vec::new()));
     }
 
     #[test]

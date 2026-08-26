@@ -195,6 +195,7 @@ objdump -d target/release/yorkie | grep -c '%zmm'
 | `gameover` | 対局終了 |
 | `quit` | 終了する |
 | `bench [ttSizeMB] [threads] [limit] [default\|current\|<fenFile>] [limitType]` | 固定条件での NPS 計測。引数はすべて省略可で、左から順に既定値（`ttSizeMB=1024`, `threads=1`, `limit=15000`, ソース `default`, `limitType=movetime`）で埋められる |
+| `tt store` / `tt probe` / `tt children` | 置換表を読み書きするコマンド。`usi-extras` feature を指定したビルドでのみ有効 |
 
 認識できないコマンドを受け取った場合は `info string unknown command: <入力行>` を
 出力して読み飛ばします。

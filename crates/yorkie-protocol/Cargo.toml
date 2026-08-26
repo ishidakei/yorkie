@@ -19,5 +19,17 @@ yorkie-storage = { path = "../yorkie-storage" }
 serde = { version = "~1.0", features = ["derive"] }
 serde_json = "~1.0"
 
+# `usi-extras` is the umbrella feature for USI commands a tournament game never
+# issues — book-construction and analysis tooling only. It is OFF by default, so
+# the tournament binary does not contain the commands at all (the parser has no
+# arm for them, the driver has no handler, and the enum variants do not exist).
+#
+# It currently covers the `tt store` / `tt probe` / `tt children` commands. The
+# other existing non-match commands (`go depth` / `nodes` / `mate` / `movetime` /
+# `infinite` / `rtime`, `bench`) are intended to move under it later; that
+# migration is deliberately not part of this feature's first cut.
+[features]
+usi-extras = []
+
 [lints]
 workspace = true

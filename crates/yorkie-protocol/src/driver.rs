@@ -16,6 +16,8 @@ use yorkie_search::{
 };
 use yorkie_state::{Move, Position, format_usi_move, parse_sfen, parse_usi_move};
 use yorkie_storage::{Book, TranspositionTable, Value};
+#[cfg(feature = "usi-extras")]
+use yorkie_storage::{TTData, VALUE_NONE};
 
 use crate::bench;
 use crate::engine_options::{OverrideLine, parse_override_line};
@@ -23,6 +25,10 @@ use crate::formatter::Formatter;
 use crate::option_profile::{ENGINE_OPTION_PROFILE_FILE, read_engine_option_profile};
 use crate::options::{OptionStore, OptionValue};
 use crate::parser::{Command, GoLimits, MATE_UNLIMITED_MS, PositionSfen, parse_line};
+#[cfg(feature = "usi-extras")]
+use crate::tt_command::{
+    TtCommand, TtPosition, TtStoreArgs, bound_name, parse_tt, value_from_tt, value_to_tt,
+};
 
 /// The decided public values used in the `id name` / `id author` lines. They
 /// must remain free of event-specific terms.
@@ -61,12 +67,15 @@ const KEEP_ALIVE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const KEEP_ALIVE_TICKS_PER_NEWLINE: u32 = 50;
 
 // --- Reference USI score conversion (score.cpp / usi.cpp `format_score`). ---
+// The three constants and `format_score` are `pub(crate)` because the
+// `usi-extras` `tt` commands speak the same score surface as an `info … score`
+// line and must not grow a second copy of the scale (see `crate::tt_command`).
 /// `VALUE_MATE` (`types.h`).
-const VALUE_MATE: Value = 32000;
+pub(crate) const VALUE_MATE: Value = 32000;
 /// `VALUE_TB_WIN_IN_MAX_PLY` (`types.h`): the `is_decisive` threshold.
-const VALUE_TB_WIN_IN_MAX_PLY: Value = VALUE_MATE - 246;
+pub(crate) const VALUE_TB_WIN_IN_MAX_PLY: Value = VALUE_MATE - 246;
 /// `Eval::PawnValue` / `NormalizeToPawnValue` (`usi.cpp`).
-const PAWN_VALUE: Value = 90;
+pub(crate) const PAWN_VALUE: Value = 90;
 /// `VALUE_INFINITE` (`types.h`): the pre-search `rootMoves[0].score` sentinel
 /// the `ResignValue` guard excludes (`yaneuraou-search.cpp`).
 const VALUE_INFINITE: Value = 32001;
@@ -102,7 +111,7 @@ fn push_score(out: &mut String, v: Value) {
 }
 
 /// [`push_score`] into a fresh `String`.
-fn format_score(v: Value) -> String {
+pub(crate) fn format_score(v: Value) -> String {
     let mut out = String::new();
     push_score(&mut out, v);
     out
@@ -442,6 +451,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 Command::GameOver => self.handle_gameover(),
                 Command::PonderHit => self.handle_ponderhit()?,
                 Command::Bench(tokens) => self.handle_bench(&tokens)?,
+                #[cfg(feature = "usi-extras")]
+                Command::Tt(tokens) => self.handle_tt(&tokens)?,
                 Command::Quit => {
                     self.finish_search_join();
                     return Ok(());
@@ -1707,12 +1718,266 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         Ok(())
     }
 
+    // --- `usi-extras`: the `tt` command family. ---
+    //
+    // These exist only under the `usi-extras` cargo feature; the default
+    // (tournament) build contains neither the parser arm nor these handlers.
+    // The `usi-extras` reference documentation is the user-facing spec — output
+    // format, score convention, generation behaviour and the key16 caveat.
+
+    /// Dispatch one `tt …` line.
+    ///
+    /// Refuses while a search is in flight (the commands read and write the very
+    /// table the workers are churning) and before the table has been allocated;
+    /// both are one clear `info string tt error: …` line, never a panic. A
+    /// worker that has already finished but not yet been joined does not count
+    /// as "searching": it is reclaimed first, so the natural
+    /// `go … → bestmove → tt probe` sequence works.
+    #[cfg(feature = "usi-extras")]
+    fn handle_tt(&mut self, tokens: &[String]) -> io::Result<()> {
+        if self
+            .search
+            .as_ref()
+            .is_some_and(|active| active.handle.is_finished())
+        {
+            self.finish_search_join();
+        }
+        if self.search.is_some() {
+            return self.tt_error("a search is running; `stop` it first");
+        }
+
+        let command = match parse_tt(tokens) {
+            Ok(command) => command,
+            Err(e) => return self.tt_error(&e.to_string()),
+        };
+
+        // The table is unsized until the first `isready` (or an explicit
+        // `setoption name USI_Hash`); probing it would panic, so this is a
+        // checked error.
+        if self.tt.cluster_count() == 0 {
+            return self.tt_error(
+                "transposition table not allocated; run `isready` or `setoption name USI_Hash value <mb>` first",
+            );
+        }
+
+        match command {
+            TtCommand::Store(args) => self.tt_store(&args),
+            TtCommand::Probe(position) => self.tt_probe(&position),
+            TtCommand::Children(position) => self.tt_children(&position),
+        }
+    }
+
+    /// The single error channel for the `tt` commands.
+    #[cfg(feature = "usi-extras")]
+    fn tt_error(&self, msg: &str) -> io::Result<()> {
+        self.info_string(&format!("tt error: {msg}"))
+    }
+
+    /// Build the [`Position`] a `tt` command names.
+    ///
+    /// SFEN diagnostics come from the same `parse_sfen` the `position` command
+    /// uses. The extra king check is this surface's own: `parse_sfen` happily
+    /// accepts a kingless board, but the move generators these commands then run
+    /// assume both kings are present, so a missing king is rejected up front
+    /// rather than reaching movegen.
+    #[cfg(feature = "usi-extras")]
+    fn tt_position(&self, position: &TtPosition) -> Result<Position, String> {
+        use yorkie_state::Color;
+
+        let pos = match position {
+            TtPosition::StartPos => Position::startpos(),
+            TtPosition::Sfen(sfen) => parse_sfen(sfen).map_err(|e| e.to_string())?,
+        };
+        if pos.king_square(Color::Black).is_none() || pos.king_square(Color::White).is_none() {
+            return Err("position has no king for one or both sides".to_string());
+        }
+        Ok(pos)
+    }
+
+    /// `tt store …` — write one entry for the named position.
+    ///
+    /// The value is converted with `value_to_tt(v, 0)` (the named position is
+    /// the root, so this is the identity and the stored mate value is
+    /// position-absolute), and the write goes through the ordinary
+    /// probe-then-write path with the table's **current generation** — exactly
+    /// what a search storing that value at that depth would do. That includes
+    /// `TTEntry::save`'s replacement policy, which may decline the write; the
+    /// command re-probes afterwards and says which happened rather than
+    /// reporting a success it did not verify.
+    #[cfg(feature = "usi-extras")]
+    fn tt_store(&self, args: &TtStoreArgs) -> io::Result<()> {
+        let pos = match self.tt_position(&args.position) {
+            Ok(pos) => pos,
+            Err(e) => return self.tt_error(&e),
+        };
+        let mut legal: Vec<Move> = Vec::new();
+        pos.generate_legal_all(&mut legal);
+
+        // `none` stores the `MOVE_NONE` fragment, which `TTEntry::save` reads as
+        // "keep whatever move this entry already holds for this position".
+        let move16 = if args.mv == "none" {
+            0
+        } else {
+            match parse_usi_move(&args.mv, &pos) {
+                Ok(mv) if legal.contains(&mv) => mv.move16(),
+                Ok(_) => return self.tt_error(&format!("move `{}` is not legal here", args.mv)),
+                Err(e) => {
+                    return self.tt_error(&format!("move `{}` is not a USI move: {e:?}", args.mv));
+                }
+            }
+        };
+
+        let key = pos.key();
+        let side = pos.side_to_move().index() as u8;
+        let stored_value = value_to_tt(args.value, 0);
+        let generation = self.tt.generation();
+
+        let (_, _, writer) = self.tt.probe(key, side);
+        writer.write(
+            key,
+            stored_value,
+            args.pv,
+            args.bound,
+            args.depth,
+            move16,
+            args.eval,
+            generation,
+        );
+
+        // Verify rather than assume. `move16 == 0` is excluded from the
+        // comparison on purpose: `save` deliberately preserves the pre-existing
+        // move for a `move none` write, so a mismatch there is the documented
+        // behaviour, not a declined write.
+        let (found, data, _) = self.tt.probe(key, side);
+        let stored = found
+            && data.value == stored_value
+            && data.eval == args.eval
+            && data.depth == args.depth
+            && data.bound == args.bound
+            && data.is_pv == args.pv
+            && (move16 == 0 || data.move16 == move16);
+        if stored {
+            self.info_string("tt store ok")
+        } else {
+            self.info_string("tt store skipped (replacement policy kept the existing entry)")
+        }
+    }
+
+    /// `tt probe …` — read the entry for the named position (`ply == 0`, so the
+    /// reported value is exactly the stored one).
+    #[cfg(feature = "usi-extras")]
+    fn tt_probe(&self, position: &TtPosition) -> io::Result<()> {
+        let pos = match self.tt_position(position) {
+            Ok(pos) => pos,
+            Err(e) => return self.tt_error(&e),
+        };
+        let (found, data, _) = self.tt.probe(pos.key(), pos.side_to_move().index() as u8);
+        if !found {
+            return self.info_string("tt probe miss");
+        }
+        let mut legal: Vec<Move> = Vec::new();
+        pos.generate_legal_all(&mut legal);
+        self.info_string(&format!(
+            "tt probe hit {}",
+            tt_entry_fields(&data, &legal, 0)
+        ))
+    }
+
+    /// `tt children …` — probe every legal child of the named position, one ply
+    /// deep.
+    ///
+    /// Children are reported at `ply == 1`, i.e. their values are expressed
+    /// relative to the *named* position as root: a child holding "mate in 5 from
+    /// the child" prints as `mate 6` here, one ply further out than a
+    /// `tt probe` of that child's own SFEN would print. A child with no entry
+    /// produces no line; the closing `tt children end <n>` line tells a caller
+    /// driving the engine over a pipe that the list is complete.
+    #[cfg(feature = "usi-extras")]
+    fn tt_children(&self, position: &TtPosition) -> io::Result<()> {
+        let mut pos = match self.tt_position(position) {
+            Ok(pos) => pos,
+            Err(e) => return self.tt_error(&e),
+        };
+        let mut legal: Vec<Move> = Vec::new();
+        pos.generate_legal_all(&mut legal);
+
+        let mut child_legal: Vec<Move> = Vec::new();
+        let mut hits = 0usize;
+        for mv in &legal {
+            let undo = pos.do_move(*mv);
+            let (found, data, _) = self.tt.probe(pos.key(), pos.side_to_move().index() as u8);
+            let line = found.then(|| {
+                child_legal.clear();
+                pos.generate_legal_all(&mut child_legal);
+                format!(
+                    "tt child {} {}",
+                    format_usi_move(*mv),
+                    tt_entry_fields(&data, &child_legal, 1)
+                )
+            });
+            pos.undo_move(*mv, undo);
+            if let Some(line) = line {
+                hits += 1;
+                self.info_string(&line)?;
+            }
+        }
+        self.info_string(&format!("tt children end {hits}"))
+    }
+
     fn handle_unknown(&mut self, line: &str) -> io::Result<()> {
         self.info_string(&format!("unknown command: {line}"))
     }
 
     fn handle_too_long(&mut self) -> io::Result<()> {
         self.info_string("command too long")
+    }
+}
+
+/// The labelled body shared by `tt probe hit` and `tt child` lines:
+/// `move <usi|none> value <score> depth <d> bound <b> eval <score> pv <bool>`.
+///
+/// Line-oriented with labelled fields on purpose — a later entry layout can add
+/// fields without breaking a parser that reads the ones it knows.
+///
+/// `legal` is the legal-move list of the position the entry belongs to, used to
+/// widen the stored 16-bit fragment exactly as the search does (`widen_tt_move`
+/// / `select_tt_move` in `yorkie-search`): a fragment with no matching legal
+/// move prints as `none` rather than being decoded into a nonsense square. That
+/// is also what a **key16 false positive** looks like from here — the table
+/// matches entries on the low 16 bits of the key, so a hit may belong to a
+/// different position that shares those bits, and the search lives with exactly
+/// the same risk (it validates the move and re-searches).
+///
+/// `ply` is the entry's distance from the position the command named, so the
+/// value is reported in that position's frame (0 for `tt probe`, 1 for
+/// `tt children`).
+#[cfg(feature = "usi-extras")]
+fn tt_entry_fields(data: &TTData, legal: &[Move], ply: i32) -> String {
+    let mv = legal
+        .iter()
+        .copied()
+        .find(|m| m.move16() == data.move16)
+        .map_or_else(|| "none".to_string(), format_usi_move);
+    format!(
+        "move {mv} value {} depth {} bound {} eval {} pv {}",
+        tt_score_field(value_from_tt(data.value, ply)),
+        data.depth,
+        bound_name(data.bound),
+        tt_score_field(data.eval),
+        data.is_pv,
+    )
+}
+
+/// One score field of a `tt` output line: `cp <n>` / `mate <n>` in the same USI
+/// scale [`format_score`] gives an `info … score` line, or the literal `none`
+/// for the `VALUE_NONE` sentinel (which the search writes into `eval16`
+/// whenever a node has no static eval — `tt store` cannot produce it).
+#[cfg(feature = "usi-extras")]
+fn tt_score_field(v: Value) -> String {
+    if v == VALUE_NONE {
+        "none".to_string()
+    } else {
+        format_score(v)
     }
 }
 

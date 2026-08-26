@@ -19,5 +19,11 @@ yorkie-state = { path = "../yorkie-state" }
 serde = { version = "~1.0", features = ["derive"] }
 serde_json = "~1.0"
 
+# Re-exported so `cargo build -p yorkie --features usi-extras` (and the
+# workspace-wide `--all-features` gate runs) reach the Protocol-layer feature.
+# Off by default: the tournament binary is built without it.
+[features]
+usi-extras = ["yorkie-protocol/usi-extras"]
+
 [lints]
 workspace = true
