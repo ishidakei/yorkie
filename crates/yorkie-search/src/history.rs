@@ -139,6 +139,12 @@ impl CapturePieceToHistory {
         Self::default()
     }
 
+    /// The `(address, byte length)` of this table's large-page block — see
+    /// [`WorkerHistories::backing_regions`](crate::WorkerHistories::backing_regions).
+    pub fn backing_region(&self) -> Option<(usize, usize)> {
+        self.table.backing_region()
+    }
+
     /// Overwrite every entry with `v` — the reference's `captureHistory.fill(v)`
     /// (`yaneuraou-search.cpp`, init `-678`).
     pub fn fill(&mut self, v: i16) {
@@ -191,6 +197,12 @@ impl ButterflyHistory {
     /// A fresh, zero-filled table.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The `(address, byte length)` of this table's large-page block — see
+    /// [`WorkerHistories::backing_regions`](crate::WorkerHistories::backing_regions).
+    pub fn backing_region(&self) -> Option<(usize, usize)> {
+        self.table.backing_region()
     }
 
     /// Overwrite every entry with `v` — the reference's `mainHistory.fill(v)`
@@ -291,6 +303,12 @@ impl LowPlyHistory {
     /// A fresh, zero-filled table.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The `(address, byte length)` of this table's large-page block — see
+    /// [`WorkerHistories::backing_regions`](crate::WorkerHistories::backing_regions).
+    pub fn backing_region(&self) -> Option<(usize, usize)> {
+        self.table.backing_region()
     }
 
     /// Overwrite every entry with `v` — the reference's `lowPlyHistory.fill(v)`
@@ -550,6 +568,13 @@ impl ContinuationCorrectionHistory {
         Self::default()
     }
 
+    /// The `(address, byte length)` of this table's large-page block — see
+    /// [`WorkerHistories::backing_regions`](crate::WorkerHistories::backing_regions).
+    /// A [`LargePageBox`] always owns a block, so this is never `None`.
+    pub fn backing_region(&self) -> (usize, usize) {
+        self.table.backing_region()
+    }
+
     /// Overwrite every entry with `v` — the reference fills each continuation
     /// correction plane with `6` (`yaneuraou-search.cpp`).
     pub fn fill(&mut self, v: i16) {
@@ -609,6 +634,14 @@ impl ContinuationHistory {
     /// A fresh, zero-filled table. Use [`Self::fill`] for the reference init.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The `(address, byte length)` of this table's large-page block — see
+    /// [`WorkerHistories::backing_regions`](crate::WorkerHistories::backing_regions).
+    /// This is the big one: ~54 MiB, more than three quarters of a worker's
+    /// private footprint.
+    pub fn backing_region(&self) -> Option<(usize, usize)> {
+        self.table.backing_region()
     }
 
     /// Overwrite every entry with `v` — the reference fills each continuation

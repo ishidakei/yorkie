@@ -31,6 +31,18 @@
 //!   affinity (`sched_getaffinity`), matching the reference's use of startup
 //!   affinities "so as not to modify its own behaviour in time".
 //!
+//! # What is *not* ported but added here
+//!
+//! Pinning a worker to a node says nothing about where that worker's memory
+//! lives: under a many-core host's `numactl --interleave=all` the
+//! process default policy round-robins every page, first-touch included. The
+//! [`mempolicy`] module adds the Linux `set_mempolicy` / `mbind` /
+//! `get_mempolicy` wrappers that let a pinned worker keep its *private* working
+//! set on its own node without disturbing the process default (which the shared
+//! transposition table depends on). See that module's docs for the three-layer
+//! policy; [`NumaConfig::bind_current_thread_with_local_memory`] is the
+//! pin-then-prefer pair a worker calls once at startup.
+//!
 //! Linux-only by design (a deliberate decision for this port): the reference's
 //! `_WIN64` paths are **not** ported. The pure parsing and topology code
 //! compiles and runs everywhere; only the real-syscall pieces
@@ -46,6 +58,8 @@
 //! `/sys` tree. [`NumaConfig::from_system`] is the thin production wrapper that
 //! plugs in the real `/sys` root, the real [`startup_affinity`] snapshot, and
 //! the real [`system_threads`] count.
+
+pub mod mempolicy;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -470,6 +484,36 @@ impl NumaConfig {
             );
         }
         bind_current_thread_to_cpus(self.highest_cpu_index, &self.nodes[n]);
+    }
+
+    /// Pin the current thread to logical node `n` **and** point its private
+    /// allocations at `system_node` — the pin-then-prefer pair every worker
+    /// runs once, right after it is spawned.
+    ///
+    /// [`Self::bind_current_thread_to_numa_node`] alone only constrains where
+    /// the thread *runs*. Under a many-core host's
+    /// `numactl --interleave=all` the inherited process policy still spreads
+    /// everything the thread allocates across all nodes, so the pin buys nothing
+    /// for the worker's private history tables, search stack and move buffers.
+    /// [`mempolicy::set_current_thread_preferred_node`] closes that gap; being
+    /// per-thread, it cannot perturb the shared transposition table's interleave
+    /// or the master thread's policy.
+    ///
+    /// `system_node` is a **system** NUMA node index while `n` is a *logical*
+    /// one; they differ whenever L3-aware bundling renumbers nodes, so resolve
+    /// it through [`Self::system_nodes_for_binding`] rather than reusing `n`.
+    ///
+    /// The pin is fail-loud (as the reference is); the memory policy is
+    /// best-effort and its `false` — a kernel without `CONFIG_NUMA`, a seccomp
+    /// filter — merely leaves today's placement in force. Returns whether the
+    /// policy took.
+    pub fn bind_current_thread_with_local_memory(
+        &self,
+        n: NumaIndex,
+        system_node: NumaIndex,
+    ) -> bool {
+        self.bind_current_thread_to_numa_node(n);
+        mempolicy::set_current_thread_preferred_node(system_node)
     }
 
     /// Run `f` on a temporary thread bound to NUMA node `n`, then join it
@@ -1286,6 +1330,38 @@ mod tests {
             let after = current_thread_affinity();
             let expected: BTreeSet<CpuIndex> = allowed.into_iter().collect();
             assert_eq!(after, expected);
+        });
+        handle.join().expect("bind test thread must not panic");
+    }
+
+    /// The pin-and-place pair: the affinity half is fail-loud and observable
+    /// via `sched_getaffinity`, the memory half is best-effort and observable
+    /// via `get_mempolicy`. Both are asserted here — on a single-node runner the
+    /// *placement* is node 0 either way, but the thread's *policy* is whatever
+    /// it inherited until this call changes it.
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn bind_with_local_memory_sets_both_the_affinity_and_the_policy() {
+        let handle = std::thread::spawn(|| {
+            let allowed: Vec<CpuIndex> = current_thread_affinity().into_iter().collect();
+            assert!(!allowed.is_empty(), "the test thread must have >= 1 CPU");
+            let cfg = config_from_nodes(&[&allowed]);
+
+            let took = cfg.bind_current_thread_with_local_memory(0, 0);
+
+            let expected: BTreeSet<CpuIndex> = allowed.into_iter().collect();
+            assert_eq!(
+                current_thread_affinity(),
+                expected,
+                "the pin half is unconditional"
+            );
+            if took {
+                let policy = mempolicy::current_thread_policy()
+                    .expect("get_mempolicy after a successful set");
+                assert_eq!(policy.mode, mempolicy::MODE_PREFERRED);
+                assert_eq!(policy.nodes, vec![0]);
+            }
         });
         handle.join().expect("bind test thread must not panic");
     }

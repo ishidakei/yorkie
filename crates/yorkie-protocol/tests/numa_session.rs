@@ -10,6 +10,8 @@
 //! suffix — the assertions stay deterministic on any machine, single- or
 //! multi-node.
 
+mod common;
+
 use std::sync::{Arc, Mutex};
 
 use yorkie_protocol::UsiDriver;
@@ -79,5 +81,77 @@ fn numa_policy_config_line_matches_available_processors_format() {
     assert!(
         !list.is_empty(),
         "processor list must be non-empty: {line:?}"
+    );
+}
+
+/// Turning the binding on must not move a single node.
+///
+/// A custom `NumaPolicy` node string always suggests binding, so this forces the
+/// whole pin-and-place path on — thread pinning, the per-worker
+/// `set_mempolicy(MPOL_PREFERRED)`, and the `mbind` migration of the
+/// coordinator's history tables — on a machine where `auto` would never bind.
+/// All of it is memory *placement*: the search reads the same tables, in the
+/// same order, and must reproduce the `none` transcript byte for byte.
+///
+/// Single-threaded so the comparison is deterministic by construction (the
+/// helper-vote path is not, across runs).
+#[cfg_attr(miri, ignore)]
+#[test]
+fn forced_binding_reproduces_the_unbound_search_output() {
+    let dir = common::TempDir::new("numa-parity");
+    common::write_synthetic_nn_bin(dir.path());
+
+    // A one-node custom config over a CPU the process is definitely allowed on:
+    // `custom_affinity` short-circuits `suggests_binding_threads` to true, so
+    // binding turns on even on a single-node runner, and the fail-loud
+    // `sched_setaffinity` behind it can never see a forbidden CPU.
+    let bound_policy = yorkie_numa::startup_affinity()
+        .iter()
+        .next()
+        .copied()
+        .unwrap_or(0)
+        .to_string();
+
+    let session = |policy: &str| {
+        drive(&format!(
+            "setoption name EvalDir value {}\n\
+             setoption name Threads value 1\n\
+             setoption name NumaPolicy value {policy}\n\
+             isready\n\
+             position startpos\n\
+             go depth 4\n\
+             quit\n",
+            dir.path().display()
+        ))
+    };
+
+    let bound = session(&bound_policy);
+    let unbound = session("none");
+
+    assert!(
+        bound.contains("with NUMA node thread binding"),
+        "the custom policy must actually bind: {bound:?}"
+    );
+    assert!(
+        !unbound.contains("with NUMA node thread binding"),
+        "`none` must not bind: {unbound:?}"
+    );
+
+    // The NUMA information lines differ (different configs); the search does not.
+    let search_lines = |out: &str| {
+        out.lines()
+            .filter(|l| l.starts_with("info depth") || l.starts_with("bestmove"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let bound_search = search_lines(&bound);
+    assert!(
+        !bound_search.is_empty(),
+        "the bound session must have searched: {bound:?}"
+    );
+    assert_eq!(
+        bound_search,
+        search_lines(&unbound),
+        "placement-only change: the search transcript must be identical"
     );
 }

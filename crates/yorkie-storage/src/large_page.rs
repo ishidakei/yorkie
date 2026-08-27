@@ -214,6 +214,23 @@ impl<T: Zeroable> LargePageArray<T> {
         self.ptr
     }
 
+    /// The `(address, byte length)` of the backing block, or `None` when the
+    /// array is empty (which allocates nothing).
+    ///
+    /// The address is [`LARGE_PAGE_ALIGN`]-aligned and the length is the
+    /// *rounded* allocation size, not `len * size_of::<T>()` — i.e. exactly the
+    /// span the allocator reserved. Exposed so a NUMA placement call
+    /// (`yorkie_numa::mempolicy::migrate_region_to_node`) can name the block
+    /// whole: the alignment already satisfies `mbind`'s page-aligned-base
+    /// requirement, and the rounded length keeps the call from spilling policy
+    /// onto a neighbouring allocation.
+    ///
+    /// The address is deliberately a `usize`, not a pointer: the only consumer
+    /// hands it to the kernel as a range descriptor and never dereferences it.
+    pub fn backing_region(&self) -> Option<(usize, usize)> {
+        (self.len != 0).then(|| (self.ptr.as_ptr() as usize, self.layout.size()))
+    }
+
     /// Copy `src` into a fresh large-page-backed array of the same length.
     pub fn from_slice(src: &[T]) -> Self
     where
@@ -303,6 +320,14 @@ impl<T: Zeroable> LargePageBox<T> {
             ptr: raw.cast(),
             layout,
         }
+    }
+
+    /// The `(address, byte length)` of the backing block — see
+    /// [`LargePageArray::backing_region`] for what it is for and why it is a
+    /// `usize`. Always present: a [`LargePageBox`] holds exactly one non-ZST
+    /// `T`, so it always owns a block.
+    pub fn backing_region(&self) -> (usize, usize) {
+        (self.ptr.as_ptr() as usize, self.layout.size())
     }
 }
 
@@ -416,6 +441,33 @@ mod tests {
             "box base pointer not {LARGE_PAGE_ALIGN}-aligned",
         );
         assert_eq!(*boxed, [[0i16; 4]; 2]);
+    }
+
+    #[test]
+    fn backing_region_names_the_whole_rounded_block() {
+        // A length that does not fill a whole alignment unit: the region must
+        // report the *rounded* allocation, not the element bytes, so a NUMA
+        // placement call covers the block and stops at its end.
+        let buf = LargePageArray::<i16>::zeroed(7);
+        let (addr, bytes) = buf
+            .backing_region()
+            .expect("a non-empty array owns a block");
+        assert_eq!(addr, buf.as_ptr() as usize);
+        assert_eq!(addr % LARGE_PAGE_ALIGN, 0, "base must be page-aligned");
+        assert_eq!(bytes, rounded_size(7 * size_of::<i16>()));
+        assert_eq!(bytes, LARGE_PAGE_ALIGN);
+
+        // An empty array allocates nothing, so there is no region to place.
+        assert_eq!(LargePageArray::<i16>::zeroed(0).backing_region(), None);
+    }
+
+    #[test]
+    fn box_backing_region_names_the_whole_rounded_block() {
+        let boxed = LargePageBox::<[[i16; 4]; 2]>::zeroed();
+        let (addr, bytes) = boxed.backing_region();
+        assert_eq!(addr, &*boxed as *const _ as usize);
+        assert_eq!(addr % LARGE_PAGE_ALIGN, 0, "base must be page-aligned");
+        assert_eq!(bytes, rounded_size(size_of::<[[i16; 4]; 2]>()));
     }
 
     #[test]

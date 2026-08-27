@@ -153,6 +153,33 @@ impl WorkerHistories {
         }
     }
 
+    /// The `(address, byte length)` of every large-page block backing this
+    /// worker's **private** tables, in declaration order.
+    ///
+    /// Exists for NUMA placement: when a bundle is built by one thread and then
+    /// handed to a worker pinned to a different node — which is exactly what
+    /// happens to the coordinator's session-owned bundle, allocated and
+    /// `fill`ed on the USI/master thread — first-touch has already happened and
+    /// only an explicit `mbind` can still move the pages. The driver feeds these
+    /// regions to `yorkie_numa::mempolicy::migrate_region_to_node` at pool
+    /// (re)build time. Every block comes from `yorkie_storage`'s large-page
+    /// allocator, so each address is 2 MiB-aligned and each length is the
+    /// rounded allocation size — the shape `mbind` wants.
+    ///
+    /// [`Self::shared`] is deliberately absent: the correction / pawn tables are
+    /// shared by every worker of a node and are placed by whoever builds them,
+    /// not by an individual worker. [`TtMoveHistory`] is absent too — a single
+    /// `i16` living inline in this struct, with no block of its own.
+    pub fn backing_regions(&self) -> Vec<(usize, usize)> {
+        let mut regions = Vec::with_capacity(5);
+        regions.extend(self.main.backing_region());
+        regions.extend(self.low_ply.backing_region());
+        regions.extend(self.capture.backing_region());
+        regions.extend(self.continuation.backing_region());
+        regions.push(self.continuation_correction.backing_region());
+        regions
+    }
+
     /// Swap in a different node's shared tables, leaving the per-worker tables
     /// untouched. The driver calls this on a pool rebuild so the session
     /// (coordinator) worker keeps its game-scoped per-worker tables while picking
@@ -449,6 +476,67 @@ mod tests {
         PAWN_HISTORY_D, apply_gravity,
     };
     use yorkie_state::{Move, PieceKind, Square, parse_sfen};
+
+    // ---- NUMA placement surface -------------------------------------------
+
+    /// `miri, ignore`: the bundle allocates ~68 MiB across five large-page
+    /// blocks and `with_shared` fills every entry, which miri walks one element
+    /// at a time. Nothing here is a UB question — it is pointer arithmetic the
+    /// allocator already proves — so the gate loses no coverage.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn backing_regions_cover_every_private_table_exactly_once() {
+        let h = WorkerHistories::new();
+        let regions = h.backing_regions();
+
+        // One per private table: main, low_ply, capture, continuation,
+        // continuation_correction. `tt_move` is inline and `shared` is not this
+        // worker's to place.
+        assert_eq!(regions.len(), 5, "one region per private large-page table");
+
+        for &(addr, len) in &regions {
+            assert_ne!(addr, 0);
+            assert!(len > 0);
+            assert_eq!(
+                addr % yorkie_storage::LARGE_PAGE_ALIGN,
+                0,
+                "mbind needs a page-aligned base: {addr:#x}"
+            );
+            assert_eq!(
+                len % yorkie_storage::LARGE_PAGE_ALIGN,
+                0,
+                "the length must be the rounded allocation size: {len}"
+            );
+        }
+
+        // Distinct allocations, so no two regions overlap — a placement call on
+        // one can never re-place another.
+        let mut sorted = regions.clone();
+        sorted.sort_unstable();
+        for pair in sorted.windows(2) {
+            let (a_addr, a_len) = pair[0];
+            let (b_addr, _) = pair[1];
+            assert!(
+                a_addr + a_len <= b_addr,
+                "regions {a_addr:#x}+{a_len} and {b_addr:#x} overlap"
+            );
+        }
+
+        // The continuation history is the dominant block (~54 MiB), which is
+        // what makes the placement worth doing at all.
+        let biggest = regions
+            .iter()
+            .map(|&(_, len)| len)
+            .max()
+            .expect("non-empty");
+        assert_eq!(
+            biggest,
+            h.continuation
+                .backing_region()
+                .expect("the continuation table owns a block")
+                .1
+        );
+    }
 
     // ---- gravity primitive ------------------------------------------------
 

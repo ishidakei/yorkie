@@ -14,11 +14,13 @@ publish = false
 # path, so it is exercised against fixture directories under `tests/`.
 [dependencies]
 
-# Linux-only: `sched_getaffinity` for the startup process-affinity snapshot
-# (see `startup_affinity`). The syscall itself is Linux-gated in code; the
-# dependency is `cfg(target_os = "linux")`-gated so other targets never pull it
-# in, and never reference it (the non-Linux affinity path falls back to
-# "all system threads" without touching libc).
+# Linux-only: `sched_getaffinity` / `sched_setaffinity` for the startup
+# process-affinity snapshot and thread pinning (see `startup_affinity`,
+# `bind_current_thread_to_numa_node`), plus the `set_mempolicy` / `mbind` /
+# `get_mempolicy` syscalls behind the `mempolicy` module. Every one of them is
+# Linux-gated in code; the dependency is `cfg(target_os = "linux")`-gated so
+# other targets never pull it in, and never reference it (the non-Linux paths
+# fall back to "all system threads" / no-op placement without touching libc).
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 

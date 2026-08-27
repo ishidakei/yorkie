@@ -7,7 +7,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use yorkie_numa::{DEFAULT_POLICY, NumaConfig, NumaIndex, SysfsOptions};
+use yorkie_numa::{DEFAULT_POLICY, NumaConfig, NumaIndex, SysfsOptions, mempolicy};
 use yorkie_search::{
     BookConfig, BookHit, EnteringKingConfig, EnteringKingRule, PonderSignal, Prng, PvBound, PvInfo,
     PvOutputConfig, PvSink, QSearch, RootMove, Search, SearchControl, SharedHistories, TimeControl,
@@ -311,6 +311,13 @@ pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
     /// until the next one. Index `i` is worker `i` (slot 0 = per-`go`
     /// coordinator; `1..` = helper threads).
     numa_bound: Vec<NumaIndex>,
+    /// The shareable form of the binding assignment: [`Self::numa_config`] plus
+    /// [`Self::numa_bound`] plus the worker → *system*-node map the memory
+    /// policy is indexed by. `None` when binding is inactive. Rebuilt with the
+    /// pool and handed (as an [`Arc`] clone) to every helper thread at spawn and
+    /// to each `go`'s coordinator, so the sysfs read behind the system-node map
+    /// happens once per pool rebuild rather than once per `go`.
+    numa_plan: Option<Arc<NumaBindPlan>>,
     /// Per-worker handles to the node-shared correction / pawn tables.
     /// Index `i` is worker `i`'s [`SharedHistories`] — a cheap [`Arc`]
     /// clone of its NUMA node's table set. Rebuilt at every pool (re)build from
@@ -386,11 +393,18 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         let numa_config = numa_config_from_policy("auto", &real_sysfs_options())
             .expect("default NumaPolicy `auto` always resolves to a valid config");
         let numa_bound = compute_numa_binding(&numa_config, "auto", threads);
-        let pool = ThreadPool::with_binding(threads, bind_plan(&numa_config, &numa_bound));
+        let numa_plan = bind_plan(&numa_config, &numa_bound);
+        let pool = ThreadPool::with_binding(threads, numa_plan.clone());
         // Build the per-node shared correction / pawn tables and give the
         // coordinator (worker 0) its node's set.
         let worker_shared = build_worker_shared(&numa_config, &numa_bound, threads);
         let histories = Some(WorkerHistories::with_shared(Arc::clone(&worker_shared[0])));
+        // The coordinator's bundle is built (and filled) right here, on the USI
+        // thread — so place it explicitly; see `place_coordinator_histories`.
+        place_coordinator_histories(
+            histories.as_ref(),
+            coordinator_system_node(numa_plan.as_ref()),
+        );
         Self {
             reader,
             writer,
@@ -412,6 +426,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             pool,
             numa_config,
             numa_bound,
+            numa_plan,
             worker_shared,
             // No network loaded yet; populated by the first `isready`.
             worker_networks: Vec::new(),
@@ -568,8 +583,18 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         if let Some(h) = self.histories.as_mut() {
             h.set_shared(Arc::clone(&self.worker_shared[0]));
         }
-        let plan = bind_plan(&self.numa_config, &self.numa_bound);
-        self.pool.set_with_binding(requested, plan);
+        self.numa_plan = bind_plan(&self.numa_config, &self.numa_bound);
+        // The coordinator's per-worker tables outlive a pool rebuild (only their
+        // shared handle is swapped above) and were faulted on the USI thread, so
+        // re-assert their placement for the fresh assignment. Helpers need
+        // nothing here: `set_with_binding` respawns them, and each allocates its
+        // own bundle on-thread after pinning.
+        place_coordinator_histories(
+            self.histories.as_ref(),
+            coordinator_system_node(self.numa_plan.as_ref()),
+        );
+        self.pool
+            .set_with_binding(requested, self.numa_plan.clone());
         // Re-resolve the per-worker network handles for the fresh binding /
         // pool size: the reference forces replication right after
         // `resize_threads` (`engine.cpp` `ensure_network_replicated`).
@@ -1524,15 +1549,12 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         let generate_all_legal_moves = self.options.check("GenerateAllLegalMoves");
 
         // The per-`go` coordinator (worker slot 0) binds itself to its assigned
-        // NUMA node at the start of every `go` when binding is active. The
-        // reference binds pool thread 0 once at creation (`thread.cpp`); the
-        // port's coordinator is spawned per `go`, so it re-binds each time — same
-        // target node, idempotent. Empty binding (single-node CI/VM) → no bind.
-        let numa_bind = if self.numa_bound.is_empty() {
-            None
-        } else {
-            Some((self.numa_config.clone(), self.numa_bound[0]))
-        };
+        // NUMA node — and points its allocations at that node's memory — at the
+        // start of every `go` when binding is active. The reference binds pool
+        // thread 0 once at creation (`thread.cpp`); the port's coordinator
+        // is spawned per `go`, so it re-binds each time — same target node,
+        // idempotent. `None` (single-node CI/VM) → no bind, no policy.
+        let numa_bind = self.numa_plan.clone();
 
         Some(CoordinatorJob {
             search,
@@ -2591,8 +2613,18 @@ impl ThreadPool {
     /// [`UsiDriver::rebuild_pool`]), so every helper is parked when this runs.
     ///
     /// When `plan` is `Some` and its assignment is non-empty, each helper thread
-    /// binds itself to its assigned NUMA node (worker index `1..size`) at spawn,
-    /// before entering [`helper_loop`].
+    /// binds itself to its assigned NUMA node (worker index `1..size`) at spawn
+    /// — and, in the same breath, makes that node its preferred allocation
+    /// target — before entering [`helper_loop`].
+    ///
+    /// The memory half matters because the pin alone does not place anything:
+    /// under `numactl --interleave=all` the inherited process policy would still
+    /// spread this helper's private history tables across every node. Setting the
+    /// preference *here*, at spawn, is what makes [`helper_loop`]'s lazy
+    /// `WorkerHistories::with_shared` — the helper's ~68 MiB of private tables,
+    /// allocated and filled on this very thread when its first job arrives —
+    /// land node-locally. It is a per-thread policy, so the shared transposition
+    /// table's interleave is untouched.
     fn set_with_binding(&mut self, size: usize, plan: Option<Arc<NumaBindPlan>>) {
         self.shutdown();
         let size = size.max(1);
@@ -2604,8 +2636,10 @@ impl ThreadPool {
                 if let Some(p) = &plan_for_thread
                     && !p.bound.is_empty()
                 {
-                    p.config
-                        .bind_current_thread_to_numa_node(p.bound[worker_id]);
+                    p.config.bind_current_thread_with_local_memory(
+                        p.bound[worker_id],
+                        p.system_nodes[worker_id],
+                    );
                 }
                 helper_loop(slot_for_thread);
             }));
@@ -2657,6 +2691,12 @@ struct NumaBindPlan {
     /// The worker → node assignment (index `i` = worker `i`). Empty means no
     /// binding; `set_with_binding` then leaves every helper unbound.
     bound: Vec<NumaIndex>,
+    /// The worker → **system** NUMA node map, aligned with [`Self::bound`]: the
+    /// node each worker's private memory should live on. Distinct from `bound`
+    /// because L3-aware bundling renumbers logical nodes, while the kernel's
+    /// memory policy is indexed by system node
+    /// ([`NumaConfig::system_nodes_for_binding`]).
+    system_nodes: Vec<NumaIndex>,
 }
 
 /// The `SysfsOptions` for the live machine: the real `/sys` root, the startup
@@ -2721,6 +2761,13 @@ fn compute_numa_binding(config: &NumaConfig, policy: &str, requested: usize) -> 
 
 /// Wrap a non-empty binding assignment into a shareable [`NumaBindPlan`]; an
 /// empty assignment yields `None` (no thread binds).
+///
+/// The worker → *system* node map is resolved here, once per pool (re)build, and
+/// never on the search path: it reads sysfs, and the kernel's memory policy is
+/// indexed by system node while `bound` holds *logical* nodes that L3-aware
+/// bundling may have renumbered. Building it alongside `bound` keeps the two
+/// vectors the same length by construction, which is what lets every worker
+/// index both with one id.
 fn bind_plan(config: &NumaConfig, bound: &[NumaIndex]) -> Option<Arc<NumaBindPlan>> {
     if bound.is_empty() {
         None
@@ -2728,7 +2775,37 @@ fn bind_plan(config: &NumaConfig, bound: &[NumaIndex]) -> Option<Arc<NumaBindPla
         Some(Arc::new(NumaBindPlan {
             config: config.clone(),
             bound: bound.to_vec(),
+            system_nodes: config.system_nodes_for_binding(bound, &real_sysfs_options()),
         }))
+    }
+}
+
+/// Worker 0's system NUMA node under `plan`, or `None` when binding is inactive.
+fn coordinator_system_node(plan: Option<&Arc<NumaBindPlan>>) -> Option<NumaIndex> {
+    plan.and_then(|p| p.system_nodes.first().copied())
+}
+
+/// Move the coordinator's session-owned history tables onto worker 0's node.
+///
+/// The one per-worker bundle this engine does **not** allocate inside the worker
+/// that uses it: it is built (and `fill`ed, so every page is faulted) on the USI
+/// / master thread — at construction and again at `usinewgame` — and only then
+/// lent to the per-`go` coordinator thread. Under a many-core host's
+/// `numactl --interleave=all` those pages are spread across every node before
+/// the coordinator ever runs, and no per-thread policy can retroactively move
+/// them; `mbind(MPOL_BIND | MPOL_MF_MOVE)` can, so that is what this does. The
+/// helpers need none of this — each allocates its own bundle inside
+/// [`helper_loop`], after it has pinned itself and set its preferred node.
+///
+/// Best-effort throughout: `node` is `None` when binding is inactive (the
+/// single-node CI/VM case), and every individual call degrades to leaving the
+/// placement alone. Runs at pool-(re)build time only — outside any clock.
+fn place_coordinator_histories(histories: Option<&WorkerHistories>, node: Option<NumaIndex>) {
+    let (Some(histories), Some(node)) = (histories, node) else {
+        return;
+    };
+    for (addr, len) in histories.backing_regions() {
+        mempolicy::migrate_region_to_node(addr, len, node);
     }
 }
 
@@ -2961,10 +3038,10 @@ struct CoordinatorJob<W: Write + Send + 'static> {
     helper_networks: Vec<Arc<Search>>,
     /// The worker count (main + helpers).
     n_threads: usize,
-    /// The coordinator's own NUMA binding target: `Some((config,
-    /// node))` when binding is active, in which case the coordinator binds itself
-    /// to `node` at the start of this `go`. `None` when binding is inactive.
-    numa_bind: Option<(NumaConfig, NumaIndex)>,
+    /// The active binding plan, or `None` when binding is inactive. When set,
+    /// the coordinator pins itself to worker 0's logical node and prefers that
+    /// worker's system node for memory at the start of this `go`.
+    numa_bind: Option<Arc<NumaBindPlan>>,
     /// The loaded opening book to probe once, if any.
     book: Option<Arc<LoadedBook>>,
     /// The book-selection config snapshot for this `go`.
@@ -3074,12 +3151,18 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     let multi_pv = pv_config.multi_pv.max(1);
 
     // Bind this coordinator (worker slot 0) to its assigned NUMA node before any
-    // search work, when binding is active. Idempotent across the
-    // per-`go` coordinator respawns — the target node is stable until the next
-    // pool rebuild. No-op when binding is inactive (single-node CI/VM) or off
-    // Linux.
-    if let Some((cfg, node)) = &numa_bind {
-        cfg.bind_current_thread_to_numa_node(*node);
+    // search work, when binding is active, and make that node's memory its
+    // allocation preference — everything this thread allocates from here on (the
+    // search stack, the root move list, the move buffers) then stays node-local
+    // instead of following the launcher's process-wide interleave. Idempotent
+    // across the per-`go` coordinator respawns — the target node is stable until
+    // the next pool rebuild. No-op when binding is inactive (single-node CI/VM)
+    // or off Linux. The bundle in `histories` is placed separately, at pool
+    // (re)build time, because it was already faulted on the USI thread by then
+    // (`place_coordinator_histories`).
+    if let Some(plan) = &numa_bind {
+        plan.config
+            .bind_current_thread_with_local_memory(plan.bound[0], plan.system_nodes[0]);
     }
 
     // One TT generation bump per `go`, on the main worker, BEFORE any helper
@@ -3910,6 +3993,116 @@ mod tests {
         let ws1 = build_worker_shared(&cfg, &[], 1);
         assert_eq!(ws1.len(), 1);
         assert_eq!(ws1[0].thread_count(), 1);
+    }
+
+    // --- NUMA memory placement --------------------------------------------
+
+    /// A `NumaPolicy` value that forces binding on any machine: a one-node
+    /// custom config over a single CPU the process is definitely allowed on.
+    /// `custom_affinity` short-circuits `suggests_binding_threads` to true, so
+    /// this turns the whole pin-and-place path on even where `auto` would never
+    /// bind — and picking the CPU from the live affinity keeps the fail-loud
+    /// `sched_setaffinity` inside it from ever seeing a forbidden CPU.
+    fn forced_binding_policy() -> String {
+        let cpu = yorkie_numa::startup_affinity()
+            .iter()
+            .next()
+            .copied()
+            .unwrap_or(0);
+        cpu.to_string()
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn bind_plan_is_absent_when_binding_is_inactive() {
+        // The single-node CI/VM case: no assignment, so no plan, so no thread
+        // ever pins itself and nothing touches a memory policy.
+        let cfg = NumaConfig::from_string("0-3").unwrap();
+        assert!(bind_plan(&cfg, &[]).is_none());
+        assert_eq!(coordinator_system_node(None), None);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn bind_plan_carries_one_system_node_per_worker() {
+        // A custom node string always suggests binding. Whatever the runner's
+        // real topology is, the map must be one entry per worker and every entry
+        // must be a system node the machine actually has — this is the vector
+        // both the pin site and the placement calls index with a worker id, so a
+        // length mismatch would be an out-of-bounds panic on a worker thread.
+        let cfg = NumaConfig::from_string("0:1").unwrap();
+        let bound = vec![0, 1, 0];
+        let plan = bind_plan(&cfg, &bound).expect("a non-empty assignment yields a plan");
+        assert_eq!(plan.bound, bound);
+        assert_eq!(
+            plan.system_nodes.len(),
+            bound.len(),
+            "one system node per worker"
+        );
+        assert_eq!(
+            plan.system_nodes,
+            cfg.system_nodes_for_binding(&bound, &real_sysfs_options()),
+            "the plan's map is exactly the config's resolution"
+        );
+        assert_eq!(
+            coordinator_system_node(Some(&plan)),
+            Some(plan.system_nodes[0])
+        );
+    }
+
+    /// The remedy for the one bundle this engine builds off-worker, asserted
+    /// end-to-end through the driver: after a `NumaPolicy` that forces binding,
+    /// every large-page block behind the coordinator's history tables must be
+    /// governed by an `MPOL_BIND` policy naming worker 0's system node.
+    ///
+    /// Meaningful on a single-node runner: the *placement* answer there is node
+    /// 0 either way, but the *policy* over those pages is `MPOL_DEFAULT` until
+    /// something binds it — which is precisely the before/after this change is
+    /// about. `cfg_attr(miri, ignore)`: the syscalls compile out under miri.
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn forced_binding_places_the_coordinator_histories_on_worker_zero_node() {
+        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut driver = UsiDriver::new(&b""[..], Arc::clone(&output));
+
+        // A custom node string always suggests binding, so this turns the
+        // binding on even on a single-node runner. The node is the one CPU the
+        // process is certain to be allowed on, so the (fail-loud) pin the
+        // rebuild's helper threads perform cannot hit a forbidden CPU.
+        driver
+            .handle_setoption("NumaPolicy", &forced_binding_policy())
+            .expect("setoption writes to the in-memory sink");
+
+        let node = coordinator_system_node(driver.numa_plan.as_ref())
+            .expect("a custom NumaPolicy binds, so a plan exists");
+        let regions = driver
+            .histories
+            .as_ref()
+            .expect("the coordinator bundle survives a pool rebuild")
+            .backing_regions();
+        assert!(!regions.is_empty(), "the bundle owns large-page blocks");
+
+        for (addr, len) in regions {
+            let Some(policy) = mempolicy::policy_at_address(addr) else {
+                continue; // `get_mempolicy` unavailable — nothing to assert.
+            };
+            if policy.mode == mempolicy::MODE_DEFAULT {
+                // The kernel refused the `mbind` (no CONFIG_NUMA, seccomp, a
+                // restricted cgroup). Best-effort: today's behaviour stands.
+                continue;
+            }
+            assert_eq!(
+                policy.mode,
+                mempolicy::MODE_BIND,
+                "region {addr:#x}+{len} must be bound, not merely preferred"
+            );
+            assert_eq!(
+                policy.nodes,
+                vec![node],
+                "region {addr:#x}+{len} must name worker 0's system node"
+            );
+        }
     }
 
     // A book / declaration / resign short-circuit carries the reference's
