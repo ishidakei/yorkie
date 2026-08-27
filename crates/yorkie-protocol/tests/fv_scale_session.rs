@@ -12,6 +12,14 @@
 //! the only test in this binary that runs a `go`, so that global is never raced
 //! by a sibling test. The byte layout mirrors `crates/yorkie-eval/src/loader.rs`
 //! (as in `tests/eval_session.rs`).
+//!
+//! **`usi-extras` gate.** These sessions drive the analysis-only `go` clauses
+//! (`depth` / `nodes` / `movetime` / `infinite`), which a default build refuses
+//! rather than reinterprets, so the whole file is gated on the feature and runs
+//! under the `--all-features` gate. See the `usi-extras` reference
+//! documentation.
+
+#![cfg(feature = "usi-extras")]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};

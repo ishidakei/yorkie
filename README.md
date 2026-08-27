@@ -189,16 +189,20 @@ objdump -d target/release/yorkie | grep -c '%zmm'
 | `setoption name <名前> value <値>` | オプションを設定する |
 | `usinewgame` | 新規対局の開始（出力なし） |
 | `position [startpos \| sfen <SFEN>] [moves <手> …]` | 局面を設定する |
-| `go […]` | 探索を開始し `bestmove` を返す |
+| `go [btime <ms>] [wtime <ms>] [binc <ms>] [winc <ms>] [byoyomi <ms>] [ponder]` | 探索を開始し `bestmove` を返す。対局で使う持ち時間系の指定はすべて既定ビルドで有効 |
+| `go depth <d>` / `go nodes <n>` / `go mate [ms\|infinite]` / `go movetime <ms>` / `go infinite` / `go rtime <ms>` | 対局では使わない探索指定。`usi-extras` feature を指定したビルドでのみ有効。既定ビルドでは `info string go error: …` を出力して探索を開始しない |
 | `stop` | 探索を停止する |
 | `ponderhit` | 先読みが的中したことを通知する |
 | `gameover` | 対局終了 |
 | `quit` | 終了する |
-| `bench [ttSizeMB] [threads] [limit] [default\|current\|<fenFile>] [limitType]` | 固定条件での NPS 計測。引数はすべて省略可で、左から順に既定値（`ttSizeMB=1024`, `threads=1`, `limit=15000`, ソース `default`, `limitType=movetime`）で埋められる |
+| `bench [ttSizeMB] [threads] [limit] [default\|current\|<fenFile>] [limitType]` | 固定条件での NPS 計測。引数はすべて省略可で、左から順に既定値（`ttSizeMB=1024`, `threads=1`, `limit=15000`, ソース `default`, `limitType=movetime`）で埋められる。`usi-extras` feature を指定したビルドでのみ有効 |
 | `tt store` / `tt probe` / `tt children` | 置換表を読み書きするコマンド。`usi-extras` feature を指定したビルドでのみ有効 |
 
 認識できないコマンドを受け取った場合は `info string unknown command: <入力行>` を
-出力して読み飛ばします。
+出力して読み飛ばします。`usi-extras` を指定しない既定ビルドでは `bench` と `tt` は
+コマンドとして存在しないため、この経路で読み飛ばされます。`usi-extras` の有効時のみ
+組み込まれる `go` の指定だけは、`go` 自体が対局用コマンドであるため読み飛ばさず、
+`info string go error: …` を出力して探索を開始しません。
 
 コマンドライン用のサブコマンドとして、perft（指し手生成の数え上げ）も利用できます
 （[`crates/yorkie/src/main.rs`](crates/yorkie/src/main.rs)）。

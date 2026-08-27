@@ -24,10 +24,16 @@ serde_json = "~1.0"
 # the tournament binary does not contain the commands at all (the parser has no
 # arm for them, the driver has no handler, and the enum variants do not exist).
 #
-# It currently covers the `tt store` / `tt probe` / `tt children` commands. The
-# other existing non-match commands (`go depth` / `nodes` / `mate` / `movetime` /
-# `infinite` / `rtime`, `bench`) are intended to move under it later; that
-# migration is deliberately not part of this feature's first cut.
+# It covers the `tt store` / `tt probe` / `tt children` commands, the whole
+# `bench` command, and the non-match `go` clauses (`depth` / `nodes` / `mate` /
+# `movetime` / `infinite` / `rtime`).
+#
+# `tt` and `bench` disappear as command tokens with the feature off. The gated
+# `go` clauses cannot disappear the same way — `go` itself is a match command —
+# so with the feature off a `go` line carrying one is REJECTED with an
+# `info string` and starts no search. Silently ignoring the clause would turn
+# `go depth 4` into an unbounded, clock-less search mid-game. See the
+# `usi-extras` reference documentation.
 [features]
 usi-extras = []
 

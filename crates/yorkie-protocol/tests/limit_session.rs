@@ -7,6 +7,14 @@
 //! they are hermetic. Multi-depth / node-capped / infinite searches run on a
 //! worker thread, so they use [`StreamHarness`] and wait for the `bestmove`
 //! before quitting — a fixed result never races the `quit`-driven join.
+//!
+//! **`usi-extras` gate.** These sessions drive the analysis-only `go` clauses
+//! (`depth` / `nodes` / `movetime` / `infinite`), which a default build refuses
+//! rather than reinterprets, so the whole file is gated on the feature and runs
+//! under the `--all-features` gate. See the `usi-extras` reference
+//! documentation.
+
+#![cfg(feature = "usi-extras")]
 
 mod common;
 

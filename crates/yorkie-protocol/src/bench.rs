@@ -2,6 +2,11 @@
 //! the reference `setup_bench` (`source/benchmark.cpp`,
 //! the non-Stockfish branch) and its `Defaults` list (`benchmark.cpp`).
 //!
+//! The whole module exists only under the `usi-extras` cargo feature — a
+//! tournament game never benchmarks, so the default build has neither this
+//! parse nor the `bench` command token (see the `usi-extras` reference
+//! documentation).
+//!
 //! This module owns only the *semantic parse* of the `bench` argument tokens
 //! (TT size, threads, per-position limit, position source, limit type) into a
 //! [`BenchConfig`]. The driver ([`crate::driver`]) consumes the config: it

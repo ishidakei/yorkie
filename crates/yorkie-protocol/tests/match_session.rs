@@ -1,0 +1,144 @@
+//! The command surface a rated game actually uses, and what the default
+//! (tournament) build does with the commands it does not.
+//!
+//! A bridge in a rated game sends only `usi`, `isready`, `setoption`,
+//! `usinewgame`, `position`, `go` with clock clauses (`btime` / `wtime` /
+//! `binc` / `winc` / `byoyomi`) or `go ponder`, `stop`, `ponderhit`, `gameover`
+//! and `quit`. Everything else — `bench` and the `go depth` / `nodes` / `mate` /
+//! `movetime` / `infinite` / `rtime` clauses — lives behind `usi-extras`.
+//!
+//! [`match_shaped_session_is_byte_identical`] is deliberately NOT feature-gated:
+//! it runs in both configurations and pins the same bytes, which is the
+//! "turning the feature off changes nothing a game can see" claim. The gated
+//! module below compiles only with the feature OFF and pins the refusals; run
+//! `cargo nextest run -p yorkie-protocol` (default features, i.e. without
+//! `--all-features`) to execute it.
+//!
+//! No network is loaded, so every `go` resolves through the no-eval path — the
+//! one search outcome that is deterministic to the byte. The handshake itself is
+//! pinned separately in `tests/handshake.rs`.
+
+mod common;
+
+use common::drive;
+
+/// A whole game-shaped session, byte-for-byte. Same expectation with the feature
+/// on and off.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn match_shaped_session_is_byte_identical() {
+    let session = "\
+        usinewgame\n\
+        position startpos moves 7g7f 3c3d\n\
+        go btime 60000 wtime 60000 binc 1000 winc 1000\n\
+        stop\n\
+        position startpos moves 7g7f 3c3d 2g2f 8c8d\n\
+        go btime 58000 wtime 58000 byoyomi 5000\n\
+        gameover lose\n\
+        quit\n";
+    assert_eq!(
+        drive(session),
+        "info string no eval network loaded; run isready\n\
+         bestmove resign\n\
+         info string no eval network loaded; run isready\n\
+         bestmove resign\n"
+    );
+}
+
+/// `go ponder` is a match command too: the reply is held until the search is
+/// released, and `ponderhit` releases it.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn go_ponder_and_ponderhit_are_match_commands() {
+    let session = "\
+        usinewgame\n\
+        position startpos moves 7g7f\n\
+        go ponder btime 60000 wtime 60000\n\
+        ponderhit\n\
+        quit\n";
+    assert_eq!(
+        drive(session),
+        "info string no eval network loaded; run isready\n\
+         bestmove resign\n"
+    );
+}
+
+/// The default build: the non-match commands are gone, and they go out loudly.
+#[cfg(not(feature = "usi-extras"))]
+mod without_usi_extras {
+    use super::drive;
+
+    /// `bench` is not a command token at all — it lands in the ordinary
+    /// unknown-command path, exactly as `tt` does.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn bench_is_an_unknown_command() {
+        assert_eq!(
+            drive("bench\nquit\n"),
+            "info string unknown command: bench\n"
+        );
+        assert_eq!(
+            drive("bench 16 1 6 default depth\nquit\n"),
+            "info string unknown command: bench 16 1 6 default depth\n"
+        );
+    }
+
+    /// Every gated `go` clause is refused by name, and no search starts: no
+    /// `bestmove`, no `info` beyond the one error line. Silently dropping the
+    /// clause would turn `go depth 4` into an unbounded, clock-less search in
+    /// the middle of a game.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn gated_go_clauses_are_refused_and_start_no_search() {
+        for clause in [
+            "depth 4",
+            "nodes 1000",
+            "mate 5000",
+            "movetime 250",
+            "rtime 100",
+        ] {
+            let name = clause.split_whitespace().next().expect("clause name");
+            assert_eq!(
+                drive(&format!("position startpos\ngo {clause}\nquit\n")),
+                format!(
+                    "info string go error: `{name}` requires a usi-extras build; \
+                     no search started\n"
+                ),
+            );
+        }
+        assert_eq!(
+            drive("position startpos\ngo infinite\nquit\n"),
+            "info string go error: `infinite` requires a usi-extras build; no search started\n"
+        );
+    }
+
+    /// A gated clause riding along with legitimate clock clauses is refused too:
+    /// the `go` is not quietly downgraded to the subset this build understands.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_gated_clause_poisons_the_whole_go_line() {
+        assert_eq!(
+            drive("go btime 60000 wtime 60000 depth 4\nquit\n"),
+            "info string go error: `depth` requires a usi-extras build; no search started\n"
+        );
+    }
+
+    /// A refusal is not a wedge: the very next match-shaped `go` searches
+    /// normally.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_refused_go_leaves_the_session_usable() {
+        let session = "\
+            usinewgame\n\
+            position startpos\n\
+            go depth 4\n\
+            go btime 60000 wtime 60000 byoyomi 5000\n\
+            quit\n";
+        assert_eq!(
+            drive(session),
+            "info string go error: `depth` requires a usi-extras build; no search started\n\
+             info string no eval network loaded; run isready\n\
+             bestmove resign\n"
+        );
+    }
+}

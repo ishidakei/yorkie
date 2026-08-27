@@ -19,6 +19,7 @@ use yorkie_storage::{Book, TranspositionTable, Value};
 #[cfg(feature = "usi-extras")]
 use yorkie_storage::{TTData, VALUE_NONE};
 
+#[cfg(feature = "usi-extras")]
 use crate::bench;
 use crate::engine_options::{OverrideLine, parse_override_line};
 use crate::formatter::Formatter;
@@ -462,9 +463,12 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 Command::UsiNewGame => self.handle_usinewgame(),
                 Command::Position { sfen, moves } => self.handle_position(sfen, &moves)?,
                 Command::Go(limits) => self.handle_go(limits)?,
+                #[cfg(not(feature = "usi-extras"))]
+                Command::GoExtraClause(clause) => self.handle_go_extra_clause(&clause)?,
                 Command::Stop => self.handle_stop(),
                 Command::GameOver => self.handle_gameover(),
                 Command::PonderHit => self.handle_ponderhit()?,
+                #[cfg(feature = "usi-extras")]
                 Command::Bench(tokens) => self.handle_bench(&tokens)?,
                 #[cfg(feature = "usi-extras")]
                 Command::Tt(tokens) => self.handle_tt(&tokens)?,
@@ -1252,6 +1256,23 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         Ok(())
     }
 
+    /// A `go` line carrying a clause that lives behind `usi-extras`
+    /// (`depth` / `nodes` / `mate` / `movetime` / `infinite` / `rtime`), seen by
+    /// a build without the feature: report it and start nothing.
+    ///
+    /// Failing loud is deliberate. Ignoring the clause would silently change the
+    /// search's terms — `go depth 4` would become a clock-less `go` in the
+    /// middle of a game — and a rated game never issues these clauses in the
+    /// first place, so the line can only be a harness or bridge
+    /// misconfiguration. Any search already running is left alone: this `go` is
+    /// not a `go` at all.
+    #[cfg(not(feature = "usi-extras"))]
+    fn handle_go_extra_clause(&mut self, clause: &str) -> io::Result<()> {
+        self.info_string(&format!(
+            "go error: `{clause}` requires a usi-extras build; no search started"
+        ))
+    }
+
     /// Stochastic_Ponder `go ponder` rewind (`usi.cpp`): reconstruct the
     /// retained position with its last move dropped and install it as the search
     /// root. A best-effort trim — an empty move list (nothing to rewind) or a
@@ -1596,6 +1617,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// a `go` would; only the driving is synchronous (bench needs each position's
     /// node total before moving on). `disablePvInterval` is set so every iteration
     /// prints. A position with no network loaded resigns and contributes 0 nodes.
+    #[cfg(feature = "usi-extras")]
     fn bench_run_one(&mut self, limits: GoLimits) -> io::Result<u64> {
         let Some(job) = self.prepare_coordinator_job(limits, true) else {
             self.info_string("no eval network loaded; run isready")?;
@@ -1621,6 +1643,10 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// node count. Ends with one machine-parsable summary line so optimization PRs
     /// can grep it. A parse failure is reported as an `info string` and runs
     /// nothing, never a panic.
+    ///
+    /// `usi-extras` only: a tournament game never benchmarks, so the default
+    /// build has neither this handler nor the command token.
+    #[cfg(feature = "usi-extras")]
     fn handle_bench(&mut self, tokens: &[String]) -> io::Result<()> {
         // Reclaim any running search before touching options / the TT.
         self.finish_search_join();
@@ -3098,6 +3124,11 @@ struct CoordinatorJob<W: Write + Send + 'static> {
 /// untouched — see [`SearchState::time_state`]).
 struct CoordinatedOutcome {
     histories: WorkerHistories,
+    /// `bench` is the only reader (the async `go` path takes its node total off
+    /// the wire), and `bench` is `usi-extras`. The field is still *written* on
+    /// every search in both configurations — keeping the coordinator itself
+    /// feature-agnostic is worth one `allow` here.
+    #[cfg_attr(not(feature = "usi-extras"), allow(dead_code))]
     nodes: u64,
     time_state: Option<(Value, Value, Option<f64>)>,
 }
@@ -3770,6 +3801,7 @@ mod tests {
         assert_eq!(bestmoves, vec!["bestmove resign"]);
     }
 
+    #[cfg(feature = "usi-extras")]
     #[cfg_attr(miri, ignore)]
     #[test]
     fn go_with_limit_subtokens_still_emits_one_bestmove() {
@@ -3780,6 +3812,45 @@ mod tests {
         let out = run_with(session);
         let bestmoves: Vec<&str> = out.lines().filter(|l| l.starts_with("bestmove ")).collect();
         assert_eq!(bestmoves.len(), 1);
+    }
+
+    /// Feature off — the default (tournament) build: the same line is refused by
+    /// name and starts nothing, so there is no `bestmove` at all. The clock
+    /// clauses riding along on it do not rescue it: a `go` whose terms the build
+    /// cannot honour is not silently downgraded to one it can.
+    #[cfg(not(feature = "usi-extras"))]
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn go_with_gated_limit_subtokens_is_refused_and_starts_no_search() {
+        let session = "go depth 8 wtime 60000 btime 60000 byoyomi 5000\nquit\n";
+        assert_eq!(
+            run_with(session),
+            "info string go error: `depth` requires a usi-extras build; no search started\n"
+        );
+    }
+
+    /// Feature off: the match clauses are untouched — a clock-bounded `go` runs
+    /// exactly as before (resign here, as no network is loaded).
+    #[cfg(not(feature = "usi-extras"))]
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn go_with_match_subtokens_still_emits_one_bestmove() {
+        let session = "go wtime 60000 btime 60000 byoyomi 5000\nquit\n";
+        let out = run_with(session);
+        let bestmoves: Vec<&str> = out.lines().filter(|l| l.starts_with("bestmove ")).collect();
+        assert_eq!(bestmoves, vec!["bestmove resign"]);
+    }
+
+    /// Feature off: `bench` is not a command, so it lands in the ordinary
+    /// unknown-command path — the same line any stray input produces.
+    #[cfg(not(feature = "usi-extras"))]
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn bench_is_an_unknown_command_without_usi_extras() {
+        assert_eq!(
+            run_with("bench 16 1 6 default depth\nquit\n"),
+            "info string unknown command: bench 16 1 6 default depth\n"
+        );
     }
 
     #[cfg_attr(miri, ignore)]

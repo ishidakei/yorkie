@@ -10,6 +10,14 @@
 //! PV-content assertions that depend on per-iteration output set `PvInterval
 //! value 0` in the preamble so the pin's default 300 ms throttle does not
 //! suppress the intermediate lines.
+//!
+//! **`usi-extras` gate.** These sessions drive the analysis-only `go` clauses
+//! (`depth` / `nodes` / `movetime` / `infinite`), which a default build refuses
+//! rather than reinterprets, so the whole file is gated on the feature and runs
+//! under the `--all-features` gate. See the `usi-extras` reference
+//! documentation.
+
+#![cfg(feature = "usi-extras")]
 
 mod common;
 

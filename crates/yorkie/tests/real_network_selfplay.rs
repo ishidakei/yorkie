@@ -13,6 +13,15 @@
 //! `bestmove` must be legal for the running position, the process must never
 //! crash, and it must exit cleanly on `quit`. A `bestmove resign` or
 //! `bestmove win` (a mate or a declaration win can happen) ends the loop early.
+//!
+//! **`usi-extras` gate.** The session drives the analysis-only `go` clauses
+//! (`depth` / `movetime` / `infinite`), which the default build refuses rather
+//! than reinterprets, so the whole file is gated on the feature: the spawned
+//! `yorkie` binary carries it only when the test binary does. The hosted CI
+//! builds and tests with `--all-features`, so this runs there. See the
+//! `usi-extras` reference documentation.
+
+#![cfg(feature = "usi-extras")]
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;

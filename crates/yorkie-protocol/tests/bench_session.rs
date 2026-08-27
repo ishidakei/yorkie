@@ -7,6 +7,17 @@
 //! argument parse and summary plumbing without a real search. The determinism
 //! and multi-thread gates stage a synthetic (all-zero) network in a temp dir and
 //! run a small fixed-depth bench so they stay fast.
+//!
+//! **`usi-extras` gate.** `bench` is an analysis command a tournament game never
+//! issues, so the whole file is gated on the feature — with `usi-extras` off it
+//! compiles to nothing, matching the default build where `bench` is not a
+//! command token at all. The complementary "feature off" assertions live in
+//! `src/parser.rs::tests::bench_is_not_a_command_without_usi_extras` and
+//! `src/driver.rs::tests::bench_is_an_unknown_command_without_usi_extras`, both
+//! compiled only when the feature is OFF; run `cargo nextest run -p
+//! yorkie-protocol` (default features) to execute them.
+
+#![cfg(feature = "usi-extras")]
 
 mod common;
 

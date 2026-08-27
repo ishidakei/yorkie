@@ -6,6 +6,14 @@
 //! deterministic; a book hit short-circuits the search entirely, so a reply that
 //! equals the book's best move (and carries the depth-0 book `info` signature)
 //! proves the book was consulted.
+//!
+//! **`usi-extras` gate.** These sessions drive the analysis-only `go` clauses
+//! (`depth` / `nodes` / `movetime` / `infinite`), which a default build refuses
+//! rather than reinterprets, so the whole file is gated on the feature and runs
+//! under the `--all-features` gate. See the `usi-extras` reference
+//! documentation.
+
+#![cfg(feature = "usi-extras")]
 
 mod common;
 

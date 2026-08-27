@@ -9,6 +9,14 @@
 //! `NumaPolicy none` is used so the allocation line never carries a binding
 //! suffix — the assertions stay deterministic on any machine, single- or
 //! multi-node.
+//!
+//! **`usi-extras` gate.** These sessions drive the analysis-only `go` clauses
+//! (`depth` / `nodes` / `movetime` / `infinite`), which a default build refuses
+//! rather than reinterprets, so the whole file is gated on the feature and runs
+//! under the `--all-features` gate. See the `usi-extras` reference
+//! documentation.
+
+#![cfg(feature = "usi-extras")]
 
 mod common;
 

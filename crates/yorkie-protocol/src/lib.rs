@@ -1,3 +1,5 @@
+/// The feature-gated `bench` command — present only under `usi-extras`.
+#[cfg(feature = "usi-extras")]
 pub mod bench;
 pub mod driver;
 pub mod engine_options;
@@ -9,6 +11,7 @@ pub mod parser;
 #[cfg(feature = "usi-extras")]
 pub mod tt_command;
 
+#[cfg(feature = "usi-extras")]
 pub use bench::{BENCH_DEFAULT_POSITIONS, BenchConfig, BenchParseError, parse_bench};
 pub use driver::UsiDriver;
 pub use engine_options::{OverrideLine, parse_override_line};

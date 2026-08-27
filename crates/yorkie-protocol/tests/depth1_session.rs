@@ -16,6 +16,14 @@
 //! `eval/nn.bin` and is never committed. When absent
 //! (a checkout without it staged) the test prints a notice and passes, so the
 //! default `cargo test` run stays green everywhere.
+//!
+//! **`usi-extras` gate.** These sessions drive the analysis-only `go` clauses
+//! (`depth` / `nodes` / `movetime` / `infinite`), which a default build refuses
+//! rather than reinterprets, so the whole file is gated on the feature and runs
+//! under the `--all-features` gate. See the `usi-extras` reference
+//! documentation.
+
+#![cfg(feature = "usi-extras")]
 
 use std::path::PathBuf;
 

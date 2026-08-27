@@ -10,6 +10,14 @@
 //! — of which the two side-to-move-dependent option NAMES are
 //! observable from a session, via both the filtering they perform and the
 //! `info string` that names the option used.
+//!
+//! **`usi-extras` gate.** These sessions drive the analysis-only `go` clauses
+//! (`depth` / `nodes` / `movetime` / `infinite`), which a default build refuses
+//! rather than reinterprets, so the whole file is gated on the feature and runs
+//! under the `--all-features` gate. See the `usi-extras` reference
+//! documentation.
+
+#![cfg(feature = "usi-extras")]
 
 mod common;
 

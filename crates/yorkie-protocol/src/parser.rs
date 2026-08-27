@@ -12,6 +12,14 @@ pub enum PositionSfen {
 
 /// All USI `go` sub-tokens captured verbatim, including the ones the driver
 /// does not act on, so the parse is lossless.
+///
+/// The struct carries every field in both feature configurations. The
+/// `usi-extras` gate sits on the *parser arms* (`EXTRA_GO_CLAUSES`), not on
+/// the fields: `depth` and `nodes` are also seeded from the `DepthLimit` /
+/// `NodesLimit` options, which are ordinary `setoption` names a match may use,
+/// so a field-level gate would have to cut those too. With the feature off no
+/// `go` line can reach the gated fields — they stay at their defaults unless an
+/// option seeds them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GoLimits {
     pub depth: Option<u32>,
@@ -44,6 +52,18 @@ pub struct GoLimits {
 /// `usi.cpp`): `go mate infinite` and a bare `go mate` both map here.
 pub const MATE_UNLIMITED_MS: u64 = i32::MAX as u64;
 
+/// The `go` clauses that live behind `usi-extras` — the ones a rated game never
+/// issues. A tournament bridge sends only the clock clauses (`btime` / `wtime` /
+/// `binc` / `winc` / `byoyomi`) and `ponder`; everything here is analysis or
+/// tooling.
+///
+/// With the feature off these tokens are **rejected**, not ignored: silently
+/// dropping the clause would turn `go depth 4` into an unbounded, clock-less
+/// search in the middle of a game, so the driver reports the clause and starts
+/// nothing (see [`Command::GoExtraClause`]).
+#[cfg(not(feature = "usi-extras"))]
+pub const EXTRA_GO_CLAUSES: [&str; 6] = ["depth", "nodes", "mate", "movetime", "infinite", "rtime"];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     Usi,
@@ -58,6 +78,13 @@ pub enum Command {
         moves: Vec<String>,
     },
     Go(GoLimits),
+    /// A `go` line carrying one of the [`EXTRA_GO_CLAUSES`], parsed by a build
+    /// without `usi-extras`. Holds the offending clause token so the driver can
+    /// name it; **no search is started**. The variant exists only when the
+    /// feature is off — with it on, every one of those clauses parses into
+    /// [`Command::Go`] exactly as before.
+    #[cfg(not(feature = "usi-extras"))]
+    GoExtraClause(String),
     Stop,
     /// `gameover [win|lose|draw]` — the game ended. The optional result token is
     /// ignored; the command is treated exactly like `stop` (`usi.cpp`):
@@ -70,6 +97,11 @@ pub enum Command {
     /// — the reproducible NPS benchmark (`benchmark.cpp` / `usi.cpp`). The raw
     /// trailing tokens are carried verbatim; [`crate::bench::parse_bench`] gives
     /// them meaning (defaults, limit type, position source).
+    ///
+    /// `usi-extras` only — a tournament game never issues it. The variant exists
+    /// only when the feature is on, so the default build cannot even name the
+    /// command.
+    #[cfg(feature = "usi-extras")]
     Bench(Vec<String>),
     /// `tt <store|probe|children> …` — the feature-gated transposition-table
     /// read/write commands (`usi-extras`). Like [`Command::Bench`] the trailing
@@ -108,6 +140,9 @@ pub fn parse_line(input: &str) -> Command {
         "ponderhit" => Command::PonderHit,
         // The trailing `bench` tokens are preserved verbatim for the semantic
         // parse in `crate::bench` (which fills defaults and validates them).
+        // `usi-extras` only: with the feature off this arm does not exist and
+        // `bench …` falls through to `Command::Unknown`, exactly like `tt`.
+        #[cfg(feature = "usi-extras")]
         "bench" => Command::Bench(parts.map(str::to_string).collect()),
         // `usi-extras` only. With the feature off this arm does not exist, so
         // `tt …` falls through to `Command::Unknown` like any other unrecognised
@@ -152,6 +187,16 @@ fn parse_go<'a>(line: &str, parts: impl Iterator<Item = &'a str>) -> Command {
     let mut i = 0;
     while i < tokens.len() {
         let key = tokens[i];
+        // `usi-extras` gate. Checked before the clause is interpreted, so a
+        // gated clause is reported by name whatever follows it (including a
+        // missing or malformed value, which would otherwise be `Unknown`). The
+        // match clauses ahead of it in the line have already been consumed into
+        // `limits`, which is then dropped on the floor — the caller starts no
+        // search.
+        #[cfg(not(feature = "usi-extras"))]
+        if EXTRA_GO_CLAUSES.contains(&key) {
+            return Command::GoExtraClause(key.to_string());
+        }
         match key {
             "infinite" => {
                 limits.infinite = true;
@@ -395,6 +440,7 @@ mod tests {
         assert_eq!(parse_line("go"), Command::Go(GoLimits::default()));
     }
 
+    #[cfg(feature = "usi-extras")]
     #[test]
     fn parses_go_depth() {
         let expected = GoLimits {
@@ -404,6 +450,7 @@ mod tests {
         assert_eq!(parse_line("go depth 8"), Command::Go(expected));
     }
 
+    #[cfg(feature = "usi-extras")]
     #[test]
     fn parses_go_nodes_movetime_combined() {
         let expected = GoLimits {
@@ -417,6 +464,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "usi-extras")]
     #[test]
     fn parses_go_infinite() {
         let expected = GoLimits {
@@ -458,6 +506,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "usi-extras")]
     #[test]
     fn go_with_missing_value_is_unknown() {
         assert_eq!(
@@ -466,6 +515,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "usi-extras")]
     #[test]
     fn go_with_non_integer_value_is_unknown() {
         assert_eq!(
@@ -489,11 +539,13 @@ mod tests {
         assert_eq!(parse_line("gameover\n"), Command::GameOver);
     }
 
+    #[cfg(feature = "usi-extras")]
     #[test]
     fn parses_bare_bench() {
         assert_eq!(parse_line("bench"), Command::Bench(Vec::new()));
     }
 
+    #[cfg(feature = "usi-extras")]
     #[test]
     fn parses_bench_with_all_tokens() {
         assert_eq!(
@@ -536,6 +588,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "usi-extras")]
     #[test]
     fn parses_go_mate_with_budget() {
         let expected = GoLimits {
@@ -545,6 +598,7 @@ mod tests {
         assert_eq!(parse_line("go mate 5000"), Command::Go(expected));
     }
 
+    #[cfg(feature = "usi-extras")]
     #[test]
     fn parses_go_mate_bare_is_unlimited() {
         let expected = GoLimits {
@@ -554,6 +608,7 @@ mod tests {
         assert_eq!(parse_line("go mate"), Command::Go(expected));
     }
 
+    #[cfg(feature = "usi-extras")]
     #[test]
     fn parses_go_mate_infinite_is_unlimited() {
         let expected = GoLimits {
@@ -563,11 +618,95 @@ mod tests {
         assert_eq!(parse_line("go mate infinite"), Command::Go(expected));
     }
 
+    #[cfg(feature = "usi-extras")]
     #[test]
     fn go_mate_non_integer_budget_is_unknown() {
         assert_eq!(
             parse_line("go mate soon"),
             Command::Unknown("go mate soon".to_string())
+        );
+    }
+
+    /// Feature off — the default build: `bench` is not a command token at all,
+    /// so it reaches the `Unknown` catch-all like any other stray line, exactly
+    /// as `tt` does.
+    #[cfg(not(feature = "usi-extras"))]
+    #[test]
+    fn bench_is_not_a_command_without_usi_extras() {
+        assert_eq!(parse_line("bench"), Command::Unknown("bench".to_string()));
+        assert_eq!(
+            parse_line("bench 16 1 6 default depth"),
+            Command::Unknown("bench 16 1 6 default depth".to_string())
+        );
+    }
+
+    /// Feature off: every gated `go` clause is rejected by name — loudly, so a
+    /// misconfigured harness cannot turn `go depth 4` into a clock-less search.
+    #[cfg(not(feature = "usi-extras"))]
+    #[test]
+    fn gated_go_clauses_are_rejected_without_usi_extras() {
+        for clause in EXTRA_GO_CLAUSES {
+            assert_eq!(
+                parse_line(&format!("go {clause} 4")),
+                Command::GoExtraClause(clause.to_string()),
+                "`go {clause} …` must be rejected by name"
+            );
+        }
+        // Bare forms (no value) and clauses trailing a legitimate clock clause
+        // are rejected the same way — the gate is checked before the clause is
+        // interpreted, so a missing or malformed value cannot mask it.
+        assert_eq!(
+            parse_line("go infinite"),
+            Command::GoExtraClause("infinite".to_string())
+        );
+        assert_eq!(
+            parse_line("go mate"),
+            Command::GoExtraClause("mate".to_string())
+        );
+        assert_eq!(
+            parse_line("go depth"),
+            Command::GoExtraClause("depth".to_string())
+        );
+        assert_eq!(
+            parse_line("go nodes not-a-number"),
+            Command::GoExtraClause("nodes".to_string())
+        );
+        assert_eq!(
+            parse_line("go btime 1000 wtime 1000 depth 4"),
+            Command::GoExtraClause("depth".to_string())
+        );
+    }
+
+    /// Feature off: the match clauses are untouched — the tournament surface
+    /// parses byte-identically to a build with the feature on.
+    #[cfg(not(feature = "usi-extras"))]
+    #[test]
+    fn match_go_clauses_still_parse_without_usi_extras() {
+        assert_eq!(parse_line("go"), Command::Go(GoLimits::default()));
+        assert_eq!(
+            parse_line("go btime 60000 wtime 60000 binc 1000 winc 1000 byoyomi 5000"),
+            Command::Go(GoLimits {
+                btime: Some(60000),
+                wtime: Some(60000),
+                binc: Some(1000),
+                winc: Some(1000),
+                byoyomi: Some(5000),
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            parse_line("go ponder btime 1000 wtime 1000"),
+            Command::Go(GoLimits {
+                ponder: true,
+                btime: Some(1000),
+                wtime: Some(1000),
+                ..Default::default()
+            })
+        );
+        // A genuinely unknown sub-token is still `Unknown`, not a gate report.
+        assert_eq!(
+            parse_line("go searchmoves 7g7f"),
+            Command::Unknown("go searchmoves 7g7f".to_string())
         );
     }
 
