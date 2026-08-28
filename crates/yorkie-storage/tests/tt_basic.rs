@@ -18,6 +18,26 @@
 //! so fixing `hi` **and** `side` keeps a family of keys in one cluster while the
 //! fragment varies.
 //!
+//! Bits `16..49` are the *middle* bits: they are read by neither the cluster
+//! index nor the 16-bit key fragment, which is precisely why [`key_mid`] exists
+//! — a key that varies only there is indistinguishable from its sibling to the
+//! default build and distinguishable to a `tt-entry16` one. That is the whole
+//! observable difference between the two layouts, so it is what the
+//! `wide_key_identity` / `narrow_key_identity` tests at the bottom of this file
+//! pin.
+//!
+//! # Cluster size and the `tt-entry16` feature
+//!
+//! Some tests below depend on how many entries a cluster holds — 3 by default,
+//! 2 under `tt-entry16` (a 16-byte entry in the unchanged 32-byte cluster). The
+//! two whose walk-through only reads correctly for one count
+//! (`replacement_evicts_lowest_priority_entry`,
+//! `generation_aging_lowers_replacement_priority`) carry a `cfg`-selected pair
+//! of bodies, so **both** layouts get the assertion rather than one being
+//! skipped; `a_cluster_holds_exactly_cluster_size_positions` instead reads
+//! [`CLUSTER_ENTRIES`] and is one body for both. Everything else in the file is
+//! layout-neutral and runs unchanged in either build.
+//!
 //! # Why every test here is `#[cfg_attr(miri, ignore)]`
 //!
 //! The addressing model above is what forces it: the smallest table these tests
@@ -32,11 +52,27 @@
 
 use yorkie_storage::{Bound, DEPTH_NONE, TTData, TranspositionTable};
 
+/// Entries per 32-byte cluster: three 10-byte ones by default, two 16-byte ones
+/// under `tt-entry16`. Mirrors the crate-private `CLUSTER_SIZE` in `src/tt.rs`,
+/// whose value the compile-time layout proofs there pin.
+const CLUSTER_ENTRIES: usize = if cfg!(feature = "tt-entry16") { 2 } else { 3 };
+
 /// Build a key that lands in cluster `hi` (before the side fold) with
 /// in-cluster fragment `frag`. Requires `hi < 2¹⁵`.
 fn key(hi: u64, frag: u16) -> u64 {
+    key_mid(hi, 0, frag)
+}
+
+/// [`key`] with the otherwise-unused middle bits (`16..49`) set to `mid`.
+///
+/// Two keys that share `hi` and `frag` but differ in `mid` land in the same
+/// cluster and carry the same low 16 bits, so they are the same key as far as
+/// the default 16-bit entry can tell and different keys to a 64-bit one.
+/// Requires `hi < 2¹⁵` and `mid < 2³³`.
+fn key_mid(hi: u64, mid: u64, frag: u16) -> u64 {
     assert!(hi < (1 << 15));
-    (hi << 49) | frag as u64
+    assert!(mid < (1 << 33));
+    (hi << 49) | (mid << 16) | frag as u64
 }
 
 /// Probe `k` and, on the returned writer, store `(depth, mv, ...)`. Uses the
@@ -154,6 +190,7 @@ fn miss_on_wrong_key() {
 
 #[cfg_attr(miri, ignore)]
 #[test]
+#[cfg(not(feature = "tt-entry16"))]
 fn replacement_evicts_lowest_priority_entry() {
     // Fill one three-entry cluster, all written at generation 0 so every
     // relative_age is 0 and replace_priority == depth8 == depth − DEPTH_NONE.
@@ -190,8 +227,45 @@ fn replacement_evicts_lowest_priority_entry() {
     assert!(tt.probe(key(hi, 4), side).0, "frag 4 should now be present");
 }
 
+/// The `tt-entry16` counterpart: the same replacement scan over a **2**-entry
+/// cluster. Two entries fill it, and the third store evicts the shallower one.
 #[cfg_attr(miri, ignore)]
 #[test]
+#[cfg(feature = "tt-entry16")]
+fn replacement_evicts_lowest_priority_entry() {
+    // Both written at generation 0, so every relative_age is 0 and
+    // replace_priority == depth8 == depth − DEPTH_NONE.
+    //
+    //   slot 0: frag 1, depth 10 → depth8 13, priority 13
+    //   slot 1: frag 2, depth  5 → depth8  8, priority  8   ← lowest
+    //
+    // The cluster is now full, so a miss replaces slot 1 (frag 2).
+    let mut tt = TranspositionTable::new();
+    tt.resize(1);
+    let side = 0;
+    let hi = 100;
+
+    store(&mut tt, key(hi, 1), side, 0, false, Bound::Lower, 10, 1, 0);
+    store(&mut tt, key(hi, 2), side, 0, false, Bound::Lower, 5, 2, 0);
+
+    // Both present before the eviction.
+    assert!(tt.probe(key(hi, 1), side).0);
+    assert!(tt.probe(key(hi, 2), side).0);
+
+    // Miss on frag 3 → writer targets the evicted slot; write frag 3 there.
+    store(&mut tt, key(hi, 3), side, 0, false, Bound::Lower, 1, 3, 0);
+
+    assert!(
+        !tt.probe(key(hi, 2), side).0,
+        "frag 2 (depth 5) should have been evicted"
+    );
+    assert!(tt.probe(key(hi, 1), side).0, "frag 1 should survive");
+    assert!(tt.probe(key(hi, 3), side).0, "frag 3 should now be present");
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+#[cfg(not(feature = "tt-entry16"))]
 fn generation_aging_lowers_replacement_priority() {
     // A deep-but-old entry loses to a shallow-but-fresh one once enough
     // generations pass, because replace_priority = depth8 − 8·relative_age.
@@ -236,6 +310,104 @@ fn generation_aging_lowers_replacement_priority() {
         "fresh shallow entry Q should survive"
     );
     assert!(tt.probe(key(hi, 3), side).0, "fresh entry R should survive");
+}
+
+/// The `tt-entry16` counterpart: the same generation arithmetic over a
+/// **2**-entry cluster. `relative_age` and the `− 8·age` weighting are shared
+/// code, so what this pins is that the smaller scan still applies them.
+#[cfg_attr(miri, ignore)]
+#[test]
+#[cfg(feature = "tt-entry16")]
+fn generation_aging_lowers_replacement_priority() {
+    // After three new_search() bumps the table is at generation 3:
+    //   P: frag 1, depth 20, gen 0 → depth8 23, age 3, priority 23 − 24 = −1  ← lowest
+    //   Q: frag 2, depth  3, gen 3 → depth8  6, age 0, priority  6
+    //
+    // Without aging P's priority would be 23 — higher than Q's 6, so Q would be
+    // the victim. Aging flips the order and the miss evicts P instead.
+    let mut tt = TranspositionTable::new();
+    tt.resize(1);
+    let side = 0;
+    let hi = 200;
+
+    // P written at generation 0.
+    assert_eq!(tt.generation(), 0);
+    store(&mut tt, key(hi, 1), side, 0, false, Bound::Lower, 20, 1, 0);
+
+    // Advance to generation 3, then write Q.
+    tt.new_search();
+    tt.new_search();
+    tt.new_search();
+    assert_eq!(tt.generation(), 3);
+    store(&mut tt, key(hi, 2), side, 0, false, Bound::Lower, 3, 2, 0);
+
+    // Sanity: both occupy the cluster.
+    assert!(tt.probe(key(hi, 1), side).0);
+    assert!(tt.probe(key(hi, 2), side).0);
+
+    // Miss → evicts the aged, deep entry P (frag 1), not the shallow fresh Q.
+    store(&mut tt, key(hi, 3), side, 0, false, Bound::Lower, 1, 3, 3);
+    assert!(
+        !tt.probe(key(hi, 1), side).0,
+        "aged deep entry P should be evicted"
+    );
+    assert!(
+        tt.probe(key(hi, 2), side).0,
+        "fresh shallow entry Q should survive"
+    );
+    assert!(tt.probe(key(hi, 3), side).0, "frag 3 should now be present");
+}
+
+/// A cluster holds exactly [`CLUSTER_ENTRIES`] distinct positions: filling it
+/// keeps every one of them, and one more store must displace one.
+///
+/// This is the entry-count half of the `tt-entry16` trade — the same 32-byte
+/// cluster, and hence the same table byte budget, holding 2/3 as many entries —
+/// stated as a behavioural assertion rather than left to the layout constants.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_cluster_holds_exactly_cluster_size_positions() {
+    let mut tt = TranspositionTable::new();
+    tt.resize(1);
+    let side = 0;
+    let hi = 555;
+
+    // Equal depth throughout, so nothing is preferentially retained and the
+    // test turns purely on capacity.
+    for f in 1..=CLUSTER_ENTRIES as u16 {
+        store(&mut tt, key(hi, f), side, 0, false, Bound::Lower, 7, f, 0);
+    }
+    for f in 1..=CLUSTER_ENTRIES as u16 {
+        assert!(
+            tt.probe(key(hi, f), side).0,
+            "a full cluster must retain all {CLUSTER_ENTRIES} of its entries (frag {f} missing)"
+        );
+    }
+
+    // One more distinct position than the cluster can hold: it is stored, and
+    // exactly one of the previous occupants is gone.
+    let extra = CLUSTER_ENTRIES as u16 + 1;
+    store(
+        &mut tt,
+        key(hi, extra),
+        side,
+        0,
+        false,
+        Bound::Lower,
+        7,
+        extra,
+        0,
+    );
+    assert!(tt.probe(key(hi, extra), side).0, "the new entry is present");
+    let survivors = (1..=CLUSTER_ENTRIES as u16)
+        .filter(|&f| tt.probe(key(hi, f), side).0)
+        .count();
+    assert_eq!(
+        survivors,
+        CLUSTER_ENTRIES - 1,
+        "storing a {}th position must displace exactly one",
+        CLUSTER_ENTRIES + 1
+    );
 }
 
 #[cfg_attr(miri, ignore)]
@@ -545,4 +717,172 @@ fn miss_sentinel() -> TTData {
 /// round-trip test read clearly.
 fn tt_generation_zero() -> u8 {
     0
+}
+
+// -------------------------------------------------------------------------
+// Position identity: what an entry's stored key actually distinguishes.
+//
+// The two modules below assert the same scenarios against the two layouts, and
+// they are deliberately written as a matched pair: the property `tt-entry16`
+// buys is only meaningful next to the default behaviour it replaces, and
+// pinning both means a layout regression in either direction is a red test
+// rather than a silently-still-green suite. Only the aliasing verdict differs —
+// where the wide layout keeps two entries apart, the narrow one merges them.
+// -------------------------------------------------------------------------
+
+/// Identity under `tt-entry16`: the entry stores the whole 64-bit key, so a hit
+/// is exact and no two distinct positions can be mistaken for one another.
+#[cfg(feature = "tt-entry16")]
+mod wide_key_identity {
+    use super::*;
+
+    /// Keys sharing their low 16 bits but landing in **different** clusters:
+    /// neither can be reached by probing the other.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn equal_low_16_bits_in_different_clusters_do_not_alias() {
+        let mut tt = TranspositionTable::new();
+        tt.resize(1);
+        let side = 0;
+
+        let a = key(10, 0xBEEF);
+        let b = key(20, 0xBEEF);
+        assert_eq!(a as u16, b as u16, "the pair shares its low 16 bits");
+
+        store(&mut tt, a, side, 111, false, Bound::Exact, 9, 0x11, 111);
+        assert!(!tt.probe(b, side).0, "b must not read a's entry");
+
+        store(&mut tt, b, side, 222, false, Bound::Exact, 9, 0x22, 222);
+        assert_eq!(tt.probe(a, side).1.value, 111, "a keeps its own payload");
+        assert_eq!(tt.probe(b, side).1.value, 222, "b keeps its own payload");
+    }
+
+    /// The sharp case: keys that share their low 16 bits **and** their cluster,
+    /// differing only in the middle bits neither the index nor a 16-bit
+    /// fragment reads. The default layout cannot tell these apart; a 64-bit key
+    /// can, so they occupy two entries and each reads back its own payload.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn same_cluster_and_low_16_bits_do_not_alias() {
+        let mut tt = TranspositionTable::new();
+        tt.resize(1);
+        let side = 0;
+
+        let a = key_mid(300, 0, 0xABCD);
+        let b = key_mid(300, 1, 0xABCD);
+        assert_ne!(a, b);
+        assert_eq!(a as u16, b as u16, "the pair shares its low 16 bits");
+        assert_eq!(a >> 49, b >> 49, "and its cluster");
+
+        store(&mut tt, a, side, 111, false, Bound::Exact, 9, 0x11, 111);
+        assert!(
+            !tt.probe(b, side).0,
+            "a 64-bit key must not be matched by a sibling that differs above bit 16"
+        );
+
+        store(&mut tt, b, side, 222, true, Bound::Lower, 12, 0x22, 222);
+
+        let (found_a, data_a, _) = tt.probe(a, side);
+        assert!(found_a, "a survives — b took the cluster's other entry");
+        assert_eq!(data_a.value, 111);
+        assert_eq!(data_a.move16, 0x11);
+        assert_eq!(data_a.depth, 9);
+
+        let (found_b, data_b, _) = tt.probe(b, side);
+        assert!(found_b);
+        assert_eq!(data_b.value, 222);
+        assert_eq!(data_b.move16, 0x22);
+        assert_eq!(data_b.depth, 12);
+    }
+
+    /// Every bit above 16 is load-bearing, one at a time: for each bit in
+    /// `16..49` (the ones the cluster index does not consume), the sibling that
+    /// differs in exactly that bit is a miss.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn every_middle_bit_participates_in_identity() {
+        let mut tt = TranspositionTable::new();
+        tt.resize(1);
+        let side = 0;
+        let hi = 4000;
+
+        for bit in 16..49u32 {
+            // One cluster for the whole loop, with a distinct fragment per bit.
+            // Earlier iterations may still occupy the cluster's other entry, but
+            // every key here has a zero middle part while every `sibling` has a
+            // nonzero one, so no leftover can be mistaken for the sibling.
+            let base = key_mid(hi, 0, (bit as u16).wrapping_mul(7) | 1);
+            let sibling = base | (1u64 << bit);
+            assert_ne!(base, sibling);
+            assert_eq!(base as u16, sibling as u16);
+            assert_eq!(base >> 49, sibling >> 49);
+
+            store(&mut tt, base, side, 5, false, Bound::Exact, 9, 0x33, 5);
+            assert!(
+                !tt.probe(sibling, side).0,
+                "key bit {bit} must take part in the identity check"
+            );
+        }
+    }
+}
+
+/// Identity in the default layout: the entry stores the key's low 16 bits, so a
+/// hit is a 16-bit match and a same-cluster sibling *does* alias. This is the
+/// reference's behaviour and the reason the search validates every TT move
+/// against the actual position — pinned here as the contrast that the
+/// `wide_key_identity` module above removes.
+#[cfg(not(feature = "tt-entry16"))]
+mod narrow_key_identity {
+    use super::*;
+
+    /// Keys sharing their low 16 bits but landing in different clusters still
+    /// do not alias: the cluster index separates them. Identical assertion to
+    /// the `tt-entry16` case — this half of identity is layout-independent.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn equal_low_16_bits_in_different_clusters_do_not_alias() {
+        let mut tt = TranspositionTable::new();
+        tt.resize(1);
+        let side = 0;
+
+        let a = key(10, 0xBEEF);
+        let b = key(20, 0xBEEF);
+        assert_eq!(a as u16, b as u16, "the pair shares its low 16 bits");
+
+        store(&mut tt, a, side, 111, false, Bound::Exact, 9, 0x11, 111);
+        assert!(!tt.probe(b, side).0, "b must not read a's entry");
+
+        store(&mut tt, b, side, 222, false, Bound::Exact, 9, 0x22, 222);
+        assert_eq!(tt.probe(a, side).1.value, 111, "a keeps its own payload");
+        assert_eq!(tt.probe(b, side).1.value, 222, "b keeps its own payload");
+    }
+
+    /// Keys that share their cluster and their low 16 bits **do** alias here:
+    /// `b`'s probe reports a hit on `a`'s entry, and storing through it
+    /// overwrites `a`'s payload rather than taking a second slot. This is the
+    /// ~1/65536-per-entry false hit the reference lives with.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn same_cluster_and_low_16_bits_alias() {
+        let mut tt = TranspositionTable::new();
+        tt.resize(1);
+        let side = 0;
+
+        let a = key_mid(300, 0, 0xABCD);
+        let b = key_mid(300, 1, 0xABCD);
+        assert_ne!(a, b);
+
+        store(&mut tt, a, side, 111, false, Bound::Exact, 9, 0x11, 111);
+
+        let (found_b, data_b, _) = tt.probe(b, side);
+        assert!(found_b, "a 16-bit key cannot tell b from a");
+        assert_eq!(data_b.value, 111, "b reads a's payload");
+
+        // Writing through b lands in the same entry, so a now reads b's data.
+        store(&mut tt, b, side, 222, true, Bound::Lower, 12, 0x22, 222);
+        let (found_a, data_a, _) = tt.probe(a, side);
+        assert!(found_a);
+        assert_eq!(data_a.value, 222, "the two share one entry");
+        assert_eq!(data_a.move16, 0x22);
+    }
 }

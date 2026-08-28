@@ -19,6 +19,42 @@
 //! replacement policy decides which entry survives a collision — both feed
 //! directly into how many nodes qsearch visits.
 //!
+//! ## The `tt-entry16` feature
+//!
+//! The `tt-entry16` cargo feature (additive, **off** by default) is the one
+//! sanctioned departure from that layout. It widens the entry to 16 bytes by
+//! replacing the 16-bit key fragment with the **whole 64-bit position key**:
+//!
+//! | | default | `tt-entry16` |
+//! |---|---|---|
+//! | `TteKey` (the stored key) | `u16` — the hash's low 16 bits | `u64` — the whole hash |
+//! | `size_of::<TTEntry>()` | 10 | 16 |
+//! | `CLUSTER_SIZE` | 3 | 2 |
+//! | `size_of::<Cluster>()` | 32 (`3 × 10 + 2` padding) | 32 (`2 × 16`, no padding) |
+//!
+//! The five payload fields (`depth8`, `gen_bound8`, `move16`, `value16`,
+//! `eval16`) are byte-for-byte the same in both layouts — the entire size
+//! increase goes into the key, and no field is added. Position identity at
+//! probe and store is then full 64-bit equality rather than a 16-bit compare,
+//! so a hit is exact instead of carrying a ~1/65536 per-entry false-hit rate.
+//!
+//! Everything else is untouched: the cluster is still 32 bytes, so the
+//! `clusterCount` arithmetic, the table sizing and the cluster-index
+//! computation are literally the same code; only the per-cluster scan runs over
+//! 2 entries instead of 3, which means the same byte budget holds 2/3 as many
+//! entries. Generation handling, the replacement policy, mate-value handling
+//! and the atomics-per-field threading model are all shared between the two
+//! layouts.
+//!
+//! A `tt-entry16` build's search output is nonetheless tied to neither the
+//! default build's nor the reference's. Both changes — exact identity, and a
+//! third fewer entries — move which probes hit, so that output is free to
+//! diverge, and nothing here promises otherwise. (It happens not to diverge on
+//! the fixtures this repository pins, because those run against tables far too
+//! sparse for either change to bite; that is an observation about the fixtures,
+//! not a guarantee about the feature.) The default build is byte-identical to
+//! what it was before the feature existed.
+//!
 //! # Layering
 //!
 //! The Storage layer must not depend on the State
@@ -75,10 +111,12 @@
 //! type system therefore enforces that a resize/clear never races a probe.
 
 use std::alloc::Layout;
-use std::mem::size_of;
+use std::mem::{offset_of, size_of};
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::slice;
+#[cfg(feature = "tt-entry16")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicI16, AtomicU8, AtomicU16, Ordering};
 
 use crate::large_page;
@@ -120,8 +158,71 @@ const BOUND_MASK: u8 = 0b11 << BOUND_SHIFT;
 const PV_SHIFT: u8 = BOUND_SHIFT + 2;
 const PV_MASK: u8 = 1 << PV_SHIFT;
 
+// --- The two entry layouts (see the module docs' `tt-entry16` section). ---
+//
+// Everything the layouts differ in is declared here as a `cfg`-selected type or
+// constant, so the rest of the module — probe, locate, save, the replacement
+// scan, `hashfull`, the sizing arithmetic — is one shared body of code that
+// reads `TteKey` / `CLUSTER_SIZE` and never a `cfg` of its own.
+
+/// The key an entry stores, i.e. what position identity is checked on.
+///
+/// Default: `u16`, the position hash's low 16 bits (the reference's
+/// `TTE_KEY_TYPE`), so a match is a 16-bit compare with a ~1/65536 per-entry
+/// false-hit rate.
+#[cfg(not(feature = "tt-entry16"))]
+type TteKey = u16;
+/// The atomic wrapper for [`TteKey`]; same size and alignment as the plain type.
+#[cfg(not(feature = "tt-entry16"))]
+type AtomicTteKey = AtomicU16;
+/// Narrow `key` to what an entry stores — the low 16 bits.
+#[cfg(not(feature = "tt-entry16"))]
+#[inline]
+fn tte_key(key: u64) -> TteKey {
+    key as TteKey
+}
+/// A stored key widened back to 64 bits, for [`TranspositionTable::checksum`].
+#[cfg(not(feature = "tt-entry16"))]
+#[inline]
+fn key_bits(k: TteKey) -> u64 {
+    k as u64
+}
 /// Number of entries per cluster (`TT_CLUSTER_SIZE == 3`).
+#[cfg(not(feature = "tt-entry16"))]
 const CLUSTER_SIZE: usize = 3;
+/// Trailing bytes that pad a [`Cluster`] out to 32 (`3 × 10 + 2`).
+#[cfg(not(feature = "tt-entry16"))]
+const CLUSTER_PADDING: usize = 2;
+
+/// The key an entry stores, i.e. what position identity is checked on.
+///
+/// `tt-entry16`: the **whole** 64-bit position hash, so a match is exact and an
+/// entry cannot be mistaken for a different position's.
+#[cfg(feature = "tt-entry16")]
+type TteKey = u64;
+/// The atomic wrapper for [`TteKey`]; same size and alignment as the plain type.
+#[cfg(feature = "tt-entry16")]
+type AtomicTteKey = AtomicU64;
+/// The whole key is stored, so this is the identity.
+#[cfg(feature = "tt-entry16")]
+#[inline]
+fn tte_key(key: u64) -> TteKey {
+    key
+}
+/// A stored key widened back to 64 bits, for [`TranspositionTable::checksum`] —
+/// already 64 bits wide here, so likewise the identity.
+#[cfg(feature = "tt-entry16")]
+#[inline]
+fn key_bits(k: TteKey) -> u64 {
+    k
+}
+/// Number of entries per cluster: a 16-byte entry fits twice in the unchanged
+/// 32-byte cluster.
+#[cfg(feature = "tt-entry16")]
+const CLUSTER_SIZE: usize = 2;
+/// None needed — `2 × 16` is exactly 32.
+#[cfg(feature = "tt-entry16")]
+const CLUSTER_PADDING: usize = 0;
 
 /// Bound type of a stored value (`source/types.h`). The
 /// discriminants matter: `Exact == Upper | Lower`, and the value is packed
@@ -203,18 +304,22 @@ fn relative_age(gen_bound8: u8, curr_generation: u8) -> u8 {
     curr_generation.wrapping_sub(gen_bound8) & GENERATION_MASK
 }
 
-/// A single transposition-table entry — 10 bytes, laid out field-for-field
-/// like the reference's `TTEntry`, with each field an atomic so the entry can
-/// be shared `&self` across threads (see the module docs' Threading section).
-/// `#[repr(C)]` pins the layout so a [`Cluster`] is exactly 32 bytes and the
-/// `clusterCount` sizing arithmetic matches the reference. Every atomic has the
-/// same size and alignment as its plain counterpart, so the layout is
-/// byte-for-byte the plain-field version's.
+/// A single transposition-table entry — 10 bytes by default (16 under
+/// `tt-entry16`), laid out field-for-field like the reference's `TTEntry`, with
+/// each field an atomic so the entry can be shared `&self` across threads (see
+/// the module docs' Threading section). `#[repr(C)]` pins the layout so a
+/// [`Cluster`] is exactly 32 bytes and the `clusterCount` sizing arithmetic
+/// matches the reference. Every atomic has the same size and alignment as its
+/// plain counterpart, so the layout is byte-for-byte the plain-field version's.
+///
+/// The two layouts differ in the `key` field alone; the five payload fields
+/// below it are identical in both.
 #[repr(C)]
 #[derive(Default)]
 struct TTEntry {
-    /// Low 16 bits of the position key (`TTE_KEY_TYPE`).
-    key: AtomicU16,
+    /// The stored position key: the hash's low 16 bits (`TTE_KEY_TYPE`) by
+    /// default, the whole 64-bit hash under `tt-entry16`.
+    key: AtomicTteKey,
     /// `depth − DEPTH_NONE`; `0` means unoccupied.
     depth8: AtomicU8,
     /// Packed `generation | bound << 5 | pv << 7`.
@@ -278,9 +383,10 @@ impl TTEntry {
     }
 
     /// Store a new node's data, possibly overwriting an older position
-    /// (`TTEntry::save`). `k` is the low-16-bit key fragment; `curr_generation`
-    /// is the caller-supplied age (the reference lets learners pass a per-thread
-    /// generation, so it is an argument rather than read from the table).
+    /// (`TTEntry::save`). `k` is the stored key ([`tte_key`] of the position
+    /// hash); `curr_generation` is the caller-supplied age (the reference lets
+    /// learners pass a per-thread generation, so it is an argument rather than
+    /// read from the table).
     ///
     /// Takes `&self`: the fields are mutated through relaxed atomic stores,
     /// exactly like the reference's racy in-place writes. The old `key` /
@@ -291,7 +397,7 @@ impl TTEntry {
     #[allow(clippy::too_many_arguments)]
     fn save(
         &self,
-        k: u16,
+        k: TteKey,
         v: Value,
         pv: bool,
         b: Bound,
@@ -333,19 +439,47 @@ impl TTEntry {
     }
 }
 
-/// A cluster of [`CLUSTER_SIZE`] entries plus padding to a round 32 bytes.
-/// Entries in one cluster share a hash slot; a collision spills into the
-/// following entries and is resolved by the replacement policy in `probe`.
+/// A cluster of [`CLUSTER_SIZE`] entries plus [`CLUSTER_PADDING`] bytes of
+/// padding to a round 32 bytes (2 bytes by default, none under `tt-entry16`,
+/// where two 16-byte entries already fill the cluster exactly). Entries in one
+/// cluster share a hash slot; a collision spills into the following entries and
+/// is resolved by the replacement policy in `probe`.
 #[repr(C)]
 #[derive(Default)]
 struct Cluster {
     entry: [TTEntry; CLUSTER_SIZE],
-    _padding: [u8; 2],
+    _padding: [u8; CLUSTER_PADDING],
 }
 
+// --- Layout proofs. ---
+//
 // The `clusterCount` sizing arithmetic and cache-line reasoning both assume a
-// 32-byte cluster; pin it so a layout regression is a compile error.
+// 32-byte cluster; pin it so a layout regression is a compile error. The
+// remaining assertions pin the entry size and every field offset, in both
+// configurations — the `tt-entry16` spec is precisely "16 bytes, with all six
+// of the extra ones spent on the key and the payload fields unmoved relative to
+// it", and that is a statement about offsets, so it is checked where it cannot
+// drift: at compile time, in every build.
 const _: () = assert!(size_of::<Cluster>() == 32);
+const _: () = assert!(size_of::<TTEntry>() * CLUSTER_SIZE + CLUSTER_PADDING == 32);
+
+/// Size of the stored key, and hence the offset of every payload field after
+/// it: 2 by default, 8 under `tt-entry16`.
+const KEY_SIZE: usize = size_of::<TteKey>();
+
+const _: () = assert!(size_of::<TTEntry>() == if cfg!(feature = "tt-entry16") { 16 } else { 10 });
+const _: () = assert!(KEY_SIZE == if cfg!(feature = "tt-entry16") { 8 } else { 2 });
+const _: () = assert!(CLUSTER_SIZE == if cfg!(feature = "tt-entry16") { 2 } else { 3 });
+
+// The payload fields, in declaration order, packed against the key with no
+// interior padding in either layout: under `tt-entry16` the `u64` key leaves
+// `move16` already 2-aligned at offset 10, so `#[repr(C)]` inserts nothing.
+const _: () = assert!(offset_of!(TTEntry, key) == 0);
+const _: () = assert!(offset_of!(TTEntry, depth8) == KEY_SIZE);
+const _: () = assert!(offset_of!(TTEntry, gen_bound8) == KEY_SIZE + 1);
+const _: () = assert!(offset_of!(TTEntry, move16) == KEY_SIZE + 2);
+const _: () = assert!(offset_of!(TTEntry, value16) == KEY_SIZE + 4);
+const _: () = assert!(offset_of!(TTEntry, eval16) == KEY_SIZE + 6);
 
 /// Base alignment of the cluster allocation, mirroring the reference's
 /// `aligned_large_pages_alloc` (`source/memory.cpp`): a
@@ -668,8 +802,9 @@ impl TranspositionTable {
     /// Look up `key` (`TranspositionTable::probe`).
     ///
     /// Returns `(found, data, writer)`:
-    /// - `found` is `true` when a matching, occupied entry exists (possibly a
-    ///   16-bit key collision);
+    /// - `found` is `true` when a matching, occupied entry exists (by default
+    ///   possibly a 16-bit key collision; under `tt-entry16` the 64-bit key
+    ///   match makes it exact);
     /// - `data` is a copy of that entry's payload, or [`TTData::none`] on a
     ///   miss;
     /// - `writer` targets the matching entry on a hit, or the least-valuable
@@ -683,13 +818,14 @@ impl TranspositionTable {
         );
 
         let ci = self.cluster_index(key, side_to_move);
-        let key16 = key as u16;
+        let k = tte_key(key);
         let generation = self.generation8.load(REL);
         let cluster = &self.table[ci];
 
-        // The low 16 bits are the in-cluster key. On a match, return that
+        // Identity is equality on the stored key — the hash's low 16 bits by
+        // default, all 64 of them under `tt-entry16`. On a match, return that
         // entry's data and a writer to it.
-        if let Some(i) = (0..CLUSTER_SIZE).find(|&i| cluster.entry[i].key.load(REL) == key16) {
+        if let Some(i) = (0..CLUSTER_SIZE).find(|&i| cluster.entry[i].key.load(REL) == k) {
             let found = cluster.entry[i].is_occupied();
             let data = cluster.entry[i].read();
             return (found, data, TTWriter::new(&cluster.entry[i]));
@@ -732,11 +868,11 @@ impl TranspositionTable {
         );
 
         let ci = self.cluster_index(key, side_to_move);
-        let key16 = key as u16;
+        let k = tte_key(key);
         let generation = self.generation8.load(REL);
         let cluster = &self.table[ci];
 
-        if let Some(i) = (0..CLUSTER_SIZE).find(|&i| cluster.entry[i].key.load(REL) == key16) {
+        if let Some(i) = (0..CLUSTER_SIZE).find(|&i| cluster.entry[i].key.load(REL) == k) {
             let found = cluster.entry[i].is_occupied();
             let data = cluster.entry[i].read();
             return (
@@ -786,8 +922,16 @@ impl TranspositionTable {
         eval: Value,
         generation: u8,
     ) {
-        self.table[slot.cluster].entry[slot.entry]
-            .save(key as u16, value, pv, bound, depth, mv, eval, generation);
+        self.table[slot.cluster].entry[slot.entry].save(
+            tte_key(key),
+            value,
+            pv,
+            bound,
+            depth,
+            mv,
+            eval,
+            generation,
+        );
     }
 
     /// A stable checksum over the whole table's raw bytes, for determinism
@@ -801,7 +945,7 @@ impl TranspositionTable {
         };
         for cluster in self.table.iter() {
             for e in &cluster.entry {
-                mix(e.key.load(REL) as u64);
+                mix(key_bits(e.key.load(REL)));
                 mix(e.depth8.load(REL) as u64);
                 mix(e.gen_bound8.load(REL) as u64);
                 mix(e.move16.load(REL) as u64);
@@ -837,9 +981,10 @@ impl<'a> TTWriter<'a> {
     }
 
     /// Store data into the targeted entry, subject to the replacement policy
-    /// (`TTWriter::write`). `key` is the full 64-bit position key (its low 16
-    /// bits become the stored fragment); `mv` is the 16-bit move fragment;
-    /// `generation` is the current [`TranspositionTable::generation`].
+    /// (`TTWriter::write`). `key` is the full 64-bit position key (of which the
+    /// low 16 bits become the stored fragment by default, all 64 under
+    /// `tt-entry16`); `mv` is the 16-bit move fragment; `generation` is the
+    /// current [`TranspositionTable::generation`].
     #[inline]
     #[allow(clippy::too_many_arguments)]
     pub fn write(
@@ -854,7 +999,7 @@ impl<'a> TTWriter<'a> {
         generation: u8,
     ) {
         self.entry
-            .save(key as u16, value, pv, bound, depth, mv, eval, generation);
+            .save(tte_key(key), value, pv, bound, depth, mv, eval, generation);
     }
 }
 
@@ -926,7 +1071,7 @@ mod alloc_tests {
                 assert_eq!(e.value16.load(REL), 0);
                 assert_eq!(e.eval16.load(REL), 0);
             }
-            assert_eq!(cluster._padding, [0u8; 2]);
+            assert_eq!(cluster._padding, [0u8; CLUSTER_PADDING]);
         }
     }
 

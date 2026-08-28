@@ -34,8 +34,14 @@ serde_json = "~1.0"
 # `info string` and starts no search. Silently ignoring the clause would turn
 # `go depth 4` into an unbounded, clock-less search mid-game. See the
 # `usi-extras` reference documentation.
+#
+# `tt-entry16` is the Storage-layer entry-widening feature, re-exported so this
+# crate's session tests can `cfg` on it. The two are independent and compose:
+# a `usi-extras,tt-entry16` build has the whole `tt` command family operating on
+# the wide table. Off by default.
 [features]
 usi-extras = []
+tt-entry16 = ["yorkie-search/tt-entry16", "yorkie-storage/tt-entry16"]
 
 [lints]
 workspace = true

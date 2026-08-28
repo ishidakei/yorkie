@@ -27,5 +27,21 @@ mimalloc = "0.1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# `tt-entry16` widens the transposition-table entry from the reference's 10
+# bytes to 16, spending the whole increase on the key: `key: u16` (the position
+# hash's low 16 bits) becomes `key: u64` (the whole hash), so a probe checks
+# position identity on all 64 bits and a stored entry's identity is exact
+# instead of ~1/65536-false-positive. The payload fields are untouched.
+#
+# The cluster stays 32 bytes and therefore holds 2 entries instead of 3: the TT
+# sizing arithmetic, the cluster-count and the index computation are all
+# unchanged, and the same byte budget simply holds 2/3 as many entries.
+#
+# OFF by default, and the default build is byte-identical to what it was before
+# the feature existed. With it ON the probe-hit pattern changes, so search
+# output matches neither the default build's nor the reference's.
+[features]
+tt-entry16 = []
+
 [lints]
 workspace = true

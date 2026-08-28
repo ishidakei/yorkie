@@ -115,8 +115,10 @@ fn omitting_pv_stores_a_non_pv_entry() {
 ///    through `PawnValue == 90` (`v = cp * 90 / 100`, and back `cp = 100 * v /
 ///    90`), with truncating division in each direction — so a `cp` argument is
 ///    quantised to a multiple of the 9/10 ratio and small values collapse.
-/// 2. **`value16` / `eval16`.** Both are `i16` in the 10-byte entry; every value
-///    that survives step 1 fits, so step 1 is the only *observable* loss here.
+/// 2. **`value16` / `eval16`.** Both are `i16` in the entry — in either entry
+///    layout, since `tt-entry16` spends its extra bytes entirely on the key and
+///    leaves the payload fields alone; every value that survives step 1 fits,
+///    so step 1 is the only *observable* loss here.
 ///
 /// `mate` arguments are exact — they bypass the centipawn scale entirely.
 #[cfg_attr(miri, ignore)]
@@ -490,4 +492,112 @@ fn usinewgame_clears_stored_entries() {
         "tt probe startpos",
     ]);
     assert_eq!(got, vec!["store ok".to_string(), "probe miss".to_string()]);
+}
+
+// -------------------------------------------------------------------------
+// 6. `usi-extras` × `tt-entry16` — the command family over the wide table.
+// -------------------------------------------------------------------------
+
+/// The two features are independent and compose: with both on, the whole `tt`
+/// family drives a table of 16-byte, full-64-bit-key entries. Every test above
+/// already runs in that configuration under `--all-features`; this one exists to
+/// name the combination explicitly and to exercise all three subcommands over
+/// one wide table in a single session, at a scale (a dozen distinct positions,
+/// each with its own payload) that a single narrow assertion would not reach.
+///
+/// What it deliberately does *not* try to do is discriminate the two layouts.
+/// That takes hand-chosen colliding keys, which this surface cannot produce —
+/// a `tt` command names a position and the key falls out of it — so the
+/// aliasing proofs live at the Storage layer, in
+/// `yorkie-storage/tests/tt_basic.rs::wide_key_identity`, where keys are
+/// constructed bit by bit.
+#[cfg(feature = "tt-entry16")]
+#[cfg_attr(miri, ignore)]
+#[test]
+fn the_tt_commands_round_trip_through_the_wide_table() {
+    // Twelve distinct legal first moves, hence twelve distinct child positions
+    // and twelve distinct 64-bit keys.
+    const CHILDREN: [&str; 12] = [
+        "7g7f", "2g2f", "1g1f", "9g9f", "3g3f", "4g4f", "5g5f", "6g6f", "8g8f", "6i7h", "4i3h",
+        "3i4h",
+    ];
+
+    // Store one entry per child, each with its own value and depth.
+    let mut script: Vec<String> = CHILDREN
+        .iter()
+        .enumerate()
+        .map(|(i, mv)| {
+            store_at(
+                &sfen_after(&[mv]),
+                &format!(
+                    "move none value {} depth {} bound lower eval 0",
+                    (i as i32 + 1) * 100,
+                    i + 4
+                ),
+            )
+        })
+        .collect();
+    // Then probe each child on its own SFEN (ply 0) …
+    script.extend(
+        CHILDREN
+            .iter()
+            .map(|mv| format!("tt probe sfen {}", sfen_after(&[mv]))),
+    );
+    // … and sweep them all as children of the start position (ply 1).
+    script.push("tt children startpos".to_string());
+
+    let refs: Vec<&str> = script.iter().map(String::as_str).collect();
+    let got = tt_session(&refs);
+
+    // Every store landed: a fresh 1 MiB table has room for all twelve, and no
+    // two of them are the same position.
+    let stores: Vec<&String> = got.iter().filter(|l| l.starts_with("store ")).collect();
+    assert_eq!(stores.len(), CHILDREN.len());
+    assert!(
+        stores.iter().all(|l| *l == "store ok"),
+        "every distinct position must get its own entry; got: {got:?}"
+    );
+
+    // Every probe reads back that position's own payload, unshifted.
+    let probes: Vec<&str> = got
+        .iter()
+        .map(String::as_str)
+        .filter(|l| l.starts_with("probe "))
+        .collect();
+    let expected_probes: Vec<String> = (0..CHILDREN.len())
+        .map(|i| {
+            format!(
+                "probe hit move none value cp {} depth {} bound lower eval cp 0 pv false",
+                (i + 1) * 100,
+                i + 4
+            )
+        })
+        .collect();
+    assert_eq!(probes, expected_probes, "got: {got:?}");
+
+    // `tt children startpos` finds exactly the twelve seeded children (the
+    // start position has more legal moves than that, and the rest stay silent).
+    let mut children: Vec<&str> = got
+        .iter()
+        .map(String::as_str)
+        .filter(|l| l.starts_with("child "))
+        .collect();
+    children.sort_unstable();
+    let mut expected_children: Vec<String> = CHILDREN
+        .iter()
+        .enumerate()
+        .map(|(i, mv)| {
+            format!(
+                "child {mv} move none value cp {} depth {} bound lower eval cp 0 pv false",
+                (i + 1) * 100,
+                i + 4
+            )
+        })
+        .collect();
+    expected_children.sort_unstable();
+    assert_eq!(children, expected_children, "got: {got:?}");
+    assert_eq!(
+        got.last().map(String::as_str),
+        Some(&format!("children end {}", CHILDREN.len())[..])
+    );
 }

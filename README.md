@@ -48,6 +48,20 @@ cargo build --release
   `-C target-cpu=native` を適用します。生成されるバイナリはビルドしたマシンの
   CPU に最適化されるため、実行するマシン上でビルドしてください。
 
+既定でオフの Cargo feature が 2 つあります。互いに独立で、併用もできます。
+
+| feature | 効果 |
+| --- | --- |
+| `usi-extras` | 対局では使わない USI コマンド（`bench`、`tt` 系、`go` の解析用指定）を有効にする |
+| `tt-entry16` | 置換表のエントリを 10 バイトから 16 バイトに広げ、増えた分をすべてキーに充てる（下位 16 ビットではなく 64 ビットのハッシュ全体を保持するので、局面の同一性判定が厳密になる）。クラスタは 32 バイトのままなので 1 クラスタあたりのエントリ数は 3 から 2 に減る |
+
+```bash
+cargo build --release -F usi-extras,tt-entry16
+```
+
+`tt-entry16` は置換表のヒットの仕方が変わるため、探索の出力が既定ビルドとも参照
+実装とも一致しなくなります。
+
 エンジンは USI プロトコルを標準入力／標準出力で話します。引数なしで起動すると
 USI のイベントループに入ります。
 
@@ -250,7 +264,7 @@ TOML ファイルを参照してください。
 | `gameover` | 対局終了 |
 | `quit` | 終了する |
 | `bench [ttSizeMB] [threads] [limit] [default\|current\|<fenFile>] [limitType]` | 固定条件での NPS 計測。引数はすべて省略可で、左から順に既定値（`ttSizeMB=1024`, `threads=1`, `limit=15000`, ソース `default`, `limitType=movetime`）で埋められる。`usi-extras` feature を指定したビルドでのみ有効 |
-| `tt store` / `tt probe` / `tt children` | 置換表を読み書きするコマンド。`usi-extras` feature を指定したビルドでのみ有効 |
+| `tt store` / `tt probe` / `tt children` | 置換表を読み書きするコマンド。`usi-extras` feature を指定したビルドでのみ有効（`tt-entry16` と併用した場合は 16 バイトエントリの置換表を読み書きする） |
 
 認識できないコマンドを受け取った場合は `info string unknown command: <入力行>` を
 出力して読み飛ばします。`usi-extras` を指定しない既定ビルドでは `bench` と `tt` は

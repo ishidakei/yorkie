@@ -22,8 +22,13 @@ serde_json = "~1.0"
 # Re-exported so `cargo build -p yorkie --features usi-extras` (and the
 # workspace-wide `--all-features` gate runs) reach the Protocol-layer feature.
 # Off by default: the tournament binary is built without it.
+#
+# `tt-entry16` reaches the Storage-layer 16-byte TT entry the same way. It is
+# likewise off by default — without it a build keeps the reference's 10-byte
+# entry — and it composes with `usi-extras` rather than excluding it.
 [features]
 usi-extras = ["yorkie-protocol/usi-extras"]
+tt-entry16 = ["yorkie-protocol/tt-entry16"]
 
 [lints]
 workspace = true
