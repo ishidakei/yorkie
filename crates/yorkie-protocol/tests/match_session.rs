@@ -22,26 +22,59 @@ mod common;
 
 use common::drive;
 
-/// A whole game-shaped session, byte-for-byte. Same expectation with the feature
-/// on and off.
+/// The play part of a game-shaped session, byte-for-byte. Same expectation with
+/// the feature on and off.
+///
+/// This is the transcript that must never move: from `usinewgame` onward, the
+/// two builds emit the same bytes, and the compile-time configuration changed
+/// none of them. The handshake in front of it — where the builds legitimately
+/// differ — is pinned separately by [`whole_session_including_the_handshake`]
+/// below and by `tests/handshake.rs`.
+const PLAY_OUTPUT: &str = "\
+info string no eval network loaded; run isready\n\
+bestmove resign\n\
+info string no eval network loaded; run isready\n\
+bestmove resign\n";
+
+/// The commands behind [`PLAY_OUTPUT`], minus the terminating `quit`.
+const PLAY_SESSION: &str = "\
+usinewgame\n\
+position startpos moves 7g7f 3c3d\n\
+go btime 60000 wtime 60000 binc 1000 winc 1000\n\
+stop\n\
+position startpos moves 7g7f 3c3d 2g2f 8c8d\n\
+go btime 58000 wtime 58000 byoyomi 5000\n\
+gameover lose\n";
+
 #[cfg_attr(miri, ignore)]
 #[test]
 fn match_shaped_session_is_byte_identical() {
-    let session = "\
-        usinewgame\n\
-        position startpos moves 7g7f 3c3d\n\
-        go btime 60000 wtime 60000 binc 1000 winc 1000\n\
-        stop\n\
-        position startpos moves 7g7f 3c3d 2g2f 8c8d\n\
-        go btime 58000 wtime 58000 byoyomi 5000\n\
-        gameover lose\n\
-        quit\n";
+    assert_eq!(drive(&format!("{PLAY_SESSION}quit\n")), PLAY_OUTPUT);
+}
+
+/// The same session with the handshake a bridge actually sends in front of it:
+/// `usi`, then a `setoption` (bridges send them whether or not the engine asked
+/// for any).
+///
+/// Both builds reply identically: the `usi` reply advertises nothing, because
+/// neither build has anything to advertise, and neither replies to the
+/// `setoption` — USI asks for no reply, and there is no option to set. From
+/// `usinewgame` on, both emit [`PLAY_OUTPUT`] — the same bytes, in the same
+/// order, as before the settings were compiled in.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn whole_session_including_the_handshake() {
+    let out = drive(&format!(
+        "usi\nsetoption name USI_Hash value 256\n{PLAY_SESSION}quit\n"
+    ));
     assert_eq!(
-        drive(session),
-        "info string no eval network loaded; run isready\n\
-         bestmove resign\n\
-         info string no eval network loaded; run isready\n\
-         bestmove resign\n"
+        out,
+        format!(
+            "id name Yorkie 3.1.0\n\
+             id author Kei Ishida <ishida.kei@gmail.com>\n\
+             usiok\n\
+             {PLAY_OUTPUT}"
+        )
     );
 }
 

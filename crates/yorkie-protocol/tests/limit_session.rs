@@ -1,12 +1,27 @@
-//! Driver-level session tests for the drive / limit group:
-//! `USI_Hash` resize, `DepthLimit` / `NodesLimit`, `MaxMovesToDraw`, and the
-//! `gameover` command.
+//! Driver-level session tests for the drive / limit group: the compiled-in
+//! `DepthLimit` / `NodesLimit` / `MaxMovesToDraw` seeds, and the `gameover`
+//! command.
 //!
-//! Each test drives a full `usi → setoption → isready → position → go` session
-//! in-process against a synthetic (all-zero) network staged in a temp dir, so
-//! they are hermetic. Multi-depth / node-capped / infinite searches run on a
-//! worker thread, so they use [`StreamHarness`] and wait for the `bestmove`
-//! before quitting — a fixed result never races the `quit`-driven join.
+//! Each test drives a full `usi → isready → position → go` session in-process
+//! against a synthetic (all-zero) network staged at the compiled-in `EvalDir`
+//! (see [`common::stage_configured_eval_dir`]), so they are hermetic.
+//! Multi-depth / node-capped / infinite searches run on a worker thread, so they
+//! use [`StreamHarness`] and wait for the `bestmove` before quitting — a fixed
+//! result never races the `quit`-driven join.
+//!
+//! # Reading a setting the build fixed
+//!
+//! These settings are compile-time constants; a session cannot change one. Each
+//! test therefore asserts what the value it was BUILT with implies, branching on
+//! the constant, so the same test body is meaningful under either checked-in
+//! config: `configs/test.toml` leaves the three limits off, and
+//! `configs/test-limits.toml` turns them on. Run the second with
+//! `YORKIE_CONFIG=configs/test-limits.toml cargo nextest run -p yorkie-protocol
+//! --all-features`.
+//!
+//! There is no session-level `USI_Hash` test here: the table is sized once from
+//! the compiled-in constant and no session can resize it, so there are no two
+//! legs to compare. `TranspositionTable`'s own tests cover the resize itself.
 //!
 //! **`usi-extras` gate.** These sessions drive the analysis-only `go` clauses
 //! (`depth` / `nodes` / `movetime` / `infinite`), which a default build refuses
@@ -18,7 +33,8 @@
 
 mod common;
 
-use common::{StreamHarness, TempDir, bestmove_lines, legal, parse, write_synthetic_nn_bin};
+use common::{StreamHarness, bestmove_lines, legal, parse, stage_configured_eval_dir};
+use yorkie_protocol::config;
 use yorkie_state::parse_usi_move;
 
 const STARTPOS: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
@@ -28,16 +44,11 @@ const STARTPOS: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSN
 /// `MaxMovesToDraw` horizon suppressing a mate.
 const MATE_AT_PLY_100: &str = "k8/9/G1N6/9/9/9/9/9/8K b G 100";
 
-/// Send the standard single-threaded synthetic-network preamble and block until
-/// `readyok`. `extra` carries any option lines to insert before `isready`.
-fn start_ready(evaldir: &str, extra: &[&str]) -> StreamHarness {
+/// Stage the synthetic network, start a session, and block until `readyok`.
+fn start_ready() -> StreamHarness {
+    stage_configured_eval_dir();
     let h = StreamHarness::start();
     h.send("usi");
-    h.send("setoption name Threads value 1");
-    h.send(&format!("setoption name EvalDir value {evaldir}"));
-    for line in extra {
-        h.send(line);
-    }
     h.send("isready");
     assert!(
         h.wait_until(30_000, |o| o.contains("readyok")),
@@ -46,28 +57,18 @@ fn start_ready(evaldir: &str, extra: &[&str]) -> StreamHarness {
     h
 }
 
-/// Preamble option for every test that compares one search's transcript against
-/// another's: it makes the `info` output a pure function of the search.
-///
-/// Under the default `PvInterval 300` the per-iteration PV is gated on wall clock
-/// (`yorkie-search/src/qsearch.rs:2016`, `pv_interval_elapsed`), and the
-/// coordinator only emits its end-of-search fallback PV when the last iteration's
-/// own line was throttled away (`yorkie-protocol/src/driver.rs:2821`,
-/// `!uci_pv_sent`). The two lines report different depths — the aborted
-/// iteration's `root_depth` versus the last *completed* depth — so whether a
-/// search's last `info` line reads `depth 11` or `depth 10` depends only on how
-/// long it happened to take. Two searches that visit the identical node sequence
-/// can therefore print different final lines, which is flaky, not a divergence.
-/// `PvInterval 0` removes the gate: every iteration prints unconditionally.
-const DETERMINISTIC_PV: &str = "setoption name PvInterval value 0";
-
 /// One summary per completed search in `out`: each search's last `info depth …`
 /// line joined with its `bestmove …` line, in order. Loading the 107 MiB
 /// synthetic network dominates a session's cost, so tests that compare two
 /// searches run both in ONE session (one load) and split the transcript here.
 ///
-/// Which `info` line ends up last is only meaningful under [`DETERMINISTIC_PV`],
-/// so every session whose summaries are compared must send it.
+/// Which `info` line ends up last is only meaningful when the PV is not
+/// throttled — under a non-zero `PvInterval` the per-iteration PV is gated on
+/// the wall clock (`yorkie-search/src/qsearch.rs`, `pv_interval_elapsed`) and
+/// the coordinator's end-of-search fallback reports a different depth, so two
+/// searches over an identical node sequence can print different final lines.
+/// Both checked-in test configs set `pv_interval = 0`; a comparison test skips
+/// itself under a config that does not.
 fn go_summaries(out: &str) -> Vec<String> {
     let mut res = Vec::new();
     let mut cur_info = "";
@@ -80,6 +81,11 @@ fn go_summaries(out: &str) -> Vec<String> {
         }
     }
     res
+}
+
+/// Whether a transcript comparison is meaningful in this build.
+fn pv_is_deterministic() -> bool {
+    config::PV_INTERVAL == 0
 }
 
 /// Send `position` then `go`, and block until the transcript holds
@@ -95,145 +101,83 @@ fn go_and_wait(h: &StreamHarness, position: &str, go: &str, expect_bestmoves: us
 }
 
 // -------------------------------------------------------------------------
-// USI_Hash.
-// -------------------------------------------------------------------------
-
-#[cfg_attr(miri, ignore)]
-#[test]
-fn usi_hash_small_matches_default_fixed_depth() {
-    // A small USI_Hash only changes speed, not a fixed-depth result: the depth-3
-    // startpos search under USI_Hash 8 must produce the same info line (nodes /
-    // score) and bestmove as the default 1024. Both run in one session (default
-    // first, then a mid-session resize to 8) so the network loads once.
-    let dir = TempDir::new("hash-fixed");
-    write_synthetic_nn_bin(dir.path());
-    let e = dir.path().to_str().unwrap();
-
-    let h = start_ready(e, &[DETERMINISTIC_PV]);
-    go_and_wait(&h, "position startpos", "go depth 3", 1);
-    // `usinewgame` resets the game-scoped histories and clears the table, so the
-    // second search is independent of the first — the only difference is the
-    // hash size under test.
-    h.send("usinewgame");
-    h.send("setoption name USI_Hash value 8");
-    go_and_wait(&h, "position startpos", "go depth 3", 2);
-    let out = h.quit_join();
-
-    let s = go_summaries(&out);
-    assert_eq!(s.len(), 2, "two searches in:\n{out}");
-    assert_eq!(
-        s[0], s[1],
-        "USI_Hash 8 must not change the depth-3 result:\n{out}"
-    );
-}
-
-#[cfg_attr(miri, ignore)]
-#[test]
-fn usi_hash_mid_session_resize_between_gos() {
-    // A resize between two go's works and the second search completes. The
-    // driver joins the first (async) worker before resizing, so both go's emit a
-    // bestmove and the engine exits cleanly.
-    let dir = TempDir::new("hash-resize");
-    write_synthetic_nn_bin(dir.path());
-    let e = dir.path().to_str().unwrap();
-
-    let h = start_ready(e, &[]);
-    h.send("position startpos");
-    h.send("go depth 2");
-    assert!(
-        h.wait_until(30_000, |o| bestmove_lines(o).len() == 1),
-        "first go must complete"
-    );
-    h.send("setoption name USI_Hash value 16");
-    h.send("position startpos");
-    h.send("go depth 2");
-    assert!(
-        h.wait_until(30_000, |o| bestmove_lines(o).len() == 2),
-        "second go after a mid-session resize must complete"
-    );
-    let out = h.quit_join();
-    let bms = bestmove_lines(&out);
-    assert_eq!(bms.len(), 2, "exactly two bestmoves in:\n{out}");
-    let start = parse(STARTPOS);
-    for bm in &bms {
-        let tok = bm.split_whitespace().next().unwrap();
-        let mv = parse_usi_move(tok, &start).expect("well-formed USI move");
-        assert!(
-            legal(&start).contains(&mv),
-            "{tok} is not a legal startpos move"
-        );
-    }
-}
-
-// -------------------------------------------------------------------------
 // DepthLimit / NodesLimit.
 // -------------------------------------------------------------------------
 
 #[cfg_attr(miri, ignore)]
 #[test]
-fn depth_limit_caps_search_and_matches_plain_go_depth() {
-    // With DepthLimit 2 and a generous movetime the search stops at depth 2 (no
-    // `info depth 3`), and its bestmove / nodes equal the plain `go depth 2` run.
-    // Both run in one session (plain first, then DepthLimit 2) so the net loads
-    // once. An explicit `go depth 4` in the same session then reaches depth 4,
-    // proving an explicit token overwrites the option-seeded limit.
-    let dir = TempDir::new("depthlimit");
-    write_synthetic_nn_bin(dir.path());
-    let e = dir.path().to_str().unwrap();
+fn depth_limit_caps_a_time_bounded_search_and_yields_to_an_explicit_depth() {
+    let limit = config::DEPTH_LIMIT;
+    if limit == 0 {
+        eprintln!("skipped: this build compiled in no DepthLimit");
+        return;
+    }
+    if !pv_is_deterministic() {
+        eprintln!("skipped: PvInterval is non-zero, so transcripts are wall-clock dependent");
+        return;
+    }
 
-    let h = start_ready(e, &[DETERMINISTIC_PV]);
-    go_and_wait(&h, "position startpos", "go depth 2", 1);
+    // A generous movetime, seeded by the compiled-in DepthLimit, must stop at the
+    // limit — and produce exactly what a plain `go depth <limit>` produces. An
+    // explicit `go depth <limit + 2>` in the same session then goes deeper,
+    // proving an explicit token overwrites the seed.
+    let h = start_ready();
+    go_and_wait(&h, "position startpos", &format!("go depth {limit}"), 1);
     let plain_out = h.output();
 
     // `usinewgame` isolates each search (fresh histories + cleared table) so the
-    // DepthLimit-capped run is comparable to the plain `go depth 2`.
+    // seeded run is comparable to the explicit one.
     h.send("usinewgame");
-    h.send("setoption name DepthLimit value 2");
     go_and_wait(&h, "position startpos", "go movetime 5000", 2);
     let capped_out = h.output();
     let capped_block = capped_out[plain_out.len()..].to_string();
+    let past = limit + 1;
     assert!(
-        !capped_block.lines().any(|l| l.starts_with("info depth 3")),
-        "DepthLimit 2 must stop at depth 2 (no info depth 3) in:\n{capped_block}"
+        !capped_block
+            .lines()
+            .any(|l| l.starts_with(&format!("info depth {past}"))),
+        "DepthLimit {limit} must stop there (no info depth {past}) in:\n{capped_block}"
     );
 
-    // An explicit go depth 4 overwrites the DepthLimit-seeded 2.
     h.send("usinewgame");
-    go_and_wait(&h, "position startpos", "go depth 4", 3);
+    let deeper = limit + 2;
+    go_and_wait(&h, "position startpos", &format!("go depth {deeper}"), 3);
     let out = h.quit_join();
     let override_block = out[capped_out.len()..].to_string();
     assert!(
         override_block
             .lines()
-            .any(|l| l.starts_with("info depth 4")),
-        "explicit go depth 4 must reach depth 4 despite DepthLimit 2 in:\n{override_block}"
+            .any(|l| l.starts_with(&format!("info depth {deeper}"))),
+        "an explicit go depth {deeper} must reach it despite DepthLimit {limit} in:\n{override_block}"
     );
 
     let s = go_summaries(&out);
     assert_eq!(s.len(), 3, "three searches in:\n{out}");
     assert_eq!(
         s[0], s[1],
-        "DepthLimit 2 must match plain go depth 2:\n{out}"
+        "DepthLimit {limit} must match plain go depth {limit}:\n{out}"
     );
 }
 
 #[cfg_attr(miri, ignore)]
 #[test]
-fn nodes_limit_matches_go_nodes() {
-    // With NodesLimit N (below the position's uncapped node count) the final
-    // aggregated node count respects the cap exactly as `go nodes N` does: the
-    // explicit `go nodes N` and the option-seeded bare `go` produce the same
-    // final info line (nodes) and bestmove. Both run in one session, under
-    // `PvInterval 0` so neither transcript depends on the wall clock.
-    let dir = TempDir::new("nodeslimit");
-    write_synthetic_nn_bin(dir.path());
-    let e = dir.path().to_str().unwrap();
+fn nodes_limit_matches_the_same_go_nodes() {
+    let limit = config::NODES_LIMIT;
+    if limit == 0 {
+        eprintln!("skipped: this build compiled in no NodesLimit");
+        return;
+    }
+    if !pv_is_deterministic() {
+        eprintln!("skipped: PvInterval is non-zero, so transcripts are wall-clock dependent");
+        return;
+    }
 
-    let h = start_ready(e, &[DETERMINISTIC_PV]);
-    go_and_wait(&h, "position startpos", "go nodes 3000", 1);
+    // The compiled-in NodesLimit caps a bare `go` exactly as an explicit
+    // `go nodes <limit>` does: same final info line (nodes) and same bestmove.
+    let h = start_ready();
+    go_and_wait(&h, "position startpos", &format!("go nodes {limit}"), 1);
     // `usinewgame` isolates the two node-capped searches so they are comparable.
     h.send("usinewgame");
-    h.send("setoption name NodesLimit value 3000");
     go_and_wait(&h, "position startpos", "go", 2);
     let out = h.quit_join();
 
@@ -241,7 +185,7 @@ fn nodes_limit_matches_go_nodes() {
     assert_eq!(s.len(), 2, "two searches in:\n{out}");
     assert_eq!(
         s[0], s[1],
-        "NodesLimit 3000 must behave exactly as go nodes 3000:\n{out}"
+        "NodesLimit {limit} must behave exactly as go nodes {limit}:\n{out}"
     );
 }
 
@@ -252,48 +196,47 @@ fn nodes_limit_matches_go_nodes() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn max_moves_to_draw_adjudicates_a_draw_past_the_horizon() {
-    // A mate-in-1 position at a high game ply. Unlimited (MaxMovesToDraw 0 =
-    // default) the search finds the mate; a small MaxMovesToDraw makes every
-    // interior / qsearch node adjudicate a draw before the mate is seen, so the
-    // reported score collapses from `mate` to a draw-band `cp` value and the
-    // search still terminates with a bestmove.
-    let dir = TempDir::new("mmtd");
-    write_synthetic_nn_bin(dir.path());
-    let e = dir.path().to_str().unwrap();
-    let position = format!("position sfen {MATE_AT_PLY_100}");
-
-    let h = start_ready(e, &[]);
-
-    // Value 0 (unlimited, default): searches normally and finds the mate.
-    go_and_wait(&h, &position, "go depth 2", 1);
-    let unlimited = h.output();
-    assert!(
-        unlimited.lines().any(|l| l.contains("score mate")),
-        "unlimited MaxMovesToDraw must find the mate in:\n{unlimited}"
+    // A mate-in-1 position at game ply 100. Unlimited (`MaxMovesToDraw 0`) the
+    // search finds the mate; a horizon below the game ply makes every interior /
+    // qsearch node adjudicate a draw before the mate is seen, so the reported
+    // score collapses from `mate` to a draw-band `cp` value and the search still
+    // terminates with a bestmove. Which of the two this build shows is decided by
+    // the constant.
+    let horizon = config::MAX_MOVES_TO_DRAW;
+    let h = start_ready();
+    go_and_wait(
+        &h,
+        &format!("position sfen {MATE_AT_PLY_100}"),
+        "go depth 2",
+        1,
     );
-    assert_eq!(
-        bestmove_lines(&unlimited)[0]
-            .split_whitespace()
-            .next()
-            .unwrap(),
-        "G*8a",
-        "unlimited search plays the mating drop in:\n{unlimited}"
-    );
-
-    // Small horizon (50 < game ply 100): the mate is suppressed for a draw.
-    h.send("usinewgame");
-    h.send("setoption name MaxMovesToDraw value 50");
-    go_and_wait(&h, &position, "go depth 2", 2);
     let out = h.quit_join();
-    let capped = out[unlimited.len()..].to_string();
-    assert!(
-        !capped.lines().any(|l| l.contains("score mate")),
-        "MaxMovesToDraw must suppress the mate in:\n{capped}"
-    );
-    assert!(
-        capped.lines().any(|l| l.contains("score cp")),
-        "the capped search must report a draw-adjudicated cp score in:\n{capped}"
-    );
+
+    if horizon == 0 || horizon > 100 {
+        assert!(
+            out.lines().any(|l| l.contains("score mate")),
+            "an unreached MaxMovesToDraw horizon must let the mate stand in:\n{out}"
+        );
+        assert_eq!(
+            bestmove_lines(&out)[0].split_whitespace().next().unwrap(),
+            "G*8a",
+            "the unbounded search plays the mating drop in:\n{out}"
+        );
+    } else {
+        assert!(
+            !out.lines().any(|l| l.contains("score mate")),
+            "MaxMovesToDraw {horizon} must suppress the mate in:\n{out}"
+        );
+        assert!(
+            out.lines().any(|l| l.contains("score cp")),
+            "the capped search must report a draw-adjudicated cp score in:\n{out}"
+        );
+        assert_eq!(
+            bestmove_lines(&out).len(),
+            1,
+            "the capped search still terminates with one bestmove in:\n{out}"
+        );
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -305,11 +248,7 @@ fn max_moves_to_draw_adjudicates_a_draw_past_the_horizon() {
 fn gameover_releases_infinite_search_and_a_fresh_go_works() {
     // `go infinite` then `gameover lose` releases the bestmove exactly as `stop`
     // would; afterwards `usinewgame` + a fresh `go` works normally.
-    let dir = TempDir::new("gameover-inf");
-    write_synthetic_nn_bin(dir.path());
-    let e = dir.path().to_str().unwrap();
-
-    let h = start_ready(e, &[]);
+    let h = start_ready();
     h.send("position startpos");
     h.send("go infinite");
     // An infinite search emits no bestmove until stopped (this engine reports a
@@ -355,11 +294,7 @@ fn gameover_releases_infinite_search_and_a_fresh_go_works() {
 fn gameover_result_token_is_optional_and_ignored() {
     // A bare `gameover` (no win/lose/draw token) is accepted and releases the
     // held reply just like `gameover lose` / `stop`.
-    let dir = TempDir::new("gameover-bare");
-    write_synthetic_nn_bin(dir.path());
-    let e = dir.path().to_str().unwrap();
-
-    let h = start_ready(e, &[]);
+    let h = start_ready();
     h.send("position startpos");
     h.send("go infinite");
     std::thread::sleep(std::time::Duration::from_millis(80));

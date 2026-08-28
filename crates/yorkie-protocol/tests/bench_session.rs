@@ -21,7 +21,7 @@
 
 mod common;
 
-use common::{TempDir, drive, write_synthetic_nn_bin};
+use common::{drive, stage_configured_eval_dir};
 
 /// Extract the `nodes=` field from the single `bench:` summary line in `out`.
 fn bench_summary_nodes(out: &str) -> u64 {
@@ -125,12 +125,10 @@ fn current_source_benches_the_set_position() {
 
 /// The standard bench session against a staged synthetic network: a small
 /// fixed-depth default bench so CI stays fast. Returns the full transcript.
-fn bench_session(evaldir: &str, bench_line: &str) -> String {
+fn bench_session(bench_line: &str) -> String {
+    stage_configured_eval_dir();
     let input = format!(
         "usi\n\
-         setoption name Threads value 1\n\
-         setoption name USI_Hash value 16\n\
-         setoption name EvalDir value {evaldir}\n\
          isready\n\
          {bench_line}\n\
          quit\n"
@@ -141,23 +139,16 @@ fn bench_session(evaldir: &str, bench_line: &str) -> String {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn two_runs_in_one_process_report_identical_nodes() {
-    let dir = TempDir::new("bench-determinism-1proc");
-    write_synthetic_nn_bin(dir.path());
-    let evaldir = dir.path().to_str().expect("utf-8 path");
+    stage_configured_eval_dir();
 
     // Two bench runs in ONE process (one network load). Each resets the TT and
     // histories at its start, so run 2 sees the same clean state as run 1.
-    let input = format!(
-        "usi\n\
-         setoption name Threads value 1\n\
-         setoption name USI_Hash value 16\n\
-         setoption name EvalDir value {evaldir}\n\
-         isready\n\
-         bench 16 1 3 default depth\n\
-         bench 16 1 3 default depth\n\
-         quit\n"
-    );
-    let out = drive(&input);
+    let input = "usi\n\
+                 isready\n\
+                 bench 16 1 3 default depth\n\
+                 bench 16 1 3 default depth\n\
+                 quit\n";
+    let out = drive(input);
     let summaries: Vec<&str> = out
         .lines()
         .filter(|l| l.contains("bench: positions="))
@@ -179,15 +170,11 @@ fn two_runs_in_one_process_report_identical_nodes() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn two_process_launches_report_identical_nodes() {
-    let dir = TempDir::new("bench-determinism-2proc");
-    write_synthetic_nn_bin(dir.path());
-    let evaldir = dir.path().to_str().expect("utf-8 path");
-
     // Two independent driver runs (separate "process launches") with identical
     // input must report the same total nodes — determinism does not depend on
     // in-process carry-over.
-    let a = bench_session(evaldir, "bench 16 1 3 default depth");
-    let b = bench_session(evaldir, "bench 16 1 3 default depth");
+    let a = bench_session("bench 16 1 3 default depth");
+    let b = bench_session("bench 16 1 3 default depth");
     let na = bench_summary_nodes(&a);
     let nb = bench_summary_nodes(&b);
     assert!(na > 0, "real search:\n{a}");
@@ -204,11 +191,7 @@ fn two_process_launches_report_identical_nodes() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn threads_two_bench_completes_and_reports() {
-    let dir = TempDir::new("bench-threads2");
-    write_synthetic_nn_bin(dir.path());
-    let evaldir = dir.path().to_str().expect("utf-8 path");
-
-    let out = bench_session(evaldir, "bench 16 2 3 default depth");
+    let out = bench_session("bench 16 2 3 default depth");
     assert_eq!(
         bench_summary_positions(&out),
         4,

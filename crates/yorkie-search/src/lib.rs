@@ -31,12 +31,7 @@ pub mod timeman;
 pub mod update;
 
 pub use book::{BookConfig, BookHit, BookInfoLine, BookProbeResult, Prng, probe_book};
-// Re-exported so the Protocol layer can drive the NNUE fixed-point output scale
-// (the `FV_SCALE` USI option) without a direct Protocol -> Evaluation
-// dependency, which the layering rules forbid. `set_fv_scale` writes the
-// eval's live scale; `FV_SCALE_DEFAULT` is the reference default (16).
 pub use timeman::{TimeInput, TimeManagement};
-pub use yorkie_eval::{FV_SCALE_DEFAULT, fv_scale, set_fv_scale};
 
 pub use history::{
     ButterflyHistory, CapturePieceToHistory, ContinuationCorrectionHistory, ContinuationHistory,

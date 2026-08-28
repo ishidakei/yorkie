@@ -1,0 +1,92 @@
+# The config the test suite runs against. Select it with the `YORKIE_CONFIG`
+# environment variable:
+#
+#     YORKIE_CONFIG=configs/test.toml cargo nextest run --all-features
+#
+# No build has a runtime option surface, so a test cannot dial a setting in with
+# `setoption`: the values below ARE the values every session test sees. Three of
+# them are therefore chosen for the suite rather than for play — a small
+# `usi_hash`, a single worker, and an unthrottled PV — and each says so at its
+# own key. Everything else is `configs/default.toml`'s value.
+#
+# The schema and its rules are identical to `configs/default.toml` — see that
+# file for the per-key commentary. Every key must be present exactly once, no
+# key outside the schema may appear, and every value is type- and range-checked
+# at build time.
+
+# ---------------------------------------------------------------------------
+# Engine core
+# ---------------------------------------------------------------------------
+
+# TEST VALUE: the play value is 1024. Every session test that reaches `readyok`
+# allocates this table for real, and nothing can shrink it at run time, so a
+# play-sized value here would have the suite allocate a gibibyte per test
+# process.
+usi_hash = 16
+
+# TEST VALUE: the play value is 4. The session tests pin a deterministic
+# `bestmove` against a direct single-worker search; Lazy-SMP with more than one
+# worker is deliberately not reproducible move-for-move.
+threads = 1
+
+multi_pv = 1
+eval_dir = "eval"
+fv_scale = 16
+numa_policy = "auto"
+usi_ponder = false
+stochastic_ponder = false
+
+# ---------------------------------------------------------------------------
+# Opening book
+# ---------------------------------------------------------------------------
+
+book_options_v2 = false
+usi_own_book = true
+narrow_book = false
+book_moves = 16
+book_ignore_rate = 0
+book_file = "no_book"
+book_dir = "book"
+book_eval_diff = 30
+book_eval_black_diff = 0
+book_eval_white_diff = 0
+book_eval_black_limit = 0
+book_eval_white_limit = -140
+book_depth_limit = 16
+book_depth_black_limit = 0
+book_depth_white_limit = 5
+book_on_the_fly = false
+consider_book_move_count = false
+book_pv_moves = 8
+ignore_book_ply = false
+flipped_book = true
+
+# ---------------------------------------------------------------------------
+# Search behaviour
+# ---------------------------------------------------------------------------
+
+entering_king_rule = "CSARule27"
+depth_limit = 0
+nodes_limit = 0
+max_moves_to_draw = 0
+
+# TEST VALUE: the play value is 300. A throttle makes which iterations print
+# depend on how fast the machine ran them, which no assertion can pin.
+pv_interval = 0
+
+consideration_mode = false
+output_fail_lh_pv = true
+draw_value_black = -2
+draw_value_white = -2
+resign_value = 99999
+generate_all_legal_moves = false
+
+# ---------------------------------------------------------------------------
+# Time management
+# ---------------------------------------------------------------------------
+
+network_delay = 120
+network_delay2 = 1120
+minimum_thinking_time = 2000
+slow_mover = 100
+round_up_to_full_second = true

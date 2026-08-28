@@ -1,0 +1,96 @@
+# The second test config: every setting whose OTHER value a session test wants to
+# see.
+#
+# The engine carries no runtime configuration, so a setting has exactly one value
+# per build and a session test cannot vary it with `setoption`. A test that needs
+# a setting's other value branches on the compiled-in constant, and this file is
+# the build that takes the second branch. Run it with:
+#
+#     YORKIE_CONFIG=configs/test-limits.toml \
+#         cargo nextest run -p yorkie-protocol --all-features
+#
+# Everything not listed as a DIFFERENCE below is `configs/test.toml`'s value, so
+# the two runs differ only in the settings under test.
+
+# ---------------------------------------------------------------------------
+# Engine core
+# ---------------------------------------------------------------------------
+
+usi_hash = 16
+threads = 1
+# DIFFERENCE: 1 in test.toml. Three ranked PVs per iteration.
+multi_pv = 3
+eval_dir = "eval"
+fv_scale = 16
+numa_policy = "auto"
+usi_ponder = false
+# DIFFERENCE: false in test.toml. The rewind-and-re-issue ponder path.
+stochastic_ponder = true
+
+# ---------------------------------------------------------------------------
+# Opening book
+# ---------------------------------------------------------------------------
+
+book_options_v2 = false
+usi_own_book = true
+narrow_book = false
+book_moves = 16
+book_ignore_rate = 0
+book_file = "no_book"
+book_dir = "book"
+book_eval_diff = 30
+book_eval_black_diff = 0
+book_eval_white_diff = 0
+book_eval_black_limit = 0
+book_eval_white_limit = -140
+book_depth_limit = 16
+book_depth_black_limit = 0
+book_depth_white_limit = 5
+book_on_the_fly = false
+consider_book_move_count = false
+book_pv_moves = 8
+ignore_book_ply = false
+flipped_book = true
+
+# ---------------------------------------------------------------------------
+# Search behaviour
+# ---------------------------------------------------------------------------
+
+entering_king_rule = "CSARule27"
+
+# DIFFERENCE: both 0 in test.toml. A time-bounded `go` is seeded with these,
+# and an explicit `go depth` / `go nodes` token still overrides them.
+depth_limit = 2
+nodes_limit = 3000
+
+# DIFFERENCE: 0 in test.toml. Below the ply-100 fixture position, so the
+# search adjudicates a draw before it can see the mate.
+max_moves_to_draw = 50
+
+pv_interval = 0
+
+# DIFFERENCE: false in test.toml. Each PV is collected from the transposition
+# table rather than from the search stack.
+consideration_mode = true
+output_fail_lh_pv = true
+
+# DIFFERENCE: -2 in test.toml. A contempt large enough to dominate the
+# reported root score of an adjudicated-draw position.
+draw_value_black = 500
+draw_value_white = 500
+
+# DIFFERENCE: 99999 (unreachable) in test.toml. A decisive negative score
+# clears this threshold, so a lost position is resigned.
+resign_value = 100
+
+generate_all_legal_moves = false
+
+# ---------------------------------------------------------------------------
+# Time management
+# ---------------------------------------------------------------------------
+
+network_delay = 120
+network_delay2 = 1120
+minimum_thinking_time = 2000
+slow_mover = 100
+round_up_to_full_second = true

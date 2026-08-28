@@ -1,15 +1,19 @@
 //! Driver-level session tests for the MultiPV + PV-output group: the real
-//! MultiPV loop, the `PvInterval` throttle, `ConsiderationMode`, and
-//! the voting-off-under-MultiPV path.
+//! MultiPV loop, the PV-output path, and `ConsiderationMode`.
 //!
-//! Each test drives a full `usi → setoption → isready → position → go` session
-//! in-process against a synthetic (all-zero) network staged in a temp dir, so
-//! they are hermetic. They use [`StreamHarness`] and wait for the `bestmove`
-//! before quitting: a MultiPV search runs many root searches per iteration, so
-//! quitting early would abort it mid-iteration (`quit` sets the stop flag). All
-//! PV-content assertions that depend on per-iteration output set `PvInterval
-//! value 0` in the preamble so the pin's default 300 ms throttle does not
-//! suppress the intermediate lines.
+//! Each test drives a full `usi → isready → position → go` session in-process
+//! against a synthetic (all-zero) network staged at the compiled-in `EvalDir`
+//! (see [`common::stage_configured_eval_dir`]), so they are hermetic. They use
+//! [`StreamHarness`] and wait for the `bestmove` before quitting: a MultiPV
+//! search runs many root searches per iteration, so quitting early would abort
+//! it mid-iteration (`quit` sets the stop flag).
+//!
+//! `MultiPV`, `PvInterval` and `ConsiderationMode` are compile-time constants, so
+//! each test asserts what the value it was BUILT with implies and skips itself
+//! when that value has nothing to show. `configs/test.toml` builds a
+//! single-PV engine; `configs/test-limits.toml` builds `MultiPV 3` with
+//! `ConsiderationMode` on. See `tests/limit_session.rs` for how to run the
+//! second.
 //!
 //! **`usi-extras` gate.** These sessions drive the analysis-only `go` clauses
 //! (`depth` / `nodes` / `movetime` / `infinite`), which a default build refuses
@@ -21,7 +25,8 @@
 
 mod common;
 
-use common::{StreamHarness, TempDir, bestmove_lines, legal, parse, write_synthetic_nn_bin};
+use common::{StreamHarness, bestmove_lines, legal, parse, stage_configured_eval_dir};
+use yorkie_protocol::config;
 use yorkie_state::parse_usi_move;
 
 const STARTPOS: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
@@ -29,17 +34,13 @@ const STARTPOS: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSN
 /// checking gold on 5b (every other escape square is covered by that gold).
 const ONE_LEGAL_MOVE: &str = "4k4/4G4/9/9/9/9/9/9/4K4 w - 1";
 
-/// Drive a full session on a stream harness with the single-threaded synthetic
-/// preamble plus `extra` option lines, then `position` + `go`, waiting for the
-/// `bestmove` so the search fully completes before `quit`. Returns the transcript.
-fn run_session(evaldir: &str, threads: u32, extra: &[&str], position: &str, go: &str) -> String {
+/// Stage the synthetic network, drive `position` + `go` on a stream harness, and
+/// wait for the `bestmove` so the search fully completes before `quit`. Returns
+/// the transcript.
+fn run_session(position: &str, go: &str) -> String {
+    stage_configured_eval_dir();
     let h = StreamHarness::start();
     h.send("usi");
-    h.send(&format!("setoption name Threads value {threads}"));
-    h.send(&format!("setoption name EvalDir value {evaldir}"));
-    for line in extra {
-        h.send(line);
-    }
     h.send("isready");
     assert!(
         h.wait_until(30_000, |o| o.contains("readyok")),
@@ -121,34 +122,31 @@ fn last_multipv_block(out: &str) -> Vec<&str> {
 
 #[cfg_attr(miri, ignore)]
 #[test]
-fn multipv_three_emits_three_ranked_lines_per_iteration() {
-    let dir = TempDir::new("multipv3");
-    write_synthetic_nn_bin(dir.path());
-    let e = dir.path().to_str().unwrap();
-
-    let out = run_session(
-        e,
-        1,
-        &[
-            "setoption name MultiPV value 3",
-            "setoption name PvInterval value 0",
-        ],
-        "position startpos",
-        "go depth 3",
+fn the_configured_multipv_emits_that_many_ranked_lines_per_iteration() {
+    let want = config::MULTI_PV as usize;
+    if want < 2 {
+        eprintln!("skipped: this build compiled in MultiPV 1, which emits no multipv index");
+        return;
+    }
+    assert!(
+        want <= legal(&parse(STARTPOS)).len(),
+        "the fixture must have at least MultiPV legal moves"
     );
 
-    // The last completed iteration emits exactly three ranked lines.
+    let out = run_session("position startpos", "go depth 3");
+
+    // The last completed iteration emits exactly `want` ranked lines.
     let block = last_multipv_block(&out);
     assert_eq!(
         block.len(),
-        3,
-        "a completed MultiPV=3 iteration emits exactly 3 lines in:\n{out}"
+        want,
+        "a completed MultiPV={want} iteration emits exactly {want} lines in:\n{out}"
     );
     let idxs: Vec<usize> = block.iter().filter_map(|l| multipv_of(l)).collect();
     assert_eq!(
         idxs,
-        vec![1, 2, 3],
-        "multipv indices must be 1..3 in:\n{out}"
+        (1..=want).collect::<Vec<_>>(),
+        "multipv indices must be 1..={want} in:\n{out}"
     );
 
     // Scores are non-increasing by index.
@@ -158,11 +156,15 @@ fn multipv_three_emits_three_ranked_lines_per_iteration() {
         "scores must be non-increasing by multipv index, got {scores:?} in:\n{out}"
     );
 
-    // Three distinct first moves.
+    // Distinct first moves, one per line.
     let firsts: Vec<&str> = block.iter().filter_map(|l| first_pv_move(l)).collect();
-    assert_eq!(firsts.len(), 3, "each line has a pv in:\n{out}");
+    assert_eq!(firsts.len(), want, "each line has a pv in:\n{out}");
     let distinct: std::collections::HashSet<&str> = firsts.iter().copied().collect();
-    assert_eq!(distinct.len(), 3, "first moves must be distinct in:\n{out}");
+    assert_eq!(
+        distinct.len(),
+        want,
+        "first moves must be distinct in:\n{out}"
+    );
 
     // bestmove equals the multipv-1 line's first move.
     let bms = bestmove_lines(&out);
@@ -176,61 +178,17 @@ fn multipv_three_emits_three_ranked_lines_per_iteration() {
 
 #[cfg_attr(miri, ignore)]
 #[test]
-fn multipv_clamps_to_legal_move_count() {
-    let dir = TempDir::new("multipv-clamp");
-    write_synthetic_nn_bin(dir.path());
-    let e = dir.path().to_str().unwrap();
-
-    let legal_count = legal(&parse(STARTPOS)).len();
-    assert!(legal_count > 1, "startpos has many legal moves");
-
-    // MultiPV 600 >> legal-move count ⇒ clamps to the legal-move count.
-    let out = run_session(
-        e,
-        1,
-        &[
-            "setoption name MultiPV value 600",
-            "setoption name PvInterval value 0",
-        ],
-        "position startpos",
-        "go depth 2",
-    );
-    let block = last_multipv_block(&out);
-    assert_eq!(
-        block.len(),
-        legal_count,
-        "MultiPV must clamp to the {legal_count} legal moves in:\n{out}"
-    );
-    let idxs: Vec<usize> = block.iter().filter_map(|l| multipv_of(l)).collect();
-    assert_eq!(
-        idxs,
-        (1..=legal_count).collect::<Vec<_>>(),
-        "multipv indices must run 1..={legal_count} in:\n{out}"
-    );
-}
-
-#[cfg_attr(miri, ignore)]
-#[test]
-fn multipv_single_legal_move_works() {
-    let dir = TempDir::new("multipv-single");
-    write_synthetic_nn_bin(dir.path());
-    let e = dir.path().to_str().unwrap();
-
+fn multipv_clamps_to_the_legal_move_count() {
+    if config::MULTI_PV < 2 {
+        eprintln!("skipped: this build compiled in MultiPV 1, which cannot exceed a move count");
+        return;
+    }
     let pos = parse(ONE_LEGAL_MOVE);
     let moves = legal(&pos);
     assert_eq!(moves.len(), 1, "fixture must have exactly one legal move");
 
-    let out = run_session(
-        e,
-        1,
-        &[
-            "setoption name MultiPV value 5",
-            "setoption name PvInterval value 0",
-        ],
-        &format!("position sfen {ONE_LEGAL_MOVE}"),
-        "go depth 2",
-    );
-    // Only one PV line can exist; the bestmove is the forced move.
+    // MultiPV above the legal-move count clamps to the legal-move count.
+    let out = run_session(&format!("position sfen {ONE_LEGAL_MOVE}"), "go depth 2");
     let block = last_multipv_block(&out);
     assert_eq!(
         block.len(),
@@ -247,54 +205,12 @@ fn multipv_single_legal_move_works() {
 
 #[cfg_attr(miri, ignore)]
 #[test]
-fn threads2_multipv2_completes_with_both_lines_and_a_legal_bestmove() {
-    // Voting is off under MultiPV > 1 (the reference `MultiPV == 1` guard). The
-    // search still completes, emits both PV lines, and returns a legal bestmove.
-    let dir = TempDir::new("threads2-multipv2");
-    write_synthetic_nn_bin(dir.path());
-    let e = dir.path().to_str().unwrap();
-
-    let out = run_session(
-        e,
-        2,
-        &[
-            "setoption name MultiPV value 2",
-            "setoption name PvInterval value 0",
-        ],
-        "position startpos",
-        "go depth 3",
-    );
-
-    assert!(
-        out.lines().any(|l| multipv_of(l) == Some(1)),
-        "must emit a multipv 1 line in:\n{out}"
-    );
-    assert!(
-        out.lines().any(|l| multipv_of(l) == Some(2)),
-        "must emit a multipv 2 line in:\n{out}"
-    );
-    let bms = bestmove_lines(&out);
-    assert_eq!(bms.len(), 1, "one bestmove in:\n{out}");
-    let start = parse(STARTPOS);
-    let tok = bms[0].split_whitespace().next().unwrap();
-    let mv = parse_usi_move(tok, &start).expect("well-formed USI move");
-    assert!(legal(&start).contains(&mv), "{tok} is not a legal move");
-}
-
-#[cfg_attr(miri, ignore)]
-#[test]
-fn pv_interval_zero_prints_every_iteration() {
-    let dir = TempDir::new("pvinterval0");
-    write_synthetic_nn_bin(dir.path());
-    let e = dir.path().to_str().unwrap();
-
-    let out = run_session(
-        e,
-        1,
-        &["setoption name PvInterval value 0"],
-        "position startpos",
-        "go depth 3",
-    );
+fn an_unthrottled_pv_interval_prints_every_iteration() {
+    if config::PV_INTERVAL != 0 {
+        eprintln!("skipped: this build throttles the PV, so which iterations print is timing");
+        return;
+    }
+    let out = run_session("position startpos", "go depth 3");
     for d in 1..=3 {
         assert!(
             out.lines()
@@ -306,15 +222,18 @@ fn pv_interval_zero_prints_every_iteration() {
 
 #[cfg_attr(miri, ignore)]
 #[test]
-fn pv_interval_default_still_emits_a_final_pv_before_bestmove() {
-    // With the default PvInterval 300 a fast fixed-depth search may suppress the
-    // intermediate lines, but the final PV always precedes `bestmove`.
-    let dir = TempDir::new("pvinterval-default");
-    write_synthetic_nn_bin(dir.path());
-    let e = dir.path().to_str().unwrap();
-
-    // No PvInterval override ⇒ the 300 ms default.
-    let out = run_session(e, 1, &[], "position startpos", "go depth 3");
+fn a_final_pv_always_precedes_bestmove() {
+    // Whatever the throttle does to the intermediate lines, the final PV is
+    // always emitted before `bestmove`, and its first move is the bestmove.
+    //
+    // Which line carries that PV depends on the compiled-in `MultiPV`: a
+    // single-PV build emits one line per iteration, so the last one before
+    // `bestmove` is it, but a `MultiPV N` iteration ends on its `multipv N`
+    // line — the RANKED-FIRST line is `multipv 1`, and that is the one the
+    // bestmove comes from. Take the last `multipv 1` line there, and the last
+    // PV line outright where no index is emitted.
+    let ranked = config::MULTI_PV >= 2;
+    let out = run_session("position startpos", "go depth 3");
 
     let bm_pos = out
         .find("\nbestmove ")
@@ -322,11 +241,14 @@ fn pv_interval_default_still_emits_a_final_pv_before_bestmove() {
         .or_else(|| out.starts_with("bestmove ").then_some(0))
         .unwrap_or_else(|| panic!("missing bestmove in:\n{out}"));
 
-    // At least one `info … pv` line, before the bestmove.
     let pv_line = out[..bm_pos]
         .lines()
         .rev()
-        .find(|l| l.starts_with("info depth") && l.contains(" pv "))
+        .find(|l| {
+            l.starts_with("info depth")
+                && l.contains(" pv ")
+                && (!ranked || multipv_of(l) == Some(1))
+        })
         .unwrap_or_else(|| panic!("no info pv line before bestmove in:\n{out}"));
 
     let bms = bestmove_lines(&out);
@@ -341,20 +263,15 @@ fn pv_interval_default_still_emits_a_final_pv_before_bestmove() {
 
 #[cfg_attr(miri, ignore)]
 #[test]
-fn consideration_mode_pv_replays_as_a_legal_sequence() {
-    let dir = TempDir::new("consideration");
-    write_synthetic_nn_bin(dir.path());
-    let e = dir.path().to_str().unwrap();
+fn a_consideration_mode_pv_replays_as_a_legal_sequence() {
+    if !config::CONSIDERATION_MODE {
+        eprintln!("skipped: this build did not compile ConsiderationMode in");
+        return;
+    }
 
     // ConsiderationMode forces the interval to 0 internally, so per-iteration PVs
     // are emitted; the PV is collected from the transposition table.
-    let out = run_session(
-        e,
-        1,
-        &["setoption name ConsiderationMode value true"],
-        "position startpos",
-        "go depth 4",
-    );
+    let out = run_session("position startpos", "go depth 4");
 
     let bms = bestmove_lines(&out);
     assert_eq!(

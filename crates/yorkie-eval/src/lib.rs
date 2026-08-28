@@ -10,6 +10,7 @@
 //! engine), adapted to this workspace's std-only conventions.
 
 mod aligned;
+mod config;
 mod features;
 mod finny;
 mod loader;
@@ -25,9 +26,7 @@ pub use features::{
 };
 pub use finny::FinnyCache;
 pub use loader::{load_network, load_network_with_warnings};
-pub use network::{
-    FV_SCALE_DEFAULT, evaluate, evaluate_with, fv_scale, layer_stack_index, set_fv_scale,
-};
+pub use network::{FV_SCALE, evaluate, evaluate_with, layer_stack_index};
 pub use simd::{Backend, active_backend};
 pub use transformer::{Accumulator, FT_OUTPUT_DIMS};
 pub use types::{

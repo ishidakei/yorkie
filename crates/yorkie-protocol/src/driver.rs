@@ -12,7 +12,7 @@ use yorkie_search::{
     BookConfig, BookHit, EnteringKingConfig, EnteringKingRule, PonderSignal, Prng, PvBound, PvInfo,
     PvOutputConfig, PvSink, QSearch, RootMove, Search, SearchControl, SharedHistories, TimeControl,
     TimeInput, TimeManagement, WorkerHistories, WorkerResult, WorkerVote, declaration_win,
-    generate_root_moves, probe_book, select_best_worker, set_fv_scale,
+    generate_root_moves, probe_book, select_best_worker,
 };
 use yorkie_state::{Move, Position, format_usi_move, parse_sfen, parse_usi_move};
 use yorkie_storage::{Book, TranspositionTable, Value};
@@ -21,11 +21,9 @@ use yorkie_storage::{TTData, VALUE_NONE};
 
 #[cfg(feature = "usi-extras")]
 use crate::bench;
-use crate::engine_options::{OverrideLine, parse_override_line};
 use crate::formatter::Formatter;
-use crate::option_profile::{ENGINE_OPTION_PROFILE_FILE, read_engine_option_profile};
-use crate::options::{OptionStore, OptionValue};
 use crate::parser::{Command, GoLimits, MATE_UNLIMITED_MS, PositionSfen, parse_line};
+use crate::settings::Settings;
 #[cfg(feature = "usi-extras")]
 use crate::tt_command::{
     TtCommand, TtPosition, TtStoreArgs, bound_name, parse_tt, value_from_tt, value_to_tt,
@@ -42,12 +40,13 @@ use crate::tt_command::{
 pub const ENGINE_NAME: &str = "Yorkie 3.1.0";
 pub const ENGINE_AUTHOR: &str = "Kei Ishida <ishida.kei@gmail.com>";
 
-// The transposition table is sized from the `USI_Hash` option (default 1024
-// MiB, `yaneuraou-search.cpp` — the depth-1 fixture capture condition): the
-// first successful `isready` sizes it if still unsized, and every
-// `setoption name USI_Hash` resizes it thereafter (mirroring the reference
-// `set_tt_size`, `yaneuraou-search.cpp`). See
-// [`UsiDriver::resize_tt_to_hash_option`].
+// The transposition table is sized from the `usi_hash` config constant (the
+// reference's `USI_Hash` option, `yaneuraou-search.cpp` — the depth-1
+// fixture capture condition): the first successful `isready` sizes it if still
+// unsized, and nothing resizes it thereafter, because nothing can change the
+// constant. The `usi-extras` `bench` command is the one exception: it carries
+// its own table size as a command argument. See
+// [`UsiDriver::resize_tt_to_hash_config`].
 
 /// The largest iterative-deepening depth a `go` ever requests. `run_root`'s own
 /// `rootDepth + 1 < MAX_PLY` guard (`MAX_PLY == 246`) is the real ceiling; this
@@ -196,6 +195,18 @@ struct ActiveSearch {
     /// Stochastic_Ponder ponderhit teardown, which stops the rewound search
     /// without emitting anything (`usi.cpp`).
     suppress: Arc<AtomicBool>,
+    /// Set by the coordinator *inside* the critical section that writes
+    /// `bestmove`, so this search counts as finished from the moment its reply
+    /// is on the wire.
+    ///
+    /// [`JoinHandle::is_finished`] is not that moment: the coordinator emits
+    /// `bestmove` and only then unwinds (reclaiming its histories, dropping its
+    /// `Arc`s), so a host that reads `bestmove` and immediately sends the next
+    /// command can land in the window where the thread has not yet returned. A
+    /// flag stamped under the output lock closes it — any reader that has seen
+    /// the `bestmove` line took the same lock afterwards, so it cannot see this
+    /// as unset.
+    bestmove_sent: Arc<AtomicBool>,
     /// The root game ply this search ran at (`rootPos.game_ply()`), carried so a
     /// completed real search updates the driver's `last_game_ply`
     /// (`yaneuraou-search.cpp`).
@@ -236,14 +247,16 @@ pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
     /// `info` / `bestmove`). A `Mutex` serialises the worker's lines against any
     /// the main thread emits concurrently.
     writer: Arc<Mutex<W>>,
-    options: OptionStore,
+    /// Where every setting comes from: the compile-time constants generated
+    /// from the TOML config, in every build. See [`crate::settings`].
+    settings: Settings,
     pos: Position,
     /// The loaded network holder, present only after a successful `isready`.
     /// `go` before this is set replies `bestmove resign`.
     eval: Option<LoadedEval>,
     /// The shared transposition table the root search runs against, behind an
-    /// [`Arc`]. Sized from the `USI_Hash` option the first time
-    /// `isready` succeeds (and resized by every `setoption name USI_Hash`),
+    /// [`Arc`]. Sized from the `usi_hash` config constant the first time
+    /// `isready` succeeds (and from its own argument by `bench`),
     /// cleared on `usinewgame`, and advanced per `go` by `run_root`
     /// itself (`tt.new_search()`) — the driver never bumps the generation. A
     /// `go` hands its worker a cheap `Arc` clone; the driver keeps this one.
@@ -300,14 +313,19 @@ pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
     /// report → park); the main worker is the per-`go` coordinator thread
     /// [`Self::handle_go`] spawns. Each helper owns game-scoped histories that
     /// persist across `go`s and are reset by recreating the pool on `usinewgame`
-    /// / `Threads` resize. Rebuilt whenever the `Threads` option changes.
+    /// / a `bench` thread count.
     pool: ThreadPool,
-    /// The active NUMA layout. Detected once at construction from
-    /// the engine default policy (`NumaConfig::from_system(BundledL3{32}, true)`)
-    /// and replaced by every `setoption name NumaPolicy`.
+    /// The pool size the next (re)build uses. Always the `threads` config
+    /// constant, except while a `usi-extras` `bench` runs its own thread count
+    /// — the one command that carries a worker count as an argument. Nothing
+    /// on the match path ever writes it.
+    pool_threads: usize,
+    /// The active NUMA layout, detected once at construction from
+    /// the engine default policy (`NumaConfig::from_system(BundledL3{32}, true)`).
+    /// Never replaced: the mapping policy is the `numa_policy` config constant.
     numa_config: NumaConfig,
     /// The current worker → NUMA-node binding assignment. Empty when binding is
-    /// inactive (`NumaPolicy none`, or the single-node CI/VM case where `auto`
+    /// inactive (`numa_policy = "none"`, or the single-node CI/VM case where `auto`
     /// never suggests binding). Recomputed at every pool (re)build and stable
     /// until the next one. Index `i` is worker `i` (slot 0 = per-`go`
     /// coordinator; `1..` = helper threads).
@@ -360,40 +378,29 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// ([`Self::new`]) delegates here with [`Prng::random_seed`]; tests inject a
     /// fixed seed for deterministic book / `rtime` behaviour.
     ///
-    /// The engine-option profile is read from [`ENGINE_OPTION_PROFILE_FILE`] in
-    /// the process's current directory, matching the reference call site
-    /// (`usi.cpp`). Tests that need a specific profile inject a path with
-    /// [`Self::with_option_profile`] rather than depending on the working
-    /// directory.
+    /// No option file is opened on any path, in any build: there is no
+    /// `engine_option_profile.txt` read (the book-option profile is the
+    /// `book_options_v2` config key) and no option map to build before the `usi`
+    /// reply.
     pub fn with_book_seed(reader: R, writer: Arc<Mutex<W>>, book_seed: u64) -> Self {
-        Self::with_option_profile(
-            reader,
-            writer,
-            book_seed,
-            Path::new(ENGINE_OPTION_PROFILE_FILE),
-        )
-    }
-
-    /// A driver whose engine-option profile is read from `profile_path` (the
-    /// reference takes the filename as a parameter too,
-    /// `OptionsMap::read_engine_option_profile`). The read happens before the
-    /// option map is built — and therefore before any `usi` reply — and prints
-    /// nothing; a missing file is the V1 surface.
-    pub fn with_option_profile(
-        reader: R,
-        writer: Arc<Mutex<W>>,
-        book_seed: u64,
-        profile_path: &Path,
-    ) -> Self {
-        let options = OptionStore::with_book_options(read_engine_option_profile(profile_path));
-        let threads = options.threads();
+        let settings = Settings::new();
+        let threads = settings.threads();
         // Detect the active NUMA layout once, from the engine default policy
         // (`engine.cpp`: `from_system(BundledL3{32}, respect_affinity=true)`,
         // the `NumaPolicy` default of `auto`). On the single-node CI/VM this is a
         // one-node config, so the binding below is empty and no thread binds.
-        let numa_config = numa_config_from_policy("auto", &real_sysfs_options())
-            .expect("default NumaPolicy `auto` always resolves to a valid config");
-        let numa_bound = compute_numa_binding(&numa_config, "auto", threads);
+        //
+        // A configured policy that does not resolve (an unparsable custom node
+        // string, or one yielding zero nodes) is a build the engine cannot run:
+        // the reference reaches `std::exit(EXIT_FAILURE)` on the same input
+        // (`engine.cpp`), and here it is a config error, so fail loudly
+        // at construction rather than silently searching on the wrong layout.
+        let policy = settings.numa_policy();
+        let numa_config = match numa_config_from_policy(policy, &real_sysfs_options()) {
+            Ok(cfg) => cfg,
+            Err(msg) => panic!("configured numa_policy `{policy}` is unusable: {msg}"),
+        };
+        let numa_bound = compute_numa_binding(&numa_config, policy, threads);
         let numa_plan = bind_plan(&numa_config, &numa_bound);
         let pool = ThreadPool::with_binding(threads, numa_plan.clone());
         // Build the per-node shared correction / pawn tables and give the
@@ -409,7 +416,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         Self {
             reader,
             writer,
-            options,
+            settings,
             pos: Position::startpos(),
             eval: None,
             tt: Arc::new(TranspositionTable::new()),
@@ -425,6 +432,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             last_position: (PositionSfen::StartPos, Vec::new()),
             last_go: None,
             pool,
+            pool_threads: threads,
             numa_config,
             numa_bound,
             numa_plan,
@@ -493,13 +501,6 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         Formatter::new(&mut *self.lock_writer()).info_string(msg)
     }
 
-    /// Emit one verbatim line (no USI keyword prefix) — the option-override
-    /// `Error : ...` diagnostics the reference writes to raw `std::cout`
-    /// (`usioption.cpp`), routed here through the single output sink.
-    fn emit_raw_line(&self, text: &str) -> io::Result<()> {
-        Formatter::new(&mut *self.lock_writer()).raw_line(text)
-    }
-
     /// Emit one `bestmove <mv>` line.
     fn bestmove(&self, mv: &str) -> io::Result<()> {
         Formatter::new(&mut *self.lock_writer()).bestmove(mv)
@@ -547,23 +548,28 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         }
     }
 
-    /// Resize the shared transposition table to the current `USI_Hash` option
-    /// value (MiB), mirroring the reference `set_tt_size`
+    /// Resize the shared transposition table to `mb` MiB, mirroring the
+    /// reference `set_tt_size`
     /// (`yaneuraou-search.cpp`: `wait_for_search_finished(); tt.resize`).
     /// The caller must have run [`Self::finish_search_join`] first so the driver
     /// holds the sole [`Arc`] and [`Arc::get_mut`] succeeds. [`TranspositionTable::resize`]
     /// is itself a no-op when the requested size yields the current cluster count
     /// (reallocate-and-clear otherwise), matching the pin.
-    fn resize_tt_to_hash_option(&mut self) {
-        let mb = self.options.spin("USI_Hash").max(1) as usize;
+    fn resize_tt(&mut self, mb: usize) {
         Arc::get_mut(&mut self.tt)
-            .expect("no search worker holds the TT during a USI_Hash resize")
-            .resize(mb);
+            .expect("no search worker holds the TT during a table resize")
+            .resize(mb.max(1));
     }
 
-    /// Recompute the worker → NUMA-node binding for the current `Threads` /
-    /// `NumaPolicy` options and rebuild the worker pool with it. Every pool
-    /// (re)build routes through here so the stored [`Self::numa_bound`]
+    /// Size the shared transposition table from the `usi_hash` config constant.
+    fn resize_tt_to_hash_config(&mut self) {
+        let mb = self.settings.usi_hash().max(1) as usize;
+        self.resize_tt(mb);
+    }
+
+    /// Recompute the worker → NUMA-node binding for the current pool size and
+    /// the configured mapping policy, and rebuild the worker pool with it. Every
+    /// pool (re)build routes through here so the stored [`Self::numa_bound`]
     /// assignment stays consistent with the live pool (the reference recomputes
     /// `boundThreadToNumaNode` on each `resize_threads`, `thread.cpp`).
     /// Helper threads (worker `1..`) bind once at spawn inside the pool; the
@@ -573,9 +579,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// Callers must have joined any running search first (a resize destroys and
     /// recreates the helper threads).
     fn rebuild_pool(&mut self) {
-        let requested = self.options.threads();
-        let policy = self.options.text("NumaPolicy").to_string();
-        self.numa_bound = compute_numa_binding(&self.numa_config, &policy, requested);
+        let requested = self.pool_threads;
+        let policy = self.settings.numa_policy();
+        self.numa_bound = compute_numa_binding(&self.numa_config, policy, requested);
         // Rebuild the per-node shared correction / pawn tables from the fresh
         // binding assignment (the reference `sharedHistories.clear()` +
         // per-node `try_emplace`, `thread.cpp`). Every pool rebuild
@@ -681,6 +687,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// single output sink, mirroring the reference `print_info_string`
     /// (`usi.cpp`): the text is split on `'\n'` and whitespace-only lines
     /// are skipped.
+    #[cfg(feature = "usi-extras")]
     fn emit_info_string_lines(&self, text: &str) -> io::Result<()> {
         for line in text.split('\n') {
             if !line.trim().is_empty() {
@@ -690,13 +697,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         Ok(())
     }
 
-    /// Emit the `Available processors: ...` line (`engine.cpp`).
-    fn emit_numa_config_information(&self) -> io::Result<()> {
-        self.emit_info_string_lines(&numa_config_information_as_string(&self.numa_config))
-    }
-
     /// Emit the `Using N thread[s][ with NUMA node thread binding: ...]` line
     /// (`engine.cpp`).
+    #[cfg(feature = "usi-extras")]
     fn emit_thread_allocation_information(&self) -> io::Result<()> {
         self.emit_info_string_lines(&thread_allocation_information_as_string(
             self.pool.size(),
@@ -705,14 +708,17 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         ))
     }
 
+    /// The `usi` handshake: identity and `usiok`, with NO `option name ...`
+    /// lines — in every build.
+    ///
+    /// The engine has no runtime configuration to advertise. Every setting was
+    /// compiled in from the TOML config, and a GUI that saw an option list would
+    /// be shown a control it cannot actually operate.
     fn handle_usi(&mut self) -> io::Result<()> {
         let mut guard = self.lock_writer();
         let mut f = Formatter::new(&mut *guard);
         f.id_name(ENGINE_NAME)?;
         f.id_author(ENGINE_AUTHOR)?;
-        for decl in self.options.iter_declarations() {
-            f.option_decl(decl)?;
-        }
         f.usiok()
     }
 
@@ -722,13 +728,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// metacharacter interpretation, no symlink policy beyond what the OS
     /// `open` does.
     fn nn_bin_path(&self) -> PathBuf {
-        let dir = match self.options.get("EvalDir") {
-            Some(OptionValue::String(s)) => s.as_str(),
-            // Every declared option keeps its declared type, so this is
-            // unreachable; fall back to the declared default for totality.
-            _ => "eval",
-        };
-        Path::new(dir).join("nn.bin")
+        Path::new(self.settings.eval_dir()).join("nn.bin")
     }
 
     /// The absolute path a `<BookDir>/<BookFile>` pair resolves to.
@@ -763,10 +763,10 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// absent falls back to the `.ybb` sibling with the pin's fallback info
     /// string.
     fn reload_book(&mut self) -> io::Result<()> {
-        let book_file = self.options.text("BookFile").to_string();
-        let book_dir = self.options.text("BookDir").to_string();
-        let on_the_fly = self.options.check("BookOnTheFly");
-        let ignore_book_ply = self.options.check("IgnoreBookPly");
+        let book_file = self.settings.book_file().to_string();
+        let book_dir = self.settings.book_dir().to_string();
+        let on_the_fly = self.settings.book_on_the_fly();
+        let ignore_book_ply = self.settings.ignore_book_ply();
         let base = self.book_path(&book_dir, &book_file);
 
         // Enumerate the priority series now: the resolved name list is half of
@@ -846,109 +846,16 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         Ok(())
     }
 
-    /// Read an option-override file and apply each line, mirroring the reference
-    /// `OptionsMap::read_engine_options` (`usioption.cpp`). A missing /
-    /// unreadable file is a silent no-op (no output); a present file emits
-    /// exactly `info string read engine options, path = <path>` and then feeds
-    /// every line through [`Self::apply_override_line`].
-    fn read_engine_options(&mut self, path: &Path) -> io::Result<()> {
-        let contents = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            // Missing / unreadable: silent no-op, exactly like the reference's
-            // `reader.Open(...).is_not_ok()` early return.
-            Err(_) => return Ok(()),
-        };
-        self.info_string(&format!("read engine options, path = {}", path.display()))?;
-        for line in contents.lines() {
-            self.apply_override_line(line)?;
-        }
-        Ok(())
-    }
-
-    /// Apply one override line, mirroring the reference `build_option`
-    /// (`usioption.cpp`): the pure parse lives in
-    /// [`crate::engine_options::parse_override_line`]; here the parsed form is
-    /// resolved against the live option store.
-    ///
-    /// - empty line: skip;
-    /// - full-form unrecognised trailing token: `Error : invalid command: <t>`
-    ///   (the override still applies afterwards);
-    /// - unknown option name: `Error : option name not found : <name>`, skip;
-    /// - otherwise: set the value (an out-of-range / ill-typed value is silently
-    ///   not stored, as the reference `operator=` range guard is), lock the
-    ///   option FIXED so later `setoption`s can no longer change it, mirror the
-    ///   pool / table on_change side effects for an overridden `Threads` /
-    ///   `USI_Hash`, and emit
-    ///   `info string engine option override. name = <N> , value = <V>`.
-    fn apply_override_line(&mut self, line: &str) -> io::Result<()> {
-        let (name, value, invalid) = match parse_override_line(line) {
-            OverrideLine::Empty => return Ok(()),
-            OverrideLine::Plain { name, value } => (name, value, Vec::new()),
-            OverrideLine::Full {
-                name,
-                value,
-                invalid_tokens,
-            } => (name, value, invalid_tokens),
-        };
-
-        // Full-form unrecognised tokens are reported first, but do not abort the
-        // override (reference scan loop, `usioption.cpp`).
-        for tok in &invalid {
-            self.emit_raw_line(&format!("Error : invalid command: {tok}"))?;
-        }
-
-        // Unknown option name: report and skip the line.
-        let Some(canonical) = self.options.canonical_name(&name) else {
-            return self.emit_raw_line(&format!("Error : option name not found : {name}"));
-        };
-
-        // Set the value, then lock FIXED (order matters: a fixed option ignores
-        // `set_value`). An out-of-range value leaves the stored value unchanged
-        // but the option is still locked and the override still announced —
-        // matching the reference `Options[name] = value; Options[name].fixed = true`.
-        let _ = self.options.set_value(canonical, &value);
-        self.options.mark_fixed(canonical);
-
-        // Mirror the reference option `on_change` handlers for the two options
-        // whose value drives a resource: an overridden `Threads` rebuilds the
-        // pool and an overridden `USI_Hash` resizes the shared table, exactly as
-        // a `setoption` would. The `finish_search_join` at the top of `isready`
-        // (the sole caller) already made the driver the TT's sole owner.
-        if canonical.eq_ignore_ascii_case("Threads") {
-            self.finish_search_join();
-            self.rebuild_pool();
-        } else if canonical.eq_ignore_ascii_case("USI_Hash") {
-            self.finish_search_join();
-            self.resize_tt_to_hash_option();
-        } else if canonical.eq_ignore_ascii_case("NumaPolicy") {
-            // An overridden `NumaPolicy` re-detects the layout and rebuilds the
-            // pool. Unlike the `setoption` path, an override is a startup-time
-            // config step, so a bad value is reported (not process-fatal) and the
-            // previously detected config is kept.
-            self.finish_search_join();
-            let policy = self.options.text("NumaPolicy").to_string();
-            match numa_config_from_policy(&policy, &real_sysfs_options()) {
-                Ok(cfg) => self.numa_config = cfg,
-                Err(msg) => self.info_string(&format!("NumaPolicy error: {msg}"))?,
-            }
-            self.rebuild_pool();
-        }
-
-        self.info_string(&format!(
-            "engine option override. name = {name} , value = {value}"
-        ))
-    }
-
     fn handle_isready(&mut self) -> io::Result<()> {
         // Reclaim any worker before touching the table it may hold.
         self.finish_search_join();
-        // Apply option-override files BEFORE the engine's own isready work
-        // (reference `USIEngine::isready`, `usi.cpp`): first
-        // `engine_options.txt` in the current directory, then
-        // `<EvalDir>/eval_options.txt`. Both are silent no-ops when absent.
-        self.read_engine_options(Path::new("engine_options.txt"))?;
-        let eval_options = Path::new(self.options.text("EvalDir")).join("eval_options.txt");
-        self.read_engine_options(&eval_options)?;
+        // The reference applies two option-override files here, before its own
+        // isready work (`USIEngine::isready`, `usi.cpp`):
+        // `engine_options.txt` in the current directory and
+        // `<EvalDir>/eval_options.txt`. This engine opens neither, in any build.
+        // Its settings are compiled in, so a file that claims to override one of
+        // them would be a lie on disk — and reading a file only to ignore what it
+        // says would be worse than not reading it.
 
         // Wrap the heavy initialisation — the book reload, the `nn.bin`
         // load/parse, and the transposition-table sizing/zeroing — in a
@@ -1001,16 +908,14 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 for warning in &warnings {
                     self.info_string(warning)?;
                 }
-                // Size the transposition table from the `USI_Hash` option the
-                // first time a network loads (an explicit `setoption name
-                // USI_Hash` before this will already have sized it, so this only
-                // fires when the host never set the option). `resize` is a no-op
+                // Size the transposition table from the `usi_hash` config
+                // constant the first time a network loads. `resize` is a no-op
                 // once the cluster count matches, so a later reload never
                 // reallocates it. The `finish_search_join` above dropped any
                 // worker's `Arc` clone, so `get_mut` holds the sole reference
                 // here (the exclusivity contract on `TranspositionTable`).
                 if self.tt.cluster_count() == 0 {
-                    self.resize_tt_to_hash_option();
+                    self.resize_tt_to_hash_config();
                 }
                 self.eval = Some(LoadedEval {
                     path,
@@ -1031,79 +936,16 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         }
     }
 
-    fn handle_setoption(&mut self, name: &str, value: &str) -> io::Result<()> {
-        // `NumaPolicy` is resolved specially: the option store accepts any string,
-        // but mapping that string to a `NumaConfig` can fail-loud (parse error or
-        // a zero-node config), and a successful set emits BOTH info lines.
-        if name.eq_ignore_ascii_case("NumaPolicy") {
-            return self.handle_setoption_numa_policy(value);
-        }
-        match self.options.set_value(name, value) {
-            Ok(()) => {
-                // A `Threads` change resizes the worker pool. Like the reference
-                // (`thread.cpp` `ThreadPool::set`) this always waits for any
-                // running search to finish, then destroys and recreates every
-                // worker — it never diffs the count. The recreate joins the old
-                // helper threads first, so repeated `setoption name Threads`
-                // cycles leak no OS threads.
-                if name.eq_ignore_ascii_case("Threads") {
-                    self.finish_search_join();
-                    self.rebuild_pool();
-                    // The reference `Threads` on_change callback returns the
-                    // allocation line, printed as an info string
-                    // (`engine.cpp`, `usi.cpp`), so `setoption
-                    // name Threads` is not silent here either.
-                    self.emit_thread_allocation_information()?;
-                }
-                // A `USI_Hash` change resizes the shared table. The reference's
-                // option callback calls `set_tt_size` (`yaneuraou-search.cpp`),
-                // which waits for any running search then resizes
-                // (`346-349`); mirror that: join any worker, then resize via the
-                // `Arc::get_mut` route, valid once the driver holds the sole
-                // clone.
-                if name.eq_ignore_ascii_case("USI_Hash") {
-                    self.finish_search_join();
-                    self.resize_tt_to_hash_option();
-                }
-                Ok(())
-            }
-            Err(e) => self.info_string(&format!("option {name} rejected: {e}")),
-        }
-    }
-
-    /// Apply `setoption name NumaPolicy value <v>` (`engine.cpp`).
+    /// `setoption name <N> value <V>`: the USI minimum, in every build.
     ///
-    /// `auto` / `system` detect from the system respecting affinity; `hardware`
-    /// detects ignoring affinity; `none` is a single all-threads node; anything
-    /// else is a custom node string. A string that fails to parse (duplicate CPU)
-    /// or yields ZERO nodes is fail-loud: the reference reaches
-    /// `std::exit(EXIT_FAILURE)` (an uncaught `stoull` / empty-config path), so
-    /// this port prints a clear `info string` and terminates the process (the
-    /// empty-config case is made an explicit checked error — declared in the PR).
-    /// On success the pool is rebuilt and BOTH info lines are emitted.
-    fn handle_setoption_numa_policy(&mut self, value: &str) -> io::Result<()> {
-        // Store the raw policy string (a fixed override silently ignores this;
-        // `text` then returns the fixed value, which is what we resolve).
-        let _ = self.options.set_value("NumaPolicy", value);
-        let policy = self.options.text("NumaPolicy").to_string();
-
-        self.finish_search_join();
-
-        match numa_config_from_policy(&policy, &real_sysfs_options()) {
-            Ok(cfg) => self.numa_config = cfg,
-            Err(msg) => {
-                self.info_string(&format!("NumaPolicy error: {msg}"))?;
-                let _ = self.lock_writer().flush();
-                std::process::exit(1);
-            }
-        }
-
-        // Rebuild the pool with the new binding, then emit both info lines
-        // (`engine.cpp`: the `NumaPolicy` callback returns the config line
-        // and the allocation line, joined by a newline).
-        self.rebuild_pool();
-        self.emit_numa_config_information()?;
-        self.emit_thread_allocation_information()
+    /// There is no option to set. Every setting was fixed when the binary was
+    /// built, from the TOML config, and nothing at run time can change one — the
+    /// `usi` reply says so by advertising no options at all. USI requires no
+    /// reply to `setoption`, so the line is parsed, consumed and dropped: no
+    /// output, no state change, no crash, and the session continues exactly as
+    /// if the line had never arrived.
+    fn handle_setoption(&mut self, _name: &str, _value: &str) -> io::Result<()> {
+        Ok(())
     }
 
     fn handle_position(&mut self, sfen: PositionSfen, moves: &[String]) -> io::Result<()> {
@@ -1190,21 +1032,21 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// false), which is inert on the leg that never consults it.
     fn book_config(&self) -> BookConfig {
         BookConfig {
-            book_options_v2: self.options.book_options_v2(),
-            narrow_book: self.options.check("NarrowBook"),
-            book_moves: self.options.spin("BookMoves"),
-            ignore_rate: self.options.spin("BookIgnoreRate"),
-            eval_diff: self.options.spin("BookEvalDiff"),
-            eval_black_diff: self.options.spin("BookEvalBlackDiff"),
-            eval_white_diff: self.options.spin("BookEvalWhiteDiff"),
-            eval_black_limit: self.options.spin("BookEvalBlackLimit"),
-            eval_white_limit: self.options.spin("BookEvalWhiteLimit"),
-            depth_limit: self.options.spin("BookDepthLimit"),
-            depth_black_limit: self.options.spin("BookDepthBlackLimit"),
-            depth_white_limit: self.options.spin("BookDepthWhiteLimit"),
-            consider_move_count: self.options.check("ConsiderBookMoveCount"),
-            pv_moves: self.options.spin("BookPvMoves"),
-            flipped_book: self.options.check("FlippedBook"),
+            book_options_v2: self.settings.book_options_v2(),
+            narrow_book: self.settings.narrow_book(),
+            book_moves: self.settings.book_moves(),
+            ignore_rate: self.settings.book_ignore_rate(),
+            eval_diff: self.settings.book_eval_diff(),
+            eval_black_diff: self.settings.book_eval_black_diff(),
+            eval_white_diff: self.settings.book_eval_white_diff(),
+            eval_black_limit: self.settings.book_eval_black_limit(),
+            eval_white_limit: self.settings.book_eval_white_limit(),
+            depth_limit: self.settings.book_depth_limit(),
+            depth_black_limit: self.settings.book_depth_black_limit(),
+            depth_white_limit: self.settings.book_depth_white_limit(),
+            consider_move_count: self.settings.consider_book_move_count(),
+            pv_moves: self.settings.book_pv_moves(),
+            flipped_book: self.settings.flipped_book(),
         }
     }
 
@@ -1217,7 +1059,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 
         // Stochastic_Ponder `go ponder` (`usi.cpp`): ponder one move earlier
         // than the retained position (drop its last move); `ponderMode` stays set.
-        if limits.ponder && self.options.check("Stochastic_Ponder") {
+        if limits.ponder && self.settings.stochastic_ponder() {
             self.apply_stochastic_ponder_rewind();
         }
 
@@ -1238,6 +1080,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         let stop_for_active = Arc::clone(&job.stop);
         let ponder_for_active = job.ponder.as_ref().map(Arc::clone);
         let suppress_for_active = Arc::clone(&job.suppress_bestmove);
+        let sent_for_active = Arc::clone(&job.bestmove_sent);
         let handle = std::thread::spawn(move || {
             let outcome = run_coordinated(job);
             SearchState {
@@ -1251,6 +1094,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             stop: stop_for_active,
             ponder: ponder_for_active,
             suppress: suppress_for_active,
+            bestmove_sent: sent_for_active,
             game_ply,
         });
         Ok(())
@@ -1303,13 +1147,10 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         mut limits: GoLimits,
         disable_pv_interval: bool,
     ) -> Option<CoordinatorJob<W>> {
-        // Propagate the `FV_SCALE` option to the eval's live fixed-point scale
-        // (the reference mutable global `NNUE::FV_SCALE`). This is the port's
-        // chosen propagation point: written at the start of every `go` / `bench`,
-        // so a `setoption` or an override file takes effect no later than the
-        // next search, and a `setoption` issued mid-search leaves the already
-        // running search (which read the scale at its own start) unperturbed.
-        set_fv_scale(self.options.spin("FV_SCALE") as i32);
+        // Nothing propagates the NNUE fixed-point scale here: the reference's
+        // mutable global `NNUE::FV_SCALE` is a compile-time constant in the
+        // evaluation layer, generated from the same `fv_scale` config key, so
+        // there is no live value for a search to pick up.
 
         // Seed the depth / node ceilings from the `DepthLimit` / `NodesLimit`
         // options when this `go` carries no explicit token, then let an explicit
@@ -1320,13 +1161,13 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // (`yaneuraou-search.cpp`) keys off the final value regardless of its
         // source, and `use_voting` is derived from `limits.depth` after this seed.
         if limits.depth.is_none() {
-            let dl = self.options.spin("DepthLimit");
+            let dl = self.settings.depth_limit();
             if dl != 0 {
                 limits.depth = Some(dl as u32);
             }
         }
         if limits.nodes.is_none() {
-            let nl = self.options.spin("NodesLimit");
+            let nl = self.settings.nodes_limit();
             if nl != 0 {
                 limits.nodes = Some(nl as u64);
             }
@@ -1387,7 +1228,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 yorkie_state::Color::Black => (limits.btime, limits.binc),
                 yorkie_state::Color::White => (limits.wtime, limits.winc),
             };
-            let mmtd = remap_max_moves_to_draw(self.options.spin("MaxMovesToDraw"));
+            let mmtd = remap_max_moves_to_draw(self.settings.max_moves_to_draw());
             // A distinct PRNG stream from the book selection, so `go rtime`'s
             // randomised budget never perturbs (or is perturbed by) book choice.
             let mut prng = Prng::new(self.book_seed ^ 0xA5A5_5A5A_1234_5678);
@@ -1398,13 +1239,13 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                     byoyomi_us: limits.byoyomi.unwrap_or(0) as i64,
                     movetime: movetime.unwrap_or(0),
                     rtime: limits.rtime.unwrap_or(0) as i64,
-                    network_delay: self.options.spin("NetworkDelay"),
-                    network_delay2: self.options.spin("NetworkDelay2"),
-                    minimum_thinking_time: self.options.spin("MinimumThinkingTime"),
-                    slow_mover: self.options.spin("SlowMover"),
-                    round_up_to_fullsecond: self.options.check("RoundUpToFullSecond"),
-                    usi_ponder: self.options.check("USI_Ponder"),
-                    stochastic_ponder: self.options.check("Stochastic_Ponder"),
+                    network_delay: self.settings.network_delay(),
+                    network_delay2: self.settings.network_delay2(),
+                    minimum_thinking_time: self.settings.minimum_thinking_time(),
+                    slow_mover: self.settings.slow_mover(),
+                    round_up_to_fullsecond: self.settings.round_up_to_full_second(),
+                    usi_ponder: self.settings.usi_ponder(),
+                    stochastic_ponder: self.settings.stochastic_ponder(),
                     ply: self.pos.ply() as i32,
                     max_moves_to_draw: mmtd,
                     start_time: now,
@@ -1445,7 +1286,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 
         // MultiPV snapshot for this `go` (read per `go`, like the other search
         // options — no global). Clamped to the legal-move count inside the worker.
-        let multi_pv = (self.options.spin("MultiPV").max(1)) as usize;
+        let multi_pv = (self.settings.multi_pv().max(1)) as usize;
 
         // `get_best_thread` is consulted only when no explicit `depth` was given
         // AND `MultiPV == 1` AND this is not a `go mate` search
@@ -1461,17 +1302,17 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // `computed_pv_interval` is `0` (never suppress — every iteration prints)
         // under `go infinite`, `ConsiderationMode`, or the bench-only
         // `disablePvInterval` (`usi.cpp`); else the `PvInterval` option [ms].
-        let consideration_mode = self.options.check("ConsiderationMode");
+        let consideration_mode = self.settings.consideration_mode();
         let computed_pv_interval = if disable_pv_interval || limits.infinite || consideration_mode {
             Duration::ZERO
         } else {
-            Duration::from_millis(self.options.spin("PvInterval").max(0) as u64)
+            Duration::from_millis(self.settings.pv_interval().max(0) as u64)
         };
         let pv_config = PvOutputConfig {
             multi_pv,
             pv_interval: computed_pv_interval,
             consideration_mode,
-            output_fail_lh_pv: self.options.check("OutputFailLHPV"),
+            output_fail_lh_pv: self.settings.output_fail_lh_pv(),
             start_time: now,
         };
 
@@ -1515,7 +1356,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // `USI_OwnBook` gate, an options snapshot, a fresh seed, and whether a
         // book reply must be held for `stop`/`ponderhit` (`go ponder`/`infinite`).
         let book = self.book.as_ref().map(Arc::clone);
-        let own_book = self.options.check("USI_OwnBook");
+        let own_book = self.settings.usi_own_book();
         let book_config = self.book_config();
         self.book_seed = self
             .book_seed
@@ -1529,6 +1370,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // The Stochastic_Ponder teardown flag: when set, the coordinator emits no
         // `bestmove` (nor final PV) for this search (`usi.cpp`).
         let suppress_bestmove = Arc::new(AtomicBool::new(false));
+        // Raised when this `go`'s reply reaches the output sink; the driver reads
+        // it to decide whether a search is still in flight.
+        let bestmove_sent = Arc::new(AtomicBool::new(false));
 
         // Snapshot the entering-king rule for this `go` and precompute its
         // per-side thresholds from the root position, mirroring the
@@ -1536,7 +1380,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // The material total is invariant across the search, so every worker
         // shares this one snapshot.
         let entering_king = EnteringKingConfig::new(
-            EnteringKingRule::from_option(self.options.text("EnteringKingRule")),
+            EnteringKingRule::from_option(self.settings.entering_king_rule()),
             &pos,
         );
 
@@ -1544,7 +1388,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // applying the pin's `0 → 100000` remap (`yaneuraou-search.cpp`): a
         // set value of 0 means unlimited. Passed per `go`, like the entering-king
         // config, so every worker shares one value and no global is touched.
-        let max_moves_to_draw = remap_max_moves_to_draw(self.options.spin("MaxMovesToDraw"));
+        let max_moves_to_draw = remap_max_moves_to_draw(self.settings.max_moves_to_draw());
 
         // Behavior-option snapshots for this `go`, read per
         // `go` like the other search options — no global.
@@ -1555,19 +1399,19 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // returns `+draw_contempt` for the root side and `-draw_contempt` for the
         // opponent, exactly the reference's symmetric `±draw_value`.
         let draw_option = match self.pos.side_to_move() {
-            yorkie_state::Color::Black => self.options.spin("DrawValueBlack"),
-            yorkie_state::Color::White => self.options.spin("DrawValueWhite"),
+            yorkie_state::Color::Black => self.settings.draw_value_black(),
+            yorkie_state::Color::White => self.settings.draw_value_white(),
         };
         let draw_contempt: Value = (draw_option as Value) * PAWN_VALUE / 100;
 
         // `ResignValue`: the post-search resign threshold in centipawns
         // (`yaneuraou-search.cpp`). Consumed on the coordinator at emit time.
-        let resign_value = self.options.spin("ResignValue") as Value;
+        let resign_value = self.settings.resign_value() as Value;
 
         // `GenerateAllLegalMoves`: when true the search also considers the
         // non-promoting moves the default generator suppresses
         // (`yaneuraou-search.cpp`). Every worker shares the flag.
-        let generate_all_legal_moves = self.options.check("GenerateAllLegalMoves");
+        let generate_all_legal_moves = self.settings.generate_all_legal_moves();
 
         // The per-`go` coordinator (worker slot 0) binds itself to its assigned
         // NUMA node — and points its allocations at that node's memory — at the
@@ -1598,6 +1442,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             ponder,
             infinite,
             suppress_bestmove,
+            bestmove_sent,
             entering_king,
             max_moves_to_draw,
             draw_contempt,
@@ -1636,19 +1481,26 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// — a reproducible NPS benchmark ported from the reference `USIEngine::bench`
     /// (`usi.cpp`) + `setup_bench` (`benchmark.cpp`).
     ///
-    /// Mirrors the reference command replay: apply `setoption name Threads` /
-    /// `setoption name USI_Hash`, run the `usinewgame` (`search_clear`) equivalent
-    /// once, reset the timer, then search each position with the requested limit
-    /// through the ordinary coordinator path — accumulating each position's final
-    /// node count. Ends with one machine-parsable summary line so optimization PRs
-    /// can grep it. A parse failure is reported as an `info string` and runs
-    /// nothing, never a panic.
+    /// Mirrors the reference command replay: apply the requested thread count and
+    /// table size, run the `usinewgame` (`search_clear`) equivalent once, reset
+    /// the timer, then search each position with the requested limit through the
+    /// ordinary coordinator path — accumulating each position's final node count.
+    /// Ends with one machine-parsable summary line so optimization PRs can grep
+    /// it. A parse failure is reported as an `info string` and runs nothing,
+    /// never a panic.
+    ///
+    /// The reference replays those two values as `setoption` lines; here they are
+    /// `bench`'s own command arguments, applied directly. They are the only
+    /// worker count and table size in the engine that do not come from the config
+    /// constants, and they last as long as the session — a benchmark run says so
+    /// on its own summary line, and a build without `usi-extras` has no `bench`
+    /// at all.
     ///
     /// `usi-extras` only: a tournament game never benchmarks, so the default
     /// build has neither this handler nor the command token.
     #[cfg(feature = "usi-extras")]
     fn handle_bench(&mut self, tokens: &[String]) -> io::Result<()> {
-        // Reclaim any running search before touching options / the TT.
+        // Reclaim any running search before touching the pool / the TT.
         self.finish_search_join();
 
         let current = bench::current_sfen(&self.pos);
@@ -1657,12 +1509,14 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             Err(e) => return self.info_string(&format!("bench: {e}")),
         };
 
-        // Apply the two option lines the reference emits (`benchmark.cpp`),
-        // reusing the ordinary `setoption` path so the pool + TT resize exactly as
-        // a host `setoption` would (a rejected out-of-range value is a loud
-        // `info string`, not a panic).
-        self.handle_setoption("Threads", &config.threads.to_string())?;
-        self.handle_setoption("USI_Hash", &config.tt_mb.to_string())?;
+        // The two values the reference replays as `setoption` lines
+        // (`benchmark.cpp`). The pool rebuild reports itself exactly as
+        // the reference `Threads` on_change callback does (`engine.cpp`,
+        // `usi.cpp`).
+        self.pool_threads = config.threads.max(1) as usize;
+        self.rebuild_pool();
+        self.emit_thread_allocation_information()?;
+        self.resize_tt(config.tt_mb.max(1) as usize);
 
         // The `ucinewgame` (`search_clear`) the reference runs once before the
         // positions: clears the TT, resets histories, and rebuilds the pool — the
@@ -1723,7 +1577,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// position, and re-issue the retained `go` with `ponder` stripped. A no-op
     /// when idle.
     fn handle_ponderhit(&mut self) -> io::Result<()> {
-        let stochastic = self.options.check("Stochastic_Ponder")
+        let stochastic = self.settings.stochastic_ponder()
             && self.search.as_ref().is_some_and(|a| a.ponder.is_some());
         if stochastic {
             return self.stochastic_ponderhit();
@@ -1778,16 +1632,21 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// Refuses while a search is in flight (the commands read and write the very
     /// table the workers are churning) and before the table has been allocated;
     /// both are one clear `info string tt error: …` line, never a panic. A
-    /// worker that has already finished but not yet been joined does not count
+    /// worker that has already replied but not yet been joined does not count
     /// as "searching": it is reclaimed first, so the natural
     /// `go … → bestmove → tt probe` sequence works.
+    ///
+    /// "Already replied" is [`ActiveSearch::bestmove_sent`], not
+    /// `JoinHandle::is_finished`: the coordinator writes `bestmove` and *then*
+    /// unwinds, so a host that sends this line the moment it reads `bestmove`
+    /// would otherwise be refused for as long as that unwinding takes.
+    /// `is_finished` still stands beside it for the searches that end without a
+    /// reply (a suppressed Stochastic_Ponder teardown).
     #[cfg(feature = "usi-extras")]
     fn handle_tt(&mut self, tokens: &[String]) -> io::Result<()> {
-        if self
-            .search
-            .as_ref()
-            .is_some_and(|active| active.handle.is_finished())
-        {
+        if self.search.as_ref().is_some_and(|active| {
+            active.bestmove_sent.load(Ordering::Relaxed) || active.handle.is_finished()
+        }) {
             self.finish_search_join();
         }
         if self.search.is_some() {
@@ -1799,13 +1658,12 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             Err(e) => return self.tt_error(&e.to_string()),
         };
 
-        // The table is unsized until the first `isready` (or an explicit
-        // `setoption name USI_Hash`); probing it would panic, so this is a
-        // checked error.
+        // The table is unsized until a successful `isready` (or a `bench`, which
+        // carries its own size); probing it would panic, so this is a checked
+        // error.
         if self.tt.cluster_count() == 0 {
-            return self.tt_error(
-                "transposition table not allocated; run `isready` or `setoption name USI_Hash value <mb>` first",
-            );
+            return self
+                .tt_error("transposition table not allocated; run `isready` or `bench` first");
         }
 
         match command {
@@ -2238,9 +2096,14 @@ fn build_position_from(sfen: &PositionSfen, moves: &[String]) -> Option<Position
 /// Emit a bare `bestmove <mv>` for the resign / declaration-win short-circuits,
 /// which produce no `info` line (best-effort: a broken pipe must not panic the
 /// coordinator).
-fn emit_bestmove<W: Write>(writer: &Arc<Mutex<W>>, mv: &str) {
+///
+/// `sent` is raised before the lock is released, so the reply becoming visible
+/// and this search counting as finished are one indivisible step for anyone
+/// downstream.
+fn emit_bestmove<W: Write>(writer: &Arc<Mutex<W>>, sent: &AtomicBool, mv: &str) {
     let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
     let _ = Formatter::new(&mut *guard).bestmove(mv);
+    sent.store(true, Ordering::Relaxed);
 }
 
 /// Emit one `info string <msg>` from the coordinator (best-effort).
@@ -2344,6 +2207,7 @@ fn emit_book_hit<W: Write>(
     infinite: bool,
     stop: &AtomicBool,
     suppress_bestmove: &AtomicBool,
+    sent: &AtomicBool,
 ) {
     // Per-candidate multipv info lines (emitted immediately, like the pin's
     // in-probe isRoot block).
@@ -2393,6 +2257,7 @@ fn emit_book_hit<W: Write>(
         format_score(Value::from(hit.value)),
     ));
     let _ = f.bestmove(&bm);
+    sent.store(true, Ordering::Relaxed);
 }
 
 /// Everything one helper needs to run its own iterative deepening for a single
@@ -2968,17 +2833,19 @@ fn resolve_worker_networks<T>(
         .collect()
 }
 
-/// `"Available processors: " + cfg.to_string()` (`engine.cpp`).
-fn numa_config_information_as_string(cfg: &NumaConfig) -> String {
-    format!("Available processors: {cfg}")
-}
-
+// The engine's own diagnostic about thread allocation is emitted by the
+// `usi-extras` `bench` command and nowhere else — it is the only command that
+// changes the worker count. The NUMA layout and the match-path worker count are
+// compile-time constants: there is no moment at which their numbers could
+// change, and (by the byte-identity contract) no new line may appear on a
+// default build's output.
 /// The `(bound_count, cpus_in_node)` pairs per node (`thread.cpp` +
 /// `engine.cpp`).
 ///
 /// Empty when nothing is bound. Otherwise the pairs cover nodes
 /// `0..=highest_bound_node`, then — since at least one thread is bound — extend
 /// with `(0, cpus_in_node)` for the remaining nodes up to `num_numa_nodes`.
+#[cfg(feature = "usi-extras")]
 fn bound_thread_counts(cfg: &NumaConfig, bound: &[NumaIndex]) -> Vec<(usize, usize)> {
     if bound.is_empty() {
         return Vec::new();
@@ -3002,6 +2869,7 @@ fn bound_thread_counts(cfg: &NumaConfig, bound: &[NumaIndex]) -> Vec<(usize, usi
 
 /// The `a/x:b/y:...` per-node `bound/total` string (`engine.cpp`); empty
 /// when nothing is bound.
+#[cfg(feature = "usi-extras")]
 fn thread_binding_information_as_string(cfg: &NumaConfig, bound: &[NumaIndex]) -> String {
     bound_thread_counts(cfg, bound)
         .iter()
@@ -3012,6 +2880,7 @@ fn thread_binding_information_as_string(cfg: &NumaConfig, bound: &[NumaIndex]) -
 
 /// `"Using N thread[s]"`, plus `" with NUMA node thread binding: a/x:b/y..."`
 /// when any thread is bound (`engine.cpp`).
+#[cfg(feature = "usi-extras")]
 fn thread_allocation_information_as_string(
     threads_size: usize,
     cfg: &NumaConfig,
@@ -3086,6 +2955,11 @@ struct CoordinatorJob<W: Write + Send + 'static> {
     /// The Stochastic_Ponder teardown flag: when set the coordinator emits no
     /// `bestmove` (nor final PV) for this search (`usi.cpp`).
     suppress_bestmove: Arc<AtomicBool>,
+    /// Stamped `true` in the same output-lock critical section that writes this
+    /// search's `bestmove`, so the driver can tell "reply is out" from "thread
+    /// has exited" (see [`ActiveSearch::bestmove_sent`]). A suppressed reply
+    /// never sets it — nothing went out.
+    bestmove_sent: Arc<AtomicBool>,
     /// The entering-king declaration config snapshot for this `go`.
     entering_king: EnteringKingConfig,
     /// The `MaxMovesToDraw` horizon for this `go` (already `0 → 100000` remapped).
@@ -3170,6 +3044,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         ponder,
         infinite,
         suppress_bestmove,
+        bestmove_sent,
         entering_king,
         max_moves_to_draw,
         draw_contempt,
@@ -3206,7 +3081,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     // dispatched, exactly as `start_searching` exits before `threads.start_searching()`.
     let root_moves = generate_root_moves(&pos, generate_all_legal_moves);
     if root_moves.is_empty() {
-        emit_bestmove(&writer, "resign");
+        emit_bestmove(&writer, &bestmove_sent, "resign");
         return CoordinatedOutcome {
             histories,
             nodes: 0,
@@ -3219,9 +3094,9 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     // verbatim so the host plays it.
     if let Some(mv) = declaration_win(&pos, &entering_king) {
         if mv == Move::win() {
-            emit_bestmove(&writer, "win");
+            emit_bestmove(&writer, &bestmove_sent, "win");
         } else {
-            emit_bestmove(&writer, &format_usi_move(mv));
+            emit_bestmove(&writer, &bestmove_sent, &format_usi_move(mv));
         }
         return CoordinatedOutcome {
             histories,
@@ -3255,6 +3130,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
                 infinite,
                 &stop,
                 &suppress_bestmove,
+                &bestmove_sent,
             );
             return CoordinatedOutcome {
                 histories,
@@ -3447,7 +3323,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     // reply the GUI sees. The `time_state` below is still returned so the rewound
     // search's score / ply seed the re-issue's side-flip continuity.
     if !suppress_bestmove.load(Ordering::Relaxed) {
-        emit_bestmove(&writer, &bm);
+        emit_bestmove(&writer, &bestmove_sent, &bm);
     }
 
     // Consume the driver (ending the `&tt` / `&net` borrows) and reclaim the main
@@ -3684,28 +3560,41 @@ mod tests {
         );
     }
 
+    /// There is no option to set in any build, and USI requires no reply to
+    /// `setoption`, so every one of them is consumed in silence: a name the
+    /// reference implementation registers, a nonexistent one and an ill-typed
+    /// one all take the same path and all emit nothing.
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn setoption_happy_path_silent() {
-        assert_eq!(run_with("setoption name USI_Hash value 256\nquit\n"), "");
+    fn setoption_is_consumed_silently() {
+        for line in [
+            "setoption name USI_Hash value 256",
+            "setoption name Nonexistent value foo",
+            "setoption name USI_Hash value not-a-number",
+            "setoption name Threads value 8",
+            // No `value` token at all — still consumed.
+            "setoption name Threads",
+        ] {
+            assert_eq!(run_with(&format!("{line}\nquit\n")), "", "line {line:?}");
+        }
     }
 
+    /// Consuming the line really is inert: a `setoption name Threads` an older
+    /// build would have acted on leaves the pool exactly as it was, so the
+    /// following `go` behaves as if the line had never arrived — and the
+    /// transcript is byte-identical to the one without the lines.
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn setoption_unknown_option_rejected() {
-        assert_eq!(
-            run_with("setoption name Nonexistent value foo\nquit\n"),
-            "info string option Nonexistent rejected: unknown option\n"
+    fn a_consumed_setoption_changes_nothing() {
+        let with_setoption = run_with(
+            "setoption name Threads value 1\n\
+             setoption name USI_Hash value 1\n\
+             position startpos\n\
+             go btime 1000 wtime 1000\n\
+             quit\n",
         );
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn setoption_bad_int_rejected() {
-        assert_eq!(
-            run_with("setoption name USI_Hash value not-a-number\nquit\n"),
-            "info string option USI_Hash rejected: value `not-a-number` is not an integer\n"
-        );
+        let without = run_with("position startpos\ngo btime 1000 wtime 1000\nquit\n");
+        assert_eq!(with_setoption, without);
     }
 
     #[cfg_attr(miri, ignore)]
@@ -3862,32 +3751,29 @@ mod tests {
         assert_eq!(run_with("go\nstop\nquit\n"), run_with("go\nquit\n"));
     }
 
+    /// `bench` is the one command that resizes the worker pool, and a pool
+    /// rebuild emits the reference allocation info line. Each cycle joins its
+    /// helpers first, so repeated rebuilds never wedge the main loop or leak
+    /// threads. No network is loaded, so every bench position resigns
+    /// immediately and the run is fast.
+    #[cfg(feature = "usi-extras")]
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn setoption_threads_emits_allocation_line() {
-        // Resizing the worker pool emits the reference allocation info line.
-        // `NumaPolicy
-        // none` keeps binding off so the line is deterministic across machines
-        // (no binding suffix, no machine-specific processor list). The pool
-        // never wedges the main loop: each cycle joins its helpers first.
+    fn a_bench_thread_count_emits_the_allocation_line() {
         let out = run_with(
-            "setoption name NumaPolicy value none\n\
-             setoption name Threads value 1\n\
-             setoption name Threads value 4\n\
-             setoption name Threads value 2\n\
+            "bench 1 1 1 current movetime\n\
+             bench 1 4 1 current movetime\n\
+             bench 1 2 1 current movetime\n\
              quit\n",
         );
-        assert!(out.contains("info string Using 1 thread\n"), "{out}");
-        assert!(out.contains("info string Using 4 threads\n"), "{out}");
-        assert!(out.contains("info string Using 2 threads\n"), "{out}");
-        // `none` never binds, so no allocation line carries the binding suffix.
-        assert!(
-            !out.contains("with NUMA node thread binding"),
-            "none policy must not bind: {out}"
-        );
+        // Prefix matches: on a machine whose layout suggests binding, the line
+        // carries a `with NUMA node thread binding: ...` suffix.
+        assert!(out.contains("info string Using 1 thread"), "{out}");
+        assert!(out.contains("info string Using 4 threads"), "{out}");
+        assert!(out.contains("info string Using 2 threads"), "{out}");
     }
 
-    // -- NUMA option mapping / info strings ------------------------------
+    // -- NUMA policy mapping / info strings ------------------------------
 
     /// A miniature 2-node sysfs fixture tree (system-NUMA path; no L3 cache
     /// dirs). Returned root is cleaned up by the caller.
@@ -3943,14 +3829,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[cfg(feature = "usi-extras")]
     #[test]
     fn info_strings_exact_formats() {
-        // `Available processors:` uses the config's canonical Display.
         let cfg = NumaConfig::from_string("0-3,8:16-31").unwrap();
-        assert_eq!(
-            numa_config_information_as_string(&cfg),
-            "Available processors: 0-3,8:16-31"
-        );
 
         // No binding → bare `Using N thread[s]`, singular/plural.
         assert_eq!(
@@ -4068,12 +3950,13 @@ mod tests {
 
     // --- NUMA memory placement --------------------------------------------
 
-    /// A `NumaPolicy` value that forces binding on any machine: a one-node
+    /// A NUMA node string that forces binding on any machine: a one-node
     /// custom config over a single CPU the process is definitely allowed on.
     /// `custom_affinity` short-circuits `suggests_binding_threads` to true, so
     /// this turns the whole pin-and-place path on even where `auto` would never
     /// bind — and picking the CPU from the live affinity keeps the fail-loud
     /// `sched_setaffinity` inside it from ever seeing a forbidden CPU.
+    #[cfg(target_os = "linux")]
     fn forced_binding_policy() -> String {
         let cpu = yorkie_numa::startup_affinity()
             .iter()
@@ -4122,7 +4005,7 @@ mod tests {
     }
 
     /// The remedy for the one bundle this engine builds off-worker, asserted
-    /// end-to-end through the driver: after a `NumaPolicy` that forces binding,
+    /// end-to-end through the driver: with a NUMA layout that forces binding,
     /// every large-page block behind the coordinator's history tables must be
     /// governed by an `MPOL_BIND` policy naming worker 0's system node.
     ///
@@ -4130,6 +4013,12 @@ mod tests {
     /// 0 either way, but the *policy* over those pages is `MPOL_DEFAULT` until
     /// something binds it — which is precisely the before/after this change is
     /// about. `cfg_attr(miri, ignore)`: the syscalls compile out under miri.
+    ///
+    /// The layout is injected rather than selected: `numa_policy` is a
+    /// compile-time constant, and no config that a checked-in file could name
+    /// would force binding on an arbitrary runner. Everything downstream of the
+    /// layout — `rebuild_pool` and `place_coordinator_histories` — is the
+    /// production path, unmodified and un-`cfg`d.
     #[cfg(target_os = "linux")]
     #[cfg_attr(miri, ignore)]
     #[test]
@@ -4141,9 +4030,10 @@ mod tests {
         // binding on even on a single-node runner. The node is the one CPU the
         // process is certain to be allowed on, so the (fail-loud) pin the
         // rebuild's helper threads perform cannot hit a forbidden CPU.
-        driver
-            .handle_setoption("NumaPolicy", &forced_binding_policy())
-            .expect("setoption writes to the in-memory sink");
+        driver.numa_config =
+            numa_config_from_policy(&forced_binding_policy(), &real_sysfs_options())
+                .expect("a one-CPU custom node string is a valid config");
+        driver.rebuild_pool();
 
         let node = coordinator_system_node(driver.numa_plan.as_ref())
             .expect("a custom NumaPolicy binds, so a plan exists");
@@ -4211,6 +4101,7 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             ponder: None,
             suppress: Arc::new(AtomicBool::new(false)),
+            bestmove_sent: Arc::new(AtomicBool::new(true)),
             game_ply: 20,
         });
         driver.finish_search_join();
@@ -4245,6 +4136,7 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             ponder: None,
             suppress: Arc::new(AtomicBool::new(false)),
+            bestmove_sent: Arc::new(AtomicBool::new(true)),
             game_ply: 3,
         });
         driver.finish_search_join();

@@ -34,9 +34,7 @@
 //! `[sqr(15) | relu(15)]` into L2 (`fc_1`)'s input. L2 (→ 32) is followed by a
 //! clipped ReLU, then L3 (`fc_2`) (→ 1). The 16th L1 output is raw (pre-ReLU)
 //! and is added to L3's single output as the shortcut term. The final network
-//! output is divided by the live [`fv_scale`] to produce the score.
-
-use std::sync::atomic::{AtomicI32, Ordering};
+//! output is divided by the compiled-in [`FV_SCALE`] to produce the score.
 
 use yorkie_state::{Color, Position, Square};
 
@@ -49,30 +47,20 @@ use crate::types::{
     HIDDEN1_DIMS, LAYER_STACKS, NetworkStack, NnueNetwork,
 };
 
-/// The reference default fixed-point scale (`Options.add("FV_SCALE", 16, ...)`
-/// in `evaluate_nnue.cpp` / `int FV_SCALE = 16`). Also the USI option's default
-/// and the condition the eval fixtures were captured under.
-pub const FV_SCALE_DEFAULT: i32 = 16;
+/// The fixed-point scale applied to the network output to produce the final
+/// score — the reference's mutable global `NNUE::FV_SCALE`
+/// (`evaluate_nnue.cpp`), compiled in.
+///
+/// It is the `fv_scale` key of the TOML config this binary was built from (see
+/// [`crate::config`]), whose reference default is `16` — the condition the eval
+/// fixtures were captured under. There is no setter: the engine carries no
+/// runtime configuration, so the single consumption site in [`evaluate_with`]
+/// divides by a literal.
+pub const FV_SCALE: i32 = crate::config::FV_SCALE as i32;
 
-/// The live fixed-point scale applied to the network output to produce the final
-/// score, mirroring the reference's mutable global `NNUE::FV_SCALE`
-/// (`evaluate_nnue.cpp`). It is read at the single consumption site in
-/// [`evaluate_with`] and written by [`set_fv_scale`] (which the USI layer drives
-/// from the `FV_SCALE` option). Defaults to [`FV_SCALE_DEFAULT`], so with no
-/// override the whole eval path is byte-identical to the previous constant.
-static FV_SCALE: AtomicI32 = AtomicI32::new(FV_SCALE_DEFAULT);
-
-/// The current fixed-point scale (the reference live global `NNUE::FV_SCALE`).
-pub fn fv_scale() -> i32 {
-    FV_SCALE.load(Ordering::Relaxed)
-}
-
-/// Set the live fixed-point scale, mirroring the reference `FV_SCALE` option
-/// callback (`evaluate_nnue.cpp`). The next [`evaluate`] / [`evaluate_with`]
-/// divides by this value; the USI layer writes it no later than the next `go`.
-pub fn set_fv_scale(scale: i32) {
-    FV_SCALE.store(scale, Ordering::Relaxed);
-}
+// The build script range-checks `fv_scale` against the schema; this repeats the
+// only bound the division actually depends on, in a `const` context.
+const _: () = assert!(FV_SCALE >= 1, "FV_SCALE must be at least 1");
 
 /// `k*ToIndex` tables from `stack_index_for_nnue`: the own-king rank contributes
 /// the coarse third `{0,3,6}`, the enemy-king rank the fine third `{0,1,2}`.
@@ -112,7 +100,7 @@ pub fn layer_stack_index(pos: &Position) -> usize {
 ///
 /// Full refresh: rebuilds both accumulator halves from scratch, runs the
 /// output transform for the side to move, feeds the byte buffer through the
-/// selected layer stack, and divides the network output by the live [`fv_scale`].
+/// selected layer stack, and divides the network output by [`FV_SCALE`].
 /// Positive means the side to move is better. Equivalent to
 /// `Eval::evaluate(pos)` / `ComputeScore(pos, refresh=true)`.
 ///
@@ -148,8 +136,8 @@ pub fn evaluate_with(net: &NnueNetwork, acc: &Accumulator, pos: &Position) -> i3
 
     let score = per_layer_flow(&transformed, &net.stacks[bucket]);
     // The single FV_SCALE consumption site (reference `evaluate_nnue.cpp`):
-    // divide the raw network output by the live scale.
-    score / fv_scale()
+    // divide the raw network output by the compiled-in scale.
+    score / FV_SCALE
 }
 
 /// Layer-stack forward pass over the transformed byte buffer.
@@ -159,7 +147,7 @@ pub fn evaluate_with(net: &NnueNetwork, acc: &Accumulator, pos: &Position) -> i3
 /// the per-layer flow below runs, with each element-wise kernel selected — also
 /// at compile time — through [`crate::simd`]. Both are byte-for-byte equivalent
 /// to `sfnn-1536.h::Propagate` and the reference `per_layer_flow`. Returns the
-/// raw network output (pre-`fv_scale`).
+/// raw network output (pre-`FV_SCALE`).
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -367,8 +355,8 @@ mod tests {
         transformed[0] = 39;
 
         assert_eq!(per_layer_flow(&transformed, stack), 1_256);
-        // Whole-pipeline division by the default FV_SCALE: 1_256 / 16 = 78.
-        assert_eq!(per_layer_flow(&transformed, stack) / FV_SCALE_DEFAULT, 78);
+        // Whole-pipeline division by the configured FV_SCALE: 1_256 / 16 = 78.
+        assert_eq!(per_layer_flow(&transformed, stack) / FV_SCALE, 78);
     }
 
     #[test]

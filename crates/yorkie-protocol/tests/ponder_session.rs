@@ -3,34 +3,42 @@
 //! `stopOnPonderhit` prompt-stop path), `Stochastic_Ponder` rewinds and
 //! re-issues, and `gameover` during pondering still terminates.
 //!
-//! Each test drives a full `usi → setoption → isready → position → go ponder`
-//! session in-process against a synthetic (all-zero) network staged in a temp
-//! dir, so they are hermetic. Ponder searches never self-terminate, so they use
+//! Each test drives a full `usi → isready → position → go ponder`
+//! session in-process against a synthetic (all-zero) network staged at the
+//! compiled-in `EvalDir` (see [`common::stage_configured_eval_dir`]), so they
+//! are hermetic. Ponder searches never self-terminate, so they use
 //! [`StreamHarness`] and drive `stop` / `ponderhit` / `gameover` explicitly. The
 //! wall bounds are deliberately loose (debug builds poll the clock only at
 //! ~512-node `check_time` checkpoints), like the fischer / byoyomi timing tests
 //! — they prove exactly one `bestmove` arrives at the right moment, not a precise
 //! deadline.
+//!
+//! `Stochastic_Ponder` is a compile-time constant, so the test for it asserts
+//! what the value this build carries implies and skips itself otherwise:
+//! `configs/test.toml` leaves it off and `configs/test-limits.toml` turns it
+//! on (see `tests/limit_session.rs` for how to run the second).
+//!
+//! `usi-extras` only, for one mechanical reason: these sessions drive the
+//! analysis-only `go` clauses. The ponder machinery itself is not feature-gated;
+//! it is match behaviour, exercised in both builds by `tests/match_session.rs`
+//! (`go ponder` / `ponderhit`) and by the driver's own no-network tests.
+#![cfg(feature = "usi-extras")]
 
 mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{StreamHarness, TempDir, bestmove_lines, legal, parse, write_synthetic_nn_bin};
+use common::{StreamHarness, bestmove_lines, legal, parse, stage_configured_eval_dir};
+use yorkie_protocol::config;
 use yorkie_state::parse_usi_move;
 
 const STARTPOS: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
 
-/// Send the standard single-threaded synthetic-network preamble and block until
-/// `readyok`. `extra` carries any option lines to insert before `isready`.
-fn start_ready(evaldir: &str, extra: &[String]) -> StreamHarness {
+/// Stage the synthetic network, start a session, and block until `readyok`.
+fn start_ready() -> StreamHarness {
+    stage_configured_eval_dir();
     let h = StreamHarness::start();
     h.send("usi");
-    h.send("setoption name Threads value 1");
-    h.send(&format!("setoption name EvalDir value {evaldir}"));
-    for line in extra {
-        h.send(line);
-    }
     h.send("isready");
     assert!(
         h.wait_until(30_000, |o| o.contains("readyok")),
@@ -70,11 +78,7 @@ fn assert_legal_after(moves: &[&str], tok: &str) {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn go_ponder_holds_until_stop() {
-    let dir = TempDir::new("ponder-hold-stop");
-    write_synthetic_nn_bin(dir.path());
-    let e = dir.path().to_str().unwrap();
-
-    let h = start_ready(e, &[]);
+    let h = start_ready();
     h.send("position startpos");
     h.send("go ponder btime 60000 wtime 60000");
 
@@ -105,11 +109,7 @@ fn go_ponder_holds_until_stop() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn ponderhit_continues_and_emits_one_bestmove() {
-    let dir = TempDir::new("ponder-hit");
-    write_synthetic_nn_bin(dir.path());
-    let e = dir.path().to_str().unwrap();
-
-    let h = start_ready(e, &[]);
+    let h = start_ready();
     h.send("position startpos");
     // A comfortable clock: the budget is not exhausted during the short ponder,
     // so the ponderhit resumes normal time management rather than the prompt
@@ -147,11 +147,7 @@ fn ponderhit_continues_and_emits_one_bestmove() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn stop_on_ponderhit_stops_promptly_after_a_late_ponderhit() {
-    let dir = TempDir::new("ponder-stoponhit");
-    write_synthetic_nn_bin(dir.path());
-    let e = dir.path().to_str().unwrap();
-
-    let h = start_ready(e, &[]);
+    let h = start_ready();
     h.send("position startpos");
     // A tiny clock: the soft budget is exhausted almost immediately, arming
     // `stopOnPonderhit` while pondering.
@@ -191,14 +187,12 @@ fn stop_on_ponderhit_stops_promptly_after_a_late_ponderhit() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn stochastic_ponder_reissues_on_the_current_position() {
-    let dir = TempDir::new("ponder-stochastic");
-    write_synthetic_nn_bin(dir.path());
-    let e = dir.path().to_str().unwrap();
+    if !config::STOCHASTIC_PONDER {
+        eprintln!("skipped: this build did not compile Stochastic_Ponder in");
+        return;
+    }
 
-    let h = start_ready(
-        e,
-        &["setoption name Stochastic_Ponder value true".to_string()],
-    );
+    let h = start_ready();
     // The current position is one move deep; `go ponder` internally rewinds it to
     // startpos and ponders there.
     h.send("position startpos moves 7g7f");
@@ -230,11 +224,7 @@ fn stochastic_ponder_reissues_on_the_current_position() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn gameover_terminates_a_pondering_search() {
-    let dir = TempDir::new("ponder-gameover");
-    write_synthetic_nn_bin(dir.path());
-    let e = dir.path().to_str().unwrap();
-
-    let h = start_ready(e, &[]);
+    let h = start_ready();
     h.send("position startpos");
     h.send("go ponder btime 60000 wtime 60000");
 

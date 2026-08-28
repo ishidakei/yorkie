@@ -1,7 +1,5 @@
 use std::io::{self, Write};
 
-use crate::options::OptionDecl;
-
 pub struct Formatter<'w, W: Write + ?Sized> {
     writer: &'w mut W,
 }
@@ -19,37 +17,8 @@ impl<'w, W: Write + ?Sized> Formatter<'w, W> {
         self.line(format_args!("id author {author}"))
     }
 
-    pub fn option_decl(&mut self, decl: &OptionDecl) -> io::Result<()> {
-        match decl {
-            OptionDecl::Spin {
-                name,
-                default,
-                min,
-                max,
-            } => self.line(format_args!(
-                "option name {name} type spin default {default} min {min} max {max}"
-            )),
-            OptionDecl::String { name, default } => self.line(format_args!(
-                "option name {name} type string default {default}"
-            )),
-            OptionDecl::Check { name, default } => self.line(format_args!(
-                "option name {name} type check default {default}"
-            )),
-            OptionDecl::Combo {
-                name,
-                default,
-                choices,
-            } => {
-                // `option name X type combo default D var A var B ...`
-                let mut body = format!("option name {name} type combo default {default}");
-                for choice in *choices {
-                    body.push_str(" var ");
-                    body.push_str(choice);
-                }
-                self.line(format_args!("{body}"))
-            }
-        }
-    }
+    // There is no `option name ...` renderer: no build advertises a runtime
+    // option, so the `usi` reply is identity plus `usiok` everywhere.
 
     pub fn usiok(&mut self) -> io::Result<()> {
         self.line(format_args!("usiok"))
@@ -74,10 +43,9 @@ impl<'w, W: Write + ?Sized> Formatter<'w, W> {
         self.line(format_args!("bestmove {move_str}"))
     }
 
-    /// Emit a verbatim line with no USI keyword prefix. Used only for the
-    /// option-override diagnostics the reference prints to raw `std::cout`
-    /// (`Error : ...`, `usioption.cpp`); the port routes them through
-    /// its single output sink rather than a separate stream.
+    /// Emit a verbatim line with no USI keyword prefix — the `isready`
+    /// keep-alive's bare newline (`engine.cpp`), routed through the single
+    /// output sink like every other line.
     pub fn raw_line(&mut self, text: &str) -> io::Result<()> {
         self.line(format_args!("{text}"))
     }
@@ -115,55 +83,6 @@ mod tests {
     fn id_author_emits_one_line() {
         let s = captured(|f| f.id_author("Kei Ishida <ishida.kei@gmail.com>").unwrap());
         assert_eq!(s, "id author Kei Ishida <ishida.kei@gmail.com>\n");
-    }
-
-    #[test]
-    fn option_spin_decl_format() {
-        let decl = OptionDecl::Spin {
-            name: "USI_Hash",
-            default: 1024,
-            min: 1,
-            max: 33_554_432,
-        };
-        let s = captured(|f| f.option_decl(&decl).unwrap());
-        assert_eq!(
-            s,
-            "option name USI_Hash type spin default 1024 min 1 max 33554432\n"
-        );
-    }
-
-    #[test]
-    fn option_string_decl_format() {
-        let decl = OptionDecl::String {
-            name: "EvalDir",
-            default: "eval",
-        };
-        let s = captured(|f| f.option_decl(&decl).unwrap());
-        assert_eq!(s, "option name EvalDir type string default eval\n");
-    }
-
-    #[test]
-    fn option_check_decl_format() {
-        let decl = OptionDecl::Check {
-            name: "USI_OwnBook",
-            default: true,
-        };
-        let s = captured(|f| f.option_decl(&decl).unwrap());
-        assert_eq!(s, "option name USI_OwnBook type check default true\n");
-    }
-
-    #[test]
-    fn option_combo_decl_format() {
-        let decl = OptionDecl::Combo {
-            name: "BookFile",
-            default: "no_book",
-            choices: &["no_book", "standard_book.db", "book.bin"],
-        };
-        let s = captured(|f| f.option_decl(&decl).unwrap());
-        assert_eq!(
-            s,
-            "option name BookFile type combo default no_book var no_book var standard_book.db var book.bin\n"
-        );
     }
 
     #[test]

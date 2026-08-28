@@ -17,6 +17,26 @@ use std::sync::{Arc, Mutex};
 use yorkie_protocol::UsiDriver;
 use yorkie_state::{Move, Position, parse_sfen, parse_usi_move, sfen_pack};
 
+/// The message a test that is pinned to the test config's values fails with when
+/// the engine was built from another config.
+const WRONG_CONFIG: &str = "this test requires the test config \
+     — build with `YORKIE_CONFIG=configs/test.toml`";
+
+/// Assert that this build compiled in the three values the suite's pinned
+/// assertions were captured under (`configs/test.toml`: `usi_hash = 16`,
+/// `threads = 1`, `pv_interval = 0`).
+///
+/// A test whose expected transcript only holds under those values calls this
+/// first, so a run that forgot `YORKIE_CONFIG` fails naming the fix rather than
+/// as an unexplained transcript mismatch. It never skips: a suite that quietly
+/// passed by running nothing would be worse than a red one.
+pub fn require_test_config() {
+    use yorkie_protocol::config;
+    assert_eq!(config::USI_HASH, 16, "{WRONG_CONFIG}");
+    assert_eq!(config::THREADS, 1, "{WRONG_CONFIG}");
+    assert_eq!(config::PV_INTERVAL, 0, "{WRONG_CONFIG}");
+}
+
 // --- SFNN-1536 file-format constants (mirror yorkie-eval/src/loader.rs).
 const NNUE_VERSION: u32 = 0x7AF3_2F16;
 const NNUE_HASH_VALUE: u32 = 0x3C20_3B32;
@@ -131,23 +151,88 @@ pub fn drive_with_seed(input: &str, book_seed: u64) -> String {
     String::from_utf8(bytes).expect("utf-8")
 }
 
-/// Like [`drive_with_seed`] but with an injected `engine_option_profile.txt`
-/// path, so a session can exercise a non-default engine-option profile without
-/// the test process's working directory containing a profile file.
-pub fn drive_with_profile(input: &str, book_seed: u64, profile: &Path) -> String {
-    let output = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let driver =
-        UsiDriver::with_option_profile(input.as_bytes(), Arc::clone(&output), book_seed, profile);
-    driver.run().expect("driver run");
-    let bytes = output.lock().expect("output lock").clone();
-    String::from_utf8(bytes).expect("utf-8")
+/// Put the synthetic network where this build will look for it, and return.
+///
+/// `EvalDir` is a compile-time constant — no build has a runtime option surface,
+/// so a test cannot point the engine at a temp directory. It points the *process*
+/// at one instead: a fixture root under the workspace `target/` directory becomes
+/// the working directory, and the synthetic `nn.bin` is written at
+/// `<fixture root>/<EvalDir>/nn.bin`, which is exactly where a relative
+/// `EvalDir` resolves.
+///
+/// Safe to call from every test in a binary, and from several at once: every
+/// caller names the same directory and writes the same bytes, the write is an
+/// atomic rename from a unique temporary, and a staged file is reused rather
+/// than rewritten. Tests that need the engine to find NO network (the handshake
+/// / match sessions) simply never call this, and keep the package-root working
+/// directory, where no `eval/` exists.
+///
+/// The fixture root lives under `target/` on purpose: it survives across runs
+/// (the ~112 MiB all-zero network is written once, not once per test) and
+/// `cargo clean` takes it away.
+///
+/// Returns the staged `nn.bin` path, for a test that also wants to load the
+/// same network directly.
+pub fn stage_configured_eval_dir() -> PathBuf {
+    let root = fixture_root("synthetic");
+    let eval_dir = root.join(yorkie_protocol::config::EVAL_DIR);
+    std::fs::create_dir_all(&eval_dir).expect("create fixture eval dir");
+    let nn_bin = eval_dir.join("nn.bin");
+    let bytes = build_zero_network_bytes();
+    let staged = std::fs::metadata(&nn_bin).is_ok_and(|m| m.len() == bytes.len() as u64);
+    if !staged {
+        // Unique temporary + rename: a concurrent staging attempt from another
+        // test in this process (or another test binary) either sees no file or
+        // sees the complete one, never a half-written one.
+        static CTR: AtomicU32 = AtomicU32::new(0);
+        let tmp = eval_dir.join(format!(
+            "nn.bin.{}.{}",
+            std::process::id(),
+            CTR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&tmp, &bytes).expect("write synthetic nn.bin");
+        std::fs::rename(&tmp, &nn_bin).expect("publish synthetic nn.bin");
+    }
+    std::env::set_current_dir(&root).expect("enter the fixture root");
+    nn_bin
 }
 
-/// Write an `engine_option_profile.txt` into `dir` and return its path.
-pub fn write_option_profile(dir: &Path, contents: &str) -> PathBuf {
-    let path = dir.join("engine_option_profile.txt");
-    std::fs::write(&path, contents).expect("write engine_option_profile.txt");
-    path
+/// Point the compiled-in `EvalDir` at an existing network directory, the same
+/// way [`stage_configured_eval_dir`] points it at the synthetic one: enter a
+/// fixture root whose `<EvalDir>` entry is a symlink to `src`.
+///
+/// For the tests that gate on the real `nn.bin`, which is staged outside the
+/// workspace's build tree and is far too large to copy per run.
+pub fn stage_eval_dir_link(src: &Path) {
+    let root = fixture_root("linked");
+    std::fs::create_dir_all(&root).expect("create fixture root");
+    let link = root.join(yorkie_protocol::config::EVAL_DIR);
+    let src = src.canonicalize().expect("real eval dir resolves");
+    // Link only when it does not already name `src`; concurrent callers in other
+    // test binaries all want the same target, so losing the race is harmless.
+    if std::fs::read_link(&link).ok().as_deref() != Some(src.as_path()) {
+        let _ = std::os::unix::fs::symlink(&src, &link);
+    }
+    assert_eq!(
+        std::fs::read_link(&link).ok().as_deref(),
+        Some(src.as_path()),
+        "the fixture root's EvalDir must link to the real network directory"
+    );
+    std::env::set_current_dir(&root).expect("enter the fixture root");
+}
+
+/// A fixture root under the workspace `target/` directory, one per `tag`.
+/// Derived from the test executable's own path
+/// (`<target>/<profile>/deps/<name>-<hash>`), so it follows `CARGO_TARGET_DIR`
+/// wherever it points.
+fn fixture_root(tag: &str) -> PathBuf {
+    let exe = std::env::current_exe().expect("test executable path");
+    let target = exe
+        .parent() // deps
+        .and_then(Path::parent) // <profile>
+        .and_then(Path::parent) // target
+        .expect("test executable lives under <target>/<profile>/deps");
+    target.join(format!("usi-session-fixtures-{tag}"))
 }
 
 pub fn bestmove_lines(out: &str) -> Vec<&str> {

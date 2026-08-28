@@ -19,16 +19,15 @@
 
 #![cfg(feature = "usi-extras")]
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use common::{engine_cwd_with_eval_dir, eval_dir};
 use serde::Deserialize;
-
-fn eval_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../eval")
-}
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
@@ -68,9 +67,10 @@ struct Engine {
 }
 
 impl Engine {
-    /// Spawn the engine, load the real network via `EvalDir`, and complete the
-    /// `usi` / `isready` handshake. Returns `None` (with a printed notice) when
-    /// the network is absent, so callers can skip.
+    /// Spawn the engine in a working directory whose `EvalDir` links to the
+    /// staged network, and complete the `usi` / `isready` handshake. Returns
+    /// `None` (with a printed notice) when the network is absent, so callers can
+    /// skip.
     fn start() -> Option<Self> {
         let dir = eval_dir();
         if !dir.join("nn.bin").exists() {
@@ -83,6 +83,7 @@ impl Engine {
 
         let exe = env!("CARGO_BIN_EXE_yorkie");
         let mut child = Command::new(exe)
+            .current_dir(engine_cwd_with_eval_dir(&dir))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -98,10 +99,6 @@ impl Engine {
         };
         eng.send("usi");
         eng.read_until(|l| l == "usiok");
-        eng.send(&format!(
-            "setoption name EvalDir value {}",
-            dir.to_str().expect("utf-8 eval dir")
-        ));
         eng.send("isready");
         eng.read_until(|l| l == "readyok")
             .expect("network must load (readyok)");
@@ -189,18 +186,13 @@ impl Engine {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn go_depth_2_and_3_match_fixtures_via_binary() {
+    // The fixture assertions need the single worker and the unthrottled PV the
+    // test configs compile in: helpers sharing the TT would move the node count,
+    // and a PV throttle would decide which iterations printed by wall clock.
+    common::require_test_config();
     let Some(mut eng) = Engine::start() else {
         return;
     };
-
-    // Pin the single-worker search: the default is 4 workers, which share and
-    // pollute the TT once helpers really search, so any fixture
-    // (nodes / cp / bestmove) assertion must run on one worker.
-    eng.send("setoption name Threads value 1");
-    // `PvInterval 0` retains per-iteration `info` output regardless of wall-clock
-    // timing (the default 300 ms would suppress intermediate lines on a fast
-    // search and print them on a slow one). The reads target the final depth.
-    eng.send("setoption name PvInterval value 0");
 
     // depth 2: position startpos moves 7g7f, go depth 2. Assert the info line's
     // nodes and cp score as well as the bestmove.
@@ -248,62 +240,53 @@ fn go_depth_2_and_3_match_fixtures_via_binary() {
 
 #[cfg_attr(miri, ignore)]
 #[test]
-fn threads_cycle_single_thread_matches_fixture_multi_thread_is_legal() {
-    // The Lazy-SMP re-scope of the Threads-cycle gate. Cycling `setoption name
-    // Threads value N` resizes the worker pool; on the `Threads=1` leg the same
-    // `position` + `go depth 2` must still reproduce the reference fixture
-    // exactly (nodes / cp / bestmove), but once helpers really search the
-    // `Threads>1` legs are nondeterministic (the workers share and pollute the
-    // TT), so those legs assert only exactly one legal bestmove and clean
-    // termination — a leaked helper would hang the `quit` `wait` below.
+fn repeated_searches_in_one_session_keep_matching_the_fixture() {
+    // The worker pool is built once and reused for every `go` in a session, so a
+    // second and third search over the same position must reproduce the same
+    // fixture numbers as the first — a helper left in a dirty state, or histories
+    // leaking across `usinewgame`, would show up as drift here.
+    //
+    // The worker count is a compile-time constant, so a session has no way to
+    // resize the pool between the rounds; every round runs the same pool.
+    common::require_test_config();
     let Some(mut eng) = Engine::start() else {
         return;
     };
 
-    // `PvInterval 0` keeps per-iteration `info` output deterministic across the
-    // Threads legs (see `go_depth_2_and_3_match_fixtures_via_binary`).
-    eng.send("setoption name PvInterval value 0");
     let d2 = load_fixture("search-depth2/startpos-7g7f.json");
-    for threads in [1u32, 4, 2] {
-        eng.send(&format!("setoption name Threads value {threads}"));
+    for round in 0..3 {
         eng.send("usinewgame");
         eng.send(&format!("position startpos moves {}", d2.moves.join(" ")));
         eng.send("go depth 2");
+        let (nodes, cp) = eng.read_info_nodes_cp(2);
+        assert_eq!(
+            nodes, d2.nodes,
+            "round {round}: node count must match fixture"
+        );
+        assert_eq!(
+            cp, d2.score.cp,
+            "round {round}: cp score must match fixture"
+        );
         let best = eng.read_bestmove();
-        if threads == 1 {
-            // Single worker: bit-identical to the reference fixture. The info
-            // line is read before the bestmove, so re-drive that leg to read it.
-            eng.send("usinewgame");
-            eng.send(&format!("position startpos moves {}", d2.moves.join(" ")));
-            eng.send("go depth 2");
-            let (nodes, cp) = eng.read_info_nodes_cp(2);
-            assert_eq!(nodes, d2.nodes, "Threads=1: node count must match fixture");
-            assert_eq!(cp, d2.score.cp, "Threads=1: cp score must match fixture");
-            assert_eq!(
-                eng.read_bestmove(),
-                d2.bestmove,
-                "Threads=1: bestmove must match fixture"
-            );
-        } else {
-            // Multi worker: assert legality, not equality.
-            assert_legal_move_after(&d2.moves, &best);
-        }
+        assert_eq!(
+            best, d2.bestmove,
+            "round {round}: bestmove must match fixture"
+        );
+        assert_legal_move_after(&d2.moves, &best);
     }
 
     eng.quit();
 }
 
-/// Multi-thread session smoke tests, all at `Threads=2`.
+/// Session smoke tests over the compiled-in worker pool.
 /// Each drives the spawned binary; each asserts exactly one *legal* bestmove and
-/// prompt termination (the search results are nondeterministic under Lazy SMP).
+/// prompt termination.
 #[cfg_attr(miri, ignore)]
 #[test]
-fn threads2_go_movetime_and_depth_and_infinite_and_fischer() {
+fn go_movetime_and_depth_and_infinite_and_fischer_all_terminate() {
     let Some(mut eng) = Engine::start() else {
         return;
     };
-    eng.send("setoption name Threads value 2");
-
     // The deadline is polled only at ~512-node `check_time` checkpoints on the
     // main worker; with two workers contending for cores in an *unoptimised test
     // build*, a single checkpoint can be several seconds. These bounds are
@@ -318,10 +301,7 @@ fn threads2_go_movetime_and_depth_and_infinite_and_fischer() {
     let t = Instant::now();
     eng.send("go movetime 300");
     let best = eng.read_bestmove();
-    assert!(
-        t.elapsed() < bound,
-        "Threads=2 go movetime 300 took too long"
-    );
+    assert!(t.elapsed() < bound, "go movetime 300 took too long");
     assert_legal_move_after(&[], &best);
 
     // (c) go depth 3 → a legal bestmove (result nondeterministic under SMP).
@@ -339,10 +319,7 @@ fn threads2_go_movetime_and_depth_and_infinite_and_fischer() {
     let t = Instant::now();
     eng.send("stop");
     let best = eng.read_bestmove();
-    assert!(
-        t.elapsed() < bound,
-        "Threads=2 bestmove after stop took too long"
-    );
+    assert!(t.elapsed() < bound, "bestmove after stop took too long");
     assert_legal_move_after(&[], &best);
 
     // (b) Fischer mini-game → every move meets its deadline with one bestmove.
@@ -361,7 +338,7 @@ fn threads2_go_movetime_and_depth_and_infinite_and_fischer() {
             "go btime {CLOCK} wtime {CLOCK} binc {INC} winc {INC}"
         ));
         let best = eng.read_bestmove();
-        assert!(t.elapsed() < bound, "Threads=2 ply {ply}: missed deadline");
+        assert!(t.elapsed() < bound, "ply {ply}: missed deadline");
         if best == "resign" || best == "win" {
             break;
         }
@@ -370,7 +347,7 @@ fn threads2_go_movetime_and_depth_and_infinite_and_fischer() {
     }
     assert!(
         moves.len() >= 2,
-        "Threads=2 mini-game should play several moves, got {moves:?}"
+        "mini-game should play several moves, got {moves:?}"
     );
 
     eng.quit();
@@ -401,14 +378,16 @@ fn assert_legal_move_after(setup: &[String], best: &str) {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn go_infinite_then_stop_yields_one_prompt_bestmove() {
+    // Single-worker timing test: the bound below holds at the one worker the
+    // test config compiles in, where the ~512-node `check_time` cadence is not
+    // slowed by helper CPU contention. Timing under a bigger pool is covered by
+    // `go_movetime_and_depth_and_infinite_and_fischer_all_terminate`, whose
+    // bounds are sized for contention.
+    common::require_test_config();
     let Some(mut eng) = Engine::start() else {
         return;
     };
 
-    // Single-worker timing test: pin Threads=1 so the ~512-node `check_time`
-    // cadence is not slowed by helper CPU contention. The
-    // multi-thread timing coverage lives in `threads2_*`.
-    eng.send("setoption name Threads value 1");
     eng.send("usinewgame");
     eng.send("position startpos");
     eng.send("go infinite");
@@ -437,12 +416,12 @@ fn go_infinite_then_stop_yields_one_prompt_bestmove() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn go_movetime_returns_within_a_generous_bound() {
+    // Single-worker timing test (see the note in the go-infinite test above).
+    common::require_test_config();
     let Some(mut eng) = Engine::start() else {
         return;
     };
 
-    // Single-worker timing test (see the note in the go-infinite test above).
-    eng.send("setoption name Threads value 1");
     eng.send("usinewgame");
     eng.send("position startpos");
     let t = Instant::now();
@@ -466,6 +445,8 @@ fn go_movetime_returns_within_a_generous_bound() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn fischer_mini_game_makes_every_deadline_with_one_bestmove_each() {
+    // Single-worker timing test (see the note in the go-infinite test above).
+    common::require_test_config();
     let Some(mut eng) = Engine::start() else {
         return;
     };
@@ -487,8 +468,6 @@ fn fischer_mini_game_makes_every_deadline_with_one_bestmove_each() {
     // one bestmove, which is what "no missed deadline" means for a debug run.
     let per_move_bound = Duration::from_secs(3);
 
-    // Single-worker timing test (see the note in the go-infinite test above).
-    eng.send("setoption name Threads value 1");
     eng.send("usinewgame");
     let mut moves: Vec<String> = Vec::new();
 
@@ -528,6 +507,8 @@ fn fischer_mini_game_makes_every_deadline_with_one_bestmove_each() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn byoyomi_mini_game_makes_every_deadline_with_one_bestmove_each() {
+    // Single-worker timing test (see the note in the go-infinite test above).
+    common::require_test_config();
     let Some(mut eng) = Engine::start() else {
         return;
     };
@@ -548,8 +529,6 @@ fn byoyomi_mini_game_makes_every_deadline_with_one_bestmove_each() {
     const BYOYOMI: u64 = 1000;
     let per_move_bound = Duration::from_secs(3);
 
-    // Single-worker timing test (see the note in the go-infinite test above).
-    eng.send("setoption name Threads value 1");
     eng.send("usinewgame");
     let mut moves: Vec<String> = Vec::new();
 

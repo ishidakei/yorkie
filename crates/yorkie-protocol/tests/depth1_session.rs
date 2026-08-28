@@ -1,12 +1,16 @@
 //! Session-level depth-1 parity gate (blocking) against the real network.
 //!
-//! Drives a full USI session in-process — `usi` → `setoption EvalDir` →
-//! `isready` → `position startpos` → `go depth 1` — and asserts the emitted
-//! `bestmove`, `score`, and `nodes` exactly match the reference-captured
+//! Drives a full USI session in-process — `usi` → `isready` →
+//! `position startpos` → `go depth 1` — and asserts the emitted `bestmove`,
+//! `score`, and `nodes` exactly match the reference-captured
 //! `tests/fixtures/search-depth1/startpos.json`. This proves the driver drives
 //! the ported depth-1 root search ([`yorkie_search::QSearch::run_root`]) with
-//! the reference TT sizing (1024 MiB, allocated on the first successful
-//! `isready`) and generation semantics (`run_root` bumps it per `go`).
+//! the compiled-in TT sizing (allocated on the first successful `isready`) and
+//! generation semantics (`run_root` bumps it per `go`).
+//!
+//! `EvalDir` is a compile-time constant, so the real network is reached the way
+//! every session test reaches its network: by entering a fixture root whose
+//! `<EvalDir>` links to it (`common::stage_eval_dir_link`).
 //!
 //! The three fields are one inseparable set: the `(nodes & 14)` root tie-break
 //! means a single-node drift can cascade into a different score and a flipped
@@ -15,7 +19,9 @@
 //! The SFNN-1536 network is staged locally at
 //! `eval/nn.bin` and is never committed. When absent
 //! (a checkout without it staged) the test prints a notice and passes, so the
-//! default `cargo test` run stays green everywhere.
+//! default `cargo test` run stays green everywhere. The fixture is also a
+//! single-PV capture, so the test skips itself in a build whose compiled-in
+//! `MultiPV` is not 1 (`configs/test-limits.toml`).
 //!
 //! **`usi-extras` gate.** These sessions drive the analysis-only `go` clauses
 //! (`depth` / `nodes` / `movetime` / `infinite`), which a default build refuses
@@ -25,8 +31,11 @@
 
 #![cfg(feature = "usi-extras")]
 
+mod common;
+
 use std::path::PathBuf;
 
+use common::stage_eval_dir_link;
 use serde::Deserialize;
 use yorkie_protocol::UsiDriver;
 
@@ -79,6 +88,26 @@ fn field_after<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn depth1_session_matches_reference_startpos_fixture() {
+    // The fixture's node count was captured on one worker; helpers sharing the
+    // TT move it, so the comparison only means anything under the test config.
+    common::require_test_config();
+
+    // It was also captured from a single-PV root search. `MultiPV` is a
+    // compile-time constant, so a `MultiPV N` build searches N ranked root moves
+    // per iteration and reports the sum — a different node count for the same
+    // search, and a different tie-break for the bestmove that count feeds. There
+    // is no second fixture to compare that against, so this build has nothing to
+    // show here. (`configs/test-limits.toml` builds `MultiPV 3`; the MultiPV loop
+    // itself is covered by `tests/multipv_session.rs`.)
+    if yorkie_protocol::config::MULTI_PV != 1 {
+        eprintln!(
+            "skipped: this build compiled in MultiPV {}, and the fixture is a \
+             single-PV capture",
+            yorkie_protocol::config::MULTI_PV
+        );
+        return;
+    }
+
     let dir = eval_dir();
     if !dir.join("nn.bin").exists() {
         eprintln!(
@@ -91,20 +120,14 @@ fn depth1_session_matches_reference_startpos_fixture() {
     let raw = std::fs::read_to_string(fixture_path()).expect("read startpos fixture");
     let fixture: Fixture = serde_json::from_str(&raw).expect("parse startpos fixture");
 
-    let eval_dir_arg = dir.to_str().expect("utf-8 eval dir");
-    // `Threads value 1` pins the single-worker search: the default is 4, and once
-    // helpers really search they pollute the shared TT, so any
-    // fixture-node assertion must run on one worker to stay deterministic.
-    let session = format!(
+    stage_eval_dir_link(&dir);
+    let out = drive(
         "usi\n\
-         setoption name Threads value 1\n\
-         setoption name EvalDir value {eval_dir_arg}\n\
          isready\n\
          position startpos\n\
          go depth 1\n\
-         quit\n"
+         quit\n",
     );
-    let out = drive(&session);
 
     assert!(
         out.contains("readyok\n"),

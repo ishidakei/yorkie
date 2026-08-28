@@ -10,14 +10,16 @@
 //! yorkie-protocol` (default features, i.e. without `--all-features`) to execute
 //! it.
 //!
-//! No network is needed: `setoption name USI_Hash value 1` allocates a 1 MiB
-//! table on its own, so these sessions never touch `isready` / `nn.bin`.
+//! No network is needed for most of them: a `bench` carries its own table size
+//! as a command argument, so `bench 1 1 1 current movetime` allocates a 1 MiB
+//! table on its own and (finding no network loaded) resigns each position
+//! immediately. These sessions therefore never touch `isready` / `nn.bin`.
 
 #![cfg(feature = "usi-extras")]
 
 mod common;
 
-use common::{StreamHarness, TempDir, drive, write_synthetic_nn_bin};
+use common::{StreamHarness, drive, stage_configured_eval_dir};
 use yorkie_state::{format_sfen, parse_sfen, parse_usi_move};
 
 const STARTPOS: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
@@ -25,7 +27,7 @@ const STARTPOS: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSN
 /// Run `script` against a driver whose table is already sized, and return every
 /// `tt …` reply with the `info string ` prefix stripped.
 fn tt_session(script: &[&str]) -> Vec<String> {
-    let mut input = String::from("setoption name USI_Hash value 1\n");
+    let mut input = String::from("bench 1 1 1 current movetime\n");
     for line in script {
         input.push_str(line);
         input.push('\n');
@@ -34,7 +36,7 @@ fn tt_session(script: &[&str]) -> Vec<String> {
     replies(&drive(&input))
 }
 
-/// Like [`tt_session`] but WITHOUT the `USI_Hash` line, so the table is still
+/// Like [`tt_session`] but WITHOUT the `bench` line, so the table is still
 /// unsized (the state right after process start, before `isready`).
 fn tt_session_unsized(script: &[&str]) -> Vec<String> {
     let mut input = String::new();
@@ -409,14 +411,12 @@ fn a_declined_write_is_reported_not_silently_dropped() {
 // 6. Idle-only admission.
 // -------------------------------------------------------------------------
 
-/// Bring up a session with a synthetic (all-zero) network and a 1 MiB table,
-/// blocking until `readyok`.
-fn ready_harness(evaldir: &str) -> StreamHarness {
+/// Bring up a session with a synthetic (all-zero) network and the compiled-in
+/// table, blocking until `readyok`.
+fn ready_harness() -> StreamHarness {
+    stage_configured_eval_dir();
     let h = StreamHarness::start();
     h.send("usi");
-    h.send("setoption name Threads value 1");
-    h.send(&format!("setoption name EvalDir value {evaldir}"));
-    h.send("setoption name USI_Hash value 1");
     h.send("isready");
     assert!(
         h.wait_until(30_000, |o| o.contains("readyok")),
@@ -432,9 +432,7 @@ fn ready_harness(evaldir: &str) -> StreamHarness {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_running_search_refuses_the_tt_commands() {
-    let dir = TempDir::new("tt-extras-busy");
-    write_synthetic_nn_bin(dir.path());
-    let h = ready_harness(dir.path().to_str().expect("utf-8 temp path"));
+    let h = ready_harness();
 
     h.send("position startpos");
     h.send("go infinite");
@@ -461,9 +459,7 @@ fn a_running_search_refuses_the_tt_commands() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_finished_search_does_not_block_the_tt_commands() {
-    let dir = TempDir::new("tt-extras-after-go");
-    write_synthetic_nn_bin(dir.path());
-    let h = ready_harness(dir.path().to_str().expect("utf-8 temp path"));
+    let h = ready_harness();
 
     h.send("position startpos");
     h.send("go depth 1");

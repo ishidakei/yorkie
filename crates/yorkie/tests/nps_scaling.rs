@@ -1,9 +1,11 @@
 //! NPS scaling measurement (Lazy SMP).
 //!
-//! Measures aggregate nodes-per-second at `Threads=1` and `Threads=2` for three
-//! positions, running `go movetime 5000` in a release build and reading the
-//! aggregated `nodes` off the final `info` line. This is a **measurement, not a
-//! hard threshold**: it prints a table (position × threads, plus the ratio) and
+//! Measures aggregate nodes-per-second at one and two workers for three
+//! positions. The worker count is a compile-time constant, so the measurement
+//! runs through `bench`, the one command that carries its own worker count as an
+//! argument: `bench <ttMB> <threads> 5000 current movetime` searches the current
+//! position and reports `nodes` / `nps` on its summary line. This is a
+//! **measurement, not a hard threshold**: it prints a table (position × threads, plus the ratio) and
 //! never asserts a scaling factor: on a host whose two logical CPUs are SMT
 //! siblings, a `Threads=2 / Threads=1` ratio well under 2× is expected and
 //! normal, so any threshold would encode the machine rather than the engine.
@@ -28,11 +30,16 @@
 
 #![cfg(feature = "usi-extras")]
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
+use common::{engine_cwd_with_eval_dir, eval_dir};
+
 const MOVETIME_MS: u64 = 5000;
+/// The table size the bench runs allocate, in MiB.
+const BENCH_TT_MB: u64 = 1024;
 const RUNS: usize = 3;
 
 /// (label, SFEN). Startpos plus two positions from the existing depth-5 parity
@@ -48,10 +55,6 @@ const POSITIONS: &[(&str, &str)] = &[
     ),
     ("check-evasion", "4k4/9/4r4/9/9/9/4K3B/9/9 b RG2gs2n3p 1"),
 ];
-
-fn eval_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../eval")
-}
 
 fn send(stdin: &mut ChildStdin, cmd: &str) {
     stdin.write_all(cmd.as_bytes()).expect("write engine stdin");
@@ -74,44 +77,31 @@ fn read_until<F: Fn(&str) -> bool>(reader: &mut BufReader<ChildStdout>, pred: F)
     }
 }
 
-/// Parse the `nodes <N>` field out of an `info` line.
-fn parse_nodes(info: &str) -> Option<u64> {
-    let mut toks = info.split_whitespace();
-    while let Some(t) = toks.next() {
-        if t == "nodes" {
-            return toks.next().and_then(|n| n.parse::<u64>().ok());
-        }
-    }
-    None
+/// Parse the `nodes=<N>` field out of a `bench:` summary line.
+fn parse_bench_nodes(summary: &str) -> Option<u64> {
+    summary
+        .split_whitespace()
+        .find_map(|t| t.strip_prefix("nodes="))
+        .and_then(|n| n.parse::<u64>().ok())
 }
 
-/// Run `go movetime 5000` once for `sfen` and return the aggregated node count.
-fn measure_nodes(stdin: &mut ChildStdin, reader: &mut BufReader<ChildStdout>, sfen: &str) -> u64 {
-    send(stdin, "usinewgame");
-    send(stdin, "isready");
-    read_until(reader, |l| l == "readyok").expect("readyok");
+/// Run one `bench … <threads> … current movetime` for `sfen` and return the
+/// aggregated node count off its summary line.
+fn measure_nodes(
+    stdin: &mut ChildStdin,
+    reader: &mut BufReader<ChildStdout>,
+    sfen: &str,
+    threads: u32,
+) -> u64 {
     send(stdin, &format!("position sfen {sfen}"));
-    send(stdin, &format!("go movetime {MOVETIME_MS}"));
-
-    // Capture the last `info` line that carries a `nodes` field before the
-    // `bestmove` (a normal search emits exactly one such line).
-    let mut nodes = 0u64;
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line).expect("read engine stdout");
-        assert!(n != 0, "engine closed stdout mid-search");
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.starts_with("bestmove ") {
-            break;
-        }
-        if trimmed.starts_with("info ")
-            && let Some(v) = parse_nodes(trimmed)
-        {
-            nodes = v;
-        }
-    }
-    nodes
+    send(
+        stdin,
+        &format!("bench {BENCH_TT_MB} {threads} {MOVETIME_MS} current movetime"),
+    );
+    let summary = read_until(reader, |l| l.contains("bench: positions="))
+        .expect("a bench summary line must arrive");
+    parse_bench_nodes(&summary)
+        .unwrap_or_else(|| panic!("no nodes= field in bench summary: {summary:?}"))
 }
 
 fn median3(mut v: [u64; RUNS]) -> u64 {
@@ -119,10 +109,11 @@ fn median3(mut v: [u64; RUNS]) -> u64 {
     v[RUNS / 2]
 }
 
-fn start_engine(threads: u32) -> (Child, ChildStdin, BufReader<ChildStdout>) {
+fn start_engine() -> (Child, ChildStdin, BufReader<ChildStdout>) {
     let dir = eval_dir();
     let exe = env!("CARGO_BIN_EXE_yorkie");
     let mut child: Child = Command::new(exe)
+        .current_dir(engine_cwd_with_eval_dir(&dir))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -133,24 +124,12 @@ fn start_engine(threads: u32) -> (Child, ChildStdin, BufReader<ChildStdout>) {
 
     send(&mut stdin, "usi");
     read_until(&mut reader, |l| l == "usiok").expect("usiok");
-    let eval_dir_arg = dir.to_str().expect("utf-8 eval dir");
-    send(
-        &mut stdin,
-        &format!("setoption name EvalDir value {eval_dir_arg}"),
-    );
-    send(
-        &mut stdin,
-        &format!("setoption name Threads value {threads}"),
-    );
     send(&mut stdin, "isready");
     let ack = read_until(&mut reader, |l| {
         l == "readyok" || l.starts_with("info string eval load failed")
     })
     .expect("readyok or load failure");
-    assert_eq!(
-        ack, "readyok",
-        "real network must load at Threads={threads}"
-    );
+    assert_eq!(ack, "readyok", "real network must load");
     (child, stdin, reader)
 }
 
@@ -171,10 +150,10 @@ fn nps_threads1_vs_threads2() {
 
     for &(label, sfen) in POSITIONS {
         let nps_for = |threads: u32| -> f64 {
-            let (mut child, mut stdin, mut reader) = start_engine(threads);
+            let (mut child, mut stdin, mut reader) = start_engine();
             let mut runs = [0u64; RUNS];
             for r in runs.iter_mut() {
-                *r = measure_nodes(&mut stdin, &mut reader, sfen);
+                *r = measure_nodes(&mut stdin, &mut reader, sfen, threads);
             }
             send(&mut stdin, "quit");
             drop(stdin);
@@ -186,10 +165,10 @@ fn nps_threads1_vs_threads2() {
         medians.push((label, nps1, nps2));
     }
 
-    eprintln!("\nNPS scaling (median of {RUNS} runs, go movetime {MOVETIME_MS}):");
+    eprintln!("\nNPS scaling (median of {RUNS} runs, bench movetime {MOVETIME_MS}):");
     eprintln!(
         "{:<20} {:>14} {:>14} {:>8}",
-        "position", "Threads=1 NPS", "Threads=2 NPS", "ratio"
+        "position", "1-worker NPS", "2-worker NPS", "ratio"
     );
     for (label, nps1, nps2) in &medians {
         let ratio = if *nps1 > 0.0 { nps2 / nps1 } else { 0.0 };

@@ -1,8 +1,8 @@
 //! Multi-thread self-play soak (Lazy SMP).
 //!
 //! With Lazy SMP live, several workers share the transposition table through
-//! relaxed atomics. This soak drives the built `yorkie` binary at `Threads=2`
-//! through a long stream of real self-play games and asserts nothing ever goes
+//! relaxed atomics. This soak drives the built `yorkie` binary through a long
+//! stream of real self-play games and asserts nothing ever goes
 //! wrong: exactly one legal `bestmove` per `go`, no panic, no hang (a per-move
 //! watchdog), and a clean `quit` at the end. It changes no search decision — it
 //! is pure stability evidence.
@@ -19,19 +19,27 @@
 //! cargo test --release -p yorkie --test threads2_soak -- --ignored --nocapture
 //! ```
 //!
+//! The worker count is a compile-time constant, so the multi-worker point of the
+//! soak needs a build whose config carries more than one worker: the test prints
+//! a notice and passes when `threads` is 1. `configs/default.toml` — the config
+//! a plain build reads — carries 4, so the command above is enough;
+//! `configs/test.toml` carries 1, and a build selecting it skips the soak.
+//!
 //! Duration defaults to ~10 minutes; override with `SOAK_SECS`:
 //!
 //! ```text
 //! SOAK_SECS=120 cargo test --release -p yorkie --test threads2_soak -- --ignored --nocapture
 //! ```
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use common::{engine_cwd_with_eval_dir, eval_dir};
 use yorkie_state::{Move, Position, parse_usi_move};
 
 /// Default soak duration when `SOAK_SECS` is unset (~10 minutes).
@@ -47,10 +55,6 @@ const MAX_PLIES_PER_GAME: usize = 256;
 
 /// Fischer time control sent every move: 300 ms on the clock + 200 ms increment.
 const TC_GO: &str = "go btime 300 wtime 300 binc 200 winc 200";
-
-fn eval_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../eval")
-}
 
 fn legal_moves(p: &Position) -> Vec<Move> {
     let mut moves = Vec::new();
@@ -73,9 +77,10 @@ struct Session {
 }
 
 impl Session {
-    fn start() -> Option<Session> {
+    fn start(cwd: &std::path::Path) -> Option<Session> {
         let exe = env!("CARGO_BIN_EXE_yorkie");
         let mut child: Child = Command::new(exe)
+            .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -135,6 +140,13 @@ impl Session {
 #[test]
 #[ignore = "long-running multi-thread soak; run explicitly on the dev VM"]
 fn threads2_self_play_soak_stays_legal_and_stable() {
+    if yorkie_protocol::config::THREADS < 2 {
+        eprintln!(
+            "skipping threads2_self_play_soak_stays_legal_and_stable: this build compiled in {} worker(s); build with a config whose `threads` is at least 2",
+            yorkie_protocol::config::THREADS
+        );
+        return;
+    }
     let dir = eval_dir();
     if !dir.join("nn.bin").exists() {
         eprintln!(
@@ -150,21 +162,16 @@ fn threads2_self_play_soak_stays_legal_and_stable() {
         .unwrap_or(DEFAULT_SOAK_SECS);
     let deadline = Instant::now() + Duration::from_secs(soak_secs);
 
-    let mut sess = Session::start().expect("engine session");
+    let cwd = engine_cwd_with_eval_dir(&dir);
+    let mut sess = Session::start(&cwd).expect("engine session");
 
     send(&mut sess.stdin, "usi");
     sess.read_until(|l| l == "usiok");
-    let eval_dir_arg = dir.to_str().expect("utf-8 eval dir");
-    send(
-        &mut sess.stdin,
-        &format!("setoption name EvalDir value {eval_dir_arg}"),
-    );
-    send(&mut sess.stdin, "setoption name Threads value 2");
     send(&mut sess.stdin, "isready");
     let ack = sess.read_until(|l| l == "readyok" || l.starts_with("info string eval load failed"));
     assert_eq!(
         ack, "readyok",
-        "real network must load at Threads=2; got a load failure instead"
+        "real network must load; got a load failure instead"
     );
 
     let mut games = 0usize;

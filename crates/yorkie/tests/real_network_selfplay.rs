@@ -7,7 +7,8 @@
 //! the default `cargo test` run stays green everywhere — the same skip pattern
 //! `yorkie-eval` and `yorkie-search`'s integration tests use.
 //!
-//! When present, it spawns the engine, loads the network via `EvalDir`, and
+//! When present, it spawns the engine in a working directory whose `EvalDir`
+//! links to the staged network (see [`common::engine_cwd_with_eval_dir`]) and
 //! drives a ~40-ply self-play loop over one live USI session: `position
 //! startpos moves <accumulated>` + `go depth 1`, reusing the session. Every
 //! `bestmove` must be legal for the running position, the process must never
@@ -23,17 +24,15 @@
 
 #![cfg(feature = "usi-extras")]
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
+use common::{engine_cwd_with_eval_dir, eval_dir};
 use yorkie_state::{Move, Position, parse_usi_move};
 
 const MAX_PLIES: usize = 40;
-
-fn eval_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../eval")
-}
 
 /// Read child stdout lines until one satisfies `pred`; returns the matched
 /// (trimmed) line, or `None` on EOF.
@@ -77,6 +76,7 @@ fn real_network_self_play_stays_legal_and_exits_cleanly() {
 
     let exe = env!("CARGO_BIN_EXE_yorkie");
     let mut child: Child = Command::new(exe)
+        .current_dir(engine_cwd_with_eval_dir(&dir))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -88,11 +88,6 @@ fn real_network_self_play_stays_legal_and_exits_cleanly() {
 
     send(&mut stdin, "usi\n");
     read_until(&mut stdout, |l| l == "usiok").expect("usiok before EOF");
-    let eval_dir_arg = dir.to_str().expect("utf-8 eval dir");
-    send(
-        &mut stdin,
-        &format!("setoption name EvalDir value {eval_dir_arg}\n"),
-    );
     send(&mut stdin, "isready\n");
     let ack = read_until(&mut stdout, |l| {
         l == "readyok" || l.starts_with("info string eval load failed")
