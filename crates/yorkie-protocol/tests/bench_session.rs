@@ -16,6 +16,11 @@
 //! `src/driver.rs::tests::bench_is_an_unknown_command_without_usi_extras`, both
 //! compiled only when the feature is OFF; run `cargo nextest run -p
 //! yorkie-protocol` (default features) to execute them.
+//!
+//! The `bench:` summary line is the command's result, not a diagnostic, so it is
+//! emitted in every `usi-extras` build and asserted unconditionally here. The
+//! argument-rejection lines ARE diagnostics and are asserted only under
+//! `info-diag`.
 
 #![cfg(feature = "usi-extras")]
 
@@ -77,21 +82,27 @@ fn bare_bench_runs_the_four_default_positions() {
     );
 }
 
+/// An argument rejection is a diagnostic, so the line that names it is
+/// `info-diag`. What "loudly" protects — that a bad argument runs no positions
+/// rather than benching something else — is asserted in every build.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn garbage_argument_fails_loudly_without_panicking() {
     // A non-integer TT size is a loud parse error, not a panic and not a search.
     let out = drive("bench notanumber\nquit\n");
-    assert!(
-        out.contains("info string bench: invalid ttSizeMB"),
-        "expected a loud parse error:\n{out}"
-    );
+    if cfg!(feature = "info-diag") {
+        assert!(
+            out.contains("info string bench: invalid ttSizeMB"),
+            "expected a loud parse error:\n{out}"
+        );
+    }
     assert!(
         !out.contains("bench: positions="),
         "a parse error runs no positions:\n{out}"
     );
 }
 
+#[cfg(feature = "info-diag")]
 #[cfg_attr(miri, ignore)]
 #[test]
 fn unsupported_limit_type_fails_loudly() {

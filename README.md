@@ -48,19 +48,29 @@ cargo build --release
   `-C target-cpu=native` を適用します。生成されるバイナリはビルドしたマシンの
   CPU に最適化されるため、実行するマシン上でビルドしてください。
 
-既定でオフの Cargo feature が 2 つあります。互いに独立で、併用もできます。
+既定でオフの Cargo feature が 4 つあります。互いに独立で、併用もできます
+（`info-output` だけは `info-diag` を含みます）。
 
 | feature | 効果 |
 | --- | --- |
 | `usi-extras` | 対局では使わない USI コマンド（`bench`、`tt` 系、`go` の解析用指定）を有効にする |
 | `tt-entry16` | 置換表のエントリを 10 バイトから 16 バイトに広げ、増えた分をすべてキーに充てる（下位 16 ビットではなく 64 ビットのハッシュ全体を保持するので、局面の同一性判定が厳密になる）。クラスタは 32 バイトのままなので 1 クラスタあたりのエントリ数は 3 から 2 に減る |
+| `info-diag` | 受け付けられない入力（認識できないコマンド、不正な `position`、対局では使わない `go` の指定）や定跡ファイルの異常があったとき、その旨を `info string` で報告する。この feature を指定しないビルドは同じ状況でも何も出力しない（入力への対処自体は変わらない） |
+| `info-output` | 探索の経過と結果を伝える `info` 行（反復深化ごとの PV、`bestmove` 直前の最終 PV、定跡ヒット時の multipv ブロック）を出力する。`info-diag` も含む |
 
 ```bash
 cargo build --release -F usi-extras,tt-entry16
+cargo build --release -F usi-extras,info-output   # 解析・計測用ビルド
 ```
 
 `tt-entry16` は置換表のヒットの仕方が変わるため、探索の出力が既定ビルドとも参照
 実装とも一致しなくなります。
+
+既定ビルド（feature なし）の探索出力は `bestmove` だけです。`isready` の初期化
+フェーズで出る `info string`（評価関数の読み込み失敗、定跡の読み込み報告、
+`Using N threads`、NUMA と置換表の確保報告）はどのビルドでも必ず出力されます
+——起動に失敗したときの唯一の手がかりだからです。gate されるのは出力だけで、
+探索の挙動もノード数も 3 つのビルドで同一です。
 
 エンジンは USI プロトコルを標準入力／標準出力で話します。引数なしで起動すると
 USI のイベントループに入ります。
@@ -113,6 +123,15 @@ YORKIE_CONFIG=configs/test.toml cargo build --release  # こちらを読む
   ```bash
   YORKIE_CONFIG=configs/test-limits.toml cargo nextest run -p yorkie-protocol --all-features
   ```
+
+feature を 1 つも指定しない既定ビルド（対局用バイナリそのもの）でしか走らないテスト
+——対局では使わない `go` の指定を受け取っても探索を開始しないこと、および
+探索中に `info` 行を 1 行も出さないことの確認——もあります。
+こちらは feature 指定なしで走らせます。
+
+```bash
+YORKIE_CONFIG=configs/test.toml cargo nextest run -p yorkie-protocol
+```
 
 TOML はフラットな `key = value` の並びで、キーの集合・型・範囲がすべてビルド時に
 検証されます。キーの過不足、型違い、範囲外の値、読めないファイルはいずれも
@@ -258,7 +277,7 @@ TOML ファイルを参照してください。
 | `usinewgame` | 新規対局の開始（出力なし） |
 | `position [startpos \| sfen <SFEN>] [moves <手> …]` | 局面を設定する |
 | `go [btime <ms>] [wtime <ms>] [binc <ms>] [winc <ms>] [byoyomi <ms>] [ponder]` | 探索を開始し `bestmove` を返す。対局で使う持ち時間系の指定はすべて既定ビルドで有効 |
-| `go depth <d>` / `go nodes <n>` / `go mate [ms\|infinite]` / `go movetime <ms>` / `go infinite` / `go rtime <ms>` | 対局では使わない探索指定。`usi-extras` feature を指定したビルドでのみ有効。既定ビルドでは `info string go error: …` を出力して探索を開始しない |
+| `go depth <d>` / `go nodes <n>` / `go mate [ms\|infinite]` / `go movetime <ms>` / `go infinite` / `go rtime <ms>` | 対局では使わない探索指定。`usi-extras` feature を指定したビルドでのみ有効。`usi-extras` を指定しないビルドでは、このコマンドを丸ごと実行しない（探索を開始しない。既定では何も出力せず、`info-diag` を有効にしたビルドでは `info string go error: …` で報告される） |
 | `stop` | 探索を停止する |
 | `ponderhit` | 先読みが的中したことを通知する |
 | `gameover` | 対局終了 |
@@ -266,11 +285,19 @@ TOML ファイルを参照してください。
 | `bench [ttSizeMB] [threads] [limit] [default\|current\|<fenFile>] [limitType]` | 固定条件での NPS 計測。引数はすべて省略可で、左から順に既定値（`ttSizeMB=1024`, `threads=1`, `limit=15000`, ソース `default`, `limitType=movetime`）で埋められる。`usi-extras` feature を指定したビルドでのみ有効 |
 | `tt store` / `tt probe` / `tt children` | 置換表を読み書きするコマンド。`usi-extras` feature を指定したビルドでのみ有効（`tt-entry16` と併用した場合は 16 バイトエントリの置換表を読み書きする） |
 
-認識できないコマンドを受け取った場合は `info string unknown command: <入力行>` を
-出力して読み飛ばします。`usi-extras` を指定しない既定ビルドでは `bench` と `tt` は
-コマンドとして存在しないため、この経路で読み飛ばされます。`usi-extras` の有効時のみ
-組み込まれる `go` の指定だけは、`go` 自体が対局用コマンドであるため読み飛ばさず、
-`info string go error: …` を出力して探索を開始しません。
+認識できないコマンドを受け取った場合は読み飛ばします。`usi-extras` を指定
+しない既定ビルドでは `bench` と `tt` はコマンドとして存在しないため、この
+経路で読み飛ばされます。`usi-extras` の有効時のみ組み込まれる `go` の指定を
+受け取った場合は、指定の一部だけを適用すると探索の条件が黙って変わって
+しまうため、その `go` コマンドを丸ごと実行せず、探索を開始しません。
+
+これらの状況で何が起きたかを出力するのは、`info-diag`（または `info-diag`
+を含む `info-output`）を指定したビルドだけです（`info string unknown
+command: <入力行>` や `info string go error: …` の通知行）。この feature を
+指定しないビルドは同じ状況でも何も出力しませんが、入力への対処自体はどの
+ビルドでも同じです。`tt` 系の応答と `bench` の集計行はコマンドの応答その
+ものなので、`usi-extras` を指定していれば `info` 系 feature に関わらず出力
+されます。
 
 コマンドライン用のサブコマンドとして、perft（指し手生成の数え上げ）も利用できます
 （[`crates/yorkie/src/main.rs`](crates/yorkie/src/main.rs)）。

@@ -29,7 +29,12 @@
 //! under the `--all-features` gate. See the `usi-extras` reference
 //! documentation.
 
-#![cfg(feature = "usi-extras")]
+//!
+//! **`info-output` gate.** Every assertion here reads the per-iteration
+//! `info depth …` lines, which only an `info-output` build emits, so the file is
+//! gated on that feature too. `--all-features` carries both.
+
+#![cfg(all(feature = "usi-extras", feature = "info-output"))]
 
 mod common;
 

@@ -4,6 +4,11 @@
 //! build has a runtime option surface, so there is no `option name ...` line to
 //! advertise — every setting was compiled in from the TOML config. The golden is
 //! exact, so a stray option line fails.
+//!
+//! The `isready` load-failure notice is asserted unconditionally on purpose: it
+//! belongs to the initialisation phase, which no `info` feature gates. The
+//! unknown-command and too-long lines are diagnostics and go through
+//! [`diag_line`], so this file pins the whole handshake surface in every build.
 
 use std::sync::{Arc, Mutex};
 
@@ -15,6 +20,17 @@ fn drive(input: &str) -> String {
     driver.run().expect("driver run");
     let bytes = output.lock().expect("output lock").clone();
     String::from_utf8(bytes).expect("utf-8")
+}
+
+/// The transcript a diagnostic `info string <body>` contributes in this build —
+/// nothing without `info-diag`. (This file predates `tests/common`, and keeps
+/// its own two-line harness so the handshake golden depends on nothing else.)
+fn diag_line(body: &str) -> String {
+    if cfg!(feature = "info-diag") {
+        format!("info string {body}\n")
+    } else {
+        String::new()
+    }
 }
 
 /// Identity and `usiok`, nothing between them — in every build.
@@ -52,7 +68,7 @@ fn isready_without_network_reports_load_failure() {
 #[test]
 fn unknown_command_emits_info_string() {
     let out = drive("frobnicate\nquit\n");
-    assert_eq!(out, "info string unknown command: frobnicate\n");
+    assert_eq!(out, diag_line("unknown command: frobnicate"));
 }
 
 #[cfg_attr(miri, ignore)]
@@ -63,7 +79,7 @@ fn oversized_line_emits_command_too_long() {
     input.push('\n');
     input.push_str("quit\n");
     let out = drive(&input);
-    assert_eq!(out, "info string command too long\n");
+    assert_eq!(out, diag_line("command too long"));
 }
 
 /// `setoption` is the USI minimum: the line is consumed, nothing is emitted, and

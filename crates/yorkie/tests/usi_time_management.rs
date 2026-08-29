@@ -17,7 +17,12 @@
 //! builds and tests with `--all-features`, so this runs there. See the
 //! `usi-extras` reference documentation.
 
-#![cfg(feature = "usi-extras")]
+//!
+//! **`info-output` gate.** Every assertion reads the search `info depth …` line
+//! (its `nodes` and `score` fields), which only an `info-output` build emits, so
+//! the file is gated on that feature too. `--all-features` carries both.
+
+#![cfg(all(feature = "usi-extras", feature = "info-output"))]
 
 mod common;
 

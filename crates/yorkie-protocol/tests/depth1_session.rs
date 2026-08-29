@@ -28,8 +28,12 @@
 //! rather than reinterprets, so the whole file is gated on the feature and runs
 //! under the `--all-features` gate. See the `usi-extras` reference
 //! documentation.
+//!
+//! **`info-output` gate.** The fixture comparison reads the depth-1 `info` line
+//! (its `nodes` and `score` fields), which only an `info-output` build emits, so
+//! the file is gated on that feature too. `--all-features` carries both.
 
-#![cfg(feature = "usi-extras")]
+#![cfg(all(feature = "usi-extras", feature = "info-output"))]
 
 mod common;
 

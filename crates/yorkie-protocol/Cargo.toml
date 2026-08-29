@@ -39,9 +39,32 @@ serde_json = "~1.0"
 # crate's session tests can `cfg` on it. The two are independent and compose:
 # a `usi-extras,tt-entry16` build has the whole `tt` command family operating on
 # the wide table. Off by default.
+#
+# `info-diag` / `info-output` are the two `info`-line features. The default build
+# emits NO `info` line at all except the `isready`/initialisation-phase
+# `info string`s (the eval-load failure, the loader warnings, the book load
+# reports, `Using N threads`, the NUMA / TT allocation reports) — those are how a
+# failed startup is diagnosed and are unconditional in every build. On top of
+# that:
+#
+#   - `info-diag` restores the diagnostic `info string` lines emitted OUTSIDE the
+#     initialisation phase: unknown command, `command too long`, the `position`
+#     rejections, the `go`-clause refusal, `Error! : MaxMovesToDraw is too
+#     small.`, the book-probe notices, the `bench` argument rejections.
+#   - `info-output` restores the search `info` lines (per-iteration / fail-high-low
+#     PV, the final PV, the book hit's multipv block) byte-for-byte, and implies
+#     `info-diag`.
+#
+# The `tt` command family and the `bench` summary line are NOT diagnostics: they
+# are the response payload of a `usi-extras` command — a `tt probe` that printed
+# nothing would be a command with no output — so they ride on `usi-extras` alone.
+#
+# Enabling both features explicitly is the same build as `info-output` alone.
 [features]
 usi-extras = []
 tt-entry16 = ["yorkie-search/tt-entry16", "yorkie-storage/tt-entry16"]
+info-diag = []
+info-output = ["info-diag"]
 
 [lints]
 workspace = true

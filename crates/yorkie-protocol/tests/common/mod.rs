@@ -235,6 +235,21 @@ fn fixture_root(tag: &str) -> PathBuf {
     target.join(format!("usi-session-fixtures-{tag}"))
 }
 
+/// The transcript a diagnostic `info string <body>` contributes in THIS build:
+/// the line itself with `info-diag`, the empty string without it.
+///
+/// The default (tournament) build emits no `info` line outside the `isready`
+/// initialisation phase, so a session test that pins bytes composes its
+/// expectation through this helper and stays byte-exact in both builds instead
+/// of being asserted in only one of them.
+pub fn diag_line(body: &str) -> String {
+    if cfg!(feature = "info-diag") {
+        format!("info string {body}\n")
+    } else {
+        String::new()
+    }
+}
+
 pub fn bestmove_lines(out: &str) -> Vec<&str> {
     out.lines()
         .filter_map(|l| l.strip_prefix("bestmove "))

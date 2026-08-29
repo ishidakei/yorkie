@@ -32,6 +32,16 @@ impl<'w, W: Write + ?Sized> Formatter<'w, W> {
         self.line(format_args!("info string {msg}"))
     }
 
+    /// Emit one `info string <body>` line from pre-composed format arguments.
+    ///
+    /// The lazy form of [`Self::info_string`]: the caller passes `format_args!`
+    /// instead of a `String`, so an interpolated message costs no allocation —
+    /// and a build whose sink drops the line (the `info-diag` gate in
+    /// [`crate::driver`]) never formats it at all.
+    pub fn info_string_fmt(&mut self, body: std::fmt::Arguments<'_>) -> io::Result<()> {
+        self.line(format_args!("info string {body}"))
+    }
+
     /// Emit a generic `info <body>` line. The caller composes everything after
     /// the `info ` keyword (e.g. `depth 1 score cp 12 nodes 30 pv 7g7f`); the
     /// search-progress reports the driver relays go through here.

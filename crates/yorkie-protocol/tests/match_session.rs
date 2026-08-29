@@ -14,27 +14,36 @@
 //! `cargo nextest run -p yorkie-protocol` (default features, i.e. without
 //! `--all-features`) to execute it.
 //!
+//! The diagnostic lines here are composed through `common::diag_line`, so the
+//! transcripts stay byte-exact under `info-diag` and without it — a default
+//! build refuses the same commands and starts the same searches, it just says
+//! nothing about it. What a game can see either way is the `bestmove` lines.
+//!
 //! No network is loaded, so every `go` resolves through the no-eval path — the
 //! one search outcome that is deterministic to the byte. The handshake itself is
 //! pinned separately in `tests/handshake.rs`.
 
 mod common;
 
-use common::drive;
+use common::{diag_line, drive};
 
 /// The play part of a game-shaped session, byte-for-byte. Same expectation with
-/// the feature on and off.
+/// `usi-extras` on and off.
 ///
 /// This is the transcript that must never move: from `usinewgame` onward, the
 /// two builds emit the same bytes, and the compile-time configuration changed
 /// none of them. The handshake in front of it — where the builds legitimately
 /// differ — is pinned separately by [`whole_session_including_the_handshake`]
 /// below and by `tests/handshake.rs`.
-const PLAY_OUTPUT: &str = "\
-info string no eval network loaded; run isready\n\
-bestmove resign\n\
-info string no eval network loaded; run isready\n\
-bestmove resign\n";
+///
+/// The no-network notice is a diagnostic, so it is present exactly when
+/// `info-diag` is: without it the two `go`s answer `bestmove resign` and say
+/// nothing else. The `bestmove` lines themselves are unconditional in every
+/// build — that is the point of the gate.
+fn play_output() -> String {
+    let notice = diag_line("no eval network loaded; run isready");
+    format!("{notice}bestmove resign\n{notice}bestmove resign\n")
+}
 
 /// The commands behind [`PLAY_OUTPUT`], minus the terminating `quit`.
 const PLAY_SESSION: &str = "\
@@ -49,7 +58,7 @@ gameover lose\n";
 #[cfg_attr(miri, ignore)]
 #[test]
 fn match_shaped_session_is_byte_identical() {
-    assert_eq!(drive(&format!("{PLAY_SESSION}quit\n")), PLAY_OUTPUT);
+    assert_eq!(drive(&format!("{PLAY_SESSION}quit\n")), play_output());
 }
 
 /// The same session with the handshake a bridge actually sends in front of it:
@@ -73,7 +82,8 @@ fn whole_session_including_the_handshake() {
             "id name Yorkie 3.1.0\n\
              id author Kei Ishida <ishida.kei@gmail.com>\n\
              usiok\n\
-             {PLAY_OUTPUT}"
+             {}",
+            play_output()
         )
     );
 }
@@ -91,28 +101,27 @@ fn go_ponder_and_ponderhit_are_match_commands() {
         quit\n";
     assert_eq!(
         drive(session),
-        "info string no eval network loaded; run isready\n\
-         bestmove resign\n"
+        format!(
+            "{}bestmove resign\n",
+            diag_line("no eval network loaded; run isready")
+        )
     );
 }
 
 /// The default build: the non-match commands are gone, and they go out loudly.
 #[cfg(not(feature = "usi-extras"))]
 mod without_usi_extras {
-    use super::drive;
+    use super::{diag_line, drive};
 
     /// `bench` is not a command token at all — it lands in the ordinary
     /// unknown-command path, exactly as `tt` does.
     #[cfg_attr(miri, ignore)]
     #[test]
     fn bench_is_an_unknown_command() {
-        assert_eq!(
-            drive("bench\nquit\n"),
-            "info string unknown command: bench\n"
-        );
+        assert_eq!(drive("bench\nquit\n"), diag_line("unknown command: bench"));
         assert_eq!(
             drive("bench 16 1 6 default depth\nquit\n"),
-            "info string unknown command: bench 16 1 6 default depth\n"
+            diag_line("unknown command: bench 16 1 6 default depth")
         );
     }
 
@@ -133,15 +142,14 @@ mod without_usi_extras {
             let name = clause.split_whitespace().next().expect("clause name");
             assert_eq!(
                 drive(&format!("position startpos\ngo {clause}\nquit\n")),
-                format!(
-                    "info string go error: `{name}` requires a usi-extras build; \
-                     no search started\n"
-                ),
+                diag_line(&format!(
+                    "go error: `{name}` requires a usi-extras build; no search started"
+                )),
             );
         }
         assert_eq!(
             drive("position startpos\ngo infinite\nquit\n"),
-            "info string go error: `infinite` requires a usi-extras build; no search started\n"
+            diag_line("go error: `infinite` requires a usi-extras build; no search started")
         );
     }
 
@@ -152,7 +160,7 @@ mod without_usi_extras {
     fn a_gated_clause_poisons_the_whole_go_line() {
         assert_eq!(
             drive("go btime 60000 wtime 60000 depth 4\nquit\n"),
-            "info string go error: `depth` requires a usi-extras build; no search started\n"
+            diag_line("go error: `depth` requires a usi-extras build; no search started")
         );
     }
 
@@ -169,9 +177,11 @@ mod without_usi_extras {
             quit\n";
         assert_eq!(
             drive(session),
-            "info string go error: `depth` requires a usi-extras build; no search started\n\
-             info string no eval network loaded; run isready\n\
-             bestmove resign\n"
+            format!(
+                "{}{}bestmove resign\n",
+                diag_line("go error: `depth` requires a usi-extras build; no search started"),
+                diag_line("no eval network loaded; run isready"),
+            )
         );
     }
 }

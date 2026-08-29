@@ -14,7 +14,12 @@
 //! under the `--all-features` gate. See the `usi-extras` reference
 //! documentation.
 
-#![cfg(feature = "usi-extras")]
+//!
+//! **`info-diag` gate.** The cycle is verified through the per-`go` no-network
+//! notice, a diagnostic line only an `info-diag` build emits, so the file is
+//! gated on that feature too. `--all-features` carries both.
+
+#![cfg(all(feature = "usi-extras", feature = "info-diag"))]
 
 use std::sync::{Arc, Mutex};
 

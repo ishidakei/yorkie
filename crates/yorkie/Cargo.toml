@@ -26,9 +26,18 @@ serde_json = "~1.0"
 # `tt-entry16` reaches the Storage-layer 16-byte TT entry the same way. It is
 # likewise off by default — without it a build keeps the reference's 10-byte
 # entry — and it composes with `usi-extras` rather than excluding it.
+# `info-diag` / `info-output` reach the Protocol-layer `info`-line features the
+# same way. Both are off by default: the tournament binary's only search output
+# is `bestmove`, and the only `info string`s it can print are the
+# initialisation-phase ones, which no feature gates. `info-output` implies
+# `info-diag` (declared in `yorkie-protocol`), and any measurement build — the
+# one that reads `nodes` / `nps` back out of the transcript — wants
+# `usi-extras,info-output`.
 [features]
 usi-extras = ["yorkie-protocol/usi-extras"]
 tt-entry16 = ["yorkie-protocol/tt-entry16"]
+info-diag = ["yorkie-protocol/info-diag"]
+info-output = ["yorkie-protocol/info-output"]
 
 [lints]
 workspace = true

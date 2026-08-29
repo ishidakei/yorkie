@@ -19,8 +19,12 @@
 //! (`depth` / `mate`), which a default build refuses rather than reinterprets, so
 //! the whole file is gated on the feature and runs under the `--all-features`
 //! gate. See the `usi-extras` reference documentation.
+//!
+//! **`info-output` gate.** The score assertions read the search `info … score`
+//! line, which only an `info-output` build emits, so the file is gated on that
+//! feature too. `--all-features` carries both.
 
-#![cfg(feature = "usi-extras")]
+#![cfg(all(feature = "usi-extras", feature = "info-output"))]
 
 mod common;
 

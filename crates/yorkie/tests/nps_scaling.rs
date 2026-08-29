@@ -28,7 +28,13 @@
 //! builds and tests with `--all-features`, so this runs there. See the
 //! `usi-extras` reference documentation.
 
-#![cfg(feature = "usi-extras")]
+//!
+//! **`info-output` gate.** This is an NPS measurement payload: it reads `nodes`
+//! back out of the engine's transcript, so it is built with `info-output` — the
+//! feature under which the whole measurement surface (per-iteration `info` lines
+//! included) is the one a bench round reports on. `--all-features` carries both.
+
+#![cfg(all(feature = "usi-extras", feature = "info-output"))]
 
 mod common;
 
