@@ -20,13 +20,9 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Per-machine agent settings, rendered at provision time and never committed.
-# Matched by basename at any depth on purpose: this file ships in the public
-# snapshot, and a surviving file must not name a path the export removes.
+# Per-machine local tool settings, written by the developer's environment and
+# never committed.
 settings.local.json
-
-# Terraform crash dumps, wherever they land.
-crash.log
 
 # Evaluation network files placed at the repository root. `nn.bin` is obtained
 # out-of-band and must never be committed.

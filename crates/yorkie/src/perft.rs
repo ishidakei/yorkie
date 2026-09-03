@@ -1,5 +1,5 @@
 //! Perft: total number of leaf nodes reachable from a position at exactly
-//! `depth` plies of legal play. Used as a parity gate against the reference
+//! `depth` plies of legal play. Used as a parity check against the reference
 //! engine — see `crates/yorkie/tests/parity/perft.rs`.
 
 use yorkie_state::{Move, Position};

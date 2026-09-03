@@ -1,37 +1,25 @@
-//! Depth-8 search parity gate.
+//! Depth-8 search parity test.
 //!
-//! Runs the `go depth 8` root search ([`QSearch::run_root`]) — real iterative
-//! deepening (iterations 1..8), real aspiration windows, and the root move loop
-//! recursing into the ported interior `search<PV/NonPV>` — against the
-//! reference-captured fixtures under `tests/fixtures/search-depth8/` and asserts
-//! **bestmove, score, and nodes** exactly, each fixture an inseparable triple.
+//! Runs the `go depth 8` root search ([`QSearch::run_root`]) against the
+//! reference-captured fixtures under `tests/fixtures/search-depth8/` and
+//! asserts **bestmove, score, and nodes** as one inseparable set. `nodes` is
+//! cumulative over the whole `go`, so the test transitively pins the depth-1..7
+//! iterations too.
 //!
-//! `nodes` is cumulative over the whole `go` (every iteration 1..8 and every
-//! aspiration re-search), and the `(nodes & 14)` root tie-break means a single
-//! node of drift can flip the bestmove — so all three are asserted together.
-//! The cumulative gate transitively pins the depth-1..7 iterations too.
-//!
-//! Depth 8 is the first depth that exercises the singular-extension family end to
-//! end (its guard `!rootNode && depth >= 6 + ss->ttPv` fires directly at interior
-//! nodes, not only through LMR re-search deepening as at depth 5): the singular
-//! search, multi-cut pruning, double/triple-margin extensions, and negative
-//! extensions. It also newly exercises internal iterative reduction (`depth >= 6`,
-//! including the `priorReduction <= 3` term) and the `depth > 5` disjunct of the
-//! non-PV early TT cutoff.
+//! Depth 8 is the first depth at which the singular guard fires directly at
+//! interior nodes rather than only through LMR re-search deepening, so it is
+//! the first to exercise the singular family end to end. It also newly reaches
+//! internal iterative reduction and the `depth > 5` disjunct of the non-PV
+//! early TT cutoff.
 //!
 //! The fixtures were captured with Threads=1, no book, `usinewgame` before each
-//! position, `go depth 8`, USI_Hash default 1024 MiB, FV_SCALE 16 — reproduced
-//! here by resizing the transposition table to 1024 MiB, clearing it per fixture
-//! (the `usinewgame` equivalent), and letting `run_root` bump the generation.
-//!
-//! Like the other real-network tests, this is skipped with a notice when
-//! `nn.bin` is absent (a checkout without it staged), so the default
-//! `cargo test` run stays green everywhere `nn.bin` is not staged.
+//! position, USI_Hash 1024 MiB and FV_SCALE 16, reproduced here. Skipped with a
+//! notice when `nn.bin` is absent.
 //!
 //! ## What `startpos` at depth 8 is sensitive to
 //!
 //! Two whole-engine invariants show up here and nowhere shallower, so this
-//! fixture is the gate that catches either of them regressing:
+//! fixture is the test that catches either of them regressing:
 //!
 //! 1. **Zobrist aliasing (observable from depth 2).** The hash-indexed pawn
 //!    history (`pawnHistory`, 8192 planes) and the correction histories alias by
@@ -67,7 +55,7 @@ const PAWN_VALUE: i32 = 90;
 const HASH_MB: usize = 1024;
 
 /// All six fixtures the ported search matches exactly at depth 8. Every one
-/// gates `bestmove` / `score` / `nodes` hard.
+/// pins `bestmove` / `score` / `nodes` exactly.
 const FIXTURES: &[&str] = &[
     "startpos.json",
     "drop-heavy.json",
@@ -141,8 +129,8 @@ fn is_decisive(v: i32) -> bool {
 }
 
 /// Format a search value the way the reference USI layer does (`score.cpp` /
-/// `usi.cpp` `format_score`): a mate distance for decisive scores, else
-/// `100 * v / PawnValue` centipawns (C++ truncating division).
+/// `usi.cpp` `format_score`): a mate distance for decisive scores, else `100 *
+/// v / PawnValue` centipawns (C++ truncating division).
 fn format_score(v: i32) -> ScoreJson {
     if is_decisive(v) {
         let distance = VALUE_MATE - v.abs();
@@ -204,7 +192,7 @@ fn assert_fixture(name: &str, net: &yorkie_eval::NnueNetwork, tt: &mut Transposi
     }
 }
 
-/// All six fixtures gate `bestmove` / `score` / `nodes` hard, each an
+/// All six fixtures pin `bestmove` / `score` / `nodes` exactly, each an
 /// inseparable triple. Skipped with a notice when `nn.bin` is absent.
 #[cfg_attr(miri, ignore)]
 #[test]
@@ -212,7 +200,7 @@ fn depth8_search_matches_reference_fixtures() {
     let path = nn_bin_path();
     if !path.exists() {
         eprintln!(
-            "skipping depth8_search_matches_reference_fixtures: {} is not present (staged only on the dev VM)",
+            "skipping depth8_search_matches_reference_fixtures: {} is not present (obtained out-of-band)",
             path.display()
         );
         return;

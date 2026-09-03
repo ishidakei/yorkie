@@ -1,18 +1,12 @@
 //! Multi-cycle session tests over `UsiDriver` with an in-memory byte sequence.
 //!
-//! These cover the driver's behaviour when **no** evaluation network is loaded
-//! (the default `EvalDir` has no `nn.bin` in the test CWD): the session must
-//! survive, `isready` must report the load failure, and every `go` must reply
-//! `bestmove resign` with the no-network notice rather than crashing. The
-//! positive play path — search-chosen legal moves — is covered by
-//! `tests/eval_session.rs` (synthetic network) and `tests/real_network_selfplay`
-//! (the real `nn.bin`).
+//! These cover the driver's behaviour when **no** evaluation network is loaded:
+//! the session must survive, `isready` must report the load failure, and every
+//! `go` must reply `bestmove resign` with the no-network notice rather than
+//! crashing.
 //!
-//! **`usi-extras` gate.** These sessions drive the analysis-only `go` clauses
-//! (`depth` / `nodes` / `movetime` / `infinite`), which a default build refuses
-//! rather than reinterprets, so the whole file is gated on the feature and runs
-//! under the `--all-features` gate. See the `usi-extras` reference
-//! documentation.
+//! Gated on `usi-extras`: these sessions drive analysis-only `go` clauses, which
+//! a default build refuses rather than reinterprets.
 
 //!
 //! **`info-diag` gate.** The cycle is verified through the per-`go` no-network

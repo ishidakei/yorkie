@@ -1,39 +1,20 @@
-//! Depth-3 search parity gate (blocking).
+//! Depth-3 search parity test.
 //!
 //! Runs the `go depth 3` root search ([`QSearch::run_root`]) — real iterative
-//! deepening (iterations 1..3), real aspiration windows, and the root move loop
-//! recursing into the ported interior `search<PV/NonPV>` — against the six
-//! reference-captured fixtures under `tests/fixtures/search/` and asserts that
-//! **bestmove, score, and nodes** match exactly.
+//! deepening, real aspiration windows, and the root move loop recursing into
+//! the ported interior `search<PV/NonPV>` — against the six
+//! reference-captured fixtures under `tests/fixtures/search/` and asserts
+//! **bestmove, score, and nodes** as one inseparable set.
 //!
-//! `nodes` is cumulative over the whole `go` (every iteration and every
-//! aspiration re-search), and the `(nodes & 14)` root tie-break means a single
-//! node of drift can flip the bestmove — so for all six fixtures the three are
-//! asserted together as one inseparable set.
-//!
-//! ## `sennichite`: game-history repetition
-//!
-//! `sennichite.json` is captured with a 12-ply `moves` prefix that walks both
-//! kings back and forth, so the search root has already occurred earlier in the
-//! **game history**. Detecting that (a forced fourfold whose earlier occurrences
-//! lie before the search root — the negative-`st->repetition` path in the
-//! reference's `Position::is_repetition`) requires the `pliesFromNull` /
-//! incremental repetition machinery this port carries.
-//! `Position::is_repetition` reads the precomputed `repetition` chain that
-//! spans the whole `do_move` history (the `moves` prefix included) and reports
-//! the forced fourfold regardless of search ply, so the three nodes the
-//! reference prunes there are pruned here too and `sennichite` gates `nodes`
-//! hard like the other five fixtures. A ply-limited repetition check would show
-//! up as exactly that three-node surplus.
+//! `sennichite.json` carries a 12-ply `moves` prefix walking both kings back
+//! and forth, so its search root has already occurred earlier in the *game
+//! history*. Detecting that forced fourfold needs the `plies_from_null` /
+//! incremental repetition chain spanning the whole `do_move` history; a
+//! ply-limited repetition check would show up as a three-node surplus.
 //!
 //! The fixtures were captured with Threads=1, no book, `usinewgame` before each
-//! position, `go depth 3`, USI_Hash default 1024 MiB — reproduced here by
-//! resizing the transposition table to 1024 MiB, clearing it per fixture (the
-//! `usinewgame` equivalent), and letting `run_root` bump the generation.
-//!
-//! Like the other real-network tests, this is skipped with a notice when
-//! `nn.bin` is absent (a checkout without it staged), so the default
-//! `cargo test` run stays green everywhere.
+//! position and USI_Hash 1024 MiB, reproduced here. Skipped with a notice when
+//! `nn.bin` is absent.
 
 use std::path::PathBuf;
 
@@ -51,10 +32,9 @@ const PAWN_VALUE: i32 = 90;
 /// Engine default `USI_Hash` in MiB (`tests/fixtures/search/README.md`).
 const HASH_MB: usize = 1024;
 
-/// One fixture, plus whether its cumulative node count is gated hard. All six
-/// fixtures now gate `nodes` hard (`sennichite`'s game-history repetition delta
-/// closed with the incremental-repetition port); the flag is retained
-/// so a future fixture can opt into a soft node check if ever needed.
+/// One fixture, plus whether its cumulative node count is asserted exactly. All
+/// six fixtures assert `nodes`; the flag is the seam for a fixture whose exact
+/// count is not reproducible and needs a soft node check instead.
 struct Fixture {
     name: &'static str,
     gate_nodes: bool,
@@ -151,8 +131,8 @@ fn is_decisive(v: i32) -> bool {
 }
 
 /// Format a search value the way the reference USI layer does (`score.cpp` /
-/// `usi.cpp` `format_score`): a mate distance for decisive scores, else
-/// `100 * v / PawnValue` centipawns (C++ truncating division).
+/// `usi.cpp` `format_score`): a mate distance for decisive scores, else `100 *
+/// v / PawnValue` centipawns (C++ truncating division).
 fn format_score(v: i32) -> ScoreJson {
     if is_decisive(v) {
         let distance = VALUE_MATE - v.abs();
@@ -230,7 +210,7 @@ fn depth3_search_matches_reference_fixtures() {
     let path = nn_bin_path();
     if !path.exists() {
         eprintln!(
-            "skipping depth3_search_matches_reference_fixtures: {} is not present (staged only on the dev VM)",
+            "skipping depth3_search_matches_reference_fixtures: {} is not present (obtained out-of-band)",
             path.display()
         );
         return;

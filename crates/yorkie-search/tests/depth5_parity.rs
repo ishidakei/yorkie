@@ -1,38 +1,20 @@
-//! Depth-5 search parity gate.
+//! Depth-5 search parity test.
 //!
-//! Runs the `go depth 5` root search ([`QSearch::run_root`]) — real iterative
-//! deepening (iterations 1..5), real aspiration windows, and the root move loop
-//! recursing into the ported interior `search<PV/NonPV>` — against the six
-//! reference-captured fixtures under `tests/fixtures/search-depth5/` and asserts
-//! **bestmove, score, and nodes** exactly for all six, as one inseparable set.
-//!
-//! `nodes` is cumulative over the whole `go` (every iteration 1..5 and every
-//! aspiration re-search), and the `(nodes & 14)` root tie-break means a single
-//! node of drift can flip the bestmove — so all three are asserted together.
-//! The cumulative gate transitively pins the depth-1..4 iterations too.
-//!
-//! ## The singular-extension family is live at depth 5
+//! Runs the `go depth 5` root search ([`QSearch::run_root`]) against the six
+//! reference-captured fixtures under `tests/fixtures/search-depth5/` and
+//! asserts **bestmove, score, and nodes** as one inseparable set. `nodes` is
+//! cumulative over the whole `go`, so the test transitively pins the depth-1..4
+//! iterations too.
 //!
 //! The singular guard `!rootNode && depth >= 6 + ss->ttPv` looks unreachable
-//! from a depth-5 root, but an LMR re-search deepening chain does reach it:
-//! `startpos` at interior `ply 2, depth 6, ttPv=false` and `sennichite` at
-//! `ply 1, depth 6/7` and `ply 2, depth 6`. A port without the singular logic
-//! therefore diverges here, not only at the depth-8 tier.
-//!
-//! Depth 5 also activates the ProbCut reduced search (`prob_cut_depth == 1`) and
-//! the deeper null-move / futility / LMR regimes; `sennichite` additionally
-//! exercises the game-history repetition detection this port carries (the
-//! `pliesFromNull` / incremental `Position::is_repetition` chain that spans the
-//! `moves` prefix before the search root).
+//! from a depth-5 root, but an LMR re-search deepening chain does reach it, so
+//! a port without the singular logic diverges here and not only at depth 8.
+//! Depth 5 also activates the ProbCut reduced search and the deeper null-move /
+//! futility / LMR regimes.
 //!
 //! The fixtures were captured with Threads=1, no book, `usinewgame` before each
-//! position, `go depth 5`, USI_Hash default 1024 MiB, FV_SCALE 16 — reproduced
-//! here by resizing the transposition table to 1024 MiB, clearing it per fixture
-//! (the `usinewgame` equivalent), and letting `run_root` bump the generation.
-//!
-//! Like the other real-network tests, this is skipped with a notice when
-//! `nn.bin` is absent, so the default `cargo test` run stays green everywhere
-//! `nn.bin` is not staged.
+//! position, USI_Hash 1024 MiB and FV_SCALE 16, reproduced here. Skipped with a
+//! notice when `nn.bin` is absent.
 
 use std::path::PathBuf;
 
@@ -50,7 +32,7 @@ const PAWN_VALUE: i32 = 90;
 /// Engine default `USI_Hash` in MiB (`tests/fixtures/search-depth5/README.md`).
 const HASH_MB: usize = 1024;
 
-/// The six fixtures. Every one gates `bestmove` / `score` / `nodes` hard.
+/// The six fixtures. Every one pins `bestmove` / `score` / `nodes` exactly.
 const FIXTURES: &[&str] = &[
     "startpos.json",
     "drop-heavy.json",
@@ -124,8 +106,8 @@ fn is_decisive(v: i32) -> bool {
 }
 
 /// Format a search value the way the reference USI layer does (`score.cpp` /
-/// `usi.cpp` `format_score`): a mate distance for decisive scores, else
-/// `100 * v / PawnValue` centipawns (C++ truncating division).
+/// `usi.cpp` `format_score`): a mate distance for decisive scores, else `100 *
+/// v / PawnValue` centipawns (C++ truncating division).
 fn format_score(v: i32) -> ScoreJson {
     if is_decisive(v) {
         let distance = VALUE_MATE - v.abs();
@@ -187,7 +169,7 @@ fn assert_fixture(name: &str, net: &yorkie_eval::NnueNetwork, tt: &mut Transposi
     }
 }
 
-/// All six fixtures gate `bestmove` / `score` / `nodes` hard, as one
+/// All six fixtures pin `bestmove` / `score` / `nodes` exactly, as one
 /// inseparable set. Skipped with a notice when `nn.bin` is absent.
 #[cfg_attr(miri, ignore)]
 #[test]
@@ -195,7 +177,7 @@ fn depth5_search_matches_reference_fixtures() {
     let path = nn_bin_path();
     if !path.exists() {
         eprintln!(
-            "skipping depth5_search_matches_reference_fixtures: {} is not present (staged only on the dev VM)",
+            "skipping depth5_search_matches_reference_fixtures: {} is not present (obtained out-of-band)",
             path.display()
         );
         return;

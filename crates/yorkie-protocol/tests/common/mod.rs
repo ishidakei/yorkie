@@ -2,9 +2,8 @@
 //! format-valid) `nn.bin` builder, a temp-dir guard, an all-at-once `drive`,
 //! a `.ybb` writer, and a streaming input harness for async-hold tests.
 //!
-//! The synthetic-network builder mirrors `yorkie-eval/src/loader.rs` (the format
-//! ground truth) and `yorkie-eval/src/types.rs` (the dimensions); it is a copy of
-//! the helper in `tests/eval_session.rs` so book tests run hermetically too.
+//! The synthetic-network builder mirrors `yorkie-eval/src/loader.rs`, the format
+//! ground truth, and `yorkie-eval/src/types.rs`, the dimensions.
 
 #![allow(dead_code)]
 
@@ -23,13 +22,11 @@ const WRONG_CONFIG: &str = "this test requires the test config \
      — build with `YORKIE_CONFIG=configs/test.toml`";
 
 /// Assert that this build compiled in the three values the suite's pinned
-/// assertions were captured under (`configs/test.toml`: `usi_hash = 16`,
-/// `threads = 1`, `pv_interval = 0`).
+/// assertions were captured under.
 ///
 /// A test whose expected transcript only holds under those values calls this
 /// first, so a run that forgot `YORKIE_CONFIG` fails naming the fix rather than
-/// as an unexplained transcript mismatch. It never skips: a suite that quietly
-/// passed by running nothing would be worse than a red one.
+/// as an unexplained transcript mismatch. It never skips.
 pub fn require_test_config() {
     use yorkie_protocol::config;
     assert_eq!(config::USI_HASH, 16, "{WRONG_CONFIG}");
@@ -122,12 +119,12 @@ pub fn write_synthetic_nn_bin(dir: &Path) -> PathBuf {
     path
 }
 
-/// Drive a full canned session in-process (input fed all at once) and return the
-/// transcript. `run` joins any worker, so the buffer is complete on return.
+/// Drive a full canned session in-process and return the transcript. `run` joins
+/// any worker, so the buffer is complete on return.
 ///
-/// The book / `rtime` PRNG seed is process entropy (the production default), so
-/// this is for sessions whose output does not depend on book-move randomisation.
-/// Book sessions use [`drive_with_seed`] for a fixed, reproducible seed.
+/// The book / `rtime` PRNG seed is process entropy, so this is for sessions
+/// whose output does not depend on book-move randomisation; book sessions use
+/// [`drive_with_seed`].
 pub fn drive(input: &str) -> String {
     let output = Arc::new(Mutex::new(Vec::<u8>::new()));
     let driver = UsiDriver::new(input.as_bytes(), Arc::clone(&output));
@@ -136,9 +133,8 @@ pub fn drive(input: &str) -> String {
     String::from_utf8(bytes).expect("utf-8")
 }
 
-/// A fixed book-PRNG seed for reproducible book / `rtime` sessions — the engine's
-/// former hard-coded session seed, so injecting it reproduces the historical
-/// deterministic book-selection behaviour exactly.
+/// A fixed seed for reproducible book / `rtime` sessions: injecting it makes
+/// book-move selection deterministic.
 pub const TEST_BOOK_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Like [`drive`] but with an explicit book-PRNG session seed, so book-move
@@ -151,28 +147,20 @@ pub fn drive_with_seed(input: &str, book_seed: u64) -> String {
     String::from_utf8(bytes).expect("utf-8")
 }
 
-/// Put the synthetic network where this build will look for it, and return.
+/// Put the synthetic network where this build will look for it, and return its
+/// path.
 ///
-/// `EvalDir` is a compile-time constant — no build has a runtime option surface,
-/// so a test cannot point the engine at a temp directory. It points the *process*
-/// at one instead: a fixture root under the workspace `target/` directory becomes
-/// the working directory, and the synthetic `nn.bin` is written at
-/// `<fixture root>/<EvalDir>/nn.bin`, which is exactly where a relative
-/// `EvalDir` resolves.
+/// `EvalDir` is a compile-time constant, so a test cannot point the engine at a
+/// temp directory; it points the *process* at one instead, making a fixture root
+/// the working directory so a relative `EvalDir` resolves inside it.
 ///
-/// Safe to call from every test in a binary, and from several at once: every
+/// Safe to call from every test in a binary and from several at once: every
 /// caller names the same directory and writes the same bytes, the write is an
-/// atomic rename from a unique temporary, and a staged file is reused rather
-/// than rewritten. Tests that need the engine to find NO network (the handshake
-/// / match sessions) simply never call this, and keep the package-root working
-/// directory, where no `eval/` exists.
+/// atomic rename from a unique temporary, and a staged file is reused. Tests
+/// that need the engine to find *no* network simply never call this.
 ///
-/// The fixture root lives under `target/` on purpose: it survives across runs
-/// (the ~112 MiB all-zero network is written once, not once per test) and
-/// `cargo clean` takes it away.
-///
-/// Returns the staged `nn.bin` path, for a test that also wants to load the
-/// same network directly.
+/// The fixture root lives under `target/` so the large all-zero network is
+/// written once across runs, and `cargo clean` takes it away.
 pub fn stage_configured_eval_dir() -> PathBuf {
     let root = fixture_root("synthetic");
     let eval_dir = root.join(yorkie_protocol::config::EVAL_DIR);
@@ -201,8 +189,8 @@ pub fn stage_configured_eval_dir() -> PathBuf {
 /// way [`stage_configured_eval_dir`] points it at the synthetic one: enter a
 /// fixture root whose `<EvalDir>` entry is a symlink to `src`.
 ///
-/// For the tests that gate on the real `nn.bin`, which is staged outside the
-/// workspace's build tree and is far too large to copy per run.
+/// For the tests that need the real `nn.bin`, which is staged outside the
+/// build tree and is too large to copy per run.
 pub fn stage_eval_dir_link(src: &Path) {
     let root = fixture_root("linked");
     std::fs::create_dir_all(&root).expect("create fixture root");
@@ -235,13 +223,11 @@ fn fixture_root(tag: &str) -> PathBuf {
     target.join(format!("usi-session-fixtures-{tag}"))
 }
 
-/// The transcript a diagnostic `info string <body>` contributes in THIS build:
+/// The transcript a diagnostic `info string <body>` contributes in *this* build:
 /// the line itself with `info-diag`, the empty string without it.
 ///
-/// The default (tournament) build emits no `info` line outside the `isready`
-/// initialisation phase, so a session test that pins bytes composes its
-/// expectation through this helper and stays byte-exact in both builds instead
-/// of being asserted in only one of them.
+/// A session test that pins bytes composes its expectation through this helper
+/// so it stays byte-exact in both builds.
 pub fn diag_line(body: &str) -> String {
     if cfg!(feature = "info-diag") {
         format!("info string {body}\n")

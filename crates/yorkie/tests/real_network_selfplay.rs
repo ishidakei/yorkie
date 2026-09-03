@@ -1,26 +1,17 @@
 //! Integration test: a real-network self-play session against the built
 //! `yorkie` binary.
 //!
-//! The SFNN-1536 network is staged locally at
-//! `eval/nn.bin` and is never committed. When it is
-//! absent (a checkout without it staged) the test prints a notice and passes, so
-//! the default `cargo test` run stays green everywhere — the same skip pattern
-//! `yorkie-eval` and `yorkie-search`'s integration tests use.
+//! The network is staged locally and never committed; when it is absent the test
+//! prints a notice and passes.
 //!
 //! When present, it spawns the engine in a working directory whose `EvalDir`
-//! links to the staged network (see [`common::engine_cwd_with_eval_dir`]) and
-//! drives a ~40-ply self-play loop over one live USI session: `position
-//! startpos moves <accumulated>` + `go depth 1`, reusing the session. Every
-//! `bestmove` must be legal for the running position, the process must never
-//! crash, and it must exit cleanly on `quit`. A `bestmove resign` or
-//! `bestmove win` (a mate or a declaration win can happen) ends the loop early.
+//! links to the staged network and drives a ~40-ply self-play loop over one live
+//! USI session. Every `bestmove` must be legal for the running position, the
+//! process must never crash, and it must exit cleanly on `quit`. A
+//! `bestmove resign` or `bestmove win` ends the loop early.
 //!
-//! **`usi-extras` gate.** The session drives the analysis-only `go` clauses
-//! (`depth` / `movetime` / `infinite`), which the default build refuses rather
-//! than reinterprets, so the whole file is gated on the feature: the spawned
-//! `yorkie` binary carries it only when the test binary does. The hosted CI
-//! builds and tests with `--all-features`, so this runs there. See the
-//! `usi-extras` reference documentation.
+//! Gated on `usi-extras`: the session drives analysis-only `go` clauses, and the
+//! spawned `yorkie` binary carries the feature only when the test binary does.
 
 #![cfg(feature = "usi-extras")]
 
@@ -68,7 +59,7 @@ fn real_network_self_play_stays_legal_and_exits_cleanly() {
     let dir = eval_dir();
     if !dir.join("nn.bin").exists() {
         eprintln!(
-            "skipping real_network_self_play_stays_legal_and_exits_cleanly: {} is not present (staged only on the dev VM)",
+            "skipping real_network_self_play_stays_legal_and_exits_cleanly: {} is not present (obtained out-of-band)",
             dir.join("nn.bin").display()
         );
         return;

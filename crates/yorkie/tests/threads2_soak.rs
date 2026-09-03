@@ -2,28 +2,19 @@
 //!
 //! With Lazy SMP live, several workers share the transposition table through
 //! relaxed atomics. This soak drives the built `yorkie` binary through a long
-//! stream of real self-play games and asserts nothing ever goes
-//! wrong: exactly one legal `bestmove` per `go`, no panic, no hang (a per-move
-//! watchdog), and a clean `quit` at the end. It changes no search decision — it
-//! is pure stability evidence.
+//! stream of real self-play games and asserts nothing goes wrong: exactly one
+//! legal `bestmove` per `go`, no panic, no hang, and a clean `quit`.
 //!
-//! It is `#[ignore]`-gated so the default `cargo test` stays fast, and it needs
-//! the real SFNN-1536 network (staged locally at
-//! `eval/nn.bin`, never committed). When the network
-//! is absent it prints a notice and passes, the same skip pattern the other
-//! session tests use.
-//!
-//! Run it in a release build:
+//! `#[ignore]`-gated, and it needs the real network staged locally; when the
+//! network is absent it prints a notice and passes. Run it in a release build:
 //!
 //! ```text
 //! cargo test --release -p yorkie --test threads2_soak -- --ignored --nocapture
 //! ```
 //!
 //! The worker count is a compile-time constant, so the multi-worker point of the
-//! soak needs a build whose config carries more than one worker: the test prints
-//! a notice and passes when `threads` is 1. `configs/default.toml` — the config
-//! a plain build reads — carries 4, so the command above is enough;
-//! `configs/test.toml` carries 1, and a build selecting it skips the soak.
+//! soak needs a build whose config carries more than one worker; the test prints
+//! a notice and passes when `threads` is 1.
 //!
 //! Duration defaults to ~10 minutes; override with `SOAK_SECS`:
 //!
@@ -138,7 +129,7 @@ impl Session {
 }
 
 #[test]
-#[ignore = "long-running multi-thread soak; run explicitly on the dev VM"]
+#[ignore = "long-running multi-thread soak; run explicitly"]
 fn threads2_self_play_soak_stays_legal_and_stable() {
     if yorkie_protocol::config::THREADS < 2 {
         eprintln!(
@@ -150,7 +141,7 @@ fn threads2_self_play_soak_stays_legal_and_stable() {
     let dir = eval_dir();
     if !dir.join("nn.bin").exists() {
         eprintln!(
-            "skipping threads2_self_play_soak_stays_legal_and_stable: {} is not present (staged only on the dev VM)",
+            "skipping threads2_self_play_soak_stays_legal_and_stable: {} is not present (obtained out-of-band)",
             dir.join("nn.bin").display()
         );
         return;

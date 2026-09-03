@@ -3,30 +3,22 @@
 //! Measures aggregate nodes-per-second at one and two workers for three
 //! positions. The worker count is a compile-time constant, so the measurement
 //! runs through `bench`, the one command that carries its own worker count as an
-//! argument: `bench <ttMB> <threads> 5000 current movetime` searches the current
-//! position and reports `nodes` / `nps` on its summary line. This is a
-//! **measurement, not a hard threshold**: it prints a table (position × threads, plus the ratio) and
-//! never asserts a scaling factor: on a host whose two logical CPUs are SMT
-//! siblings, a `Threads=2 / Threads=1` ratio well under 2× is expected and
-//! normal, so any threshold would encode the machine rather than the engine.
+//! argument.
 //!
-//! `#[ignore]`-gated (it spends 5 s × 3 positions × 2 thread counts × 3 runs =
-//! ~90 s) and needs the real SFNN-1536 network (staged locally at
-//! `eval/nn.bin`, never committed). When the network
-//! is absent it prints a notice and passes.
+//! This is a **measurement, not a threshold**: it prints a table and never
+//! asserts a scaling factor. On a host whose two logical CPUs are SMT siblings a
+//! ratio well under 2× is normal, so any threshold would encode the machine
+//! rather than the engine.
 //!
-//! Run it in a release build:
+//! `#[ignore]`-gated, and it needs the real network staged locally; when the
+//! network is absent it prints a notice and passes. Run it in a release build:
 //!
 //! ```text
 //! cargo test --release -p yorkie --test nps_scaling -- --ignored --nocapture
 //! ```
 //!
-//! **`usi-extras` gate.** The session drives the analysis-only `go` clauses
-//! (`depth` / `movetime` / `infinite`), which the default build refuses rather
-//! than reinterprets, so the whole file is gated on the feature: the spawned
-//! `yorkie` binary carries it only when the test binary does. The hosted CI
-//! builds and tests with `--all-features`, so this runs there. See the
-//! `usi-extras` reference documentation.
+//! Gated on `usi-extras`: the session drives analysis-only `go` clauses, and the
+//! spawned `yorkie` binary carries the feature only when the test binary does.
 
 //!
 //! **`info-output` gate.** This is an NPS measurement payload: it reads `nodes`
@@ -140,12 +132,12 @@ fn start_engine() -> (Child, ChildStdin, BufReader<ChildStdout>) {
 }
 
 #[test]
-#[ignore = "spawns the engine and searches ~90s; run explicitly on the dev VM"]
+#[ignore = "spawns the engine and searches about 90 s; run explicitly"]
 fn nps_threads1_vs_threads2() {
     let dir = eval_dir();
     if !dir.join("nn.bin").exists() {
         eprintln!(
-            "skipping nps_threads1_vs_threads2: {} is not present (staged only on the dev VM)",
+            "skipping nps_threads1_vs_threads2: {} is not present (obtained out-of-band)",
             dir.join("nn.bin").display()
         );
         return;

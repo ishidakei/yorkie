@@ -1,18 +1,12 @@
 //! Opening-book probe and move-selection policy.
 //!
 //! This is the Search-layer half of the opening book: it turns raw `.ybb`
-//! readers ([`yorkie_storage::Book`]) plus a [`Position`] into a chosen
-//! book move, faithfully porting `BookMoveSelector::probe_impl` /
-//! `BookMoveSelector::find_in_books` / `MemoryBook::find` from the pinned
-//! reference (`source/book/book.cpp`), including the pin's
-//! BookOptions V2 profile (the black/white-split eval-diff and depth filters)
-//! and Multiple Book (an ordered list of books consulted in priority order,
-//! first hit wins — `book.cpp`). The `.ybb8` rework stays out of
-//! scope.
+//! readers ([`yorkie_storage::Book`]) plus a [`Position`] into a chosen book
+//! move, porting `BookMoveSelector::probe_impl` /
+//! `BookMoveSelector::find_in_books` / `MemoryBook::find` (`book.cpp`).
 //!
-//! The raw reader
-//! stays primitive (it speaks only packed keys and move fragments); everything
-//! that needs [`Position`] / movegen knowledge — packing, flipping, widening a
+//! The raw reader speaks only packed keys and move fragments; everything that
+//! needs [`Position`] or movegen knowledge — packing, flipping, widening a
 //! `move16` into a validated [`Move`], the eval / depth / narrow filters, and
 //! the random selection — lives here, above Storage.
 //!
@@ -37,11 +31,10 @@ const HAND_KINDS: [PieceKind; 7] = [
     PieceKind::Rook,
 ];
 
-/// A small, seedable PRNG for book move selection.
+/// A small, seedable xorshift64* PRNG for book move selection.
 ///
-/// The reference uses its own `PRNG` seeded per process; random-bit parity is
-/// explicitly *not* required (any decent PRNG is fine), but the seed must be
-/// injectable so tests are deterministic. This is a xorshift64* generator.
+/// Random-bit parity with the reference is explicitly not required, but the
+/// seed must be injectable so tests are deterministic.
 #[derive(Clone, Debug)]
 pub struct Prng(u64);
 
@@ -56,14 +49,10 @@ impl Prng {
         })
     }
 
-    /// A fresh process-entropy seed, mirroring the reference `PRNG()` default
-    /// constructor which mixes `time(NULL)`, the object address `(this << 32)`, and
-    /// `steady_clock::now()` (`misc.h`) so every process run differs. The
-    /// port's analogue mixes three sources: the wall clock (`SystemTime` nanos),
-    /// an ASLR-varied stack address (the reference's `(this << 32)`), and a
-    /// process-monotonic counter so two seeds drawn in the same nanosecond still
-    /// differ. No new dependency — dependency-free entropy is sufficient here since
-    /// book/`rtime` randomness is not security-sensitive.
+    /// A fresh process-entropy seed, mixing the wall clock, an ASLR-varied
+    /// stack address, and a process-monotonic counter so two seeds drawn in the
+    /// same nanosecond still differ. Dependency-free entropy is sufficient:
+    /// book and `rtime` randomness is not security-sensitive.
     pub fn random_seed() -> u64 {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -85,9 +74,9 @@ impl Prng {
         nanos ^ addr.rotate_left(32) ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15)
     }
 
-    /// A generator seeded from process entropy ([`Self::random_seed`]) — the port's
-    /// stand-in for the reference's default-constructed `PRNG` / `AsyncPRNG`
-    /// (`book.h`, `timeman.cpp`). Tests inject a fixed seed via
+    /// A generator seeded from process entropy ([`Self::random_seed`]) — the
+    /// port's stand-in for the reference's default-constructed `PRNG` /
+    /// `AsyncPRNG` (`book.h`, `timeman.cpp`). Tests inject a fixed seed via
     /// [`Self::new`] for determinism.
     pub fn from_entropy() -> Self {
         Prng::new(Self::random_seed())
@@ -110,15 +99,12 @@ impl Prng {
 
 /// A snapshot of the book-relevant USI options for one probe.
 ///
-/// `ignore_book_ply` is *not* here: the reference captures it at load time
-/// (changing it requires a reload), so it travels with the loaded book, not the
-/// per-`go` config.
+/// `ignore_book_ply` is *not* here: the reference captures it at load time, so
+/// it travels with the loaded book rather than the per-`go` config.
 ///
-/// Both book-option profiles are represented: `book_options_v2` selects between
-/// the V1 fields (`narrow_book`, `eval_diff`, `depth_limit`,
-/// `consider_move_count`) and the V2 ones (the `*_black_*` / `*_white_*` pairs),
-/// exactly as the reference resolves the option NAME at probe time from the root
-/// side to move (`book.cpp`).
+/// `book_options_v2` selects between the V1 fields and the V2 `*_black_*` /
+/// `*_white_*` pairs, as the reference resolves the option name at probe time
+/// from the root side to move.
 #[derive(Clone, Debug)]
 pub struct BookConfig {
     /// Whether the options were registered under `BOOK_OPTIONS=V2`.
@@ -167,9 +153,9 @@ impl BookConfig {
         !self.book_options_v2 && self.consider_move_count
     }
 
-    /// The depth-floor option actually consulted at the root, as a
-    /// `(name, value)` pair. Under V2 the NAME is side-to-move dependent
-    /// (`book.cpp`) and the name is what the info string reports.
+    /// The depth-floor option actually consulted at the root, as a `(name,
+    /// value)` pair. Under V2 the NAME is side-to-move dependent (`book.cpp`)
+    /// and the name is what the info string reports.
     fn depth_limit_for(&self, stm: Color) -> (&'static str, i64) {
         match (self.book_options_v2, stm) {
             (false, _) => ("BookDepthLimit", self.depth_limit),
@@ -188,8 +174,8 @@ impl BookConfig {
         }
     }
 
-    /// The per-side eval floor and its option name — unchanged between profiles
-    /// (already side-to-move dependent under V1, `book.cpp`).
+    /// The per-side eval floor and its option name — unchanged between
+    /// profiles (already side-to-move dependent under V1, `book.cpp`).
     fn eval_limit_for(&self, stm: Color) -> (&'static str, i64) {
         if stm == Color::Black {
             ("BookEvalBlackLimit", self.eval_black_limit)
@@ -248,20 +234,16 @@ struct Candidate {
     count: u16,
 }
 
-/// Probe `books` for `pos` and select a move under `config`.
+/// Probe `books` for `pos` and select a move under `config` — the reference's
+/// `BookMoveSelector::probe_impl` for the root case.
 ///
-/// Ports `BookMoveSelector::probe_impl` for the root case (`isRoot = true`,
-/// `forceHit = false`). `books` is the Multiple Book priority list (the numbered
-/// `stem-000…` series followed by the plain base name); every lookup on this
-/// path — the root probe, the PV walk and the ponder fallback — goes through
-/// [`find_in_books`], which returns the FIRST non-empty hit and never merges
-/// across books (`book.cpp`). A single-element slice reproduces the
-/// pre-Multiple-Book behaviour exactly.
+/// `books` is the Multiple Book priority list; every lookup goes through
+/// [`find_in_books`], which returns the first non-empty hit and never merges
+/// across books.
 ///
-/// The `USI_OwnBook` gate is the caller's responsibility (the driver skips the
-/// whole book path when it is off). Returns a miss (`hit == None`) for every
-/// early-out the reference takes: ignore-rate skip, past `BookMoves`, key/ply
-/// miss, or an empty surviving candidate set.
+/// The `USI_OwnBook` gate is the caller's responsibility. Returns a miss for
+/// every early-out the reference takes: ignore-rate skip, past `BookMoves`,
+/// key/ply miss, or an empty surviving candidate set.
 pub fn probe_book(
     books: &[Book],
     ignore_book_ply: bool,
@@ -477,17 +459,12 @@ fn build_pv(
 }
 
 /// `BookMoveSelector::find_in_books` (`book.cpp`): consult the books in
-/// priority order and return the FIRST non-empty hit.
+/// priority order and return the first non-empty hit.
 ///
 /// A hit in an upper book never falls through to a lower one and results are
-/// never merged — so a position present in book 0 is answered by book 0 alone,
-/// even when a lower book stores different (or more) moves for it. The pin skips
-/// a book whose `find` returns null *or* an empty move list; both map to
-/// "keep walking" here.
-///
-/// The per-book flipped-position fallback lives inside [`find_in_book`] (the pin
-/// does it inside `MemoryBook::find`, `book.cpp`), so a flipped hit in
-/// book 0 also stops the walk.
+/// never merged, so a position present in book 0 is answered by book 0 alone.
+/// The per-book flipped-position fallback lives inside [`find_in_book`], so a
+/// flipped hit in book 0 also stops the walk.
 fn find_in_books(
     books: &[Book],
     ignore_book_ply: bool,
@@ -721,8 +698,7 @@ mod tests {
         yorkie_state::format_usi_move(m)
     }
 
-    /// A one-element priority list — the shape every pre-Multiple-Book test
-    /// assumes (a single loaded book).
+    /// A one-element priority list: the single-loaded-book shape.
     fn one(book: &Book) -> &[Book] {
         std::slice::from_ref(book)
     }

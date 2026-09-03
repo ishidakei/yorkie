@@ -1,9 +1,9 @@
 //! Scalar feature-transformer accumulate/update kernels.
 //!
-//! Ported verbatim (modulo module paths) from the read-only Rust NNUE
-//! reference implementation's `scalar.rs`. These are the always-available
-//! baseline: the AVX-512 kernels in [`crate::simd::avx512`] must match them
-//! bit-for-bit (see that module's parity tests).
+//! The scalar backend, matching the reference engine's NNUE arithmetic. These
+//! are the always-available baseline: the AVX-512 kernels in
+//! [`crate::simd::avx512`] must match them bit-for-bit (see that module's
+//! parity tests).
 //!
 //! `wrapping_add`/`wrapping_sub` match upstream NNUE semantics: `i16` overflow
 //! is allowed here because the downstream clipped output transform saturates.

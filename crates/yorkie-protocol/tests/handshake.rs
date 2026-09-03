@@ -1,14 +1,13 @@
 //! The `usi` handshake, pinned to the byte.
 //!
 //! Both builds reply with identity and `usiok` and nothing between them: no
-//! build has a runtime option surface, so there is no `option name ...` line to
-//! advertise — every setting was compiled in from the TOML config. The golden is
-//! exact, so a stray option line fails.
+//! build has a runtime option surface, so there is no `option name …` line to
+//! advertise. The golden is exact, so a stray option line fails.
 //!
-//! The `isready` load-failure notice is asserted unconditionally on purpose: it
-//! belongs to the initialisation phase, which no `info` feature gates. The
+//! The `isready` load-failure notice is asserted unconditionally because it
+//! belongs to the initialisation phase, which no `info` feature gates; the
 //! unknown-command and too-long lines are diagnostics and go through
-//! [`diag_line`], so this file pins the whole handshake surface in every build.
+//! [`diag_line`].
 
 use std::sync::{Arc, Mutex};
 

@@ -1,37 +1,22 @@
-//! Session-level depth-1 parity gate (blocking) against the real network.
+//! Session-level depth-1 parity test against the real network.
 //!
 //! Drives a full USI session in-process — `usi` → `isready` →
 //! `position startpos` → `go depth 1` — and asserts the emitted `bestmove`,
-//! `score`, and `nodes` exactly match the reference-captured
-//! `tests/fixtures/search-depth1/startpos.json`. This proves the driver drives
-//! the ported depth-1 root search ([`yorkie_search::QSearch::run_root`]) with
-//! the compiled-in TT sizing (allocated on the first successful `isready`) and
-//! generation semantics (`run_root` bumps it per `go`).
+//! `score` and `nodes` match the reference-captured fixture as one inseparable
+//! set: the `(nodes & 14)` root tie-break means a single-node drift can cascade
+//! into a different score and a flipped bestmove.
 //!
-//! `EvalDir` is a compile-time constant, so the real network is reached the way
-//! every session test reaches its network: by entering a fixture root whose
-//! `<EvalDir>` links to it (`common::stage_eval_dir_link`).
+//! `EvalDir` is a compile-time constant, so the real network is reached by
+//! entering a fixture root whose `<EvalDir>` links to it.
 //!
-//! The three fields are one inseparable set: the `(nodes & 14)` root tie-break
-//! means a single-node drift can cascade into a different score and a flipped
-//! bestmove, so a mismatch on any of them signals a search divergence.
+//! The network is staged locally and never committed; when absent the test
+//! prints a notice and passes. The fixture is a single-PV capture, so the test
+//! also skips itself in a build whose compiled-in `MultiPV` is not 1.
 //!
-//! The SFNN-1536 network is staged locally at
-//! `eval/nn.bin` and is never committed. When absent
-//! (a checkout without it staged) the test prints a notice and passes, so the
-//! default `cargo test` run stays green everywhere. The fixture is also a
-//! single-PV capture, so the test skips itself in a build whose compiled-in
-//! `MultiPV` is not 1 (`configs/test-limits.toml`).
+//! Gated on `usi-extras`: these sessions drive analysis-only `go` clauses, which
+//! a default build refuses rather than reinterprets.
 //!
-//! **`usi-extras` gate.** These sessions drive the analysis-only `go` clauses
-//! (`depth` / `nodes` / `movetime` / `infinite`), which a default build refuses
-//! rather than reinterprets, so the whole file is gated on the feature and runs
-//! under the `--all-features` gate. See the `usi-extras` reference
-//! documentation.
-//!
-//! **`info-output` gate.** The fixture comparison reads the depth-1 `info` line
-//! (its `nodes` and `score` fields), which only an `info-output` build emits, so
-//! the file is gated on that feature too. `--all-features` carries both.
+//! Gated on `info-output` too, since the assertions read a search `info` line.
 
 #![cfg(all(feature = "usi-extras", feature = "info-output"))]
 
@@ -96,13 +81,10 @@ fn depth1_session_matches_reference_startpos_fixture() {
     // TT move it, so the comparison only means anything under the test config.
     common::require_test_config();
 
-    // It was also captured from a single-PV root search. `MultiPV` is a
-    // compile-time constant, so a `MultiPV N` build searches N ranked root moves
-    // per iteration and reports the sum — a different node count for the same
-    // search, and a different tie-break for the bestmove that count feeds. There
-    // is no second fixture to compare that against, so this build has nothing to
-    // show here. (`configs/test-limits.toml` builds `MultiPV 3`; the MultiPV loop
-    // itself is covered by `tests/multipv_session.rs`.)
+    // The fixture was captured from a single-PV root search. A `MultiPV N` build
+    // searches N ranked root moves per iteration and reports the sum — a
+    // different node count, and so a different tie-break for the bestmove that
+    // count feeds — and there is no second fixture to compare that against.
     if yorkie_protocol::config::MULTI_PV != 1 {
         eprintln!(
             "skipped: this build compiled in MultiPV {}, and the fixture is a \
@@ -115,7 +97,7 @@ fn depth1_session_matches_reference_startpos_fixture() {
     let dir = eval_dir();
     if !dir.join("nn.bin").exists() {
         eprintln!(
-            "skipping depth1_session_matches_reference_startpos_fixture: {} is not present (staged only on the dev VM)",
+            "skipping depth1_session_matches_reference_startpos_fixture: {} is not present (obtained out-of-band)",
             dir.join("nn.bin").display()
         );
         return;

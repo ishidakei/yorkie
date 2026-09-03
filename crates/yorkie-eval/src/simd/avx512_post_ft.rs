@@ -1,19 +1,13 @@
 //! AVX-512 (F + BW + VNNI) output-transform and layer kernels.
 //!
-//! Ported from the read-only Rust NNUE reference implementation's
-//! `avx512_post_ft.rs`. Every kernel is guaranteed
-//! bit-identical to its [`crate::simd::scalar_post_ft`] counterpart; the
-//! reference's whole-`Accumulator` `transformer_ewm` is replaced by the
-//! per-perspective [`ewm_one_perspective`] the caller invokes twice (mirroring
-//! the scalar factoring).
+//! Every kernel here is bit-identical to its [`crate::simd::scalar_post_ft`]
+//! counterpart. The reference's whole-`Accumulator` `transformer_ewm` becomes
+//! the per-perspective [`ewm_one_perspective`], which the caller invokes twice.
 //!
-//! Like [`crate::simd::avx512`], this module compiles on every `x86_64` target:
-//! each entry point is an `unsafe fn` gated by `#[target_feature(enable = ...)]`,
-//! and whether it is *called* is decided at compile time from the features the
-//! build enables — by [`crate::simd`] for the element-wise kernels and by
-//! [`crate::network`] for [`fused_fc_chain`]. `avx512vnni` is required only for
-//! the `dpbusd`-based affine/[`fused_fc_chain`] path; the element-wise kernels
-//! need only F + BW.
+//! As in [`crate::simd::avx512`], this module compiles on every `x86_64` target
+//! and only the call sites are compile-time gated. `avx512vnni` is required
+//! only for the `dpbusd`-based [`fused_fc_chain`]; the element-wise kernels need
+//! only F and BW.
 
 use std::arch::x86_64::{
     __m128i, __m256i, __m512i, _mm_storeu_si128, _mm_unpacklo_epi64, _mm256_loadu_si256,
@@ -36,12 +30,12 @@ const I32_LANES_PER_M512: usize = 16;
 const I16_LANES_PER_M512: usize = 32;
 const EWM_HALF: usize = HIDDEN_SIZE / 2;
 
-// Mirror scalar_post_ft constants as u32 (AVX-512 shift intrinsics take IMM8: u32).
+// The `scalar_post_ft` constants as `u32`, which the shift intrinsics require.
 const WEIGHT_SCALE_BITS: u32 = 6;
 const SQR_SHIFT: u32 = 19;
 const EWM_CLAMP_I16: i16 = 127 * 2;
 
-// EWM mulhi trick: mulhi(sum0 << 7, sum1) == (sum0 * sum1) >> 9 on the i16 domain.
+// On the `i16` domain, `mulhi(sum0 << 7, sum1) == (sum0 * sum1) >> 9`.
 const EWM_PRESHIFT: u32 = 7;
 
 /// Pairwise element-wise multiply for one perspective (see the scalar

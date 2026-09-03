@@ -2,15 +2,9 @@
 //! refuses everything else.
 //!
 //! `build_config.rs` is `include!`d here exactly as `build.rs` includes it, so
-//! these tests exercise the same code that decides whether a build happens. That
-//! matters because the whole design rests on one promise — a config the engine
-//! cannot make sense of never becomes a binary. A silent default for a missing
-//! key, or a skipped line for a malformed one, would put a value into a build
-//! that nobody chose.
-//!
-//! The failure modes covered: a missing key, an unknown key, a duplicate key, a
-//! wrong type, an out-of-range integer, an invalid combo choice, and each way
-//! the accepted TOML subset can be exceeded.
+//! these tests exercise the same code that decides whether a build happens. The
+//! whole design rests on one promise: a config the engine cannot make sense of
+//! never becomes a binary.
 
 #![allow(dead_code)]
 
@@ -30,7 +24,7 @@ fn config_text(rel: &str) -> String {
 }
 
 /// Every checked-in config, by repository-relative path. A new one must be added
-/// here so the two whole-file gates below cover it.
+/// here so the two whole-file tests below cover it.
 const CHECKED_IN_CONFIGS: &[&str] = &[
     "configs/default.toml",
     "configs/test.toml",

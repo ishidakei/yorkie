@@ -1,34 +1,13 @@
-//! Property gate: invariants of the move generators over random **reachable**
-//! positions.
+//! Invariants of the move generators over random reachable positions.
 //!
-//! Positions are sampled the same way as in `do_undo_roundtrip.rs`: a
-//! proptest-generated root index plus a vector of selection indices walks a
-//! legal game, each index picking one of that position's legal moves. Every
-//! position the walk *visits* is checked, not just the one it ends on — that is
-//! what gets the in-check `generate_evasions` path sampled often enough to
-//! matter. Free-form random boards would not do here: the generators assume a
-//! well-formed position (both kings present, the side *not* to move not already
-//! in check), and `Position::is_legal` carries an explicit entry contract.
+//! Positions are sampled by walking a legal game, as in `do_undo_roundtrip.rs`.
+//! Free-form random boards would not do: the generators assume a well-formed
+//! position, with both kings present and the side not to move not already in
+//! check, and `Position::is_legal` carries an explicit entry contract.
 //!
-//! Three families of invariant are checked at each of them:
-//!
-//! 1. **Uniqueness / shape** — `generate_legal_all` never repeats a move, every
-//!    emitted move is `is_ok`, and `Position::to_move(m.move16())` widens the
-//!    16-bit fragment back to exactly `m`.
-//! 2. **Legality** — every generated move satisfies the crate's own
-//!    `Position::is_legal` *and* `Position::pseudo_legal(m, true)`, and an
-//!    independent copy-apply-scan oracle (apply to a scratch board, then test
-//!    the mover's king square for enemy attacks) agrees. The oracle is run in
-//!    both directions over the raw generator output, so it also pins that
-//!    `is_legal` rejects nothing legal.
-//! 3. **Path agreement** — the pseudo-legal-plus-filter path agrees with the
-//!    direct `generate_legal_all` path on the resulting move *set*:
-//!    * not in check: `generate_captures` ∪ `generate_quiets` (which must also
-//!      be disjoint) filtered by `is_legal`;
-//!    * in check: `generate_evasions` filtered by `is_legal`.
-//!
-//! `#[cfg_attr(miri, ignore)]` and default failure persistence match the
-//! existing `sfen_roundtrip.rs` suite.
+//! Every position the walk visits is checked, not only the one it ends on,
+//! which is what samples the in-check `generate_evasions` path often enough to
+//! matter.
 
 use std::collections::HashSet;
 
@@ -36,11 +15,8 @@ use proptest::prelude::*;
 use proptest::test_runner::TestCaseResult;
 use yorkie_state::{ExtMove, Move, Position, format_sfen, format_usi_move, parse_sfen};
 
-/// Roots the random lines start from. `startpos` plus positions that are
-/// already sharp — a side in check, a drop-rich board, a tactical middlegame,
-/// and a promotion-zone tangle — so the evasion, drop and promotion branches of
-/// the generators are sampled from ply 0 rather than only where a random line
-/// happens to wander.
+/// Roots the random lines start from: `startpos`, plus already-sharp positions
+/// so the evasion, drop and promotion branches are sampled from ply 0.
 const ROOT_SFENS: &[&str] = &[
     "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1", // startpos
     "4k4/9/4r4/9/9/9/4K3B/9/9 b RG2gs2n3p 1",                          // check-evasion
@@ -49,8 +25,7 @@ const ROOT_SFENS: &[&str] = &[
     "4k4/3P3+PL/2N2PR2/1L2BNS2/4N4/9/9/9/4K4 b - 1", // promotion-zone-edges
 ];
 
-/// Upper bound on the plies walked from the root. Every visited position is
-/// checked, so this also bounds the positions checked per case.
+/// Upper bound on the plies walked from the root.
 const MAX_PLIES: usize = 40;
 
 fn arb_line() -> impl Strategy<Value = (usize, Vec<u16>)> {
@@ -66,8 +41,8 @@ fn legal_moves(pos: &Position) -> Vec<Move> {
     buf
 }
 
-/// Every position `line` visits from `ROOT_SFENS[root]`, root included. The walk
-/// stops early at a terminal position.
+/// Every position `line` visits from `ROOT_SFENS[root]`, root included, the
+/// walk stopping early at a terminal position.
 fn walk(root: usize, line: &[u16]) -> Vec<Position> {
     let mut pos = parse_sfen(ROOT_SFENS[root]).expect("root sfen parses");
     let mut visited = Vec::with_capacity(line.len() + 1);
@@ -84,15 +59,11 @@ fn walk(root: usize, line: &[u16]) -> Vec<Position> {
     visited
 }
 
-/// Independent legality oracle: apply `mv` to a scratch copy of the board and
-/// report whether the mover's king is left unattacked.
+/// Apply `mv` to a scratch copy of the board and report whether the mover's
+/// king is left unattacked.
 ///
-/// Deliberately *not* `do_move` — `do_move` maintains incremental state that
-/// assumes a legal move, and the point of this helper is to judge moves that may
-/// be illegal. Editing the board directly mirrors the crate-internal
-/// `leaves_own_king_safe` oracle: clear the from-square (nothing to clear for a
-/// drop) and write the after-promotion piece onto the to-square, which also
-/// removes any captured piece.
+/// Deliberately not `do_move`, which maintains incremental state that assumes a
+/// legal move: the point here is to judge moves that may be illegal.
 fn king_safe_after(pos: &Position, mv: Move) -> bool {
     let us = pos.side_to_move();
     let mut scratch = pos.clone();
@@ -104,15 +75,15 @@ fn king_safe_after(pos: &Position, mv: Move) -> bool {
         board.set(mv.to_sq(), Some(mv.moved_piece_after()));
     }
     match scratch.king_square(us) {
-        // `discount == sq` is documented as harmless: occupancy on the tested
-        // square never blocks a ray that terminates there.
+        // `discount == sq` is harmless: occupancy on the tested square never
+        // blocks a ray that terminates there.
         Some(king) => !scratch.is_attacked_discounting(king, us.flip(), king),
         None => false,
     }
 }
 
-/// The raw pseudo-legal candidates for the position's check state, with the
-/// `all` flag set (the generator set `generate_legal_all` filters).
+/// The raw pseudo-legal candidates for the position's check state, with `all`
+/// set — the generator output `generate_legal_all` filters.
 fn pseudo_legal_candidates(pos: &Position) -> Vec<Move> {
     let mut buf: Vec<ExtMove> = Vec::with_capacity(64);
     if pos.in_check() {
@@ -134,8 +105,8 @@ fn describe(moves: &HashSet<Move>) -> Vec<String> {
     out
 }
 
-/// Invariant family 1, for one position: every generated legal move is
-/// distinct, well-formed, and survives a `move16` round trip.
+/// Every generated legal move is distinct, well-formed, and survives a
+/// `move16` round trip.
 fn check_uniqueness_and_shape(pos: &Position) -> TestCaseResult {
     let legal = legal_moves(pos);
     let unique = as_set(&legal);
@@ -165,10 +136,9 @@ fn check_uniqueness_and_shape(pos: &Position) -> TestCaseResult {
     Ok(())
 }
 
-/// Invariant family 2, for one position: every generated legal move passes the
-/// crate's legality predicates, and `is_legal` agrees with the independent
-/// copy-apply-scan oracle across the whole pseudo-legal candidate set — both
-/// directions, so it also pins that `is_legal` rejects nothing legal.
+/// Every generated legal move passes the crate's legality predicates, and
+/// `is_legal` agrees with [`leaves_own_king_safe`] across the whole candidate
+/// set — in both directions, so it also rejects nothing legal.
 fn check_legality_predicates(pos: &Position) -> TestCaseResult {
     for mv in legal_moves(pos) {
         prop_assert!(
@@ -197,13 +167,12 @@ fn check_legality_predicates(pos: &Position) -> TestCaseResult {
     Ok(())
 }
 
-/// Invariant family 3, for one position: the pseudo-legal-plus-filter paths and
-/// the direct legal-generation path agree on the resulting move set.
+/// The pseudo-legal-plus-filter paths and the direct legal-generation path
+/// agree on the resulting move set.
 fn check_generator_paths_agree(pos: &Position) -> TestCaseResult {
     let direct = as_set(&legal_moves(pos));
 
-    // Path A: the check-state generator, filtered by `is_legal` — what
-    // `generate_legal_all` composes, driven through the public entry points.
+    // The check-state generator, filtered by `is_legal`.
     let filtered: HashSet<Move> = pseudo_legal_candidates(pos)
         .into_iter()
         .filter(|m| pos.is_legal(*m))
@@ -215,9 +184,9 @@ fn check_generator_paths_agree(pos: &Position) -> TestCaseResult {
         format_sfen(pos),
     );
 
-    // Path B (not in check only): the captures/quiets split, which must
-    // partition the same candidate space. `generate_evasions` has no such
-    // split, so an in-check position stops after path A.
+    // The captures/quiets split, which must partition the same candidate
+    // space. `generate_evasions` has no such split, so an in-check position
+    // stops above.
     if pos.in_check() {
         return Ok(());
     }
@@ -269,8 +238,8 @@ proptest! {
     }
 }
 
-/// A non-randomized anchor so the miri gate (which skips the proptest cases)
-/// still exercises the invariants once.
+/// A non-randomized anchor, so a Miri run — which skips the proptest cases
+/// as far too slow — still exercises the invariants once.
 #[test]
 fn startpos_legal_moves_are_unique_and_legal() {
     let pos = Position::startpos();

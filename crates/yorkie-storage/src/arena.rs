@@ -1,30 +1,21 @@
 //! One large-page allocation carved into many 64-byte-aligned typed sub-arrays.
 //!
-//! The reference routes each of its biggest parameter/state bundles through a
-//! *single* large-page allocation and then reads typed views out of it: the
-//! whole NNUE parameter set lives in one `make_unique_large_page<NnueNetworks>`
-//! (`evaluate_nnue.cpp`), and every per-worker history table is embedded
-//! inline in the one `make_unique_large_page<Search::Worker>` block
-//! (`search.h`, `thread.cpp`). This module is the port's one mechanism for
-//! that shape: an [`ArenaLayout`] computes a packed set of 64-byte-aligned
-//! [`Section`]s, a [`LargePageArena`] makes the single backing allocation, and
-//! each sub-array is reached either as a temporary `&mut [T]` (in-place fill,
-//! [`LargePageArena::slice_mut`]) or as a detached [`ArenaSlice`] view stored
-//! alongside the arena.
+//! The reference routes each of its biggest parameter and state bundles through
+//! a *single* large-page allocation and reads typed views out of it — the whole
+//! NNUE parameter set in one, every per-worker history table in another. This
+//! module is the port's mechanism for that shape: an [`ArenaLayout`] computes a
+//! packed set of 64-byte-aligned [`Section`]s and a [`LargePageArena`] makes the
+//! one backing allocation.
 //!
-//! # The self-referential shape
-//!
-//! An [`ArenaSlice`] is a raw-pointer view into the arena's heap buffer; it does
-//! **not** own or borrow-check against the arena. The intended use is that one
-//! struct owns *both* the [`LargePageArena`] and the [`ArenaSlice`]s carved from
-//! it (see `NnueNetwork` in yorkie-eval and `WorkerHistories` in yorkie-search).
-//! That is sound because the backing bytes live on the heap behind
-//! [`LargePageArray`]'s `NonNull`: moving the owning struct copies the pointer,
-//! never the bytes, so every view stays valid, and [`ArenaSlice`] has no `Drop`
-//! glue, so field-drop order cannot produce a use-after-free. The owner must
-//! simply keep the arena alive as long as the views and never hand out a `&mut`
-//! to the arena while a view aliases it — both of which fall out naturally from
-//! "fill through `slice_mut`, then only read through the views".
+//! **An [`ArenaSlice`] is a raw-pointer view that neither owns nor
+//! borrow-checks against its arena.** The intended use is for one struct to own
+//! both the arena and the slices carved from it. That is sound because the
+//! bytes live on the heap behind a `NonNull`, so moving the owner copies the
+//! pointer and not the bytes, and because `ArenaSlice` has no `Drop` glue, so
+//! field-drop order cannot produce a use-after-free. The owner must keep the
+//! arena alive as long as the views, and never hand out a `&mut` to the arena
+//! while a view aliases it — both of which follow from filling through
+//! `slice_mut` and thereafter only reading through the views.
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -39,9 +30,9 @@ use crate::large_page::{LargePageArray, Zeroable, rounded_size};
 /// AVX-512 NNUE kernels assume.
 pub const ARENA_SUB_ALIGN: usize = 64;
 
-/// The location of one carved sub-array within an arena: its byte offset and its
-/// element count. Pure `Copy` metadata (no pointer), so a layout can be recorded
-/// once and replayed against any arena built from it (e.g. a NUMA replica).
+/// The location of one carved sub-array within an arena. Carries no pointer, so
+/// a layout can be recorded once and replayed against any arena built from it —
+/// a NUMA replica, say.
 pub struct Section<T> {
     offset: usize,
     len: usize,
@@ -86,14 +77,9 @@ impl<T> Section<T> {
     }
 }
 
-/// Accumulates a packed, [`ARENA_SUB_ALIGN`]-aligned layout of typed sub-arrays.
-///
-/// Each [`reserve`](Self::reserve) advances a cursor to the next 64-byte
-/// boundary and hands back the [`Section`] for `count` elements of `T`;
-/// [`total_bytes`](Self::total_bytes) is then the exact size the backing
-/// [`LargePageArena`] must cover. Because the cursor only ever moves forward,
-/// the reserved sections are provably non-overlapping and all fall inside
-/// `[0, total_bytes)`.
+/// Accumulates a packed, [`ARENA_SUB_ALIGN`]-aligned layout of typed
+/// sub-arrays. Its cursor only ever moves forward, so the reserved sections are
+/// non-overlapping and all fall inside `[0, total_bytes)`.
 #[derive(Clone, Debug, Default)]
 pub struct ArenaLayout {
     cursor: usize,
@@ -137,17 +123,12 @@ impl ArenaLayout {
     }
 }
 
-/// A single large-page allocation carved into typed sub-arrays.
-///
-/// The one backing allocation is a zeroed, [`LARGE_PAGE_ALIGN`]-aligned,
-/// (on Linux) `MADV_HUGEPAGE`-hinted `[u8]` (via [`LargePageArray`]). Sub-arrays
-/// are reached by [`slice_mut`](Self::slice_mut) (a temporary `&mut [T]` for
-/// filling) or [`view`](Self::view) (a detached [`ArenaSlice`] to store).
-///
-/// [`LARGE_PAGE_ALIGN`]: crate::LARGE_PAGE_ALIGN
+/// A single large-page allocation carved into typed sub-arrays, reached either
+/// as a temporary `&mut [T]` for filling ([`slice_mut`](Self::slice_mut)) or as
+/// a detached [`ArenaSlice`] to store ([`view`](Self::view)).
 pub struct LargePageArena {
-    /// The single backing allocation; its length is `total_bytes.max(1)` so a
-    /// (never-produced) zero-byte layout still has a real, non-dangling base.
+    /// The single backing allocation. Its length is `total_bytes.max(1)`, so
+    /// even a zero-byte layout has a real, non-dangling base.
     backing: LargePageArray<u8>,
     /// The exact byte size the layout requested (`<= backing.len()`).
     total_bytes: usize,
@@ -163,18 +144,16 @@ impl fmt::Debug for LargePageArena {
 }
 
 impl LargePageArena {
-    /// Allocate a zeroed arena covering `layout` — one large-page allocation.
+    /// Allocate a zeroed arena covering `layout`.
     pub fn new(layout: &ArenaLayout) -> Self {
         Self::with_capacity(layout.total_bytes())
     }
 
-    /// Allocate a zeroed arena of exactly `total_bytes` requested bytes — one
-    /// large-page allocation. Equivalent to [`new`](Self::new) with a layout of
-    /// that total; useful when the layout total was recorded separately.
+    /// Allocate a zeroed arena of exactly `total_bytes`, for when the layout
+    /// total was recorded separately from the layout.
     pub fn with_capacity(total_bytes: usize) -> Self {
-        // At least one byte so the backing is a real allocation with a non-null,
-        // aligned base even for the degenerate empty layout (never hit in
-        // practice — every real net / worker reserves > 0).
+        // At least one byte, so even the degenerate empty layout has a
+        // non-null, aligned base.
         let backing = LargePageArray::<u8>::zeroed(total_bytes.max(1));
         Self {
             backing,
@@ -187,9 +166,8 @@ impl LargePageArena {
         self.total_bytes
     }
 
-    /// The reserved byte size actually committed by the allocator — the request
-    /// rounded up to a whole [`LARGE_PAGE_ALIGN`](crate::LARGE_PAGE_ALIGN)
-    /// multiple (the figure the allocation-disclosure table reports).
+    /// The byte size the allocator actually committed — the request rounded up
+    /// to a whole [`LARGE_PAGE_ALIGN`](crate::LARGE_PAGE_ALIGN) multiple.
     pub fn reserved_bytes(&self) -> usize {
         rounded_size(self.total_bytes.max(1))
     }
@@ -209,30 +187,26 @@ impl LargePageArena {
         if section.len == 0 {
             return &mut [];
         }
-        // SAFETY: `offset` is 64-aligned (hence aligned for `T`) and the section
-        // lies inside the backing `[u8]` (asserted above). The bytes were zeroed
-        // at allocation and `T: Zeroable`, so they form `section.len` valid `T`.
-        // `&mut self` guarantees no other view of these bytes is live. The base
-        // is taken from `base_nonnull()`, so the pointer carries the
-        // allocation's raw, write-capable provenance and never routes through a
-        // `&[u8]`/`&mut [u8]` reference reborrow.
+        // SAFETY: `offset` is 64-aligned, hence aligned for `T`, and the section
+        // lies inside the backing `[u8]` as asserted above. The bytes were
+        // zeroed at allocation and `T: Zeroable`, so they form `section.len`
+        // valid `T`, and `&mut self` guarantees no other view is live. The base
+        // comes from `base_nonnull()`, so the pointer carries the allocation's
+        // raw, write-capable provenance rather than a reference reborrow.
         unsafe {
             let p = self.backing.base_nonnull().as_ptr().add(section.offset) as *mut T;
             slice::from_raw_parts_mut(p, section.len)
         }
     }
 
-    /// A detached [`ArenaSlice`] view of `section`, valid as long as this arena's
-    /// backing allocation lives (see the module note on the self-referential
-    /// shape). Used to build the stored view fields of the owning struct.
+    /// A detached [`ArenaSlice`] view of `section`, valid as long as this
+    /// arena's backing allocation lives.
     ///
     /// # Contract
-    /// At most one live [`ArenaSlice`] view may exist per section, and no
+    /// At most one live view may exist per section, and no
     /// [`slice_mut`](Self::slice_mut) call may overlap a live view: an
-    /// `ArenaSlice` can hand out `&mut [T]` (via [`DerefMut`]), so a second
-    /// view or an overlapping `slice_mut` would alias it. The owning structs
-    /// uphold this by carving each section exactly once at construction
-    /// (`NnueNetwork` in yorkie-eval, `WorkerHistories` in yorkie-search).
+    /// `ArenaSlice` can hand out `&mut [T]`, so either would alias it. Owners
+    /// uphold this by carving each section exactly once at construction.
     ///
     /// # Panics
     /// Panics if `section` is not fully inside this arena.
@@ -242,11 +216,10 @@ impl LargePageArena {
             "arena section {section:?} out of bounds (arena has {} bytes)",
             self.total_bytes,
         );
-        // SAFETY: `offset` is in-bounds and 64-aligned; the base is non-null, so
-        // `base + offset` is a non-null, `T`-aligned pointer into the arena. The
-        // base is taken from `base_nonnull()`, so the pointer carries the
-        // allocation's raw, write-capable provenance and never routes through a
-        // `&[u8]` reference reborrow — the view may later write through it.
+        // SAFETY: `offset` is in-bounds and 64-aligned and the base is non-null,
+        // so `base + offset` is a non-null, `T`-aligned pointer into the arena.
+        // The base comes from `base_nonnull()`, so it carries the allocation's
+        // raw, write-capable provenance — the view may later write through it.
         let p = unsafe { self.backing.base_nonnull().as_ptr().add(section.offset) as *mut T };
         ArenaSlice {
             ptr: NonNull::new(p).expect("arena base pointer is non-null"),
@@ -260,8 +233,8 @@ impl LargePageArena {
         &self.backing[..self.total_bytes]
     }
 
-    /// A fresh arena of the same size with byte-identical contents in a distinct
-    /// allocation — the whole-buffer copy a NUMA replica uses.
+    /// A fresh arena of the same size with byte-identical contents in a
+    /// distinct allocation.
     pub fn clone_backing(&self) -> Self {
         let mut out = Self::with_capacity(self.total_bytes);
         if self.total_bytes != 0 {
@@ -271,20 +244,19 @@ impl LargePageArena {
     }
 }
 
-/// A raw-pointer view into a [`LargePageArena`] sub-array, exposing it as a
-/// `[T]` (via [`Deref`]/[`DerefMut`]). It does not own the backing bytes; the
-/// arena it was carved from must outlive it (guaranteed when both live in the
-/// same owning struct — see the module note).
+/// A raw-pointer view into a [`LargePageArena`] sub-array, exposed as a `[T]`.
+/// It does not own the backing bytes: the arena it was carved from must outlive
+/// it.
 pub struct ArenaSlice<T> {
     ptr: NonNull<T>,
     len: usize,
     _marker: PhantomData<T>,
 }
 
-// SAFETY: an `ArenaSlice<T>` is a view of `[T]` whose backing is kept alive by
-// the same owner; it behaves like `&[T]`/`&mut [T]`, so it is `Send`/`Sync`
-// exactly when `T` is. The owning struct enforces that no aliasing `&mut`
-// coexists (each table gets a disjoint section).
+// SAFETY: an `ArenaSlice<T>` is a view of `[T]` whose backing the same owner
+// keeps alive; it behaves like `&[T]` / `&mut [T]`, so it is `Send`/`Sync`
+// exactly when `T` is. The owner gives each view a disjoint section, so no
+// aliasing `&mut` coexists.
 unsafe impl<T: Send> Send for ArenaSlice<T> {}
 unsafe impl<T: Sync> Sync for ArenaSlice<T> {}
 
@@ -293,8 +265,8 @@ impl<T> Deref for ArenaSlice<T> {
 
     #[inline]
     fn deref(&self) -> &[T] {
-        // SAFETY: `ptr` addresses `len` contiguous, initialised (zeroed) `T`
-        // inside the still-live arena; the borrow is tied to `&self`.
+        // SAFETY: `ptr` addresses `len` contiguous, zeroed `T` inside the
+        // still-live arena, and the borrow is tied to `&self`.
         unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 }
@@ -302,8 +274,8 @@ impl<T> Deref for ArenaSlice<T> {
 impl<T> DerefMut for ArenaSlice<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
-        // SAFETY: as `deref`, but `&mut self` guarantees exclusive access to this
-        // view; disjoint sections never overlap, so no aliasing `&mut` exists.
+        // SAFETY: as `deref`, but `&mut self` guarantees exclusive access, and
+        // disjoint sections never overlap.
         unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }

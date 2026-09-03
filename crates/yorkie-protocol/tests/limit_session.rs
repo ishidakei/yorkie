@@ -3,31 +3,17 @@
 //! command.
 //!
 //! Each test drives a full `usi → isready → position → go` session in-process
-//! against a synthetic (all-zero) network staged at the compiled-in `EvalDir`
-//! (see [`common::stage_configured_eval_dir`]), so they are hermetic.
-//! Multi-depth / node-capped / infinite searches run on a worker thread, so they
-//! use [`StreamHarness`] and wait for the `bestmove` before quitting — a fixed
-//! result never races the `quit`-driven join.
+//! against a synthetic all-zero network staged at the compiled-in `EvalDir`, so
+//! they are hermetic. Searches that run on a worker thread use [`StreamHarness`]
+//! and wait for the `bestmove` before quitting.
 //!
-//! # Reading a setting the build fixed
+//! These settings are compile-time constants, so each test asserts what the
+//! value it was *built* with implies, branching on the constant: with
+//! `configs/test.toml` the three limits are off, and with
+//! `configs/test-limits.toml` they are on.
 //!
-//! These settings are compile-time constants; a session cannot change one. Each
-//! test therefore asserts what the value it was BUILT with implies, branching on
-//! the constant, so the same test body is meaningful under either checked-in
-//! config: `configs/test.toml` leaves the three limits off, and
-//! `configs/test-limits.toml` turns them on. Run the second with
-//! `YORKIE_CONFIG=configs/test-limits.toml cargo nextest run -p yorkie-protocol
-//! --all-features`.
-//!
-//! There is no session-level `USI_Hash` test here: the table is sized once from
-//! the compiled-in constant and no session can resize it, so there are no two
-//! legs to compare. `TranspositionTable`'s own tests cover the resize itself.
-//!
-//! **`usi-extras` gate.** These sessions drive the analysis-only `go` clauses
-//! (`depth` / `nodes` / `movetime` / `infinite`), which a default build refuses
-//! rather than reinterprets, so the whole file is gated on the feature and runs
-//! under the `--all-features` gate. See the `usi-extras` reference
-//! documentation.
+//! Gated on `usi-extras`: these sessions drive analysis-only `go` clauses, which
+//! a default build refuses rather than reinterprets.
 
 //!
 //! **`info-output` gate.** Every assertion here reads the per-iteration
@@ -63,17 +49,14 @@ fn start_ready() -> StreamHarness {
 }
 
 /// One summary per completed search in `out`: each search's last `info depth …`
-/// line joined with its `bestmove …` line, in order. Loading the 107 MiB
-/// synthetic network dominates a session's cost, so tests that compare two
-/// searches run both in ONE session (one load) and split the transcript here.
+/// line joined with its `bestmove …` line, in order. Loading the synthetic
+/// network dominates a session's cost, so tests that compare two searches run
+/// both in *one* session and split the transcript here.
 ///
 /// Which `info` line ends up last is only meaningful when the PV is not
-/// throttled — under a non-zero `PvInterval` the per-iteration PV is gated on
-/// the wall clock (`yorkie-search/src/qsearch.rs`, `pv_interval_elapsed`) and
-/// the coordinator's end-of-search fallback reports a different depth, so two
-/// searches over an identical node sequence can print different final lines.
-/// Both checked-in test configs set `pv_interval = 0`; a comparison test skips
-/// itself under a config that does not.
+/// throttled: under a non-zero `PvInterval` the per-iteration PV is gated on the
+/// wall clock, so two searches over an identical node sequence can print
+/// different final lines. A comparison test skips itself under such a config.
 fn go_summaries(out: &str) -> Vec<String> {
     let mut res = Vec::new();
     let mut cur_info = "";
@@ -105,9 +88,7 @@ fn go_and_wait(h: &StreamHarness, position: &str, go: &str, expect_bestmoves: us
     );
 }
 
-// -------------------------------------------------------------------------
 // DepthLimit / NodesLimit.
-// -------------------------------------------------------------------------
 
 #[cfg_attr(miri, ignore)]
 #[test]
@@ -194,19 +175,14 @@ fn nodes_limit_matches_the_same_go_nodes() {
     );
 }
 
-// -------------------------------------------------------------------------
 // MaxMovesToDraw.
-// -------------------------------------------------------------------------
 
 #[cfg_attr(miri, ignore)]
 #[test]
 fn max_moves_to_draw_adjudicates_a_draw_past_the_horizon() {
-    // A mate-in-1 position at game ply 100. Unlimited (`MaxMovesToDraw 0`) the
-    // search finds the mate; a horizon below the game ply makes every interior /
-    // qsearch node adjudicate a draw before the mate is seen, so the reported
-    // score collapses from `mate` to a draw-band `cp` value and the search still
-    // terminates with a bestmove. Which of the two this build shows is decided by
-    // the constant.
+    // A mate-in-1 position at game ply 100. Unlimited, the search finds the
+    // mate; with a horizon below the game ply every node adjudicates a draw
+    // before the mate is seen, so the score collapses to a draw-band `cp` value.
     let horizon = config::MAX_MOVES_TO_DRAW;
     let h = start_ready();
     go_and_wait(
@@ -244,9 +220,7 @@ fn max_moves_to_draw_adjudicates_a_draw_past_the_horizon() {
     }
 }
 
-// -------------------------------------------------------------------------
 // Gameover (handled exactly like stop).
-// -------------------------------------------------------------------------
 
 #[cfg_attr(miri, ignore)]
 #[test]

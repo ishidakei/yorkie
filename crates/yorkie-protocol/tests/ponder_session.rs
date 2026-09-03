@@ -3,25 +3,19 @@
 //! `stopOnPonderhit` prompt-stop path), `Stochastic_Ponder` rewinds and
 //! re-issues, and `gameover` during pondering still terminates.
 //!
-//! Each test drives a full `usi → isready → position → go ponder`
-//! session in-process against a synthetic (all-zero) network staged at the
-//! compiled-in `EvalDir` (see [`common::stage_configured_eval_dir`]), so they
-//! are hermetic. Ponder searches never self-terminate, so they use
-//! [`StreamHarness`] and drive `stop` / `ponderhit` / `gameover` explicitly. The
-//! wall bounds are deliberately loose (debug builds poll the clock only at
-//! ~512-node `check_time` checkpoints), like the fischer / byoyomi timing tests
-//! — they prove exactly one `bestmove` arrives at the right moment, not a precise
-//! deadline.
+//! Each test drives a full session in-process against a synthetic all-zero
+//! network staged at the compiled-in `EvalDir`, so they are hermetic. Ponder
+//! searches never self-terminate, so they drive `stop` / `ponderhit` /
+//! `gameover` explicitly. The wall bounds are deliberately loose, since debug
+//! builds poll the clock only at ~512-node checkpoints: they prove exactly one
+//! `bestmove` arrives at the right moment, not a precise deadline.
 //!
 //! `Stochastic_Ponder` is a compile-time constant, so the test for it asserts
-//! what the value this build carries implies and skips itself otherwise:
-//! `configs/test.toml` leaves it off and `configs/test-limits.toml` turns it
-//! on (see `tests/limit_session.rs` for how to run the second).
+//! what the value this build carries implies and skips itself otherwise.
 //!
-//! `usi-extras` only, for one mechanical reason: these sessions drive the
-//! analysis-only `go` clauses. The ponder machinery itself is not feature-gated;
-//! it is match behaviour, exercised in both builds by `tests/match_session.rs`
-//! (`go ponder` / `ponderhit`) and by the driver's own no-network tests.
+//! Gated on `usi-extras` only because these sessions drive analysis-only `go`
+//! clauses. The ponder machinery itself is match behaviour and is exercised in
+//! both builds by `tests/match_session.rs`.
 #![cfg(feature = "usi-extras")]
 
 mod common;
@@ -71,9 +65,7 @@ fn assert_legal_after(moves: &[&str], tok: &str) {
     assert!(legal(&pos).contains(&mv), "bestmove {tok:?} is not legal");
 }
 
-// -------------------------------------------------------------------------
 // 1. `go ponder` holds; `stop` releases exactly one bestmove.
-// -------------------------------------------------------------------------
 
 #[cfg_attr(miri, ignore)]
 #[test]
@@ -102,9 +94,7 @@ fn go_ponder_holds_until_stop() {
     assert_legal_after(&[], &sole_bestmove(&out));
 }
 
-// -------------------------------------------------------------------------
 // 2. `go ponder` then `ponderhit`: one bestmove, emitted after the ponderhit.
-// -------------------------------------------------------------------------
 
 #[cfg_attr(miri, ignore)]
 #[test]
@@ -140,9 +130,7 @@ fn ponderhit_continues_and_emits_one_bestmove() {
     assert_legal_after(&[], &sole_bestmove(&out));
 }
 
-// -------------------------------------------------------------------------
 // 3. `stopOnPonderhit`: tiny clock, ponderhit well after the budget is spent.
-// -------------------------------------------------------------------------
 
 #[cfg_attr(miri, ignore)]
 #[test]
@@ -179,10 +167,8 @@ fn stop_on_ponderhit_stops_promptly_after_a_late_ponderhit() {
     assert_legal_after(&[], &sole_bestmove(&out));
 }
 
-// -------------------------------------------------------------------------
 // 4. `Stochastic_Ponder`: rewound ponder, ponderhit re-issues on the current
 //    position, exactly one bestmove (legal in the current position).
-// -------------------------------------------------------------------------
 
 #[cfg_attr(miri, ignore)]
 #[test]
@@ -217,9 +203,7 @@ fn stochastic_ponder_reissues_on_the_current_position() {
     assert_legal_after(&["7g7f"], &sole_bestmove(&out));
 }
 
-// -------------------------------------------------------------------------
 // 5. `gameover` during `go ponder` still terminates the search.
-// -------------------------------------------------------------------------
 
 #[cfg_attr(miri, ignore)]
 #[test]

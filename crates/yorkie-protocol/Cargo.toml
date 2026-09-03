@@ -4,11 +4,8 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
-# Protocol layer. The dependency rules permit
-# Protocol to import Search, Storage, and State, never Evaluation directly: the
-# driver owns the transposition table (Storage) next to the loaded network and
-# drives the depth-1 root search (`yorkie-search`); only a direct Protocol ->
-# Evaluation dependency is forbidden.
+# Protocol layer: may import Search, Storage and State, never Evaluation
+# directly.
 [dependencies]
 yorkie-numa = { path = "../yorkie-numa" }
 yorkie-search = { path = "../yorkie-search" }
@@ -20,46 +17,31 @@ serde = { version = "~1.0", features = ["derive"] }
 serde_json = "~1.0"
 
 # `usi-extras` is the umbrella feature for USI commands a tournament game never
-# issues — book-construction and analysis tooling only. It is OFF by default, so
-# the tournament binary does not contain the commands at all (the parser has no
-# arm for them, the driver has no handler, and the enum variants do not exist).
-#
-# It covers the `tt store` / `tt probe` / `tt children` commands, the whole
-# `bench` command, and the non-match `go` clauses (`depth` / `nodes` / `mate` /
-# `movetime` / `infinite` / `rtime`).
+# issues: the `tt` family, `bench`, and the non-match `go` clauses (`depth` /
+# `nodes` / `mate` / `movetime` / `infinite` / `rtime`). Off by default, so the
+# tournament binary does not contain them at all.
 #
 # `tt` and `bench` disappear as command tokens with the feature off. The gated
-# `go` clauses cannot disappear the same way — `go` itself is a match command —
-# so with the feature off a `go` line carrying one is REJECTED with an
-# `info string` and starts no search. Silently ignoring the clause would turn
-# `go depth 4` into an unbounded, clock-less search mid-game. See the
-# `usi-extras` reference documentation.
+# `go` clauses cannot disappear the same way, since `go` itself is a match
+# command, so a `go` line carrying one is *rejected* with an `info string` and
+# starts no search — silently ignoring the clause would turn `go depth 4` into an
+# unbounded, clock-less search mid-game.
 #
 # `tt-entry16` is the Storage-layer entry-widening feature, re-exported so this
-# crate's session tests can `cfg` on it. The two are independent and compose:
-# a `usi-extras,tt-entry16` build has the whole `tt` command family operating on
-# the wide table. Off by default.
+# crate's session tests can `cfg` on it. Off by default, and independent of
+# `usi-extras`.
 #
-# `info-diag` / `info-output` are the two `info`-line features. The default build
-# emits NO `info` line at all except the `isready`/initialisation-phase
-# `info string`s (the eval-load failure, the loader warnings, the book load
-# reports, `Using N threads`, the NUMA / TT allocation reports) — those are how a
-# failed startup is diagnosed and are unconditional in every build. On top of
-# that:
+# The default build emits no `info` line at all except the initialisation-phase
+# `info string`s, which are how a failed startup is diagnosed and are
+# unconditional in every build. On top of that:
 #
-#   - `info-diag` restores the diagnostic `info string` lines emitted OUTSIDE the
-#     initialisation phase: unknown command, `command too long`, the `position`
-#     rejections, the `go`-clause refusal, `Error! : MaxMovesToDraw is too
-#     small.`, the book-probe notices, the `bench` argument rejections.
-#   - `info-output` restores the search `info` lines (per-iteration / fail-high-low
-#     PV, the final PV, the book hit's multipv block) byte-for-byte, and implies
-#     `info-diag`.
+#   - `info-diag` restores the diagnostic `info string` lines emitted outside the
+#     initialisation phase.
+#   - `info-output` restores the search `info` lines, and implies `info-diag`.
 #
-# The `tt` command family and the `bench` summary line are NOT diagnostics: they
-# are the response payload of a `usi-extras` command — a `tt probe` that printed
-# nothing would be a command with no output — so they ride on `usi-extras` alone.
-#
-# Enabling both features explicitly is the same build as `info-output` alone.
+# The `tt` command family and the `bench` summary line are not diagnostics but
+# the response payload of a `usi-extras` command, so they ride on that feature
+# alone.
 [features]
 usi-extras = []
 tt-entry16 = ["yorkie-search/tt-entry16", "yorkie-storage/tt-entry16"]

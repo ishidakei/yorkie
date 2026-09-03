@@ -1,27 +1,17 @@
-//! Time management — a faithful port of the reference `TimeManagement`
-//! (`upstream YaneuraOu @ 76d58ef`, `source/timeman.{h,cpp}` compiled under
-//! `USE_TIME_MANAGEMENT`, non-DEEP build).
+//! Time management — a port of the reference `TimeManagement`
+//! (`timeman.cpp`), compiled under `USE_TIME_MANAGEMENT` in a non-DEEP build.
 //!
-//! The reference class computes, for one `go`, an **optimum**, **maximum**, and
-//! **minimum** think time in milliseconds from the clock (`time[us]`), the
-//! Fischer increment (`inc[us]`), the byoyomi (`byoyomi[us]`), the game ply, and
-//! the engine's time options. The search then dynamically shrinks the deadline
-//! toward `optimum` based on eval stability (see [`crate::qsearch`]'s iterative
-//! deepening) and stops at [`TimeManagement::search_end`], which is filled by
-//! [`TimeManagement::set_search_end`] and enforced in `check_time`.
+//! For one `go` this computes an **optimum**, **maximum** and **minimum** think
+//! time in milliseconds. The search then shrinks the deadline toward `optimum`
+//! based on eval stability and stops at [`TimeManagement::search_end`].
 //!
-//! All internal arithmetic is in `i64` milliseconds, mirroring the reference
-//! `TimePoint`; the same `(int)` truncation / `float` (`f32`) / `double` (`f64`)
-//! points as the C++ code are preserved so the computed budgets match bit-for-bit
-//! given the same inputs. Wall-clock elapsed is measured from an [`Instant`]
-//! captured when the `go` arrived (the reference `limits.startTime`).
+//! All internal arithmetic is in `i64` milliseconds, and the same `(int)`
+//! truncation and `f32` / `f64` points as the C++ code are preserved so the
+//! computed budgets match bit-for-bit given the same inputs.
 //!
-//! Ponder is wired in the search / USI layers: on a `ponderhit`
-//! the search stamps [`TimeManagement::ponderhit_time`] to `now`, so the
-//! `startTime - ponderhitTime` terms in [`TimeManagement::set_search_end`] carry
-//! real (non-zero) values and the used time is counted from the ponderhit. With no
-//! ponder `ponderhitTime == startTime` and those terms vanish, exercising the same
-//! paths in their ponder-off shape.
+//! With no ponder `ponderhit_time == start_time`, so the
+//! `start_time - ponderhit_time` terms vanish and the same paths run in their
+//! ponder-off shape.
 
 use std::time::Instant;
 
@@ -76,18 +66,18 @@ pub struct TimeInput {
 pub struct TimeManagement {
     /// `startTime` — the origin for [`Self::elapsed`] (`now() - startTime`).
     pub start_time: Instant,
-    /// `ponderhitTime` — equal to `start_time` until a `ponderhit`, at which point
-    /// the search stamps it to the ponderhit instant (`set_ponderhit`,
+    /// `ponderhitTime` — equal to `start_time` until a `ponderhit`, at which
+    /// point the search stamps it to the ponderhit instant (`set_ponderhit`,
     /// `yaneuraou-search.cpp`). Used by [`Self::set_search_end`].
     pub ponderhit_time: Instant,
-    /// `search_end` [ms from `start_time`]: `0` means "not yet decided"; once set,
-    /// the search stops when `search_end <= elapsed` (`timeman.h`).
+    /// `search_end` [ms from `start_time`]: `0` means "not yet decided"; once
+    /// set, the search stops when `search_end <= elapsed` (`timeman.h`).
     pub search_end: i64,
     /// `isFinalPush` — in byoyomi with (almost) no main clock, spend it all
     /// (`timeman.cpp`); consumed by [`Self::set_search_end`].
     pub is_final_push: bool,
-    /// True only for the `MTG <= 0` error path (`timeman.cpp`), so the
-    /// driver can emit the reference `info string Error!` diagnostic.
+    /// True only for the `MTG <= 0` error path (`timeman.cpp`), so the driver
+    /// can emit the reference `info string Error!` diagnostic.
     pub mtg_error: bool,
 
     minimum_time: i64,
@@ -136,18 +126,16 @@ impl TimeManagement {
             round_up_to_fullsecond,
         };
 
-        // Remaining time this move must respect, minus the worst-case network
-        // delay; floored so a spent clock cannot self-destruct
-        // (`timeman.cpp`). Byoyomi is folded in here because it is
-        // available for *this* move; the Fischer increment is deliberately NOT
-        // (`/* + limits.inc[us] */` at the pin) — it is credited only after the
-        // move has been played, so spending it now would overdraw the clock.
+        // Byoyomi is folded in here because it is available for *this* move;
+        // the Fischer increment is deliberately not, since it is credited only
+        // after the move has been played and spending it now would overdraw the
+        // clock. Floored so a spent clock cannot self-destruct.
         let mut remain_time = time_us + byoyomi_us - network_delay2;
         remain_time = remain_time.max(if round_up_to_fullsecond { 100 } else { 1 });
         tm.remain_time = remain_time;
 
-        // `go rtime`: a randomised minimum-think budget, decaying with ply, used
-        // for self-play variety (`timeman.cpp`).
+        // `go rtime`: a randomised minimum-think budget, decaying with ply,
+        // used for self-play variety (`timeman.cpp`).
         if rtime != 0 {
             let mut r = rtime;
             if ply != 0 {
@@ -174,8 +162,8 @@ impl TimeManagement {
         // (`timeman.cpp`).
         let time_forfeit = inc_us == 0 && byoyomi_us == 0;
 
-        // The planning horizon, wider early and narrower once out of the opening
-        // (`timeman.cpp`).
+        // The planning horizon, wider early and narrower once out of the
+        // opening (`timeman.cpp`).
         let move_horizon = if time_forfeit {
             MOVE_HORIZON + 40 - ply.min(40)
         } else {
@@ -221,8 +209,8 @@ impl TimeManagement {
         // optimum candidate (`timeman.cpp`).
         let t1 = minimum_time + remain_estimate / mtg as i64;
 
-        // maximum candidate: up to `max_ratio`× the optimum, capped at 30% of the
-        // remaining estimate (`timeman.cpp`).
+        // maximum candidate: up to `max_ratio`× the optimum, capped at 30% of
+        // the remaining estimate (`timeman.cpp`).
         let mut max_ratio = 5.0f32;
         if time_forfeit {
             max_ratio = max_ratio.min((time_us as f32 / (60.0 * 1000.0)).max(1.0));
@@ -259,9 +247,9 @@ impl TimeManagement {
         tm
     }
 
-    /// Round `t0` up to a whole second (subtracting the network delay), floored at
-    /// `MinimumThinkingTime` and capped at `remain_time` (`timeman.cpp`).
-    /// A no-op rounding when `RoundUpToFullSecond` is off.
+    /// Round `t0` up to a whole second (subtracting the network delay),
+    /// floored at `MinimumThinkingTime` and capped at `remain_time`
+    /// (`timeman.cpp`). A no-op rounding when `RoundUpToFullSecond` is off.
     pub fn round_up(&self, t0: i64) -> i64 {
         if self.round_up_to_fullsecond {
             let mut t = (((t0 + 999) / 1000) * 1000).max(self.minimum_thinking_time);
@@ -277,12 +265,9 @@ impl TimeManagement {
         }
     }
 
-    /// Fix the search end time from the elapsed time `e` [ms] at which the search
-    /// decided to stop (`timeman.cpp`). Rounds the used time up to a full
-    /// second (honouring `isFinalPush` and the minimum think time) and stores the
-    /// result as a `search_end` offset from `startTime`. Without ponder,
-    /// `startTime == ponderhitTime`, so this reduces to
-    /// `search_end = round_up(max(e, minimum()))`.
+    /// Fix the search end time from the elapsed time `e` [ms] at which the
+    /// search decided to stop (`timeman.cpp`), rounding the used time up to a
+    /// full second and storing it as an offset from `start_time`.
     pub fn set_search_end(&mut self, e: i64) {
         // `startTime - ponderhitTime` in ms (0 without ponder; <= 0 with).
         let start_minus_ponderhit = -(self
@@ -377,27 +362,10 @@ mod tests {
         };
         let tm = init(&input);
 
-        // remain_time = 600000 + 10000 - 1120 = 608880 (>= 100).
-        // time_forfeit = false (byoyomi != 0).
-        // move_horizon = 160 + 20 - min(1,80) = 179.
-        // MTG = min(100000 - 1 + 2, 179) / 2 = 179/2 = 89.
-        // minimum_time = max(2000 - 120, 1000) = 1880.
-        // remain_estimate = 600000 + 0 + 10000*89 = 1490000
-        //                 - (89 + 1)*1000 = 1400000 (>= 0).
-        // t1 = 1880 + 1400000/89 = 1880 + 15730 = 17610.
-        // max_ratio = 5.0 (not forfeit).
-        // t2 = 1880 + (int)(1400000 * 5 / 89) = 1880 + 78651 = 80531.
-        //    capped at (int)(1400000 * 0.3) = 420000 -> 80531.
-        // optimum = min(17610, 608880) * 100/100 = 17610.
-        // maximum = min(80531, 608880) = 80531.
-        // not final push (600000 >= 10000*1.2 = 12000).
-        // minimum = min(round_up(1880), 608880):
-        //   round_up(1880): ((1880+999)/1000)*1000 = 2000; max(2000,2000)=2000;
-        //   2000-120=1880; 1880 < 1880? no; min(1880, 608880)=1880.
-        // optimum = min(17610, 608880) = 17610.
-        // maximum = min(round_up(80531), 608880):
-        //   round_up(80531): ((80531+999)/1000)*1000 = 81000; max(81000,2000)=81000;
-        //   81000-120=80880; 80880 < 80531? no; 80880.
+        // A byoyomi clock, so this is not the time-forfeit path and the
+        // 5.0 max ratio applies. Neither the 0.3 remaining-time cap nor the
+        // final-push branch binds here, so t1 / t2 pass through unchanged and
+        // only the round-up-to-a-second step moves `maximum`.
         assert_eq!(tm.minimum(), 1880);
         assert_eq!(tm.optimum(), 17610);
         assert_eq!(tm.maximum(), 80880);
@@ -415,19 +383,8 @@ mod tests {
         };
         let tm = init(&input);
 
-        // remain_time = 300000 + 0 - 1120 = 298880 (inc is NOT folded in).
-        // time_forfeit = false (inc != 0).
-        // move_horizon = 160 + 20 - min(20,80) = 160.
-        // MTG = min(100000 - 20 + 2, 160)/2 = 160/2 = 80.
-        // minimum_time = 1880.
-        // remain_estimate = 300000 + 5000*80 + 0 = 700000 - (80+1)*1000 = 619000.
-        // t1 = 1880 + 619000/80 = 1880 + 7737 = 9617.
-        // t2 = 1880 + (int)(619000*5/80) = 1880 + 38687 = 40567;
-        //    cap (int)(619000*0.3)=185700 -> 40567.
-        // optimum = min(9617, 298880) = 9617.
-        // maximum = min(round_up(40567), 298880):
-        //   round_up: ((40567+999)/1000)*1000=41000; -120 = 40880; 40880<40567? no.
-        // minimum = min(round_up(1880), 298880) = 1880.
+        // A Fischer clock: the increment is not folded into `remain_time`, but
+        // it does raise `remain_estimate` over the move horizon.
         assert_eq!(tm.minimum(), 1880);
         assert_eq!(tm.optimum(), 9617);
         assert_eq!(tm.maximum(), 40880);
@@ -436,10 +393,9 @@ mod tests {
     #[test]
     fn increment_is_excluded_from_remain_time() {
         // The Fischer increment is credited only *after* the move is played, so
-        // it must not enter `remain_time` (`timeman.cpp` at the pin).
-        // A tiny main clock with a huge increment makes the difference visible:
-        // `remain_time` binds both optimum and maximum, and it is computed from
-        // the main clock alone.
+        // it must not enter `remain_time`. A tiny main clock with a huge
+        // increment makes the difference visible: `remain_time` binds both
+        // optimum and maximum, and it comes from the main clock alone.
         let input = TimeInput {
             time_us: 5_000,
             inc_us: 60_000,
@@ -448,13 +404,8 @@ mod tests {
         };
         let tm = init(&input);
 
-        // remain_time = 5000 + 0 - 1120 = 3880 (with inc it would be 63880).
-        // move_horizon = 160 + 20 - min(1,80) = 179; MTG = 179/2 = 89.
-        // minimum_time = 1880.
-        // remain_estimate = 5000 + 60000*89 - (89+1)*1000 = 5255000.
-        // t1 = 1880 + 5255000/89 = 60924; t2 is larger still.
-        // optimum = min(t1, 3880) = 3880; maximum = min(round_up(t2), 3880) = 3880.
-        // minimum = min(round_up(1880), 3880) = 1880.
+        // `remain_time` is 3880 here, and would be 63880 if the increment were
+        // folded in; both t1 and t2 exceed it, so it binds optimum and maximum.
         assert_eq!(tm.minimum(), 1880);
         assert_eq!(tm.optimum(), 3880);
         assert_eq!(tm.maximum(), 3880);
@@ -470,17 +421,8 @@ mod tests {
         };
         let tm = init(&input);
 
-        // remain_time = 600000 - 1120 = 598880.
-        // time_forfeit = true. move_horizon = 160 + 40 - min(1,40) = 199.
-        // MTG = min(100000 - 1 + 2, 199)/2 = 199/2 = 99.
-        // minimum_time = 1880.
-        // remain_estimate = 600000 + 0 + 0 = 600000 - (99+1)*1000 = 500000.
-        // t1 = 1880 + 500000/99 = 1880 + 5050 = 6930.
-        // max_ratio = min(5.0, max(600000/60000, 1.0)) = min(5.0, 10.0) = 5.0.
-        // t2 = 1880 + (int)(500000*5/99) = 1880 + 25252 = 27132;
-        //    cap (int)(500000*0.3)=150000 -> 27132.
-        // optimum = 6930.
-        // maximum = round_up(27132): ((27132+999)/1000)*1000=28000; -120=27880.
+        // No byoyomi and no increment, so this is the time-forfeit path: the
+        // move horizon widens to 199 and `max_ratio` is clamped to 5.0.
         assert_eq!(tm.optimum(), 6930);
         assert_eq!(tm.maximum(), 27880);
     }
@@ -495,18 +437,8 @@ mod tests {
         };
         let tm = init(&input);
 
-        // remain_time = 30000 - 1120 = 28880.
-        // time_forfeit = true. move_horizon = 199. MTG = 99.
-        // minimum_time = 1880.
-        // remain_estimate = 30000 - 100000 = -70000 -> max(0) = 0.
-        // t1 = 1880 + 0 = 1880.
-        // max_ratio = min(5.0, max(30000/60000=0.5, 1.0)) = 1.0.
-        // t2 = 1880 + (int)(0*1/99) = 1880; cap (int)(0*0.3)=0 -> min(1880,0)=0.
-        // optimum = min(1880, 28880) = 1880.
-        // maximum = min(round_up(0), 28880):
-        //   round_up(0): ((0+999)/1000)*1000=0; max(0,2000)=2000; 2000-120=1880;
-        //   1880 < 0? no; min(1880, 28880)=1880.
-        // minimum = min(round_up(1880), 28880) = 1880.
+        // The clock is short enough that `remain_estimate` floors at 0, so t1
+        // and t2 collapse to `minimum_time` and every budget is 1880.
         assert_eq!(tm.minimum(), 1880);
         assert_eq!(tm.optimum(), 1880);
         assert_eq!(tm.maximum(), 1880);
@@ -524,14 +456,8 @@ mod tests {
         };
         let tm = init(&input);
 
-        // remain_time = 500 + 1000 - 1120 = 380 (>= 100).
-        // final push: 500 < (int)(1000*1.2)=1200 -> all = 1000 + 500 = 1500,
-        //   isFinalPush = true.
-        // then minimum = min(round_up(1500), 380):
-        //   round_up(1500): ((1500+999)/1000)*1000=2000; max(2000,2000)=2000;
-        //   2000-120=1880; 1880<1500? no; min(1880, 380)=380.
-        // optimum = min(1500, 380) = 380.
-        // maximum = min(round_up(1500), 380) = 380.
+        // The main clock is under 1.2× the byoyomi, so the final-push branch
+        // fires and every budget collapses to `remain_time`.
         assert!(tm.is_final_push);
         assert_eq!(tm.minimum(), 380);
         assert_eq!(tm.optimum(), 380);
@@ -586,16 +512,9 @@ mod tests {
         };
         let tm = init(&input);
 
-        // remain_time = 298880 (inc excluded; floor is 1, unaffected).
-        // minimum_time = max(2000 - 120, 1) = 1880.
-        // remain_estimate = 300000 + 5000*80 = 700000 (no -=(MTG+1)*1000).
-        // t1 = 1880 + 700000/80 = 1880 + 8750 = 10630.
-        // t2 = 1880 + (int)(700000*5/80) = 1880 + 43750 = 45630;
-        //    cap (int)(700000*0.3)=210000 -> 45630.
-        // optimum = 10630.
-        // maximum = round_up(45630) with round off:
-        //   max(45630, 2000)=45630; -120 = 45510; min(45510, 298880)=45510.
-        // minimum = round_up(1880) off: max(1880,2000)=2000; -120=1880.
+        // With the per-move reserve off, `remain_estimate` keeps the whole
+        // `(MTG + 1) * 1000`, and with round-up off `maximum` skips the
+        // whole-second step.
         assert_eq!(tm.minimum(), 1880);
         assert_eq!(tm.optimum(), 10630);
         assert_eq!(tm.maximum(), 45510);
@@ -663,7 +582,7 @@ mod tests {
     #[test]
     fn rtime_result_within_bounds() {
         // rtime r plus a decaying random increment in [0, min(r/2, r*10/ply)).
-        // ply 40 -> bound = min(2000, 1000) = 1000, so result in [4000, 5000).
+        // ply 40 -> bound = min = 1000, so result in [4000, 5000).
         let r: i64 = 4000;
         let ply = 40;
         for seed in 1..50u64 {
@@ -698,12 +617,12 @@ mod tests {
             ..base()
         });
         // Exactly on a whole second: 3000 -> ((3000+999)/1000)*1000 = 3000;
-        // max(3000,2000)=3000; -120 = 2880; 2880 < 3000 -> +1000 = 3880.
+        // max=3000; -120 = 2880; 2880 < 3000 -> +1000 = 3880.
         assert_eq!(tm.round_up(3000), 3880);
         // Just over: 3001 -> ceil to 4000; -120 = 3880; 3880 >= 3001 -> 3880.
         assert_eq!(tm.round_up(3001), 3880);
-        // Below the minimum floor: 100 -> ceil 1000; max(1000,2000)=2000;
-        // -120 = 1880; 1880 >= 100 -> 1880.
+        // Below the minimum floor: 100 -> ceil 1000; max=2000; -120 = 1880;
+        // 1880 >= 100 -> 1880.
         assert_eq!(tm.round_up(100), 1880);
     }
 
@@ -714,9 +633,9 @@ mod tests {
             round_up_to_fullsecond: false,
             ..base()
         });
-        // max(3001, 2000)=3001; -120 = 2881.
+        // max=3001; -120 = 2881.
         assert_eq!(tm.round_up(3001), 2881);
-        // max(100, 2000)=2000; -120 = 1880.
+        // max=2000; -120 = 1880.
         assert_eq!(tm.round_up(100), 1880);
     }
 
@@ -729,13 +648,12 @@ mod tests {
             ply: 1,
             ..base()
         });
-        // minimum() == 1880 here. Elapsed 5000 > minimum, so
-        // search_end = round_up(5000): ceil 5000; -120 = 4880; 4880<5000 -> 5880.
+        // minimum() == 1880 here. Elapsed 5000 > minimum, so search_end =
+        // round_up: ceil 5000; -120 = 4880; 4880<5000 -> 5880.
         tm.set_search_end(5000);
         assert_eq!(tm.search_end, 5880);
 
-        // Elapsed below minimum uses minimum(): max(500, 1880) = 1880;
-        // round_up(1880) = 1880.
+        // Elapsed below minimum uses minimum(): max = 1880; round_up = 1880.
         tm.search_end = 0;
         tm.set_search_end(500);
         assert_eq!(tm.search_end, 1880);
@@ -750,10 +668,10 @@ mod tests {
             ..base()
         });
         assert!(tm.is_final_push);
-        // minimum() == 380 (clamped to remain_time). Elapsed 100 < minimum:
-        // t2 = minimum() = 380 (final push branch); max(100, 380) = 380;
-        // round_up(380): ceil 1000; max(1000,2000)=2000; -120=1880; 1880<380? no;
-        // min(1880, remain_time=380) = 380.
+        // minimum() == 380 (clamped to remain_time). Elapsed 100 < minimum: t2
+        // = minimum() = 380 (final push branch); max = 380; round_up: ceil
+        // 1000; max=2000; -120=1880; 1880<380? no; min(1880, remain_time=380)
+        // = 380.
         tm.set_search_end(100);
         assert_eq!(tm.search_end, 380);
     }

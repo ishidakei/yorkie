@@ -48,7 +48,7 @@ fn startpos_choice_is_legal_deterministic_and_matches_full_refresh() {
     let path = nn_bin_path();
     if !path.exists() {
         eprintln!(
-            "skipping startpos_choice_is_legal_deterministic_and_matches_full_refresh: {} is not present (staged only on the dev VM)",
+            "skipping startpos_choice_is_legal_deterministic_and_matches_full_refresh: {} is not present (obtained out-of-band)",
             path.display()
         );
         return;

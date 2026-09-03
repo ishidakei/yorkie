@@ -1,25 +1,15 @@
-//! `#[cfg(test)]` scanning oracles for the piece-set move generators — the
-//! emission-sequence gate.
+//! Scan twins of the four search generators, deriving their emission from an
+//! 81-square walk rather than the piece sets and bitboard attack tables.
 //!
-//! Each of the four search generators has a scan twin here that derives the
-//! emission independently of the piece sets and the bitboard attack tables: the
-//! generating pieces come from an 81-square scan (via
-//! [`super::emit_group_scan`], which filters with `Group::contains` and computes
-//! destinations with the movement-walk [`super::reachable_scan`]), and the
-//! evasion king moves come from [`super::reachable_scan`] too. Only the
-//! piece-move machinery is re-derived; the drop tail reuses the production
-//! [`Position::emit_drops`], whose one bitboard-derived input (the file-mask
-//! nifu mask) is pinned separately by
-//! `nifu_blocked_files == nifu_blocked_files_scan`. So a twin's full output is
-//! that of an entirely scan-based generator, and the sequence-equality gate
-//! compares it move-for-move against production.
+//! Only the piece-move machinery is re-derived; the drop tail reuses the
+//! production [`Position::emit_drops`], whose one bitboard-derived input is
+//! pinned separately by `nifu_blocked_files == nifu_blocked_files_scan`.
 
 use super::{ExtMove, Group, Target, emit_group_scan, push_plain, reachable_scan};
 use crate::movegen::try_find_king;
 use crate::position::Position;
 
-/// The `CAPTURES` piece groups (gold-group carries the king), shared by the
-/// scan twins that emit every group.
+/// The `CAPTURES` piece groups, whose gold group carries the king.
 const CAPTURE_GROUPS: [Group; 6] = [
     Group::Pawn,
     Group::Lance,
@@ -61,8 +51,7 @@ impl Position {
             }
         }
 
-        // Same order as CAPTURES but the gold-group excludes the king (already
-        // emitted), and destinations include empty (blocking) squares.
+        // The gold group excludes the king, which was emitted above.
         const GROUPS: [Group; 6] = [
             Group::Pawn,
             Group::Lance,

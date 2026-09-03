@@ -4,42 +4,35 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
-# Storage layer. Dependency rules: Storage is a substrate
-# — it may depend on std + utility crates only, and MUST NOT import
-# yorkie-state, yorkie-eval, yorkie-search, or yorkie-protocol. The
-# transposition table therefore speaks in primitives (u64 key, u16 move
-# fragment, i32 value/depth, a local Bound enum) rather than State-layer types;
-# the Search layer, which owns both, adapts between them.
+# Storage layer: a substrate that may depend on std and utility crates only, and
+# must not import any other workspace crate. The transposition table therefore
+# speaks in primitives rather than State-layer types, and the Search layer, which
+# owns both, adapts between them.
 [dependencies]
 
-# The process-wide `#[global_allocator]` (see `src/allocator.rs` for why the
-# declaration lives in this crate rather than in the `yorkie` binary root).
-# Default features only: `secure` is deliberately off, and no mimalloc options
-# are tuned. MIT, crates.io — as is its transitive `libmimalloc-sys`, which
-# builds the vendored C sources and therefore needs a C compiler on the build
-# host.
+# The process-wide `#[global_allocator]`; `src/allocator.rs` says why the
+# declaration lives here rather than in the binary root. Its transitive
+# `libmimalloc-sys` builds vendored C sources, so a C compiler is needed on the
+# build host.
 mimalloc = "0.1"
 
-# Unix-only: `madvise(MADV_HUGEPAGE)` over the transposition-table allocation
-# (see `src/tt.rs`), mirroring the reference's `aligned_large_pages_alloc`. The
-# call itself is Linux-gated in code; the dependency is `cfg(unix)`-gated so
-# non-Unix targets never pull it in.
+# Unix-only: `madvise(MADV_HUGEPAGE)` over the transposition-table allocation,
+# mirroring the reference's `aligned_large_pages_alloc`. The call is Linux-gated
+# in code; the dependency is `cfg(unix)`-gated so non-Unix targets never pull it
+# in.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# `tt-entry16` widens the transposition-table entry from the reference's 10
-# bytes to 16, spending the whole increase on the key: `key: u16` (the position
-# hash's low 16 bits) becomes `key: u64` (the whole hash), so a probe checks
-# position identity on all 64 bits and a stored entry's identity is exact
-# instead of ~1/65536-false-positive. The payload fields are untouched.
+# `tt-entry16` widens the transposition-table entry from the reference's 10 bytes
+# to 16, spending the whole increase on the key: the stored `u16` key fragment
+# becomes the whole `u64` hash, so an entry's identity is exact instead of
+# ~1/65536-false-positive. The payload fields are untouched.
 #
-# The cluster stays 32 bytes and therefore holds 2 entries instead of 3: the TT
-# sizing arithmetic, the cluster-count and the index computation are all
-# unchanged, and the same byte budget simply holds 2/3 as many entries.
+# The cluster stays 32 bytes and therefore holds 2 entries instead of 3; the TT
+# sizing arithmetic and index computation are unchanged.
 #
-# OFF by default, and the default build is byte-identical to what it was before
-# the feature existed. With it ON the probe-hit pattern changes, so search
-# output matches neither the default build's nor the reference's.
+# Off by default. With it on the probe-hit pattern changes, so search output
+# matches neither the default build's nor the reference's.
 [features]
 tt-entry16 = []
 

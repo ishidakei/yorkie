@@ -10,16 +10,13 @@ pub enum PositionSfen {
     Sfen(String),
 }
 
-/// All USI `go` sub-tokens captured verbatim, including the ones the driver
-/// does not act on, so the parse is lossless.
+/// All USI `go` sub-tokens captured verbatim, including the ones the driver does
+/// not act on, so the parse is lossless.
 ///
-/// The struct carries every field in both feature configurations. The
-/// `usi-extras` gate sits on the *parser arms* (`EXTRA_GO_CLAUSES`), not on
-/// the fields: `depth` and `nodes` are also seeded from the `DepthLimit` /
-/// `NodesLimit` options, which are ordinary `setoption` names a match may use,
-/// so a field-level gate would have to cut those too. With the feature off no
-/// `go` line can reach the gated fields — they stay at their defaults unless an
-/// option seeds them.
+/// The `usi-extras` gate sits on the parser *arms*, not on the fields: `depth`
+/// and `nodes` are also seeded from the `DepthLimit` / `NodesLimit` options, so
+/// a field-level gate would have to cut those too. With the feature off no `go`
+/// line can reach the gated fields.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GoLimits {
     pub depth: Option<u32>,
@@ -34,16 +31,14 @@ pub struct GoLimits {
     /// `go ponder` — think on the predicted position; hold the reply until
     /// `ponderhit` or `stop`.
     pub ponder: bool,
-    /// `go mate [ms|infinite]` — mate-search mode (`usi.cpp`). In USI
-    /// (unlike UCI) the token after `mate` is a TIME BUDGET in milliseconds, not
-    /// a move count; `infinite` or a bare `mate` means unlimited. `None` means
-    /// this is not a mate search; `Some(ms)` carries the budget, with the
-    /// sentinel [`MATE_UNLIMITED_MS`] standing for unlimited (the pin's
-    /// `INT32_MAX`).
+    /// `go mate [ms|infinite]` — mate-search mode (`usi.cpp`). In USI, unlike
+    /// UCI, the token after `mate` is a time budget in milliseconds, not a move
+    /// count. `Some(ms)` carries the budget, with [`MATE_UNLIMITED_MS`] standing
+    /// for unlimited.
     pub mate: Option<u64>,
     /// `go rtime <ms>` — a randomised minimum-thinking-time budget used for
-    /// self-play variety (`timeman.cpp`). `init_` seeds all three time
-    /// bounds to `rtime` (plus a decaying random bump) and returns early. `None`
+    /// self-play variety (`timeman.cpp`). `init_` seeds all three time bounds
+    /// to `rtime` (plus a decaying random bump) and returns early. `None`
     /// means no `rtime`.
     pub rtime: Option<u64>,
 }
@@ -52,15 +47,12 @@ pub struct GoLimits {
 /// `usi.cpp`): `go mate infinite` and a bare `go mate` both map here.
 pub const MATE_UNLIMITED_MS: u64 = i32::MAX as u64;
 
-/// The `go` clauses that live behind `usi-extras` — the ones a rated game never
-/// issues. A tournament bridge sends only the clock clauses (`btime` / `wtime` /
-/// `binc` / `winc` / `byoyomi`) and `ponder`; everything here is analysis or
-/// tooling.
+/// The `go` clauses that live behind `usi-extras`: everything here is analysis
+/// or tooling, not the clock clauses and `ponder` a game bridge sends.
 ///
 /// With the feature off these tokens are **rejected**, not ignored: silently
 /// dropping the clause would turn `go depth 4` into an unbounded, clock-less
-/// search in the middle of a game, so the driver reports the clause and starts
-/// nothing (see [`Command::GoExtraClause`]).
+/// search in the middle of a game.
 #[cfg(not(feature = "usi-extras"))]
 pub const EXTRA_GO_CLAUSES: [&str; 6] = ["depth", "nodes", "mate", "movetime", "infinite", "rtime"];
 
@@ -82,25 +74,22 @@ pub enum Command {
     /// without `usi-extras`. Holds the offending clause token so the driver can
     /// name it; **no search is started**. The variant exists only when the
     /// feature is off — with it on, every one of those clauses parses into
-    /// [`Command::Go`] exactly as before.
+    /// [`Command::Go`].
     #[cfg(not(feature = "usi-extras"))]
     GoExtraClause(String),
     Stop,
-    /// `gameover [win|lose|draw]` — the game ended. The optional result token is
-    /// ignored; the command is treated exactly like `stop` (`usi.cpp`):
+    /// `gameover [win|lose|draw]` — the game ended. The optional result token
+    /// is ignored; the command is treated exactly like `stop` (`usi.cpp`):
     /// over a shogi GUI, an opponent resign during `go ponder` arrives as
     /// `gameover` without a preceding `stop`, so it must release a held reply.
     GameOver,
     /// `ponderhit` — the opponent played the pondered move; commit the search.
     PonderHit,
-    /// `bench [ttSizeMB] [threads] [limit] [default|current|<fenFile>] [limitType]`
-    /// — the reproducible NPS benchmark (`benchmark.cpp` / `usi.cpp`). The raw
-    /// trailing tokens are carried verbatim; [`crate::bench::parse_bench`] gives
-    /// them meaning (defaults, limit type, position source).
+    /// `bench [ttSizeMB] [threads] [limit] [default|current|<fenFile>]
+    /// [limitType]` — the reproducible NPS benchmark. The raw trailing tokens
+    /// are carried verbatim; [`crate::bench::parse_bench`] gives them meaning.
     ///
-    /// `usi-extras` only — a tournament game never issues it. The variant exists
-    /// only when the feature is on, so the default build cannot even name the
-    /// command.
+    /// `usi-extras` only, so the default build cannot even name the command.
     #[cfg(feature = "usi-extras")]
     Bench(Vec<String>),
     /// `tt <store|probe|children> …` — the feature-gated transposition-table
@@ -206,10 +195,10 @@ fn parse_go<'a>(line: &str, parts: impl Iterator<Item = &'a str>) -> Command {
                 limits.ponder = true;
                 i += 1;
             }
-            // `go mate [ms|infinite]` (`usi.cpp`): the token after `mate`
-            // is a millisecond time budget; `infinite`, or nothing following,
-            // means unlimited. Anything else that is not a valid `u64` is an
-            // error (the pin's `stoi` would throw).
+            // `go mate [ms|infinite]` (`usi.cpp`): the token after `mate` is a
+            // millisecond time budget; `infinite`, or nothing following, means
+            // unlimited. Anything else that is not a valid `u64` is an error
+            // (the reference's `stoi` would throw).
             "mate" => match tokens.get(i + 1) {
                 None => {
                     limits.mate = Some(MATE_UNLIMITED_MS);

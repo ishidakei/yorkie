@@ -1,18 +1,9 @@
-//! `#[cfg(test)]` equivalence oracles for the bitboard SEE in [`super`].
+//! Scalar forms of the bitboard SEE in [`super`], derived independently of the
+//! bitboard substrate.
 //!
-//! Two scalar oracles are kept, each derived independently of the bitboard
-//! substrate:
-//!
-//! * [`Position::see_ge_reference`] — the full-board-rescan form: it re-derives
-//!   `attackers_to` against the mutated occupancy every step.
-//! * [`Position::see_ge_incremental`] — collect once + scalar x-ray maintenance
-//!   (`attackers_to_bits` + `reveal_xray`).
-//!
-//! Both share the scalar attacker machinery below and the scalar
-//! [`slider_blockers_scalar`] (an `update_slider_blockers` walk, the oracle for
-//! the bitboard blocker sets). The bitboard `super::see_ge` must agree with both
-//! on every move / threshold; `super::equivalence` enforces it over fixture
-//! playouts.
+//! [`Position::see_ge_reference`] re-derives `attackers_to` against the mutated
+//! occupancy at every step; [`Position::see_ge_incremental`] collects once and
+//! maintains the x-rays, as production does.
 
 use super::{
     BISHOP_VALUE, DRAGON_VALUE, GOLD_VALUE, HORSE_VALUE, KING_VALUE, KNIGHT_VALUE, LANCE_VALUE,
@@ -26,9 +17,7 @@ use crate::piece::{Piece, PieceKind};
 use crate::position::Position;
 use crate::square::Square;
 
-/// Materialize a raw attacker/blocker `u128` mask (this oracle's internal
-/// representation) as a [`Bitboard`], so comparisons against the production
-/// `super::slider_blockers` go through the typed value.
+/// Materialize a raw attacker or blocker mask as a [`Bitboard`].
 fn bits_to_bb(mut bits: u128) -> Bitboard {
     let mut bb = Bitboard::empty();
     while let Some(idx) = bits.lowest_one() {
@@ -38,9 +27,8 @@ fn bits_to_bb(mut bits: u128) -> Bitboard {
     bb
 }
 
-/// The reference's `pieces(<TYPE>)` least-valuable-attacker buckets, including
-/// the terminal KING (which the production [`super::Bucket`] omits because it is
-/// handled by the loop's king branch rather than a `swap` update).
+/// The least-valuable-attacker buckets, including the terminal KING that
+/// [`super::Bucket`] omits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Bucket {
     Pawn,
@@ -101,7 +89,7 @@ fn bucket_value(b: Bucket) -> i32 {
     }
 }
 
-/// An 81-bit occupancy set over board squares (`bit i` ⇔ square index `i`).
+/// An 81-bit occupancy set over board squares.
 #[derive(Clone, Copy)]
 struct Occupancy(u128);
 
@@ -115,8 +103,7 @@ impl Occupancy {
     }
 }
 
-/// Forward rank delta for a color's own pieces (Black advances toward rank 0,
-/// White toward rank 8).
+/// Forward rank delta for a color's own pieces.
 fn forward_dr(color: Color) -> i8 {
     match color {
         Color::Black => -1,
@@ -247,8 +234,7 @@ fn is_sniper_type(piece: Piece, df: i8, dr: i8, king_color: Color) -> bool {
 }
 
 /// A scalar `update_slider_blockers(c)`: returns
-/// `(blockersForKing[c], pinners[~c])`. The equivalence oracle for the bitboard
-/// [`super::slider_blockers`].
+/// `(blockersForKing[c], pinners[~c])`.
 pub(crate) fn slider_blockers_scalar(board: &crate::board::Board, c: Color) -> (u128, u128) {
     let ksq = match try_find_king(board, c) {
         Some(s) => s,
@@ -298,9 +284,7 @@ pub(crate) fn slider_blockers_scalar(board: &crate::board::Board, c: Color) -> (
     (blockers, pinners)
 }
 
-/// [`slider_blockers_scalar`] with both halves lifted into [`Bitboard`], so it
-/// can be compared directly against the production `super::slider_blockers`
-/// (which returns `Bitboard`s).
+/// [`slider_blockers_scalar`] with both halves lifted into [`Bitboard`].
 pub(crate) fn slider_blockers_scalar_bb(
     board: &crate::board::Board,
     c: Color,
@@ -310,8 +294,7 @@ pub(crate) fn slider_blockers_scalar_bb(
 }
 
 impl Position {
-    /// Full-board-rescan SEE oracle — re-derives `attackers_to` against the
-    /// mutated occupancy every step.
+    /// SEE re-deriving `attackers_to` against the mutated occupancy each step.
     pub(crate) fn see_ge_reference(&self, m: Move, threshold: i32) -> bool {
         let board = self.board();
         let drop = m.is_drop();
@@ -431,7 +414,7 @@ impl Position {
         res != 0
     }
 
-    /// Incremental SEE oracle — collect-once + scalar x-ray reveal.
+    /// SEE collecting the attackers once, then revealing x-rays scalarly.
     pub(crate) fn see_ge_incremental(&self, m: Move, threshold: i32) -> bool {
         let board = self.board();
         let drop = m.is_drop();
@@ -531,9 +514,7 @@ impl Position {
     }
 }
 
-/// Scalar least-valuable-attacker scan classifying each set square by
-/// [`bucket_of`]. Returns `None` when only a KING
-/// remains.
+/// Scalar least-valuable-attacker scan, `None` when only a king remains.
 fn least_valuable_attacker_scan(
     board: &crate::board::Board,
     stm_attackers: u128,

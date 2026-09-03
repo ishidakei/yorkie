@@ -1,16 +1,13 @@
 //! That the engine does NOT read the option-override files on disk.
 //!
-//! `engine_options.txt` (current directory) and `<EvalDir>/eval_options.txt` were
-//! the reference's way to reconfigure an engine without a rebuild. This engine
-//! takes every setting from the TOML config compiled into it, in every build, so
-//! it must not read either file: a file on disk that claims to set `USI_Hash` has
-//! no authority here, and reading it — even to ignore it — would blur where the
-//! engine's settings actually come from.
+//! `engine_options.txt` and `<EvalDir>/eval_options.txt` were the reference's
+//! way to reconfigure an engine without a rebuild. This engine takes every
+//! setting from the TOML config compiled into it, so it must not read either
+//! file: a file on disk that claims to set `USI_Hash` has no authority here.
 //!
 //! `engine_options.txt` would resolve against the process working directory,
-//! which a single-process test cannot change safely. So this spawns the built
-//! binary with its own working directory instead, which is where the file would
-//! have been read from.
+//! which a single-process test cannot change safely, so this spawns the built
+//! binary with its own working directory instead.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

@@ -1,40 +1,15 @@
 //! Shared huge-page-backed allocator, a port of the reference's
-//! `aligned_large_pages_alloc` / `make_unique_large_page`
-//! (`source/memory.h`, `memory.cpp`).
+//! `aligned_large_pages_alloc` / `make_unique_large_page` (`memory.cpp`).
 //!
-//! The reference routes its biggest allocations — the transposition table, the
-//! dynamically sized history tables, and the loaded NNUE parameters — through a
-//! single large-page allocator so a `madvise(MADV_HUGEPAGE)` hint can back them
-//! with transparent huge pages. This module is the port's one copy of that
-//! policy, reused by the TT ([`crate::tt`]), the search-layer history tables,
-//! and the eval-layer network parameters instead of the logic being duplicated
-//! at each site.
+//! The transposition table, the history tables and the loaded NNUE parameters
+//! all allocate through here, so the huge-page policy lives in one place: base
+//! alignment [`LARGE_PAGE_ALIGN`], the byte size rounded **up** to a whole
+//! multiple of it, zero-initialised, and — on Linux — `MADV_HUGEPAGE`-hinted
+//! best-effort across the whole rounded region.
 //!
-//! The policy, matching `aligned_large_pages_alloc`
-//! (`memory.cpp`) exactly:
-//!
-//! * base alignment [`LARGE_PAGE_ALIGN`] — a 2 MiB huge-page boundary on Linux
-//!   (so the `MADV_HUGEPAGE` hint can take effect), a 4 KiB page boundary
-//!   elsewhere (macOS dev machines / CI, where the huge-page path does not
-//!   apply);
-//! * the byte size is rounded **up** to a whole multiple of [`LARGE_PAGE_ALIGN`]
-//!   (`size = ((allocSize + alignment - 1) / alignment) * alignment`);
-//! * the region is zero-initialised (`alloc_zeroed`);
-//! * on Linux the whole rounded region is `madvise(MADV_HUGEPAGE)`-hinted, the
-//!   call being silent and its return value ignored exactly as the reference
-//!   ignores it (the hint is best-effort).
-//!
-//! Two safe containers sit on top of that raw helper:
-//!
-//! * [`LargePageArray<T>`] — a large-page-backed `[T]`, the analogue of
-//!   `Box<[T]>` (and of `make_unique_large_page<T[]>`);
-//! * [`LargePageBox<T>`] — a large-page-backed single `T`, the analogue of
-//!   `Box<T>` (and of `make_unique_large_page<T>`), used to keep a fixed-shape
-//!   multidimensional array's compile-time dimensions.
-//!
-//! Both construct their storage zeroed, so the element type must have a valid
-//! all-zero bit pattern; that requirement is captured by the [`Zeroable`]
-//! marker.
+//! [`LargePageArray<T>`] and [`LargePageBox<T>`] are the `Box<[T]>` and `Box<T>`
+//! analogues on top of it. Both construct their storage zeroed, so the element
+//! type must have a valid all-zero bit pattern — the [`Zeroable`] marker.
 
 use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
 use std::fmt;
@@ -43,10 +18,9 @@ use std::ops::{Deref, DerefMut};
 use std::ptr::{self, NonNull};
 use std::slice;
 
-/// Base alignment of a large-page allocation, mirroring the reference's
-/// `aligned_large_pages_alloc`: a 2 MiB huge-page boundary on Linux so a
-/// `MADV_HUGEPAGE` hint can back the region with transparent huge pages, and a
-/// 4 KiB page boundary elsewhere, where the huge-page path does not apply.
+/// Base alignment of a large-page allocation: a 2 MiB huge-page boundary on
+/// Linux so a `MADV_HUGEPAGE` hint can back the region with transparent huge
+/// pages, and a plain page boundary elsewhere.
 #[cfg(target_os = "linux")]
 pub const LARGE_PAGE_ALIGN: usize = 2 * 1024 * 1024;
 /// See the Linux definition; 4 KiB elsewhere.
@@ -54,17 +28,13 @@ pub const LARGE_PAGE_ALIGN: usize = 2 * 1024 * 1024;
 pub const LARGE_PAGE_ALIGN: usize = 4096;
 
 /// Types whose all-zero bit pattern is a valid, fully initialised value, so a
-/// zeroed allocation is a valid `Self`. Implemented for the fixed-width integers
-/// the history / NNUE tables store, for the atomic integer the thread-shared
-/// history tables store, and, transitively, for arrays of them.
+/// zeroed allocation is a valid `Self`.
 ///
 /// # Safety
 ///
 /// An all-zero byte pattern of `size_of::<Self>()` bytes must be a valid value
 /// of `Self`, and `Self` must need no drop glue: the containers below free the
-/// backing bytes directly and never run element destructors. The plain-integer
-/// impls satisfy the latter because they are `Copy`; [`AtomicI16`] satisfies it
-/// because it has no `Drop` (an atomic integer is trivially destructible).
+/// backing bytes directly and never run element destructors.
 pub unsafe trait Zeroable {}
 
 // SAFETY: `0` is a valid value of each of these integer types, and all are
@@ -75,9 +45,7 @@ unsafe impl Zeroable for i32 {}
 unsafe impl Zeroable for u8 {}
 
 // SAFETY: `AtomicI16` has the same layout as `i16`, its all-zero pattern is the
-// integer `0` (a valid initialised atomic), and it has no `Drop` glue. It is the
-// entry type of the thread-shared correction / pawn history tables, which need
-// interior mutability under a shared `&SharedHistories`.
+// integer `0`, and it has no `Drop` glue.
 unsafe impl Zeroable for core::sync::atomic::AtomicI16 {}
 
 // SAFETY: an array is valid when every element is, and an all-zero array is an
@@ -85,20 +53,14 @@ unsafe impl Zeroable for core::sync::atomic::AtomicI16 {}
 // elements need none.
 unsafe impl<T: Zeroable, const N: usize> Zeroable for [T; N] {}
 
-/// Round `min_bytes` up to a whole multiple of [`LARGE_PAGE_ALIGN`]
-/// (`size = ((allocSize + alignment - 1) / alignment) * alignment`).
+/// Round `min_bytes` up to a whole multiple of [`LARGE_PAGE_ALIGN`].
 pub(crate) const fn rounded_size(min_bytes: usize) -> usize {
     min_bytes.div_ceil(LARGE_PAGE_ALIGN) * LARGE_PAGE_ALIGN
 }
 
-/// Allocate a zeroed block of at least `min_bytes`, sized up to a whole multiple
-/// of [`LARGE_PAGE_ALIGN`] and aligned to [`LARGE_PAGE_ALIGN`], then (on Linux)
-/// `madvise(MADV_HUGEPAGE)`-hint the whole rounded region. `min_bytes` must be
-/// non-zero. Returns the base pointer and the exact [`Layout`] used — replay
-/// that layout to [`free_large`] to free.
-///
-/// The raw core of [`LargePageArray`], [`LargePageBox`] and the TT's cluster
-/// store, so the huge-page policy lives in exactly one place.
+/// Allocate a zeroed block of at least `min_bytes` under the module's
+/// huge-page policy. `min_bytes` must be non-zero. The returned [`Layout`] must
+/// be replayed to [`free_large`] to free the block.
 pub(crate) fn alloc_zeroed_large(min_bytes: usize) -> (NonNull<u8>, Layout) {
     debug_assert!(min_bytes > 0, "large-page allocation must be non-empty");
 
@@ -106,28 +68,26 @@ pub(crate) fn alloc_zeroed_large(min_bytes: usize) -> (NonNull<u8>, Layout) {
     let layout = Layout::from_size_align(size, LARGE_PAGE_ALIGN)
         .expect("large-page allocation size/alignment is valid");
 
-    // SAFETY: `layout` has non-zero size (`min_bytes >= 1` ⇒ `size >=
-    // LARGE_PAGE_ALIGN`). `alloc_zeroed` returns a `LARGE_PAGE_ALIGN`-aligned,
-    // fully zeroed block.
+    // SAFETY: `layout` has non-zero size, since `min_bytes >= 1` rounds up to
+    // at least `LARGE_PAGE_ALIGN`.
     let raw = unsafe { alloc_zeroed(layout) };
     let ptr = match NonNull::new(raw) {
         Some(p) => p,
         None => handle_alloc_error(layout),
     };
 
-    // `not(miri)`: miri rejects `madvise` with any advice beyond MADV_NORMAL /
-    // RANDOM / SEQUENTIAL / WILLNEED, which would abort every miri test that
-    // allocates here — i.e. most of Storage and Evaluation. The hint is purely a
-    // kernel paging policy and has no observable effect on the returned block, so
-    // dropping it under miri leaves the allocation, the aliasing and the drop path
-    // (the parts the UB gate exists to check) fully covered.
+    // miri rejects `madvise` with any advice beyond MADV_NORMAL / RANDOM /
+    // SEQUENTIAL / WILLNEED, which would abort every miri test that allocates
+    // here. The hint has no observable effect on the returned block, so
+    // dropping it under miri still leaves the allocation, the aliasing and the
+    // drop path covered.
     #[cfg(all(target_os = "linux", not(miri)))]
     {
-        // SAFETY: `ptr`/`size` describe the live allocation just returned.
-        // `madvise` only adjusts kernel paging policy for that range; it neither
-        // reads nor writes the memory and cannot invalidate it. The return value
-        // is ignored on purpose — the hint is best-effort, and the reference
-        // discards it identically.
+        // SAFETY: `ptr` and `size` describe the live allocation just returned,
+        // and `madvise` only adjusts kernel paging policy for that range — it
+        // neither reads nor writes the memory and cannot invalidate it. The
+        // return value is discarded because the hint is best-effort, as the
+        // reference discards it too.
         unsafe {
             libc::madvise(ptr.as_ptr() as *mut libc::c_void, size, libc::MADV_HUGEPAGE);
         }
@@ -147,11 +107,9 @@ pub(crate) unsafe fn free_large(ptr: NonNull<u8>, layout: Layout) {
     unsafe { dealloc(ptr.as_ptr(), layout) }
 }
 
-/// A large-page-backed, zero-initialised `[T]` — the analogue of `Box<[T]>`
-/// (and of the reference's `make_unique_large_page<T[]>`). The base pointer is
-/// [`LARGE_PAGE_ALIGN`]-aligned and, on Linux, the backing region is
-/// `MADV_HUGEPAGE`-hinted. The exposed slice covers exactly `len` elements; the
-/// round-up tail of the allocation is not part of it.
+/// A large-page-backed, zero-initialised `[T]` — the analogue of `Box<[T]>`.
+/// The exposed slice covers exactly `len` elements; the round-up tail of the
+/// allocation is not part of it.
 pub struct LargePageArray<T: Zeroable> {
     /// Base of the aligned allocation. Dangling (never dereferenced) when
     /// `len == 0`; always [`LARGE_PAGE_ALIGN`]-aligned otherwise.
@@ -163,15 +121,13 @@ pub struct LargePageArray<T: Zeroable> {
     layout: Layout,
 }
 
-// SAFETY: `LargePageArray<T>` uniquely owns its heap block of `T`, freed once in
-// `Drop`, just like `Box<[T]>`; so it is `Send`/`Sync` exactly when `T` is.
+// SAFETY: `LargePageArray<T>` uniquely owns its heap block of `T`, freed once
+// in `Drop`, just like `Box<[T]>`, so it is `Send`/`Sync` exactly when `T` is.
 unsafe impl<T: Zeroable + Send> Send for LargePageArray<T> {}
 unsafe impl<T: Zeroable + Sync> Sync for LargePageArray<T> {}
 
 impl<T: Zeroable> LargePageArray<T> {
-    /// A zeroed array of `len` elements, its base pointer on a
-    /// [`LARGE_PAGE_ALIGN`] boundary. `len == 0` allocates nothing (a dangling,
-    /// aligned sentinel).
+    /// A zeroed array of `len` elements. `len == 0` allocates nothing.
     pub fn zeroed(len: usize) -> Self {
         debug_assert!(
             size_of::<T>() > 0,
@@ -201,32 +157,25 @@ impl<T: Zeroable> LargePageArray<T> {
         }
     }
 
-    /// The stored base pointer, carrying the allocation's original raw
-    /// provenance (write-capable), **not** a `&[T]`/`&mut [T]` reborrow.
+    /// The stored base pointer, carrying the allocation's original raw,
+    /// write-capable provenance rather than a reference reborrow.
     ///
-    /// Exists for arena views that carve sub-array pointers out of the backing
-    /// allocation and must not route through a reference reborrow: going via
-    /// `as_ptr` / `as_mut_ptr` (which resolve through `Deref` to the slice
-    /// methods) would stamp the pointer with the provenance of a temporary
-    /// shared/exclusive reference, making later writes through it undefined
-    /// behaviour under Stacked/Tree Borrows. This returns the raw base instead.
+    /// `as_ptr` / `as_mut_ptr` resolve through `Deref` to the slice methods and
+    /// so stamp the pointer with a temporary reference's provenance, making a
+    /// later write through it undefined behaviour under Stacked or Tree
+    /// Borrows. An arena view that carves sub-array pointers must use this.
     pub(crate) fn base_nonnull(&self) -> NonNull<T> {
         self.ptr
     }
 
     /// The `(address, byte length)` of the backing block, or `None` when the
-    /// array is empty (which allocates nothing).
+    /// array is empty and so allocates nothing.
     ///
-    /// The address is [`LARGE_PAGE_ALIGN`]-aligned and the length is the
-    /// *rounded* allocation size, not `len * size_of::<T>()` — i.e. exactly the
-    /// span the allocator reserved. Exposed so a NUMA placement call
-    /// (`yorkie_numa::mempolicy::migrate_region_to_node`) can name the block
-    /// whole: the alignment already satisfies `mbind`'s page-aligned-base
-    /// requirement, and the rounded length keeps the call from spilling policy
-    /// onto a neighbouring allocation.
-    ///
-    /// The address is deliberately a `usize`, not a pointer: the only consumer
-    /// hands it to the kernel as a range descriptor and never dereferences it.
+    /// The length is the *rounded* allocation size, not `len * size_of::<T>()`,
+    /// so a NUMA placement call names the block whole and does not spill policy
+    /// onto a neighbouring allocation. The address is a `usize` because the
+    /// consumer hands it to the kernel as a range descriptor and never
+    /// dereferences it.
     pub fn backing_region(&self) -> Option<(usize, usize)> {
         (self.len != 0).then(|| (self.ptr.as_ptr() as usize, self.layout.size()))
     }
@@ -239,7 +188,7 @@ impl<T: Zeroable> LargePageArray<T> {
         let buf = Self::zeroed(src.len());
         if !src.is_empty() {
             // SAFETY: `buf` holds `src.len()` elements in one allocation,
-            // disjoint from `src`; `T: Copy` makes a bytewise copy valid.
+            // disjoint from `src`, and `T: Copy` makes a bytewise copy valid.
             unsafe {
                 ptr::copy_nonoverlapping(src.as_ptr(), buf.ptr.as_ptr(), src.len());
             }
@@ -253,11 +202,10 @@ impl<T: Zeroable> Deref for LargePageArray<T> {
 
     #[inline]
     fn deref(&self) -> &[T] {
-        // SAFETY: for `len > 0`, `ptr` addresses `len` contiguous, initialised
-        // (`alloc_zeroed`) `T` within one allocation. For `len == 0` this yields
-        // an empty slice, for which `from_raw_parts` accepts any aligned non-null
-        // pointer (`NonNull::dangling` is suitably aligned). The borrow is tied
-        // to `&self`, so no `&mut` alias can coexist.
+        // SAFETY: for `len > 0`, `ptr` addresses `len` contiguous, zeroed `T`
+        // within one allocation. For `len == 0` this yields an empty slice, for
+        // which `from_raw_parts` accepts any aligned non-null pointer. The
+        // borrow is tied to `&self`, so no `&mut` can coexist.
         unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 }
@@ -265,8 +213,7 @@ impl<T: Zeroable> Deref for LargePageArray<T> {
 impl<T: Zeroable> DerefMut for LargePageArray<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
-        // SAFETY: as `deref`, but `&mut self` guarantees exclusivity, so handing
-        // out `&mut [T]` introduces no aliasing.
+        // SAFETY: as `deref`, but `&mut self` guarantees exclusivity.
         unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }
@@ -280,11 +227,10 @@ impl<T: Zeroable + fmt::Debug> fmt::Debug for LargePageArray<T> {
 impl<T: Zeroable> Drop for LargePageArray<T> {
     fn drop(&mut self) {
         if self.len != 0 {
-            // SAFETY: `ptr` came from `alloc_zeroed_large` with exactly `layout`
-            // (an empty array keeps `len == 0` and is skipped), and it is freed
-            // exactly once because `LargePageArray` uniquely owns the block. `T:
-            // Zeroable` needs no element drop glue, so freeing the raw bytes is
-            // sufficient.
+            // SAFETY: `ptr` came from `alloc_zeroed_large` with exactly
+            // `layout`, and is freed exactly once because `LargePageArray`
+            // uniquely owns the block. `T: Zeroable` needs no drop glue, so
+            // freeing the raw bytes is sufficient.
             unsafe {
                 free_large(self.ptr.cast(), self.layout);
             }
@@ -292,10 +238,9 @@ impl<T: Zeroable> Drop for LargePageArray<T> {
     }
 }
 
-/// A large-page-backed, zero-initialised single `T` — the analogue of `Box<T>`
-/// (and of the reference's `make_unique_large_page<T>`). Keeps a fixed-shape
-/// array's compile-time dimensions (so per-access index maths stay
-/// bounds-check-free) while moving the backing store onto huge pages.
+/// A large-page-backed, zero-initialised single `T` — the analogue of `Box<T>`.
+/// Keeps a fixed-shape array's compile-time dimensions, so its per-access index
+/// maths stay bounds-check-free.
 pub struct LargePageBox<T: Zeroable> {
     /// Base of the aligned allocation, holding one initialised `T`.
     ptr: NonNull<T>,
@@ -305,7 +250,7 @@ pub struct LargePageBox<T: Zeroable> {
 }
 
 // SAFETY: `LargePageBox<T>` uniquely owns one heap `T`, freed once in `Drop`,
-// just like `Box<T>`; so it is `Send`/`Sync` exactly when `T` is.
+// just like `Box<T>`, so it is `Send`/`Sync` exactly when `T` is.
 unsafe impl<T: Zeroable + Send> Send for LargePageBox<T> {}
 unsafe impl<T: Zeroable + Sync> Sync for LargePageBox<T> {}
 
@@ -322,10 +267,9 @@ impl<T: Zeroable> LargePageBox<T> {
         }
     }
 
-    /// The `(address, byte length)` of the backing block — see
-    /// [`LargePageArray::backing_region`] for what it is for and why it is a
-    /// `usize`. Always present: a [`LargePageBox`] holds exactly one non-ZST
-    /// `T`, so it always owns a block.
+    /// The `(address, byte length)` of the backing block, as
+    /// [`LargePageArray::backing_region`]. Always present, since a
+    /// [`LargePageBox`] holds one non-ZST `T`.
     pub fn backing_region(&self) -> (usize, usize) {
         (self.ptr.as_ptr() as usize, self.layout.size())
     }
@@ -336,9 +280,8 @@ impl<T: Zeroable> Deref for LargePageBox<T> {
 
     #[inline]
     fn deref(&self) -> &T {
-        // SAFETY: `ptr` addresses one initialised (`alloc_zeroed`) `T` within a
-        // live allocation; the borrow is tied to `&self`, so no `&mut` alias can
-        // coexist.
+        // SAFETY: `ptr` addresses one zeroed `T` within a live allocation, and
+        // the borrow is tied to `&self`, so no `&mut` can coexist.
         unsafe { self.ptr.as_ref() }
     }
 }
@@ -359,8 +302,8 @@ impl<T: Zeroable + fmt::Debug> fmt::Debug for LargePageBox<T> {
 
 impl<T: Zeroable> Drop for LargePageBox<T> {
     fn drop(&mut self) {
-        // SAFETY: `ptr` came from `alloc_zeroed_large` with exactly `layout`, and
-        // it is freed exactly once because `LargePageBox` uniquely owns the
+        // SAFETY: `ptr` came from `alloc_zeroed_large` with exactly `layout`,
+        // and is freed exactly once because `LargePageBox` uniquely owns the
         // block. `T: Zeroable` needs no drop glue.
         unsafe {
             free_large(self.ptr.cast(), self.layout);
@@ -381,16 +324,14 @@ mod tests {
         assert_eq!(rounded_size(2 * LARGE_PAGE_ALIGN), 2 * LARGE_PAGE_ALIGN);
     }
 
-    // `miri, ignore`: the last two lengths are ~1 M and ~2 M elements, and the
-    // all-zero assertion walks every one of them — 638 s under miri, measured.
-    // The alignment and round-up logic it checks is covered under miri by
-    // `empty_array_is_valid_and_aligned`, `array_is_mutable_in_place` and
-    // `rounded_size_rounds_up_to_alignment`, which use small lengths.
+    // Ignored under miri: the largest lengths run to millions of elements, and
+    // walking them all takes minutes there. The small-length tests below cover
+    // the same alignment and round-up logic.
     #[cfg_attr(miri, ignore)]
     #[test]
     fn array_is_aligned_zeroed_and_correct_length() {
-        // A length that does not divide the alignment (exercises the round-up)
-        // and one that spans several alignment units.
+        // A length that does not divide the alignment, and one spanning
+        // several alignment units.
         for &len in &[1usize, 7, 4096, LARGE_PAGE_ALIGN / 2 + 3, LARGE_PAGE_ALIGN] {
             let buf = LargePageArray::<i16>::zeroed(len);
             assert_eq!(buf.len(), len);
@@ -445,9 +386,8 @@ mod tests {
 
     #[test]
     fn backing_region_names_the_whole_rounded_block() {
-        // A length that does not fill a whole alignment unit: the region must
-        // report the *rounded* allocation, not the element bytes, so a NUMA
-        // placement call covers the block and stops at its end.
+        // A length that does not fill a whole alignment unit, so the region
+        // must report the rounded allocation rather than the element bytes.
         let buf = LargePageArray::<i16>::zeroed(7);
         let (addr, bytes) = buf
             .backing_region()

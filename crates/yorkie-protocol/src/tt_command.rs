@@ -1,44 +1,29 @@
 //! The `usi-extras` `tt` command family: the *semantic parse* of the argument
 //! tokens behind `tt store` / `tt probe` / `tt children`.
 //!
-//! The whole module exists only under the `usi-extras` cargo feature — the
-//! umbrella feature for USI commands a tournament game never issues. With the
-//! feature off, [`crate::parser::parse_line`] does not know the `tt` token at
-//! all (it falls through to `Command::Unknown`) and nothing here is compiled.
+//! The whole module exists only under the `usi-extras` cargo feature. With it
+//! off, [`crate::parser::parse_line`] does not know the `tt` token at all and
+//! nothing here is compiled.
 //!
-//! There is **no upstream YaneuraOu precedent** for these commands: the
-//! reference exposes no TT read/write USI command, so the syntax below is this
-//! repository's own design. The `usi-extras` reference documentation is the
-//! user-facing spec; this module is its executable half.
-//!
-//! # Division of labour
+//! There is no upstream YaneuraOu precedent for these commands — the reference
+//! exposes no TT read/write USI command — so the syntax below is this project's
+//! own design.
 //!
 //! This module owns only what can be decided from the tokens alone: the
-//! subcommand, the position clause (kept as a string), the *scalar* fields, and
-//! their range validation. Anything needing a `Position` — parsing the SFEN,
-//! resolving the `move` token, deriving the TT key, probing — is the driver's
-//! ([`crate::driver`]); it consumes a [`TtCommand`] and prints the result lines.
+//! subcommand, the position clause kept as a string, the scalar fields, and
+//! their range validation. Anything needing a `Position` is the driver's.
 //!
-//! # Score convention
-//!
-//! Every value on the command surface is expressed **relative to the named
-//! position as root**, which is also how the transposition table stores it: the
+//! Every value on the command surface is expressed relative to the named
+//! position as root, which is also how the transposition table stores it: the
 //! reference's `value_to_tt(v, ply)` shifts a mate score by the node's distance
-//! from the root before storing, so a *stored* mate value is position-absolute
-//! ("mated in 0 plies **from here**" is exactly `-VALUE_MATE`). The named
-//! position therefore sits at `ply == 0` and the conversion is the identity for
-//! `tt store` / `tt probe`; `tt children` reports its children at `ply == 1`,
-//! i.e. mate distances counted from the *named* position, one ply further out
-//! than a `tt probe` of the same child SFEN would report. [`value_to_tt`] /
-//! [`value_from_tt`] are the same functions the search uses
-//! (`yorkie-search/src/qsearch.rs`, ported from
-//! `source/yaneuraou-search.cpp`).
+//! from the root, so a *stored* mate value is position-absolute. The named
+//! position therefore sits at `ply == 0`, and `tt children` reports its children
+//! at `ply == 1`, one ply further out than a `tt probe` of the same child SFEN
+//! would.
 //!
-//! Centipawn arguments and centipawn output both use the reference USI scale
-//! (`100 * v / PawnValue`, `usi.cpp`), so `tt` speaks the same numbers as
-//! an `info ... score cp N` line. That mapping is lossy in both directions —
-//! `PawnValue == 90` does not divide 100 — so a `cp` round trip quantises to a
-//! multiple of the 9/10 ratio. `mate` arguments are exact.
+//! Centipawn arguments and output use the reference USI scale, so `tt` speaks
+//! the same numbers as an `info … score cp N` line. That mapping is lossy in
+//! both directions, so a `cp` round trip quantises; `mate` arguments are exact.
 
 use yorkie_storage::{Bound, DEPTH_NONE, Depth, Value};
 
@@ -78,9 +63,8 @@ fn err(msg: impl Into<String>) -> TtParseError {
 /// The position clause, kept verbatim: the driver turns it into a `Position` so
 /// SFEN diagnostics come from the one parser the `position` command uses.
 ///
-/// `startpos` is the optional shorthand the issue sanctions in place of a
-/// four-field `sfen` clause; it is spelled out here rather than expanded to the
-/// start SFEN string so the driver can use `Position::startpos()` directly.
+/// `startpos` is a shorthand for the four-field `sfen` clause, spelled out here
+/// rather than expanded so the driver can use `Position::startpos()` directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TtPosition {
     StartPos,
@@ -118,10 +102,7 @@ pub enum TtCommand {
 
 /// Parse the tokens following the `tt` keyword.
 ///
-/// The documented argument order is
-/// `store sfen <sfen> move <m> value <cp|mate n> depth <d> bound <b> eval <cp> [pv]`,
-/// but the clauses are keyword-driven and accepted in any order — a superset of
-/// the fixed syntax, so every documented line parses. A missing mandatory
+/// The clauses are keyword-driven and accepted in any order. A missing mandatory
 /// clause, a duplicate clause, an unknown token, or an out-of-range number is an
 /// error; this function never panics.
 pub fn parse_tt(tokens: &[String]) -> Result<TtCommand, TtParseError> {
@@ -303,8 +284,8 @@ fn parse_bound(tok: &str) -> Result<Bound, TtParseError> {
 
 /// USI centipawns → an internal search value: the inverse of the reference
 /// `to_cp` (`100 * v / PawnValue`, `usi.cpp`), with C++-style truncating
-/// division. Rejected when the result would land in the decisive band, where it
-/// would read back as a mate score instead of a centipawn one.
+/// division. Rejected when the result would land in the decisive band, where
+/// it would read back as a mate score instead of a centipawn one.
 pub fn cp_to_value(cp: i64) -> Result<Value, TtParseError> {
     let v = cp * PAWN_VALUE as i64 / 100;
     if v.abs() >= VALUE_TB_WIN_IN_MAX_PLY as i64 {
@@ -317,8 +298,8 @@ pub fn cp_to_value(cp: i64) -> Result<Value, TtParseError> {
 }
 
 /// A USI mate distance → an internal search value: `mate_in` / `mated_in`
-/// (`source/types.h`) measured from the named
-/// position. Positive is a win for the side to move, negative a loss.
+/// (`source/types.h`) measured from the named position.
+/// Positive is a win for the side to move, negative a loss.
 pub fn mate_to_value(n: i64) -> Result<Value, TtParseError> {
     if n.abs() > MAX_MATE_DISTANCE {
         return Err(err(format!(

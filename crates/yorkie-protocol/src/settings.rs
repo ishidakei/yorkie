@@ -1,27 +1,19 @@
 //! The one place that decides where a setting's value comes from.
 //!
 //! There is exactly one answer, in every build: the compile-time constant
-//! [`crate::config`] generated from the TOML config. The optimizer sees a
-//! literal, the engine cannot be reconfigured while it is running, and it never
-//! reads a constant through a variable. No build has a runtime option surface,
-//! so there is nothing else a setting could come from — no declaration table, no
-//! `setoption`, no option-override file, no profile file.
+//! [`crate::config`] generated from the TOML config. No build has a runtime
+//! option surface — no declaration table, no `setoption`, no option-override
+//! file, no profile file.
 //!
-//! The accessors stay because the driver reads settings by name
-//! (`self.settings.usi_hash()`), and keeping the name → constant mapping in one
-//! file is what makes "which constant does `USI_Hash` mean" answerable in one
-//! place.
+//! The accessors stay because the driver reads settings by name, and keeping the
+//! name → constant mapping in one file is what makes "which constant does
+//! `USI_Hash` mean" answerable in one place.
 //!
-//! # Profile-dependent book options
-//!
-//! Eight book settings come in two halves: four belong to the V1 book profile
-//! (`NarrowBook`, `ConsiderBookMoveCount`, `BookEvalDiff`, `BookDepthLimit`) and
-//! four to V2 (`BookEvalBlackDiff`, `BookEvalWhiteDiff`, `BookDepthBlackLimit`,
-//! `BookDepthWhiteLimit`). The config schema is one fixed key set, so both
-//! halves are always present; the accessors for those eight mask against
+//! Eight book settings come in two halves, four belonging to the V1 book profile
+//! and four to V2. The config schema is one fixed key set, so both halves are
+//! always present; their accessors mask against
 //! [`crate::config::BOOK_OPTIONS_V2`], and the half the selected profile does
-//! not own reads as its type's zero. `BOOK_OPTIONS_V2` is itself a constant, so
-//! the mask folds away with everything else.
+//! not own reads as its type's zero.
 
 /// The engine's settings: the generated constants, addressed by name.
 ///
@@ -240,13 +232,11 @@ impl Settings {
 mod tests {
     use super::*;
 
-    /// The masking above reproduces what an engine built under the other book
-    /// profile would not see: the half of the book group the active profile does
-    /// not own reads as its type's zero, and the half it does own reads its
-    /// configured value.
+    /// The half of the book group the active profile does not own must read as
+    /// its type's zero, and the half it does own its configured value.
     ///
-    /// Written against `config::BOOK_OPTIONS_V2` rather than against a fixed
-    /// profile, so it holds for a binary built from either kind of config file.
+    /// Written against `config::BOOK_OPTIONS_V2` rather than a fixed profile, so
+    /// it holds for a binary built from either kind of config file.
     #[test]
     fn profile_dependent_book_options_mask_to_their_types_zero() {
         use crate::config;

@@ -1,26 +1,17 @@
-//! Driver-level session tests for the `bench` command: a
-//! reproducible NPS benchmark ported from the pinned reference's `bench`
-//! (`source/benchmark.cpp` + `usi.cpp`).
+//! Driver-level session tests for the `bench` command.
 //!
-//! The hermetic syntax tests (bare `bench`, garbage argument, `current` source)
-//! run WITHOUT a network: each position resigns instantly, so they exercise the
-//! argument parse and summary plumbing without a real search. The determinism
-//! and multi-thread gates stage a synthetic (all-zero) network in a temp dir and
-//! run a small fixed-depth bench so they stay fast.
+//! The syntax tests run *without* a network: each position resigns instantly, so
+//! they exercise the argument parse and summary plumbing without a real search.
+//! The determinism and multi-thread tests stage a synthetic all-zero network and
+//! run a small fixed-depth bench.
 //!
-//! **`usi-extras` gate.** `bench` is an analysis command a tournament game never
-//! issues, so the whole file is gated on the feature — with `usi-extras` off it
-//! compiles to nothing, matching the default build where `bench` is not a
-//! command token at all. The complementary "feature off" assertions live in
-//! `src/parser.rs::tests::bench_is_not_a_command_without_usi_extras` and
-//! `src/driver.rs::tests::bench_is_an_unknown_command_without_usi_extras`, both
-//! compiled only when the feature is OFF; run `cargo nextest run -p
-//! yorkie-protocol` (default features) to execute them.
+//! Gated on `usi-extras`, so with the feature off this file compiles to nothing.
+//! The complementary "feature off" assertions live in `src/parser.rs` and
+//! `src/driver.rs`, compiled only when it is off.
 //!
 //! The `bench:` summary line is the command's result, not a diagnostic, so it is
-//! emitted in every `usi-extras` build and asserted unconditionally here. The
-//! argument-rejection lines ARE diagnostics and are asserted only under
-//! `info-diag`.
+//! asserted unconditionally; the argument-rejection lines are diagnostics and
+//! are asserted only under `info-diag`.
 
 #![cfg(feature = "usi-extras")]
 
@@ -53,9 +44,7 @@ fn bench_summary_positions(out: &str) -> u64 {
         .unwrap_or_else(|| panic!("no positions= field in: {line:?}"))
 }
 
-// -------------------------------------------------------------------------
 // Syntax variants (hermetic — no network, so each position resigns).
-// -------------------------------------------------------------------------
 
 #[cfg_attr(miri, ignore)]
 #[test]
@@ -130,12 +119,10 @@ fn current_source_benches_the_set_position() {
     );
 }
 
-// -------------------------------------------------------------------------
 // Determinism — identical total nodes across runs (threads=1).
-// -------------------------------------------------------------------------
 
 /// The standard bench session against a staged synthetic network: a small
-/// fixed-depth default bench so CI stays fast. Returns the full transcript.
+/// fixed-depth default bench so the test stays fast. Returns the full transcript.
 fn bench_session(bench_line: &str) -> String {
     stage_configured_eval_dir();
     let input = format!(
@@ -195,9 +182,7 @@ fn two_process_launches_report_identical_nodes() {
     );
 }
 
-// -------------------------------------------------------------------------
 // A threads=2 bench completes and reports a summary (no determinism).
-// -------------------------------------------------------------------------
 
 #[cfg_attr(miri, ignore)]
 #[test]

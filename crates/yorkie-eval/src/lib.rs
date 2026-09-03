@@ -4,10 +4,6 @@
 //! Protocol or Search. It covers loading and validating the `nn.bin` network
 //! file, feature extraction, the accumulator, the forward pass, and the SIMD
 //! kernels.
-//!
-//! The parsing logic is ported from a read-only Rust NNUE reference
-//! implementation (verified bit-identical against the reference C++
-//! engine), adapted to this workspace's std-only conventions.
 
 mod aligned;
 mod config;

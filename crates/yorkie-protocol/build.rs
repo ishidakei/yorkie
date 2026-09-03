@@ -1,27 +1,23 @@
 //! Compile the engine's settings in.
 //!
-//! The engine carries no runtime configuration: every setting it has is read
-//! from one TOML file at build time and emitted as a `pub const` into
-//! `$OUT_DIR/engine_config.rs`, which `src/config.rs` includes as
-//! `yorkie_protocol::config`. Every build reads those constants and nothing
-//! else, so the optimizer sees literals: `if config::CONSIDERATION_MODE` is
-//! folded away rather than branched on, and the design rule "never read a
-//! constant through a variable" holds for the whole of a game.
+//! The engine carries no runtime configuration: every setting is read from one
+//! TOML file at build time and emitted as a `pub const` into
+//! `$OUT_DIR/engine_config.rs`, which `src/config.rs` includes. The optimizer
+//! therefore sees literals, and `if config::CONSIDERATION_MODE` is folded away
+//! rather than branched on.
 //!
-//! Which file is read is chosen by the `YORKIE_CONFIG` environment variable (a
-//! path; a relative one resolves against the repository root). Unset, the build
-//! reads the checked-in play config `configs/default.toml`.
+//! Which file is read is chosen by the `YORKIE_CONFIG` environment variable, a
+//! path resolved against the repository root when relative. Unset, the build
+//! reads `configs/default.toml`.
 //!
-//! Every failure is a hard build error with a pointed message. There is no
-//! fallback value for a missing key, no default for a malformed one, and no
-//! tolerance for a key outside the schema: a config that does not say exactly
-//! what the engine will do must not produce a binary at all.
+//! Every failure is a hard build error. There is no fallback value for a missing
+//! key, no default for a malformed one, and no tolerance for a key outside the
+//! schema: a config that does not say exactly what the engine will do must not
+//! produce a binary at all.
 //!
 //! This file is the impure half — environment, filesystem, exit code. The
-//! schema, the parser, the code generator and the config-path resolution live in
-//! `build_config.rs`, which is `include!`d here and, separately, by
-//! `tests/config_schema.rs`, so the fail-loud behaviour is covered by ordinary
-//! tests rather than only by breaking a build on purpose.
+//! schema, parser, code generator and path resolution live in
+//! `build_config.rs`.
 
 include!("build_config.rs");
 

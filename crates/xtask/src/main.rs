@@ -152,7 +152,7 @@ struct CaptureSearchArgs {
     #[arg(long, default_value = "")]
     moves: String,
     /// Fixed search depth. Single-thread fixed-depth search is reproducible
-    /// byte-for-byte: same submodule pin + same nn.bin → identical fixture.
+    /// byte-for-byte: same reference build + same nn.bin → identical fixture.
     #[arg(long, default_value_t = 3)]
     depth: u32,
     /// Number of search threads. Must be 1 for deterministic fixture capture.
@@ -254,7 +254,7 @@ fn build_reference(args: &BuildReferenceArgs) -> Result<PathBuf, String> {
     let source_dir = workspace_root.join(REFERENCE_SOURCE_DIR);
     if !source_dir.join("Makefile").is_file() {
         return Err(format!(
-            "missing Makefile under {}; run `git submodule update --init --recursive` first",
+            "the YaneuraOu sources are not present under {}; this subcommand expects a checkout of them there, with its Makefile at the top level",
             source_dir.display()
         ));
     }
@@ -608,9 +608,7 @@ fn render_eval_fixture(sfen: &str, moves: &str, eval: i32) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
 // capture-search
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 enum SearchScore {
@@ -690,12 +688,9 @@ fn drive_search(
         .take()
         .ok_or_else(|| "failed to capture engine stdin".to_string())?;
 
-    // Write the search script but do NOT drop stdin yet.
-    // `go depth N` starts the search asynchronously on a separate thread inside
-    // the engine. If stdin is closed (EOF) before bestmove is output, the
-    // engine's command loop receives a synthetic "quit" (misc.cpp)
-    // and aborts the search after the first completed depth. Keeping stdin open
-    // prevents that early termination; we close it only after reading bestmove.
+    // Do NOT drop stdin yet. If it closes before `bestmove` is output, the
+    // engine's command loop receives a synthetic "quit" and aborts the search
+    // after the first completed depth.
     write_search_script(&mut stdin, sfen, moves, depth, threads)
         .map_err(|e| format!("failed to drive engine stdin: {e}"))?;
 
@@ -736,8 +731,9 @@ fn write_search_script<W: Write>(
 ) -> std::io::Result<()> {
     writeln!(out, "usi")?;
     writeln!(out, "setoption name Threads value {threads}")?;
-    // Disable the opening book so the search always runs the alpha-beta routine.
-    // BookFile "no_book" is the sentinel value recognised by book.cpp.
+    // Disable the opening book so the search always runs the alpha-beta
+    // routine. BookFile "no_book" is the sentinel value recognised by
+    // book.cpp.
     writeln!(out, "setoption name BookFile value no_book")?;
     writeln!(out, "isready")?;
     // usinewgame clears the transposition table (threads.clear() → clear_worker())
@@ -882,9 +878,7 @@ fn render_search_fixture(sfen: &str, moves: &str, result: &SearchResult) -> Stri
     out
 }
 
-// ---------------------------------------------------------------------------
 // capture-book
-// ---------------------------------------------------------------------------
 
 /// `.ybb` magic (`YbbMagic`, `source/book/book.cpp`).
 const YBB_MAGIC: &[u8; 16] = b"YANE-BINBOOK-V1\0";
@@ -1235,13 +1229,8 @@ eval = -103\n\
 
     #[test]
     fn parses_search_info_cp_score() {
-        // Sample observed from the reference engine (YaneuraOu NNUE 9.40git, tournament
-        // build, single thread, BookFile=no_book, go depth 1 on startpos):
-        //
-        //   info depth 1 multipv 1 score cp 0 nodes 0 nps 0 hashfull 0 time 1 pv 1g1f
-        //   bestmove 1g1f
-        //
-        // This test pins parsing of a cp score from the exact observed line shape.
+        // The exact line shape observed from the reference engine at `go depth 1`
+        // on startpos.
         let stdout = "\
 usiok\n\
 readyok\n\
@@ -1318,9 +1307,10 @@ bestmove 2g2f\n\
 
     #[test]
     fn write_search_script_no_moves() {
-        // Pins the exact script emitted to the engine stdin for a startpos search.
-        // The script omits `quit` — stdin is closed by the caller after bestmove
-        // is read, which triggers the engine's EOF→quit path (misc.cpp).
+        // Pins the exact script emitted to the engine stdin for a startpos
+        // search. The script omits `quit` — stdin is closed by the caller
+        // after bestmove is read, which triggers the engine's EOF→quit path
+        // (misc.cpp).
         let mut buf = Vec::new();
         write_search_script(&mut buf, STARTPOS_SFEN, "", 3, 1).unwrap();
         let expected = format!(

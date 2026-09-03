@@ -1,18 +1,11 @@
 //! The compile-time configuration: that it really is compile-time.
 //!
-//! Every generated value is used in a `const` context — array lengths, `const`
-//! initializers, `const` assertions. None of that compiles against a value that
-//! has to be read at run time, so this fails to BUILD rather than fails to pass
-//! if the mechanism ever regresses into a lookup.
+//! Every generated value is used in a `const` context, none of which compiles
+//! against a value read at run time — so this file fails to *build*, rather than
+//! fails to pass, if the mechanism ever regresses into a lookup.
 //!
-//! There is nothing here comparing the constants to a runtime option surface:
-//! no build has one. What the checked-in configs must say is enforced where it
-//! can be — by the build script's schema (every key present, typed, in range)
-//! and by `tests/config_schema.rs`.
-//!
-//! Every assertion below is written against the constants themselves, so it
-//! holds for a binary built from any config file (`YORKIE_CONFIG=...`), not just
-//! the checked-in play one.
+//! Every assertion is written against the constants themselves, so it holds for
+//! a binary built from any config file, not just the checked-in play one.
 
 use yorkie_protocol::config;
 

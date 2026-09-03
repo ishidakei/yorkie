@@ -11,7 +11,7 @@ nodes** exactly, as an inseparable triple.
 ## Why this tier exists
 
 Depth 16 is the threshold for Step 9's **null-move verification search**
-(`yaneuraou-search.cpp` at the pin). Its guard is
+(`yaneuraou-search.cpp` in the reference). Its guard is
 `nmpMinPly == 0 && depth >= 16`, so below depth 16 a null-move fail high returns
 `nullValue` outright and the entire verification block is unreachable — the
 depth-1/2/3/5/8 tiers cannot exercise it at all. From depth 16 up, a fail high
@@ -50,7 +50,7 @@ six-position sweep stays at depth 8.
   is better.
 - `nodes` — node count reported by the engine, **cumulative over the whole `go`**
   (iterations 1..16 and every aspiration re-search).
-- `pv` — principal variation as a JSON array of USI moves. Not gated.
+- `pv` — principal variation as a JSON array of USI moves. Not asserted.
 
 ### Optional `moves` prefix
 
@@ -69,7 +69,7 @@ default 16.
 
 ## Determinism
 
-Running `cargo xtask capture-search` twice against the same submodule pin and the
+Running `cargo xtask capture-search` twice against the same reference build and the
 same `nn.bin` produces a byte-identical file — re-capturing on the reference
 build leaves `git diff` empty.
 

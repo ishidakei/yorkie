@@ -1,28 +1,24 @@
 //! Compile the engine's settings into the evaluation layer.
 //!
-//! The evaluation layer needs exactly one of them — `fv_scale`, the NNUE
-//! fixed-point output scale the reference keeps in the mutable global
-//! `NNUE::FV_SCALE`. The engine has no runtime configuration, so there is no
-//! live value to be told about: the scale is read from the same TOML config
-//! every other setting comes from and emitted as a `pub const` into
-//! `$OUT_DIR/engine_config.rs`, which `src/config.rs` includes.
+//! The evaluation layer needs exactly one setting, `fv_scale`, which is read
+//! from the same TOML config every other setting comes from and emitted as a
+//! `pub const` into `$OUT_DIR/engine_config.rs`.
 //!
-//! The schema, the parser, the code generator and the `YORKIE_CONFIG` path
-//! resolution are shared verbatim with the protocol crate's build script by
-//! `include!`ing its `build_config.rs`, so the two builds cannot read the same
-//! file and disagree about what it says. (A build script cannot depend on a
-//! member of the workspace it is building, which is why this is an `include!`
-//! and not a crate.)
+//! The schema, parser, code generator and path resolution are shared verbatim
+//! with the protocol crate's build script, so the two builds cannot read the
+//! same file and disagree about what it says. That sharing is an `include!`
+//! because a build script cannot depend on a member of the workspace it is
+//! building.
 //!
 //! The generated module carries every schema key, not just `fv_scale`: the
-//! generator renders the schema as a whole, and `src/config.rs` allows the
-//! unused ones rather than growing a second, divergent code path here.
+//! generator renders the schema as a whole, and allowing the unused ones is
+//! cheaper than a second, divergent code path here.
 
 include!("../yorkie-protocol/build_config.rs");
 
 /// Report a build-stopping configuration error and exit. `process::exit` rather
-/// than `panic!` so the message cargo surfaces is the message, without a
-/// backtrace header wrapped around it.
+/// than `panic!`, so cargo surfaces the message without a backtrace header
+/// wrapped around it.
 fn fail(msg: &str) -> ! {
     eprintln!("error: {msg}");
     std::process::exit(1);

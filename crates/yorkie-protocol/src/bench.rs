@@ -1,37 +1,23 @@
 //! The `bench` command's argument parsing and default position set — a port of
-//! the reference `setup_bench` (`source/benchmark.cpp`,
-//! the non-Stockfish branch) and its `Defaults` list (`benchmark.cpp`).
+//! the reference `setup_bench` and its `Defaults` list (`benchmark.cpp`).
 //!
-//! The whole module exists only under the `usi-extras` cargo feature — a
-//! tournament game never benchmarks, so the default build has neither this
-//! parse nor the `bench` command token (see the `usi-extras` reference
-//! documentation).
+//! The whole module exists only under the `usi-extras` cargo feature, so the
+//! default build has neither this parse nor the `bench` command token.
 //!
-//! This module owns only the *semantic parse* of the `bench` argument tokens
-//! (TT size, threads, per-position limit, position source, limit type) into a
-//! [`BenchConfig`]. The driver ([`crate::driver`]) consumes the config: it
-//! applies the two `setoption` lines, does the `search_clear` equivalent, and
-//! runs each position through the ordinary coordinator path.
-//!
-//! Reference syntax (`benchmark.cpp`):
+//! This module owns only the semantic parse of the argument tokens into a
+//! [`BenchConfig`]; the driver consumes it.
 //!
 //! ```text
 //! bench [ttSizeMB] [threads] [limit] [default|current|<fenFile>] [limitType]
 //! ```
 //!
-//! The reference's non-Stockfish defaults are `ttSize=1024`, `threads=1`,
-//! `limit=15000`, `fenFile=default`, `limitType=movetime` — yaneuraou changed
-//! the default limit type from Stockfish's `depth` to a one-minute fixed-time
-//! bench (`benchmark.cpp`; the code, not the stale comment example, is the
-//! ground truth). This port mirrors those exact defaults.
+//! The reference's defaults are `ttSize=1024`, `threads=1`, `limit=15000`,
+//! `fenFile=default`, `limitType=movetime` — its *code*, not the stale comment
+//! example beside it, is the ground truth. This port mirrors them exactly.
 //!
-//! SCOPE DIVERGENCE from the pin: the reference `limitType` also accepts
-//! `perft` and `eval`. `perft` would need a `go perft` search path this crate
-//! does not own (perft lives in the top `yorkie` crate), and `eval` needs
-//! `trace_eval`; neither is part of the NPS-bench scope. They parse to a loud
-//! [`BenchParseError`] rather than panicking — the `depth` / `nodes` / `movetime`
-//! types cover every optimization-measurement need. THE PIN WINS elsewhere; this
-//! one divergence is reported in the PR.
+//! The reference's `limitType` also accepts `perft` and `eval`. `perft` needs a
+//! `go perft` path this crate does not own and `eval` needs `trace_eval`, so
+//! both parse to a loud [`BenchParseError`] rather than panicking.
 
 use std::fs;
 

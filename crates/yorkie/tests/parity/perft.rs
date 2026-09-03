@@ -5,7 +5,7 @@
 //! Default `cargo test` runs every (fixture, depth) pair where
 //! `depth <= DEFAULT_DEPTH_LIMIT`. Depths above the limit (currently startpos
 //! 4 and 5) are gated behind `#[ignore]` because debug-profile perft over
-//! them is too slow to belong on the default gate; CI invokes them via
+//! them is too slow to belong on the default `cargo test` run; run them with
 //! `cargo test --release -- --include-ignored`.
 
 use std::path::PathBuf;

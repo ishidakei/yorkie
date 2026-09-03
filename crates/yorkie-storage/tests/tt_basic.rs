@@ -1,60 +1,36 @@
-//! Gate tests for the transposition-table port
-//! (`crates/yorkie-storage/src/tt.rs`), checked against the semantics of
-//! `source/tt.cpp`.
+//! The transposition table, against the semantics of `tt.cpp`.
 //!
-//! # Addressing model used throughout
+//! # The addressing model these tests use
 //!
-//! With `resize(1)` the table holds `1 · 1024 · 1024 / 32 = 32768 = 2¹⁵`
-//! clusters, so
+//! With `resize(1)` the table holds `2¹⁵` clusters, so
 //!
 //! ```text
-//! cluster_index_pre_side = mul_hi64(key, 32768) = (key · 2¹⁵) >> 64 = key >> 49
+//! cluster_index_pre_side = mul_hi64(key, 32768) = key >> 49
 //! in_cluster_key_frag    = key & 0xffff
 //! ```
 //!
-//! Bits `49..64` (the top 15) select the cluster and bits `0..16` are the
-//! stored key fragment — disjoint ranges, so [`key`] can set each independently
-//! (middle bits kept zero). The side-to-move is OR-ed into cluster-index bit 0,
-//! so fixing `hi` **and** `side` keeps a family of keys in one cluster while the
-//! fragment varies.
+//! The top 15 bits select the cluster and the low 16 are the stored key
+//! fragment — disjoint ranges, so [`key`] sets each independently. The side to
+//! move is OR-ed into cluster-index bit 0, so fixing `hi` **and** `side` keeps
+//! a family of keys in one cluster while the fragment varies.
 //!
-//! Bits `16..49` are the *middle* bits: they are read by neither the cluster
-//! index nor the 16-bit key fragment, which is precisely why [`key_mid`] exists
-//! — a key that varies only there is indistinguishable from its sibling to the
-//! default build and distinguishable to a `tt-entry16` one. That is the whole
-//! observable difference between the two layouts, so it is what the
-//! `wide_key_identity` / `narrow_key_identity` tests at the bottom of this file
-//! pin.
+//! Bits `16..49` are read by neither, which is why [`key_mid`] exists: a key
+//! varying only there is indistinguishable from its sibling to the default
+//! build and distinguishable to a `tt-entry16` one. That is the whole
+//! observable difference between the two layouts.
 //!
-//! # Cluster size and the `tt-entry16` feature
+//! A cluster holds 3 entries by default and 2 under `tt-entry16`, so the two
+//! tests whose walk-through only reads correctly for one count carry a
+//! `cfg`-selected pair of bodies rather than skipping under the other.
 //!
-//! Some tests below depend on how many entries a cluster holds — 3 by default,
-//! 2 under `tt-entry16` (a 16-byte entry in the unchanged 32-byte cluster). The
-//! two whose walk-through only reads correctly for one count
-//! (`replacement_evicts_lowest_priority_entry`,
-//! `generation_aging_lowers_replacement_priority`) carry a `cfg`-selected pair
-//! of bodies, so **both** layouts get the assertion rather than one being
-//! skipped; `a_cluster_holds_exactly_cluster_size_positions` instead reads
-//! [`CLUSTER_ENTRIES`] and is one body for both. Everything else in the file is
-//! layout-neutral and runs unchanged in either build.
-//!
-//! # Why every test here is `#[cfg_attr(miri, ignore)]`
-//!
-//! The addressing model above is what forces it: the smallest table these tests
-//! can address is `resize(1)`, one MiB of `AtomicU64`-backed clusters, and miri
-//! interprets every one of those zeroing writes and probes. Measured on the dev
-//! VM, a single `resize(1)` test costs 10–40 minutes under miri (one took 1256 s,
-//! another had not finished after 2340 s), which is far past what a per-slice
-//! gate can absorb. The TT's unsafe surface — the aligned huge-page allocation,
-//! the cluster pointer arithmetic and the drop path — is still covered under
-//! miri by `tt::alloc_tests` and `large_page::tests` in the crate's unit tests,
-//! which exercise the same code at sizes miri can finish.
+//! Every test here is ignored under miri: the smallest table they can address
+//! is one MiB of atomics, and miri interprets every zeroing write and probe of
+//! it — tens of minutes per test. The table's unsafe surface is covered there
+//! by the crate's unit tests, at sizes miri can finish.
 
 use yorkie_storage::{Bound, DEPTH_NONE, TTData, TranspositionTable};
 
-/// Entries per 32-byte cluster: three 10-byte ones by default, two 16-byte ones
-/// under `tt-entry16`. Mirrors the crate-private `CLUSTER_SIZE` in `src/tt.rs`,
-/// whose value the compile-time layout proofs there pin.
+/// Entries per 32-byte cluster, restating the crate-private `CLUSTER_SIZE`.
 const CLUSTER_ENTRIES: usize = if cfg!(feature = "tt-entry16") { 2 } else { 3 };
 
 /// Build a key that lands in cluster `hi` (before the side fold) with
@@ -63,20 +39,16 @@ fn key(hi: u64, frag: u16) -> u64 {
     key_mid(hi, 0, frag)
 }
 
-/// [`key`] with the otherwise-unused middle bits (`16..49`) set to `mid`.
-///
-/// Two keys that share `hi` and `frag` but differ in `mid` land in the same
-/// cluster and carry the same low 16 bits, so they are the same key as far as
-/// the default 16-bit entry can tell and different keys to a 64-bit one.
-/// Requires `hi < 2¹⁵` and `mid < 2³³`.
+/// [`key`] with the otherwise-unused middle bits set to `mid`. Requires
+/// `hi < 2¹⁵` and `mid < 2³³`.
 fn key_mid(hi: u64, mid: u64, frag: u16) -> u64 {
     assert!(hi < (1 << 15));
     assert!(mid < (1 << 33));
     (hi << 49) | (mid << 16) | frag as u64
 }
 
-/// Probe `k` and, on the returned writer, store `(depth, mv, ...)`. Uses the
-/// table's current generation, as a real caller would.
+/// Probe `k` and store through the returned writer, at the table's current
+/// generation.
 #[allow(clippy::too_many_arguments)]
 fn store(
     tt: &mut TranspositionTable,
@@ -358,12 +330,8 @@ fn generation_aging_lowers_replacement_priority() {
     assert!(tt.probe(key(hi, 3), side).0, "frag 3 should now be present");
 }
 
-/// A cluster holds exactly [`CLUSTER_ENTRIES`] distinct positions: filling it
-/// keeps every one of them, and one more store must displace one.
-///
-/// This is the entry-count half of the `tt-entry16` trade — the same 32-byte
-/// cluster, and hence the same table byte budget, holding 2/3 as many entries —
-/// stated as a behavioural assertion rather than left to the layout constants.
+/// The entry-count half of the `tt-entry16` trade, as behaviour rather than a
+/// layout constant.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_cluster_holds_exactly_cluster_size_positions() {
@@ -413,9 +381,8 @@ fn a_cluster_holds_exactly_cluster_size_positions() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn save_preserves_move_when_new_move_absent() {
-    // The reference keeps the old move if the incoming move is none (0) and the
-    // key still matches. A second write to the same key with mv = 0 must keep
-    // the earlier move but refresh the value.
+    // The reference keeps the old move when the incoming one is none and the
+    // key still matches.
     let mut tt = TranspositionTable::new();
     tt.resize(1);
     let side = 0;
@@ -470,8 +437,8 @@ fn resize_to_same_size_is_a_no_op() {
     store(&mut tt, k, 0, 5, false, Bound::Exact, 9, 0x9, 5);
     let before = tt.checksum();
 
-    // Requesting the same MiB yields the same cluster count → no reallocation,
-    // no clear (faithful to the reference's early return).
+    // The same MiB yields the same cluster count, so the reference's early
+    // return leaves the table untouched.
     tt.resize(1);
     assert_eq!(tt.cluster_count(), 32_768);
     assert_eq!(
@@ -514,8 +481,6 @@ fn new_search_wraps_within_five_bits() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn determinism_identical_sequences_yield_identical_tables() {
-    // Two tables driven by byte-identical operation sequences must end in the
-    // same state, verified by a checksum over all entries.
     fn run() -> TranspositionTable {
         let mut tt = TranspositionTable::new();
         tt.resize(1);
@@ -542,9 +507,7 @@ fn determinism_identical_sequences_yield_identical_tables() {
     assert_eq!(run().checksum(), run().checksum());
 }
 
-/// Alignment the huge-page-backed TT allocation uses on this target: a 2 MiB
-/// huge-page boundary on Linux, a 4 KiB page boundary elsewhere. Mirrors the
-/// private `TT_ALLOC_ALIGN` in `src/tt.rs`.
+/// The private `TT_ALLOC_ALIGN`, restated.
 const EXPECTED_TT_ALIGN: usize = if cfg!(target_os = "linux") {
     2 * 1024 * 1024
 } else {
@@ -572,15 +535,14 @@ fn resized_table_base_pointer_is_page_aligned() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn fresh_resize_reads_back_all_misses() {
-    // The huge-page allocation is `alloc_zeroed`, so a freshly resized table is
-    // fully unoccupied — every probe across the sampled clusters is a miss with
-    // the sentinel payload, exactly like the reference's post-resize clear.
+    // The allocation is zeroed, so a freshly resized table is unoccupied
+    // without a separate clear.
     let mut tt = TranspositionTable::new();
     tt.resize(2);
     for hi in 0..2048u64 {
         for side in 0..2u8 {
-            // A nonzero key fragment cannot match the zeroed entries' `key == 0`,
-            // so probe takes the true miss path and returns the sentinel.
+            // A nonzero fragment cannot match a zeroed entry's `key == 0`, so
+            // the probe takes the true miss path.
             let k = key(hi & 0x7fff, (hi as u16).wrapping_mul(7) | 1);
             let (found, data, _) = tt.probe(k, side);
             assert!(!found, "fresh table entry occupied at hi={hi}");
@@ -592,9 +554,7 @@ fn fresh_resize_reads_back_all_misses() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn resize_grow_shrink_same_cycles_preserve_semantics() {
-    // Walk grow → shrink → same across several sizes; after each *change* the
-    // table is a valid, cleared allocation, and a same-size request is a
-    // no-op that leaves stored data intact.
+    // Grow, shrink and repeat a size, across several of them.
     let mut tt = TranspositionTable::new();
     let k = key(3, 0xabcd);
 
@@ -621,9 +581,7 @@ fn resize_grow_shrink_same_cycles_preserve_semantics() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn many_resizes_do_not_leak_or_corrupt() {
-    // Repeatedly reallocate under the new aligned layout; each drop frees with
-    // the matching layout. A double free / bad layout would trip the allocator
-    // here, and the final store/probe proves the last allocation is sound.
+    // A double free or mismatched layout would trip the allocator here.
     let mut tt = TranspositionTable::new();
     for i in 0..40u64 {
         let mb = 1 + (i % 4) as usize; // cycles 1,2,3,4 → forces real reallocs
@@ -634,11 +592,9 @@ fn many_resizes_do_not_leak_or_corrupt() {
     }
 }
 
-/// Linux-only, best-effort THP-uptake diagnostic (not a hard gate): after a
-/// ≥ 64 MiB resize, scan `/proc/self/smaps` for the mapping that contains the
-/// TT base address and report its `AnonHugePages` figure, so transparent-
-/// huge-page adoption is visible. Never fails the suite — when THP is
-/// disabled (`AnonHugePages: 0 kB`) it simply reports zero.
+/// A diagnostic, not an assertion: report the TT mapping's `AnonHugePages` figure
+/// from `/proc/self/smaps`. Never fails, since transparent huge pages may be
+/// disabled.
 #[cfg_attr(miri, ignore)]
 #[test]
 #[cfg(target_os = "linux")]
@@ -646,7 +602,7 @@ fn thp_uptake_diagnostic_over_64mib() {
     use std::fs;
 
     let mut tt = TranspositionTable::new();
-    tt.resize(64); // ≥ 64 MiB as required by the gate
+    tt.resize(64); // large enough that the huge-page path applies
     let base = tt.backing_ptr_addr();
     assert_ne!(base, 0);
 
@@ -658,11 +614,7 @@ fn thp_uptake_diagnostic_over_64mib() {
         }
     };
 
-    // smaps is a sequence of blocks, each headed by `start-end perms ...`. Find
-    // the block whose address range contains `base`, then read its
-    // `AnonHugePages:` line.
-    // Parse the `start-end` in a smaps block header, returning whether `base`
-    // falls inside the range.
+    // smaps is a sequence of blocks, each headed by `start-end perms ...`.
     fn header_contains(line: &str, base: u64) -> Option<bool> {
         let range = line
             .split_once(' ')
@@ -698,10 +650,10 @@ fn thp_uptake_diagnostic_over_64mib() {
              (kernel without THP accounting); skipping"
         ),
     }
-    // Intentionally no assertion: THP availability is environmental.
+    // No assertion: huge-page availability is environmental.
 }
 
-/// The `TTData` a miss returns (mirrors the reference's miss sentinel).
+/// The `TTData` a miss returns.
 fn miss_sentinel() -> TTData {
     TTData {
         move16: 0,
@@ -713,22 +665,15 @@ fn miss_sentinel() -> TTData {
     }
 }
 
-/// Generation of a freshly-resized table is 0; a tiny helper to make the
-/// round-trip test read clearly.
+/// The generation a freshly-resized table starts at.
 fn tt_generation_zero() -> u8 {
     0
 }
 
-// -------------------------------------------------------------------------
-// Position identity: what an entry's stored key actually distinguishes.
-//
-// The two modules below assert the same scenarios against the two layouts, and
-// they are deliberately written as a matched pair: the property `tt-entry16`
-// buys is only meaningful next to the default behaviour it replaces, and
-// pinning both means a layout regression in either direction is a red test
-// rather than a silently-still-green suite. Only the aliasing verdict differs —
-// where the wide layout keeps two entries apart, the narrow one merges them.
-// -------------------------------------------------------------------------
+// The two modules below assert the same scenarios against the two layouts, so
+// a regression in either direction is a red test rather than a still-green
+// suite. Only the aliasing verdict differs: where the wide layout keeps two
+// entries apart, the narrow one merges them.
 
 /// Identity under `tt-entry16`: the entry stores the whole 64-bit key, so a hit
 /// is exact and no two distinct positions can be mistaken for one another.
@@ -757,10 +702,8 @@ mod wide_key_identity {
         assert_eq!(tt.probe(b, side).1.value, 222, "b keeps its own payload");
     }
 
-    /// The sharp case: keys that share their low 16 bits **and** their cluster,
-    /// differing only in the middle bits neither the index nor a 16-bit
-    /// fragment reads. The default layout cannot tell these apart; a 64-bit key
-    /// can, so they occupy two entries and each reads back its own payload.
+    /// Keys sharing their low 16 bits **and** their cluster, differing only in
+    /// the middle bits neither the index nor a 16-bit fragment reads.
     #[cfg_attr(miri, ignore)]
     #[test]
     fn same_cluster_and_low_16_bits_do_not_alias() {
@@ -795,9 +738,7 @@ mod wide_key_identity {
         assert_eq!(data_b.depth, 12);
     }
 
-    /// Every bit above 16 is load-bearing, one at a time: for each bit in
-    /// `16..49` (the ones the cluster index does not consume), the sibling that
-    /// differs in exactly that bit is a miss.
+    /// Every middle bit is load-bearing, one at a time.
     #[cfg_attr(miri, ignore)]
     #[test]
     fn every_middle_bit_participates_in_identity() {
@@ -807,10 +748,9 @@ mod wide_key_identity {
         let hi = 4000;
 
         for bit in 16..49u32 {
-            // One cluster for the whole loop, with a distinct fragment per bit.
-            // Earlier iterations may still occupy the cluster's other entry, but
-            // every key here has a zero middle part while every `sibling` has a
-            // nonzero one, so no leftover can be mistaken for the sibling.
+            // Earlier iterations may still occupy the cluster's other entry,
+            // but every key here has a zero middle part while every sibling has
+            // a nonzero one, so no leftover can be mistaken for a sibling.
             let base = key_mid(hi, 0, (bit as u16).wrapping_mul(7) | 1);
             let sibling = base | (1u64 << bit);
             assert_ne!(base, sibling);
@@ -826,18 +766,15 @@ mod wide_key_identity {
     }
 }
 
-/// Identity in the default layout: the entry stores the key's low 16 bits, so a
-/// hit is a 16-bit match and a same-cluster sibling *does* alias. This is the
-/// reference's behaviour and the reason the search validates every TT move
-/// against the actual position — pinned here as the contrast that the
-/// `wide_key_identity` module above removes.
+/// Identity in the default layout, where a hit is a 16-bit match and a
+/// same-cluster sibling *does* alias. This is the reference's behaviour, and
+/// the reason the search validates every TT move against the position.
 #[cfg(not(feature = "tt-entry16"))]
 mod narrow_key_identity {
     use super::*;
 
     /// Keys sharing their low 16 bits but landing in different clusters still
-    /// do not alias: the cluster index separates them. Identical assertion to
-    /// the `tt-entry16` case — this half of identity is layout-independent.
+    /// do not alias: this half of identity is layout-independent.
     #[cfg_attr(miri, ignore)]
     #[test]
     fn equal_low_16_bits_in_different_clusters_do_not_alias() {
@@ -857,10 +794,8 @@ mod narrow_key_identity {
         assert_eq!(tt.probe(b, side).1.value, 222, "b keeps its own payload");
     }
 
-    /// Keys that share their cluster and their low 16 bits **do** alias here:
-    /// `b`'s probe reports a hit on `a`'s entry, and storing through it
-    /// overwrites `a`'s payload rather than taking a second slot. This is the
-    /// ~1/65536-per-entry false hit the reference lives with.
+    /// Keys sharing their cluster and their low 16 bits **do** alias here —
+    /// the ~1/65536-per-entry false hit the reference lives with.
     #[cfg_attr(miri, ignore)]
     #[test]
     fn same_cluster_and_low_16_bits_alias() {

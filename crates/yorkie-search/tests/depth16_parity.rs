@@ -1,44 +1,23 @@
-//! Depth-16 search parity gate — the null-move **verification search**.
+//! Depth-16 search parity test — the null-move **verification search**.
 //!
 //! Runs the `go depth 16` root search ([`QSearch::run_root`]) against the
-//! reference-captured fixture under `tests/fixtures/search-depth16/` and asserts
-//! **bestmove, score, and nodes** exactly, as an inseparable triple (the
+//! reference-captured fixture under `tests/fixtures/search-depth16/` and
+//! asserts **bestmove, score, and nodes** as an inseparable triple: the
 //! `(nodes & 14)` root tie-break means a single node of drift can flip the
-//! bestmove).
+//! bestmove.
 //!
-//! ## Why depth 16 specifically
+//! Step 9's verification search is the only regime the shallower tiers cannot
+//! reach, since its guard is `nmpMinPly == 0 && depth >= 16`. It re-enters on
+//! this node's own stack cell, so it rewrites `ss->staticEval` and can flip
+//! `ss->ttPv`; a port that cached those across Step 9 passes every shallower
+//! tier and diverges only here.
 //!
-//! Step 9's verification search (`yaneuraou-search.cpp` at the pin
-//! `76d58ef`) is the only regime the depth-1/2/3/5/8 tiers cannot reach: its
-//! guard is `nmpMinPly == 0 && depth >= 16`, so a null-move fail-high below
-//! depth 16 returns `nullValue` outright and the whole block is dead. From
-//! depth 16 up, a fail-high instead re-searches the **same node** (same `ss`, no
-//! `do_move`) at `depth - R` with null-move pruning disabled until `ss->ply`
-//! climbs past `nmpMinPly = ss->ply + 3 * (depth - R) / 4`, and only returns
-//! `nullValue` when that verification also fails high — otherwise the node falls
-//! through to its ordinary moves loop.
-//!
-//! That re-entry is also what makes the tier worth gating rather than merely
-//! running: because it re-enters on this node's own stack cell, it rewrites
-//! `ss->staticEval` (Step 6 runs again with a correction value the null-move
-//! subtree may have moved) and can flip `ss->ttPv` (a fail-low re-entry applies
-//! `ss->ttPv |= (ss-1)->ttPv`). Every reference read of those two fields after
-//! Step 9 is a live `ss->` read, so `qsearch.rs` re-syncs its locals right after
-//! the block. A port that cached them across Step 9 passes every shallower tier
-//! and diverges only here.
-//!
-//! One position keeps the tier affordable: `startpos` at depth 16 is ~230k
-//! cumulative nodes, roughly 20x the depth-8 fixture. The six-position sweep
-//! stays at depth 8.
+//! One position keeps the tier affordable: `startpos` at depth 16 is roughly
+//! 20x the depth-8 fixture. The six-position sweep stays at depth 8.
 //!
 //! The fixture was captured with Threads=1, no book, `usinewgame` before the
-//! position, `go depth 16`, USI_Hash default 1024 MiB — reproduced here by
-//! resizing the transposition table to 1024 MiB, clearing it (the `usinewgame`
-//! equivalent), and letting `run_root` bump the generation.
-//!
-//! Like the other real-network tests, this is skipped with a notice when
-//! `nn.bin` is absent (a checkout without it staged), so the default
-//! `cargo test` run stays green everywhere `nn.bin` is not staged.
+//! position, and USI_Hash 1024 MiB, reproduced here. Skipped with a notice when
+//! `nn.bin` is absent.
 
 use std::path::PathBuf;
 
@@ -121,8 +100,8 @@ fn is_decisive(v: i32) -> bool {
 }
 
 /// Format a search value the way the reference USI layer does (`score.cpp` /
-/// `usi.cpp` `format_score`): a mate distance for decisive scores, else
-/// `100 * v / PawnValue` centipawns (C++ truncating division).
+/// `usi.cpp` `format_score`): a mate distance for decisive scores, else `100 *
+/// v / PawnValue` centipawns (C++ truncating division).
 fn format_score(v: i32) -> ScoreJson {
     if is_decisive(v) {
         let distance = VALUE_MATE - v.abs();

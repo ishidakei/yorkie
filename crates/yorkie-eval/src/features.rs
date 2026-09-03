@@ -1,32 +1,17 @@
 //! `HalfKA_hm2` active-feature index extraction over `yorkie-state::Position`.
 //!
-//! SFNN-1536 uses `Features::FeatureSet<Features::HalfKA_hm2<Side::kFriend>>`
-//! (see `eval/nnue/architectures/sfnn-1536.h`). This
-//! module ports the index math of that feature set — full-refresh path only —
-//! onto this workspace's `Position` API.
+//! The index math is ported from `half_ka_hm2.{h,cpp}`. A [`Square`] index here
+//! is byte-identical to the reference's `Square` numbering, so the arithmetic
+//! carries over unchanged.
 //!
-//! The C++ ground truth lives at
-//! `eval/nnue/features/half_ka_hm2.{h,cpp}`; the
-//! index arithmetic is a faithful port of the read-only Rust NNUE reference
-//! implementation's `features.rs`, adapted from that reference's Position
-//! API to `yorkie-state`. The two coordinate systems already agree — an
-//! `yorkie-state::Square` index is `file * 9 + rank` with file `0` = shogi file
-//! `1` and rank `0` = shogi rank `a`, byte-identical to YaneuraOu's `Square`
-//! numbering — so the arithmetic carries over unchanged.
+//! A feature index is `E_KING * sq_k_code + p_adj`, where `sq_k_code` is the
+//! perspective's own-king square horizontally mirrored into files 1–5 — the
+//! `hm` canonicalization — and `p_adj` selects a plane and a square or count
+//! within it: hand planes, then board planes with friend and enemy interleaved
+//! per piece type, then a single shared king plane both kings collapse into.
 //!
-//! ## Feature layout (identical to the reference / C++ `HalfKA_hm2`)
-//!
-//! A feature index is `E_KING * sq_k_code + p_adj`, where:
-//! - `sq_k_code` is the perspective's own-king square, horizontally mirrored
-//!   into files 1–5 (`0..45`). Mirroring the whole position around the king's
-//!   file is the `hm` ("horizontal mirror") canonicalization.
-//! - `p_adj` selects a plane and a square/count within it: hand planes
-//!   `[0, 90)`, board planes `[90, 1548)` (friend/enemy interleaved per piece
-//!   type), and a single shared king plane `[1548, 1629)` that both kings
-//!   collapse into.
-//!
-//! The accumulator itself, and the application of a changed-index delta to it,
-//! live in [`crate::transformer`].
+//! The accumulator itself, and the application of a delta to it, live in
+//! [`crate::transformer`].
 
 use yorkie_state::{Color, Move, Piece, PieceKind, Position, Square};
 
@@ -36,15 +21,12 @@ use crate::types::NUM_FEATURES;
 pub type FeatureIndex = u32;
 
 /// `BONA_PIECE_ZERO`: the feature-space origin the reference initialises empty
-/// piece slots to (`EvalList::clear()`). Used to pad sparse positions up to the
-/// fixed 40 piece slots the reference iterates.
+/// piece slots to, and this pads sparse positions up to 40 slots with.
 const BONA_PIECE_ZERO: usize = 0;
 
-// --- Hand planes ---------------------------------------------------------
-// `F_*` is the friend (own-side) plane base, `E_*` the enemy plane base. The
-// per-piece span leaves room for one index per possible held count (a pawn can
-// be held up to 18 times, so its plane spans 19 slots — slot 0 is the unused
-// "zero" pad, counts land at `base + 1 ..= base + count`).
+// Hand planes. `F_*` is the friend plane base, `E_*` the enemy one. Each spans
+// one index per possible held count, with slot 0 the unused "zero" pad and
+// counts landing at `base + 1 ..= base + count`.
 const F_HAND_PAWN: usize = 0;
 const E_HAND_PAWN: usize = F_HAND_PAWN + 19;
 const F_HAND_LANCE: usize = E_HAND_PAWN + 19;
@@ -61,10 +43,9 @@ const F_HAND_ROOK: usize = E_HAND_BISHOP + 3;
 const E_HAND_ROOK: usize = F_HAND_ROOK + 3;
 const FE_HAND_END: usize = E_HAND_ROOK + 3;
 
-// --- Board planes --------------------------------------------------------
-// One 81-square plane per (side, effective piece type). Promoted minor pieces
-// collapse onto the gold plane; promoted bishop/rook land on the horse/dragon
-// planes. Ordering matches YaneuraOu's `BonaPiece` board layout.
+// Board planes, one per (side, effective piece type), in the reference's
+// `BonaPiece` order. Promoted minors collapse onto the gold plane; a promoted
+// bishop or rook lands on the horse or dragon plane.
 const F_PAWN: usize = FE_HAND_END;
 const E_PAWN: usize = F_PAWN + 81;
 const F_LANCE: usize = E_PAWN + 81;
@@ -93,13 +74,12 @@ const E_KING: usize = FE_END + SQ_NB;
 /// Number of distinct mirrored king squares (files 1–5 × 9 ranks).
 const SQ_K_COUNT: usize = 5 * 9;
 
-/// Total `HalfKA_hm2` feature dimension: `SQ_K_COUNT * E_KING`. Kept equal to
-/// [`crate::types::NUM_FEATURES`] (asserted in tests).
+/// Total `HalfKA_hm2` feature dimension: `SQ_K_COUNT * E_KING`.
 pub const FEATURE_DIMENSION: usize = SQ_K_COUNT * E_KING;
 
-/// Maximum number of simultaneously-active features (`PIECE_NUMBER_NB`): every
-/// legal shogi position has exactly 40 pieces split across board and hands, so
-/// a full position yields exactly this many active indices.
+/// Maximum simultaneously-active features (`PIECE_NUMBER_NB`). Every legal
+/// position has exactly 40 pieces across board and hands, so a full position
+/// yields exactly this many.
 pub const MAX_ACTIVE_FEATURES: usize = 40;
 
 /// The seven piece kinds that can sit in a hand, in `BonaPiece` plane order.
@@ -113,21 +93,19 @@ const HAND_KINDS: [PieceKind; 7] = [
     PieceKind::Rook,
 ];
 
-/// Rotate a square 180° when viewing the board from `persp`'s side. Black keeps
-/// the square as-is; White flips it (the enemy king / mirror math then operates
-/// in a canonical own-side-forward frame).
+/// Rotate a square 180° when viewing the board from `persp`'s side, so the
+/// mirror math operates in a canonical own-side-forward frame.
 #[inline]
 fn from_persp(sq: Square, persp: Color) -> Square {
     match persp {
         Color::Black => sq,
-        // 180° rotation == SQ_NB - 1 - index.
         Color::White => Square::from_index((SQ_NB as u8 - 1) - sq.index())
             .expect("180-degree rotation of a valid square is valid"),
     }
 }
 
-/// The `hm` trigger: mirror when the (perspective-relative) king sits on files
-/// 6–9, i.e. file index `>= 5`. Matches the C++ `sq_k >= SQ_61` test.
+/// The `hm` trigger: mirror when the perspective-relative king sits on files
+/// 6–9.
 #[inline]
 fn needs_mirror(king_sq_persp: Square) -> bool {
     king_sq_persp.file() >= 5
@@ -144,18 +122,14 @@ fn mirror_if_needed(sq: Square, mirror: bool) -> Square {
     }
 }
 
-/// A `(friend, enemy)` board-plane base pair for a king slot — never indexed in
-/// production (kings use the shared king plane), so a sentinel that would blow
-/// past `E_KING` and trip [`encode_feature`]'s `debug_assert!` if ever used.
+/// The board-plane base pair for a king slot. Kings use the shared king plane
+/// instead, so this is a sentinel that would blow past `E_KING` and trip
+/// [`encode_feature`]'s `debug_assert!` if ever indexed.
 const NO_BOARD_PLANE: (usize, usize) = (usize::MAX, usize::MAX);
 
-/// Friend/enemy board-plane bases indexed by `[PieceKind::index()][promoted]`.
-///
-/// Promoted pawn/lance/knight/silver collapse to the gold plane; promoted
-/// bishop/rook to horse/dragon; gold never promotes (both slots stay gold). The
-/// king row is a sentinel — kings have no board plane and the caller routes
-/// them to the shared king plane. Branch-free index-table form of the
-/// reference's piece-to-`BonaPiece`-base mapping.
+/// Friend and enemy board-plane bases indexed by
+/// `[PieceKind::index()][promoted]` — the reference's
+/// piece-to-`BonaPiece`-base mapping, branch-free. The king row is a sentinel.
 const BOARD_PLANE: [[(usize, usize); 2]; PieceKind::COUNT] = {
     let mut table = [[NO_BOARD_PLANE; 2]; PieceKind::COUNT];
     table[PieceKind::Pawn.index()] = [(F_PAWN, E_PAWN), (F_GOLD, E_GOLD)];
@@ -168,8 +142,8 @@ const BOARD_PLANE: [[(usize, usize); 2]; PieceKind::COUNT] = {
     table
 };
 
-/// Friend/enemy hand-plane bases indexed by `[PieceKind::index()]`. The king
-/// row is a sentinel — kings are never held in hand.
+/// Friend and enemy hand-plane bases indexed by `[PieceKind::index()]`. The
+/// king row is a sentinel: a king is never held in hand.
 const HAND_PLANE: [(usize, usize); PieceKind::COUNT] = {
     let mut table = [NO_BOARD_PLANE; PieceKind::COUNT];
     table[PieceKind::Pawn.index()] = (F_HAND_PAWN, E_HAND_PAWN);
@@ -182,11 +156,8 @@ const HAND_PLANE: [(usize, usize); PieceKind::COUNT] = {
     table
 };
 
-/// Friend/enemy board-plane base for a board piece. Promoted pawn/lance/knight/
-/// silver collapse to the gold plane; promoted bishop/rook to horse/dragon.
-///
-/// Kings have no board plane — the caller routes them to the shared king plane,
-/// so passing a king is a caller bug, guarded by `debug_assert!`.
+/// Friend and enemy board-plane base for a board piece. A king has no board
+/// plane, so passing one is a caller bug.
 #[inline]
 fn board_plane(kind: PieceKind, promoted: bool, is_friend: bool) -> usize {
     debug_assert!(
@@ -197,10 +168,8 @@ fn board_plane(kind: PieceKind, promoted: bool, is_friend: bool) -> usize {
     if is_friend { friend } else { enemy }
 }
 
-/// Friend/enemy hand-plane base for a held piece kind.
-///
-/// Kings are never held in hand, so passing a king is a caller bug, guarded by
-/// `debug_assert!`.
+/// Friend and enemy hand-plane base for a held piece kind. A king is never held
+/// in hand, so passing one is a caller bug.
 #[inline]
 fn hand_plane(kind: PieceKind, is_friend: bool) -> usize {
     debug_assert!(kind != PieceKind::King, "king is never held in hand");
@@ -218,19 +187,17 @@ fn encode_feature(sq_k_code: usize, p_adj: usize) -> FeatureIndex {
     idx as FeatureIndex
 }
 
-/// Locate `color`'s king on the board via the O(1) piece-set accessor
-/// [`Position::king_square`].
+/// Locate `color`'s king.
 ///
 /// # Panics
-/// Panics if `color` has no king — every position fed to the evaluator must
-/// have both kings, matching the reference's `pos.king_square` contract.
+/// Panics if `color` has no king: every position fed to the evaluator must have
+/// both.
 pub(crate) fn king_square(pos: &Position, color: Color) -> Square {
     pos.king_square(color)
         .unwrap_or_else(|| panic!("position has no {color:?} king"))
 }
 
-/// An 81-square mailbox scan, the `#[cfg(test)]` equivalence oracle for
-/// [`king_square`] (mirrors `yorkie-state`'s `try_find_king_scan`).
+/// An 81-square mailbox scan form of [`king_square`].
 #[cfg(test)]
 fn king_square_scan(pos: &Position, color: Color) -> Square {
     for index in 0..Square::COUNT as u8 {
@@ -247,23 +214,14 @@ fn king_square_scan(pos: &Position, color: Color) -> Square {
 
 /// Active `HalfKA_hm2` feature indices for one `perspective` of `pos`.
 ///
-/// Returns exactly [`MAX_ACTIVE_FEATURES`] indices: one per board piece, one per
-/// held-piece instance, then `BONA_PIECE_ZERO` padding (see below) for every
-/// empty piece slot. A legal position has all 40 slots filled and needs no
-/// padding; a sparse (piece-dropped) position is padded up to 40 with repeated
-/// `E_KING * sq_k_code + 0` features. Every index is `< FEATURE_DIMENSION`. The
-/// list may contain duplicates (the padding features, and only those).
+/// Always exactly [`MAX_ACTIVE_FEATURES`] indices: one per board piece, one per
+/// held-piece instance, then `BONA_PIECE_ZERO` padding for every empty slot.
+/// **The padding is load-bearing.** The reference iterates a fixed 40 slots and
+/// initialises the unused ones to `BONA_PIECE_ZERO`, so each absent piece
+/// contributes that feature — and since the accumulator sums feature columns,
+/// omitting the repeats would diverge on any sparse position.
 ///
-/// ## Why padding
-///
-/// The reference builds each accumulator half by iterating a *fixed* 40
-/// piece-number slots (`AppendActiveIndices` over `PIECE_NUMBER_NB`, with the
-/// two kings at slots 38/39). `EvalList::clear()` initialises every unused slot
-/// to `BONA_PIECE_ZERO` (`0`), so each absent piece contributes the feature
-/// `MakeIndex(sq_k, 0) = E_KING * sq_k_code + 0`. Because the accumulator *sums*
-/// feature columns, these repeated zero-features shift the result and must be
-/// reproduced exactly, or a sparse-position evaluation diverges from ground
-/// truth.
+/// The only duplicates in the list are those padding features.
 ///
 /// # Panics
 /// Panics if `pos` is missing the `perspective` side's king.
@@ -273,13 +231,8 @@ pub fn active_features(pos: &Position, perspective: Color) -> Vec<FeatureIndex> 
     list
 }
 
-/// [`active_features`] writing into a caller-owned buffer instead of a fresh
-/// `Vec`: `list` is cleared and refilled with exactly the same
-/// [`MAX_ACTIVE_FEATURES`] indices, in the same order.
-///
-/// Used by the finny-table refresh cache ([`crate::FinnyCache`]), which reuses
-/// one scratch buffer across every cached rebuild so the king-move arm does not
-/// allocate per node.
+/// [`active_features`] writing into a caller-owned buffer, so the finny cache's
+/// king-move arm does not allocate per node.
 ///
 /// # Panics
 /// Panics if `pos` is missing the `perspective` side's king.
@@ -295,7 +248,6 @@ pub(crate) fn active_features_into(
     let mirror = needs_mirror(own_king_persp);
     let sq_k_code = mirror_if_needed(own_king_persp, mirror).index() as usize;
 
-    // Board pieces.
     for index in 0..Square::COUNT as u8 {
         let sq = Square::from_index(index).expect("index < Square::COUNT is valid");
         let Some(piece) = pos.board().get(sq) else {
@@ -306,7 +258,7 @@ pub(crate) fn active_features_into(
         let sq_code = sq_persp.index() as usize;
 
         let p_adj = if piece.kind == PieceKind::King {
-            // Both kings collapse into the shared `[FE_END, E_KING)` plane.
+            // Both kings collapse into the one shared plane.
             FE_END + sq_code
         } else {
             board_plane(piece.kind, piece.promoted, is_friend) + sq_code
@@ -314,7 +266,7 @@ pub(crate) fn active_features_into(
         list.push(encode_feature(sq_k_code, p_adj));
     }
 
-    // Hand pieces: the k-th held piece of a kind lands at `base + k`.
+    // The k-th held piece of a kind lands at `base + k`.
     for hand_color in [Color::Black, Color::White] {
         let is_friend = hand_color == perspective;
         let hand = pos.hand(hand_color);
@@ -327,18 +279,14 @@ pub(crate) fn active_features_into(
         }
     }
 
-    // Pad empty piece slots with the `BONA_PIECE_ZERO` feature, matching the
-    // reference's fixed 40-slot iteration (see the doc comment above). A legal
-    // 40-piece position is already full and skips this loop.
+    // A legal 40-piece position is already full and skips this loop.
     debug_assert!(list.len() <= MAX_ACTIVE_FEATURES);
     while list.len() < MAX_ACTIVE_FEATURES {
         list.push(encode_feature(sq_k_code, BONA_PIECE_ZERO));
     }
 }
 
-/// Active features for both perspectives, indexed by [`Color::index`]
-/// (`[0]` = Black, `[1]` = White). Convenience for consumers that refresh both
-/// accumulators from a single position.
+/// Active features for both perspectives, indexed by [`Color::index`].
 pub fn active_features_both(pos: &Position) -> [Vec<FeatureIndex>; Color::COUNT] {
     [
         active_features(pos, Color::Black),
@@ -347,37 +295,29 @@ pub fn active_features_both(pos: &Position) -> [Vec<FeatureIndex>; Color::COUNT]
 }
 
 /// Whether `perspective`'s accumulator half must be fully refreshed after `mv`
-/// (rather than updated incrementally).
+/// rather than updated incrementally (`requires_full_refresh`,
+/// `half_ka_hm2.cpp`).
 ///
-/// A `HalfKA_hm2` feature index is `own_king_relative` (it embeds the
-/// perspective's own-king `sq_k_code`). When that own king moves, *every* index
-/// for the perspective shifts — and the horizontal-mirror flag may flip too —
-/// so no add/sub delta can express the change and the whole half is rebuilt.
-/// Drops never move the king, and a non-drop move only forces a refresh for the
-/// side whose king is the moved piece. Faithful port of the reference
-/// `requires_full_refresh` (`half_ka_hm2.cpp`'s king-move / mirror-boundary
-/// rule); the mirror-boundary case is subsumed here because only a king move
-/// can change the perspective's own-king file.
+/// A feature index embeds the perspective's own-king `sq_k_code`, so when that
+/// king moves *every* index shifts — and the mirror flag may flip too — and no
+/// add/sub delta can express the change. Only a king move can change the
+/// perspective's own-king file, which is why the reference's separate
+/// mirror-boundary case is subsumed here.
 pub fn requires_full_refresh(mv: Move, perspective: Color) -> bool {
     if mv.is_drop() {
         return false;
     }
-    // A king never promotes, so `moved_piece_after` reports the moving king
-    // directly for a king move.
+    // A king never promotes, so `moved_piece_after` reports it directly.
     let piece = mv.moved_piece_after();
     piece.kind == PieceKind::King && piece.color == perspective
 }
 
-/// Sorted-merge multiset difference of two active-feature lists: returns
-/// `(removed, added)` such that applying `removed` then `added` to the `before`
-/// multiset yields the `after` multiset.
+/// Sorted-merge multiset difference of two active-feature lists: `(removed,
+/// added)` such that applying both to the `before` multiset yields `after`.
 ///
-/// Both inputs are the fixed-length ([`MAX_ACTIVE_FEATURES`]) lists produced by
-/// [`active_features`], including their `BONA_PIECE_ZERO` padding. Because a
-/// legal move conserves total piece count, the padding multiplicity is equal on
-/// both sides (for any perspective updated incrementally, i.e. whose own king
-/// did not move), so the padding features cancel and never appear in either
-/// output. Faithful port of the reference `feature_diff`'s merge loop.
+/// A legal move conserves total piece count, so for any perspective updated
+/// incrementally the padding multiplicity is equal on both sides and the
+/// padding features cancel rather than appearing in either output.
 pub(crate) fn changed_indices(
     before: &[FeatureIndex],
     after: &[FeatureIndex],
@@ -387,9 +327,8 @@ pub(crate) fn changed_indices(
     (scratch.removed, scratch.added)
 }
 
-/// Reusable buffers for [`changed_indices_into`]: the two sorted copies plus the
-/// two outputs. Owned by the finny-table cache so a cached rebuild reuses the
-/// same four allocations for the whole search.
+/// Reusable buffers for [`changed_indices_into`], owned by the finny cache so a
+/// rebuild reuses the same four allocations for the whole search.
 #[derive(Debug, Default)]
 pub(crate) struct DiffScratch {
     sorted_before: Vec<FeatureIndex>,
@@ -400,10 +339,8 @@ pub(crate) struct DiffScratch {
     pub(crate) added: Vec<FeatureIndex>,
 }
 
-/// [`changed_indices`] writing into caller-owned buffers: fills
-/// `scratch.removed` / `scratch.added` with exactly the lists `changed_indices`
-/// would have returned (this is the single implementation; `changed_indices` is
-/// a thin allocating wrapper over it).
+/// [`changed_indices`] writing into caller-owned buffers. This is the single
+/// implementation; `changed_indices` is an allocating wrapper over it.
 pub(crate) fn changed_indices_into(
     before: &[FeatureIndex],
     after: &[FeatureIndex],
@@ -446,36 +383,21 @@ pub(crate) fn changed_indices_into(
     added.extend_from_slice(&sorted_after[j..]);
 }
 
-// --- Move-derived (dirty-piece) accumulator delta ------------------------
+// The hot search path cannot afford `active_features`'s 40-slot scan, sort and
+// merge at every `do_move`. The reference instead tracks the handful of "dirty"
+// pieces a move touches and rewrites only their feature columns, which
+// [`MoveDelta::from_move`] ports.
 //
-// The hot search path cannot afford [`active_features`]'s full 40-slot scan
-// (plus sort + merge) at every `do_move`. YaneuraOu instead tracks the handful
-// of "dirty" pieces a move touches and rewrites only their feature columns.
-// [`MoveDelta::from_move`] is that dirty-piece form: it reads the pre-move
-// board / hands directly from the move (mover from/to with promotion, the
-// captured piece's board removal and the capturer's hand gain, or a drop's
-// hand removal + board addition) and, for every perspective whose own king did
-// NOT move, encodes the exact add/sub feature indices `active_features` would
-// have differed by. A perspective whose own king moved is flagged for a full
-// refresh (its whole own-king-relative index space shifts).
-//
-// Bit-exactness: for a perspective updated incrementally, `refresh(before) +
-// added_columns - removed_columns == refresh(after)` under wrapping `i16`,
-// because the only `active_features` entries that changed between the pre- and
-// post-move positions are exactly these dirty pieces (the total board+hand
-// piece count is conserved by every legal move, so the `BONA_PIECE_ZERO`
-// padding multiplicity is unchanged and cancels). This is verified BIT-FOR-BIT
-// against both [`Accumulator::refresh`] and the scan-based
-// [`Accumulator::update_after_move`] in the transformer's oracle tests.
+// The only `active_features` entries that change between the pre- and post-move
+// positions are exactly those dirty pieces: every legal move conserves the
+// total piece count, so the padding multiplicity is unchanged and cancels.
 
 /// One board or hand slot a move touches, in a perspective-independent form.
-/// Encoded per perspective into a `HalfKA_hm2` feature index by [`Dirty::encode`].
 #[derive(Clone, Copy)]
 enum Dirty {
-    /// A piece sitting on `sq` (a king is encoded via the shared king plane).
+    /// A piece sitting on `sq`.
     Board { sq: Square, piece: Piece },
-    /// The `count`-th (1-based) held piece of `kind` in `color`'s hand — the
-    /// slot `active_features` emits as `hand_plane(kind, ..) + count`.
+    /// The `count`-th held piece of `kind` in `color`'s hand, 1-based.
     Hand {
         color: Color,
         kind: PieceKind,
@@ -485,8 +407,7 @@ enum Dirty {
 
 impl Dirty {
     /// Encode this slot into the feature index for `persp`, whose own-king code
-    /// is `(sq_k_code, mirror)`. Byte-for-byte the same arithmetic
-    /// [`active_features`] applies to the same slot.
+    /// is `(sq_k_code, mirror)`.
     #[inline]
     fn encode(self, persp: Color, sq_k_code: usize, mirror: bool) -> FeatureIndex {
         match self {
@@ -507,8 +428,8 @@ impl Dirty {
 }
 
 /// The add/sub feature delta for one perspective across a move. At most two
-/// columns change per side (mover + captured, or a drop's hand + board), so the
-/// lists are fixed two-slot arrays — no heap allocation on the hot path.
+/// columns change per side, so the lists are fixed two-slot arrays and the hot
+/// path allocates nothing.
 #[derive(Clone, Copy, Default)]
 pub struct PerspectiveDelta {
     removed: [FeatureIndex; 2],
@@ -532,12 +453,8 @@ impl PerspectiveDelta {
 }
 
 /// The per-perspective feature delta a move induces, computed straight from the
-/// pre-move position without the [`active_features`] scan.
-///
-/// `half(color)` is `None` when that perspective must be fully refreshed (its
-/// own king moved) and `Some(delta)` otherwise. Consumed by
-/// [`crate::Accumulator::derive_into`], which the search threads through its
-/// per-worker accumulator stack.
+/// pre-move position without the [`active_features`] scan. `half(color)` is
+/// `None` when that perspective must be fully refreshed instead.
 pub struct MoveDelta {
     halves: [Option<PerspectiveDelta>; Color::COUNT],
 }
@@ -550,11 +467,8 @@ impl MoveDelta {
         self.halves[perspective.index()].as_ref()
     }
 
-    /// Compute the delta for `mv` from the **pre-move** `pos`.
-    ///
-    /// Reads only the mover's origin square, the captured square, and the
-    /// relevant hand counts — a handful of accesses, versus the 81-square +
-    /// hand scan [`active_features`] performs. `pos` is not mutated.
+    /// Compute the delta for `mv` from the **pre-move** `pos`, which is not
+    /// mutated.
     ///
     /// # Panics
     /// Panics if a non-drop move has no piece on its origin square, or if an
@@ -563,13 +477,12 @@ impl MoveDelta {
         let mover = pos.side_to_move();
         let to = mv.to_sq();
 
-        // Perspective-independent dirty slots: at most two removed, two added.
         let mut removed: [Option<Dirty>; 2] = [None, None];
         let mut added: [Option<Dirty>; 2] = [None, None];
 
         if mv.is_drop() {
-            // Drop: the top held slot leaves the hand; a fresh (unpromoted) board
-            // piece appears at `to`.
+            // The top held slot leaves the hand and an unpromoted board piece
+            // appears at `to`.
             let kind = mv.dropped_piece_kind();
             let count = pos.hand(mover).count(kind) as usize;
             removed[0] = Some(Dirty::Hand {
@@ -583,10 +496,9 @@ impl MoveDelta {
             });
         } else {
             let from = mv.from_sq();
-            // The `Move` encoding already carries the moving piece (bits 16..21),
-            // so take it from there instead of re-reading the board. `before` is
-            // the post-move piece with any promotion undone; a non-promoting move
-            // leaves it unchanged.
+            // The `Move` encoding already carries the moving piece, so it need
+            // not be re-read from the board. `before` is that piece with any
+            // promotion undone.
             let after = mv.moved_piece_after();
             let before = if mv.is_promote() {
                 Piece {
@@ -610,8 +522,8 @@ impl MoveDelta {
                 piece: after,
             });
 
-            // Capture: the victim leaves the board and enters the mover's hand as
-            // its base (unpromoted) kind, at the next count slot.
+            // The victim leaves the board and enters the mover's hand as its
+            // base kind, at the next count slot.
             if let Some(captured) = pos.board().get(to) {
                 removed[1] = Some(Dirty::Board {
                     sq: to,
@@ -631,8 +543,8 @@ impl MoveDelta {
             if requires_full_refresh(mv, persp) {
                 return None;
             }
-            // The perspective's own king did not move, so its `(sq_k_code,
-            // mirror)` is the same pre- and post-move; read it from `pos`.
+            // This perspective's own king did not move, so its `(sq_k_code,
+            // mirror)` is the same pre- and post-move.
             let king_persp = from_persp(king_square(pos, persp), persp);
             let mirror = needs_mirror(king_persp);
             let sq_k_code = mirror_if_needed(king_persp, mirror).index() as usize;
@@ -662,7 +574,7 @@ mod tests {
     use yorkie_state::{parse_sfen, parse_usi_move};
 
     const STARTPOS: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
-    // Sparse, hand-heavy: 6 board pieces + 6 held pieces = 12 total.
+    // Sparse and hand-heavy: six board pieces and six held.
     const DROP_HEAVY: &str = "k8/1P7/G8/1N2P4/9/9/9/9/8K b 2PG2pg 1";
 
     fn sorted(list: &[FeatureIndex]) -> Vec<FeatureIndex> {
@@ -685,8 +597,7 @@ mod tests {
         }
     }
 
-    /// Horizontal mirror of `pos`: every board piece file `f -> 8 - f`, ranks
-    /// and hands unchanged (a file mirror leaves held pieces untouched).
+    /// Horizontal mirror of `pos`. A file mirror leaves held pieces untouched.
     fn mirror_position(pos: &Position) -> Position {
         let mut mirrored = Position::empty();
         for index in 0..Square::COUNT as u8 {
@@ -709,8 +620,6 @@ mod tests {
 
     #[test]
     fn king_square_matches_scan_oracle() {
-        // The O(1) piece-set lookup must agree square-for-square with an
-        // 81-square scan on every position the evaluator sees.
         for sfen in [STARTPOS, DROP_HEAVY] {
             let pos = parse_sfen(sfen).unwrap();
             for color in [Color::Black, Color::White] {
@@ -794,12 +703,11 @@ mod tests {
         let pos = parse_sfen(DROP_HEAVY).unwrap();
         for persp in [Color::Black, Color::White] {
             let list = active_features(&pos, persp);
-            // 6 board pieces + 6 held pieces = 12 real, padded up to 40.
+            // Twelve real features, padded up to forty.
             assert_eq!(list.len(), MAX_ACTIVE_FEATURES, "perspective {persp:?}");
             assert_in_bounds(&list);
 
-            // The 12 real features are distinct; the 28 padding slots all repeat
-            // the single BONA_PIECE_ZERO feature for this perspective's king.
+            // The padding slots all repeat one feature.
             let own_king_persp = from_persp(king_square(&pos, persp), persp);
             let mirror = needs_mirror(own_king_persp);
             let sq_k_code = mirror_if_needed(own_king_persp, mirror).index() as usize;
@@ -820,9 +728,7 @@ mod tests {
 
     #[test]
     fn every_position_yields_exactly_forty_features() {
-        // Both a full (startpos) and a sparse (drop-heavy) position must produce
-        // exactly PIECE_NUMBER_NB features per perspective — the reference's
-        // fixed-slot invariant.
+        // A full position and a sparse one alike.
         for sfen in [STARTPOS, DROP_HEAVY] {
             let pos = parse_sfen(sfen).unwrap();
             for persp in [Color::Black, Color::White] {
@@ -837,10 +743,8 @@ mod tests {
 
     #[test]
     fn hand_piece_indices_span_consecutive_slots() {
-        // Black holds 2 pawns + 1 gold; White holds 2 pawns + 1 gold. From
-        // Black's perspective the friend pawns occupy F_HAND_PAWN+{1,2}, the
-        // friend gold F_HAND_GOLD+1, the enemy pawns E_HAND_PAWN+{1,2}, the
-        // enemy gold E_HAND_GOLD+1 — all offset by the same king block.
+        // Each side holds two pawns and a gold, so the counted slots land at
+        // `base + 1` and `base + 2` on both the friend and enemy planes.
         let pos = parse_sfen(DROP_HEAVY).unwrap();
         let own_king_persp = from_persp(king_square(&pos, Color::Black), Color::Black);
         let mirror = needs_mirror(own_king_persp);
@@ -863,10 +767,9 @@ mod tests {
     #[test]
     fn mirror_property_preserves_feature_set() {
         // Both kings sit off the centre file, so the `hm` canonicalization
-        // makes a position and its horizontal mirror share one feature set for
-        // each perspective (the mirror flag flips between the two, cancelling
-        // out). A centre-file king would break this — that case is a genuinely
-        // distinct position, not a mirror-equivalent one.
+        // makes a position and its horizontal mirror share one feature set per
+        // perspective. A centre-file king is a genuinely distinct position
+        // rather than a mirror-equivalent one.
         let sfen = "2k6/9/4+R4/8P/9/1n7/9/9/6K2 b B2Pgp 1";
         let pos = parse_sfen(sfen).unwrap();
         let mirrored = mirror_position(&pos);
@@ -879,10 +782,8 @@ mod tests {
         }
     }
 
-    // --- Incremental-update support: refresh classification + diff ---------
-
-    /// Reconstruct the `after` multiset from `before + added - removed`, sorted,
-    /// as an independent oracle for [`changed_indices`].
+    /// Reconstruct the `after` multiset from `before + added - removed`,
+    /// independently of [`changed_indices`].
     fn apply_multiset(
         before: &[FeatureIndex],
         removed: &[FeatureIndex],
@@ -909,10 +810,9 @@ mod tests {
         out
     }
 
-    /// Drive `changed_indices` the way the accumulator does: diff the pre- and
-    /// post-move feature lists for a perspective and confirm the delta
-    /// reconstructs the post-move multiset. Asserts the move is incremental for
-    /// the perspective (no own-king move).
+    /// Diff the pre- and post-move feature lists for a perspective and confirm
+    /// the delta reconstructs the post-move multiset. Asserts the move is
+    /// incremental for that perspective.
     fn check_diff_invariant(sfen: &str, usi: &str) {
         let mut pos = parse_sfen(sfen).unwrap();
         let mv = parse_usi_move(usi, &pos).unwrap();
@@ -927,7 +827,7 @@ mod tests {
             pos.undo_move(mv, undo);
 
             let (removed, added) = changed_indices(&before, &after);
-            // Padding features cancel: neither list may contain the pad index.
+            // The padding features cancel.
             assert_eq!(
                 apply_multiset(&before, &removed, &added),
                 sorted(&after),
@@ -959,8 +859,7 @@ mod tests {
 
     #[test]
     fn changed_indices_reconstructs_after_for_all_move_types() {
-        // Quiet, capture, drop, promotion, capture-promotion — each incremental
-        // for both perspectives.
+        // Each of these is incremental for both perspectives.
         check_diff_invariant(STARTPOS, "7g7f");
         check_diff_invariant("4k4/1p7/9/9/9/9/9/1R7/4K4 b - 1", "8h8b");
         check_diff_invariant("4k4/9/9/9/9/9/9/9/4K4 b P 1", "P*5e");
@@ -978,9 +877,8 @@ mod tests {
 
     #[test]
     fn mirror_property_needs_mirror_flag_actually_flips() {
-        // Guard the test above: confirm exactly one of (pos, mirror) triggers
-        // the horizontal-mirror path for each perspective, so the equality is
-        // exercising the mirror math rather than a trivial no-op.
+        // Exactly one of the two must take the mirror path, or the equality
+        // above would be a trivial no-op.
         let sfen = "2k6/9/4+R4/8P/9/1n7/9/9/6K2 b B2Pgp 1";
         let pos = parse_sfen(sfen).unwrap();
         let mirrored = mirror_position(&pos);

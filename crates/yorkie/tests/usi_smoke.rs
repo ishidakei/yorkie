@@ -1,9 +1,6 @@
-//! Smoke test: spawn the built `yorkie` binary, drive a USI handshake, assert
-//! on stdout. Confirms the no-arg entry point routes to `UsiDriver` correctly.
-//!
-//! Both build shapes reply identically here: neither advertises an option, and
-//! neither replies to a `setoption`, having had every setting compiled into it
-//! from the TOML config.
+//! Smoke test: spawn the built `yorkie` binary, drive a USI handshake, assert on
+//! stdout. Both build shapes reply identically here, since neither advertises an
+//! option nor replies to a `setoption`.
 
 use std::io::Write;
 use std::process::{Command, Stdio};

@@ -6,16 +6,10 @@
 //! the time-managed forms (`go infinite` + `stop`, `go movetime`, a Fischer
 //! mini-game) must each terminate promptly with exactly one `bestmove`.
 //!
-//! Like the other real-network tests, the whole file is skipped with a notice
-//! when `nn.bin` is absent (a checkout without it staged), so the default
-//! `cargo test` run stays green everywhere.
+//! The whole file is skipped with a notice when `nn.bin` is absent.
 //!
-//! **`usi-extras` gate.** The session drives the analysis-only `go` clauses
-//! (`depth` / `movetime` / `infinite`), which the default build refuses rather
-//! than reinterprets, so the whole file is gated on the feature: the spawned
-//! `yorkie` binary carries it only when the test binary does. The hosted CI
-//! builds and tests with `--all-features`, so this runs there. See the
-//! `usi-extras` reference documentation.
+//! Gated on `usi-extras`: the session drives analysis-only `go` clauses, and the
+//! spawned `yorkie` binary carries the feature only when the test binary does.
 
 //!
 //! **`info-output` gate.** Every assertion reads the search `info depth …` line
@@ -38,7 +32,7 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
 }
 
-/// The gated subset of a search fixture. The depth-2/3 test asserts `bestmove`
+/// The asserted subset of a search fixture. The depth-2/3 test asserts `bestmove`
 /// plus the `nodes` count and the centipawn `score` parsed from the final `info`
 /// line — the class of drift a transposition-table refactor could introduce.
 #[derive(Debug, Deserialize)]
@@ -50,7 +44,7 @@ struct Fixture {
     score: Score,
 }
 
-/// The `score` object of a fixture. Every gated fixture is a non-mate centipawn
+/// The `score` object of a fixture. Every fixture is a non-mate centipawn
 /// score, so only the `cp` arm is modelled.
 #[derive(Debug, Deserialize)]
 struct Score {
@@ -80,7 +74,7 @@ impl Engine {
         let dir = eval_dir();
         if !dir.join("nn.bin").exists() {
             eprintln!(
-                "skipping usi_time_management: {} is not present (staged only on the dev VM)",
+                "skipping usi_time_management: {} is not present (obtained out-of-band)",
                 dir.join("nn.bin").display()
             );
             return None;
@@ -160,7 +154,7 @@ impl Engine {
         assert_eq!(
             after("score"),
             "cp",
-            "gated fixtures are centipawn scores, got: {line:?}"
+            "fixture scores are centipawn scores, got: {line:?}"
         );
         let nodes = after("nodes").parse().expect("nodes is a u64");
         let cp = after("cp").parse().expect("cp is an i64");
@@ -247,12 +241,9 @@ fn go_depth_2_and_3_match_fixtures_via_binary() {
 #[test]
 fn repeated_searches_in_one_session_keep_matching_the_fixture() {
     // The worker pool is built once and reused for every `go` in a session, so a
-    // second and third search over the same position must reproduce the same
-    // fixture numbers as the first — a helper left in a dirty state, or histories
-    // leaking across `usinewgame`, would show up as drift here.
-    //
-    // The worker count is a compile-time constant, so a session has no way to
-    // resize the pool between the rounds; every round runs the same pool.
+    // second and third search over the same position must reproduce the first's
+    // fixture numbers: a helper left in a dirty state, or histories leaking
+    // across `usinewgame`, would show up as drift here.
     common::require_test_config();
     let Some(mut eng) = Engine::start() else {
         return;
@@ -292,12 +283,11 @@ fn go_movetime_and_depth_and_infinite_and_fischer_all_terminate() {
     let Some(mut eng) = Engine::start() else {
         return;
     };
-    // The deadline is polled only at ~512-node `check_time` checkpoints on the
-    // main worker; with two workers contending for cores in an *unoptimised test
-    // build*, a single checkpoint can be several seconds. These bounds are
-    // therefore deliberately loose — they prove the search self-terminates near
-    // its budget (never running to the depth-245 ceiling, which would take far
-    // longer than the bound) and returns exactly one legal bestmove per move.
+    // The deadline is polled only at ~512-node `check_time` checkpoints, and in
+    // an unoptimised test build with two workers contending for cores a single
+    // checkpoint can be several seconds. These bounds are therefore deliberately
+    // loose: they prove the search self-terminates near its budget rather than
+    // running to the depth ceiling.
     let bound = Duration::from_secs(10);
 
     // (a) go movetime 300 → one legal bestmove within a generous bound.
@@ -462,15 +452,10 @@ fn fischer_mini_game_makes_every_deadline_with_one_bestmove_each() {
     const BTIME: u64 = 300;
     const WTIME: u64 = 300;
     const INC: u64 = 200;
-    // A generous ceiling on the per-move wall clock. The engine's hard deadline
-    // is (clock + increment - margin) ≈ 460 ms, but the deadline is polled only
-    // at ~512-node `check_time` checkpoints; in an *unoptimised test build* a
-    // checkpoint is ~0.5 s of compute (~1000 nodes/s), so a move can overshoot
-    // the nominal budget by up to one checkpoint. In a release build a checkpoint
-    // is sub-millisecond and the budget is met to the millisecond. This bound is
-    // therefore deliberately loose — it proves the engine self-terminates near
-    // its budget (never running to the depth ceiling) and always returns exactly
-    // one bestmove, which is what "no missed deadline" means for a debug run.
+    // A generous ceiling on the per-move wall clock: the deadline is polled only
+    // at ~512-node `check_time` checkpoints, and in an unoptimised test build a
+    // checkpoint is roughly half a second of compute, so a move can overshoot
+    // its nominal budget by up to one checkpoint.
     let per_move_bound = Duration::from_secs(3);
 
     eng.send("usinewgame");
@@ -518,19 +503,12 @@ fn byoyomi_mini_game_makes_every_deadline_with_one_bestmove_each() {
         return;
     };
 
-    // A byoyomi game with the main clock exhausted (`btime 0 wtime 0`): every move
-    // has only the byoyomi period. This is the reference "final push" shape
-    // (`timeman.cpp`) — with `time[us] < byoyomi * 1.2` the manager spends
-    // the byoyomi. The nominal per-move deadline is `time + byoyomi == 1000 ms`.
+    // A byoyomi game with the main clock exhausted, so every move has only the
+    // byoyomi period. This is the reference's "final push" shape, where
+    // `time[us] < byoyomi * 1.2` makes the manager spend the byoyomi.
     //
-    // The per-move wall bound is deliberately loose for the same reason as the
-    // Fischer test above: in an *unoptimised test build* the deadline is polled
-    // only at ~512-node `check_time` checkpoints (~0.5 s of compute each), so a
-    // move can overshoot its nominal budget by roughly one checkpoint. The bound
-    // proves the engine self-terminates on the byoyomi clock (never running to the
-    // depth ceiling) and always returns exactly one bestmove — "no missed
-    // deadline" for a debug run. In a release build the byoyomi is met to the
-    // millisecond (the `TimeManagement` maths is unit-tested in `yorkie_search::timeman`).
+    // The per-move wall bound is loose for the same checkpoint-granularity
+    // reason as the Fischer test above.
     const BYOYOMI: u64 = 1000;
     let per_move_bound = Duration::from_secs(3);
 

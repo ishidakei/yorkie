@@ -4,10 +4,7 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
-# Evaluation layer. Dependency rules: Evaluation may import State and Storage,
-# never Protocol or Search. Feature extraction reads the board/hands off
-# `yorkie-state::Position`; the loaded feature-transformer weights are backed by
-# the Storage layer's shared huge-page allocator (`yorkie-storage::LargePageArray`).
+# Evaluation layer: may import State and Storage, never Protocol or Search.
 [dependencies]
 yorkie-state = { path = "../yorkie-state" }
 yorkie-storage = { path = "../yorkie-storage" }

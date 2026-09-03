@@ -2,44 +2,33 @@
 //! (tournament) build does with the commands it does not.
 //!
 //! A bridge in a rated game sends only `usi`, `isready`, `setoption`,
-//! `usinewgame`, `position`, `go` with clock clauses (`btime` / `wtime` /
-//! `binc` / `winc` / `byoyomi`) or `go ponder`, `stop`, `ponderhit`, `gameover`
-//! and `quit`. Everything else — `bench` and the `go depth` / `nodes` / `mate` /
-//! `movetime` / `infinite` / `rtime` clauses — lives behind `usi-extras`.
+//! `usinewgame`, `position`, a clock-clause or `ponder` `go`, `stop`,
+//! `ponderhit`, `gameover` and `quit`; everything else lives behind
+//! `usi-extras`.
 //!
-//! [`match_shaped_session_is_byte_identical`] is deliberately NOT feature-gated:
-//! it runs in both configurations and pins the same bytes, which is the
-//! "turning the feature off changes nothing a game can see" claim. The gated
-//! module below compiles only with the feature OFF and pins the refusals; run
-//! `cargo nextest run -p yorkie-protocol` (default features, i.e. without
-//! `--all-features`) to execute it.
+//! [`match_shaped_session_is_byte_identical`] is deliberately *not*
+//! feature-gated: it runs in both configurations and pins the same bytes, which
+//! is the "turning the feature off changes nothing a game can see" claim. The
+//! gated module below compiles only with the feature off and pins the refusals.
 //!
-//! The diagnostic lines here are composed through `common::diag_line`, so the
-//! transcripts stay byte-exact under `info-diag` and without it — a default
-//! build refuses the same commands and starts the same searches, it just says
-//! nothing about it. What a game can see either way is the `bestmove` lines.
+//! The diagnostic lines are composed through `common::diag_line`, so the
+//! transcripts stay byte-exact with and without `info-diag`.
 //!
 //! No network is loaded, so every `go` resolves through the no-eval path — the
-//! one search outcome that is deterministic to the byte. The handshake itself is
-//! pinned separately in `tests/handshake.rs`.
+//! one search outcome that is deterministic to the byte.
 
 mod common;
 
 use common::{diag_line, drive};
 
-/// The play part of a game-shaped session, byte-for-byte. Same expectation with
-/// `usi-extras` on and off.
+/// The play part of a game-shaped session, byte-for-byte — the same expectation
+/// with `usi-extras` on and off.
 ///
-/// This is the transcript that must never move: from `usinewgame` onward, the
-/// two builds emit the same bytes, and the compile-time configuration changed
-/// none of them. The handshake in front of it — where the builds legitimately
-/// differ — is pinned separately by [`whole_session_including_the_handshake`]
-/// below and by `tests/handshake.rs`.
+/// The handshake in front of it, where the builds legitimately differ, is pinned
+/// separately by [`whole_session_including_the_handshake`].
 ///
 /// The no-network notice is a diagnostic, so it is present exactly when
-/// `info-diag` is: without it the two `go`s answer `bestmove resign` and say
-/// nothing else. The `bestmove` lines themselves are unconditional in every
-/// build — that is the point of the gate.
+/// `info-diag` is; the `bestmove` lines themselves are unconditional.
 fn play_output() -> String {
     let notice = diag_line("no eval network loaded; run isready");
     format!("{notice}bestmove resign\n{notice}bestmove resign\n")
@@ -62,14 +51,11 @@ fn match_shaped_session_is_byte_identical() {
 }
 
 /// The same session with the handshake a bridge actually sends in front of it:
-/// `usi`, then a `setoption` (bridges send them whether or not the engine asked
-/// for any).
+/// `usi`, then a `setoption`, which bridges send whether or not the engine asked
+/// for any.
 ///
-/// Both builds reply identically: the `usi` reply advertises nothing, because
-/// neither build has anything to advertise, and neither replies to the
-/// `setoption` — USI asks for no reply, and there is no option to set. From
-/// `usinewgame` on, both emit [`PLAY_OUTPUT`] — the same bytes, in the same
-/// order, as before the settings were compiled in.
+/// Both builds reply identically: the `usi` reply advertises nothing, and
+/// neither replies to the `setoption`.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn whole_session_including_the_handshake() {

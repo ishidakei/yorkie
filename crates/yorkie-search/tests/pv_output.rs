@@ -1,8 +1,8 @@
-//! Unit tests for the fail-high/low PV-output gate (`fail_lh_pv_gate`), the pure
-//! predicate behind the reference `main_manager()->pv()` fail-LH call site
-//! (`yaneuraou-search.cpp`). Ported per the pin, which gates on
-//! `mainThread && multiPV == 1 && fail-bound && nodes > 10M && (rootDepth < 3 ||
-//! interval elapsed) && OutputFailLHPV`.
+//! Unit tests for the fail-high/low PV-output gate (`fail_lh_pv_gate`), the
+//! pure predicate behind the reference `main_manager()->pv()` fail-LH call
+//! site (`yaneuraou-search.cpp`). Ported per the reference, which gates on
+//! `mainThread && multiPV == 1 && fail-bound && nodes > 10M && (rootDepth < 3
+//! || interval elapsed) && OutputFailLHPV`.
 
 use yorkie_search::fail_lh_pv_gate;
 

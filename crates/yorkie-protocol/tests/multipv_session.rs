@@ -2,24 +2,17 @@
 //! MultiPV loop, the PV-output path, and `ConsiderationMode`.
 //!
 //! Each test drives a full `usi → isready → position → go` session in-process
-//! against a synthetic (all-zero) network staged at the compiled-in `EvalDir`
-//! (see [`common::stage_configured_eval_dir`]), so they are hermetic. They use
-//! [`StreamHarness`] and wait for the `bestmove` before quitting: a MultiPV
-//! search runs many root searches per iteration, so quitting early would abort
-//! it mid-iteration (`quit` sets the stop flag).
+//! against a synthetic all-zero network staged at the compiled-in `EvalDir`, so
+//! they are hermetic. They wait for the `bestmove` before quitting: a MultiPV
+//! search runs many root searches per iteration, and `quit` sets the stop flag,
+//! so quitting early would abort it mid-iteration.
 //!
 //! `MultiPV`, `PvInterval` and `ConsiderationMode` are compile-time constants, so
-//! each test asserts what the value it was BUILT with implies and skips itself
-//! when that value has nothing to show. `configs/test.toml` builds a
-//! single-PV engine; `configs/test-limits.toml` builds `MultiPV 3` with
-//! `ConsiderationMode` on. See `tests/limit_session.rs` for how to run the
-//! second.
+//! each test asserts what the value it was *built* with implies and skips itself
+//! when that value has nothing to show.
 //!
-//! **`usi-extras` gate.** These sessions drive the analysis-only `go` clauses
-//! (`depth` / `nodes` / `movetime` / `infinite`), which a default build refuses
-//! rather than reinterprets, so the whole file is gated on the feature and runs
-//! under the `--all-features` gate. See the `usi-extras` reference
-//! documentation.
+//! Gated on `usi-extras`: these sessions drive analysis-only `go` clauses, which
+//! a default build refuses rather than reinterprets.
 
 //!
 //! **`info-output` gate.** MultiPV is observed through the `info … multipv <i>`
@@ -105,7 +98,8 @@ fn first_pv_move(line: &str) -> Option<&str> {
 
 /// Every `info … multipv <i>` line emitted for a single completed iteration —
 /// the last contiguous run of `multipv 1..N` lines before the `bestmove`. This is
-/// robust to the pin's `d = max(1, depth - 1)` relabel of an un-searched line: it
+/// robust to the reference's `d = max(1, depth - 1)` relabel of an un-searched
+/// line: it
 /// groups by the emitted block, not by the `depth` field.
 fn last_multipv_block(out: &str) -> Vec<&str> {
     let lines: Vec<&str> = out.lines().collect();
@@ -228,15 +222,10 @@ fn an_unthrottled_pv_interval_prints_every_iteration() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_final_pv_always_precedes_bestmove() {
-    // Whatever the throttle does to the intermediate lines, the final PV is
-    // always emitted before `bestmove`, and its first move is the bestmove.
-    //
-    // Which line carries that PV depends on the compiled-in `MultiPV`: a
+    // Which line carries the final PV depends on the compiled-in `MultiPV`: a
     // single-PV build emits one line per iteration, so the last one before
     // `bestmove` is it, but a `MultiPV N` iteration ends on its `multipv N`
-    // line — the RANKED-FIRST line is `multipv 1`, and that is the one the
-    // bestmove comes from. Take the last `multipv 1` line there, and the last
-    // PV line outright where no index is emitted.
+    // line while the bestmove comes from the ranked-first `multipv 1`.
     let ranked = config::MULTI_PV >= 2;
     let out = run_session("position startpos", "go depth 3");
 

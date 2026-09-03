@@ -3,26 +3,18 @@
 //! limit.
 //!
 //! Each test drives a full `usi → isready → position → go` session in-process
-//! against a synthetic (all-zero) network staged at the compiled-in `EvalDir`
-//! (see [`common::stage_configured_eval_dir`]), so they are hermetic. Searches
-//! run on a worker thread, so the harness waits for the `bestmove` before
-//! comparing / quitting — a fixed result never races the `quit`-driven join.
+//! against a synthetic all-zero network staged at the compiled-in `EvalDir`, so
+//! they are hermetic. Searches run on a worker thread, so the harness waits for
+//! the `bestmove` before comparing or quitting.
 //!
-//! The behaviour settings are compile-time constants; a session cannot change
-//! one. Each test therefore asserts what the value it was BUILT with implies,
-//! branching on the constant, so the same body is meaningful under either
-//! checked-in config: `configs/test.toml` carries the quiet defaults and
-//! `configs/test-limits.toml` the loud ones. See `tests/limit_session.rs` for
-//! how to run the second.
+//! The behaviour settings are compile-time constants, so each test asserts what
+//! the value it was *built* with implies, branching on the constant, and stays
+//! meaningful under either checked-in config.
 //!
-//! **`usi-extras` gate.** These sessions drive the analysis-only `go` clauses
-//! (`depth` / `mate`), which a default build refuses rather than reinterprets, so
-//! the whole file is gated on the feature and runs under the `--all-features`
-//! gate. See the `usi-extras` reference documentation.
+//! Gated on `usi-extras`: these sessions drive analysis-only `go` clauses, which
+//! a default build refuses rather than reinterprets.
 //!
-//! **`info-output` gate.** The score assertions read the search `info … score`
-//! line, which only an `info-output` build emits, so the file is gated on that
-//! feature too. `--all-features` carries both.
+//! Gated on `info-output` too, since the assertions read a search `info` line.
 
 #![cfg(all(feature = "usi-extras", feature = "info-output"))]
 
@@ -95,9 +87,7 @@ fn go_and_wait(h: &StreamHarness, position: &str, go: &str, expect_bestmoves: us
     );
 }
 
-// -------------------------------------------------------------------------
 // DrawValueBlack / DrawValueWhite.
-// -------------------------------------------------------------------------
 
 #[cfg_attr(miri, ignore)]
 #[test]
@@ -136,9 +126,7 @@ fn the_configured_draw_contempt_shows_up_in_the_root_side_score() {
     h.quit_join();
 }
 
-// -------------------------------------------------------------------------
 // ResignValue.
-// -------------------------------------------------------------------------
 
 #[cfg_attr(miri, ignore)]
 #[test]
@@ -178,8 +166,8 @@ fn a_lost_position_is_resigned_exactly_when_the_configured_threshold_is_reachabl
             config::RESIGN_VALUE
         );
         // The final PV must precede `bestmove resign` (`yaneuraou-search.cpp`
-        // at the pin: the PV-output condition gained `|| resign_by_value`), so the
-        // GUI can see the score the resignation was decided on.
+        // in the reference: the PV-output condition includes `|| resign_by_value`), so
+        // the GUI can see the score the resignation was decided on.
         let before_bestmove = out
             .split_once("bestmove")
             .map(|(head, _)| head)
@@ -193,9 +181,7 @@ fn a_lost_position_is_resigned_exactly_when_the_configured_threshold_is_reachabl
     }
 }
 
-// -------------------------------------------------------------------------
 // Go mate.
-// -------------------------------------------------------------------------
 
 #[cfg_attr(miri, ignore)]
 #[test]
@@ -240,15 +226,11 @@ fn go_mate_finds_the_mate_and_terminates_on_quiet() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn go_mate_infinite_releases_on_stop() {
-    // `go mate infinite` carries no TIME bound — but whether it is unbounded at
-    // all is decided by the build. `go mate` names no depth / nodes token, so
-    // `DepthLimit` / `NodesLimit` seed this search like any other
-    // (`driver.rs`'s `prepare_coordinator_job`); and unlike `go infinite` a
-    // mate search sets no `limits.infinite`, so it has no reply-holding loop to
-    // sit in once the seeded ceiling is reached. With both limits at 0 the search
-    // therefore runs until `stop`; with either compiled in it ends on the ceiling
-    // by itself. Both builds must end with exactly one bestmove and a session
-    // that still quits cleanly.
+    // `go mate infinite` carries no time bound, but whether it is unbounded at
+    // all is decided by the build: `go mate` names no depth / nodes token, so
+    // `DepthLimit` / `NodesLimit` seed it like any other search, and unlike
+    // `go infinite` it sets no `limits.infinite`, so it has no reply-holding
+    // loop to sit in once a seeded ceiling is reached.
     let seeded = config::DEPTH_LIMIT != 0 || config::NODES_LIMIT != 0;
     let h = start_ready();
     h.send("position startpos");

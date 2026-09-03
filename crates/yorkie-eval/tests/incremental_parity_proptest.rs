@@ -1,37 +1,18 @@
-//! Property gate: the incrementally-updated accumulator equals a from-scratch
+//! Property test: the incrementally-updated accumulator equals a from-scratch
 //! refresh at **every** step of a random legal line.
 //!
-//! This is the randomized sibling of `incremental_parity.rs`. That suite drives
-//! two fixed corpora — the recorded fixture lines and six deterministic
-//! xorshift playouts. This one hands the line choice to proptest: a root SFEN
-//! index plus a vector of legal-move selectors, shrunk automatically to a
-//! minimal failing line when an invariant breaks.
+//! The randomized sibling of `incremental_parity.rs`, which drives fixed
+//! corpora instead. Here the line choice goes to proptest — a root SFEN index
+//! plus a vector of legal-move selectors — so a broken invariant shrinks to a
+//! minimal failing line.
 //!
-//! At each ply the incremental accumulator (threaded through a do/undo stack) is
-//! compared bit-for-bit — both perspectives, `i16` equality — against a fresh
-//! [`Accumulator::refresh`], and [`evaluate_with`] over the incremental
-//! accumulator is checked against the full-refresh [`evaluate`]. The line is
-//! then unwound, re-checking the parent accumulator after every undo.
+//! Which feature-transformer kernels the `Accumulator` API dispatches to is
+//! fixed at **compile** time, so this exercises whichever the build selected;
+//! `report_active_backend` prints which. The kernels' bit-equality with each
+//! other is pinned by the in-crate backend tests.
 //!
-//! **Kernel backend.** This suite drives only the crate's public, pure-Rust
-//! `Accumulator` API — no SIMD intrinsic is called from here, and nothing is
-//! compared against the reference C++ engine (that is `eval_parity.rs`'s job).
-//! Which feature-transformer *kernels* that API dispatches to is fixed at
-//! **compile** time from the CPU features the build enables (see
-//! `yorkie_eval::Backend`), so a test binary cannot select one at run time: an
-//! AVX-512 build exercises the AVX-512 kernels through this same property, and
-//! any other build exercises the scalar ones. `report_active_backend` below
-//! prints which. The scalar-versus-AVX-512 bit-equality of the kernels
-//! themselves stays pinned by the in-crate backend tests.
-//!
-//! The network file is staged locally at
-//! `eval/nn.bin` and is never committed. When it is
-//! absent the property body is a no-op and the test passes, matching
-//! `incremental_parity.rs` so the default `cargo test` run stays green
-//! everywhere.
-//!
-//! `#[cfg_attr(miri, ignore)]` and default failure persistence match the
-//! `yorkie-state` proptest suites.
+//! The network file is staged locally and never committed, so when it is absent
+//! the property body is a no-op and the test passes.
 
 use std::path::PathBuf;
 
@@ -42,10 +23,8 @@ use yorkie_eval::{
 };
 use yorkie_state::{Color, Move, Position, Undo, format_usi_move, parse_sfen};
 
-/// Roots the random lines start from — the same six positions
-/// `incremental_parity.rs` seeds its playouts with, covering the opening,
-/// check-evasion, drop-heavy, mid-game-tactical, promotion-zone and
-/// bare-kings-with-pawns shapes.
+/// Roots the random lines start from, covering the opening, check-evasion,
+/// drop-heavy, mid-game-tactical and promotion-zone shapes.
 const ROOT_SFENS: &[&str] = &[
     "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1", // startpos
     "4k4/9/4r4/9/9/9/4K3B/9/9 b RG2gs2n3p 1",                          // check-evasion
@@ -56,7 +35,7 @@ const ROOT_SFENS: &[&str] = &[
 ];
 
 /// Plies per generated line. Every ply costs two full refreshes and two full
-/// evaluations, so this is kept short to hold the standard test gate fast.
+/// evaluations, so this stays short.
 const MAX_PLIES: usize = 12;
 
 fn workspace_relative(rel: &str) -> PathBuf {
@@ -70,9 +49,9 @@ fn nn_bin_path() -> PathBuf {
 }
 
 thread_local! {
-    /// The 113 MB network, loaded at most once per test thread — proptest runs
-    /// every case of a property on the same thread, so re-loading it per case
-    /// would dominate the runtime. `None` means the file is not staged here.
+    /// The network, loaded at most once per test thread. Proptest runs every
+    /// case of a property on the same thread, so re-loading a 113 MB file per
+    /// case would dominate the runtime.
     static NETWORK: Option<NnueNetwork> = {
         let path = nn_bin_path();
         if path.exists() {
@@ -190,17 +169,15 @@ proptest! {
         (root_index, selectors) in arb_line()
     ) {
         NETWORK.with(|net| match net {
-            // Not staged in this checkout: the property is vacuous, exactly as
-            // `incremental_parity.rs` skips.
+            // Not staged in this checkout, so the property is vacuous.
             None => Ok(()),
             Some(net) => run_line(net, root_index, &selectors),
         })?;
     }
 }
 
-/// Reports which kernel backend the property above actually exercised, so a run
-/// that silently compiled the scalar path on an AVX-512 host is visible in the
-/// log rather than invisible.
+/// Report which kernel backend the property above exercised, so a run that
+/// silently compiled the scalar path on an AVX-512 host shows in the log.
 #[test]
 fn report_active_backend() {
     eprintln!(

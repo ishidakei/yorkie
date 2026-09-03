@@ -1,21 +1,14 @@
-//! History-table **update** machinery — a faithful port of the reference
-//! `update_all_stats`, `update_quiet_histories`, `update_continuation_histories`
-//! and `update_correction_history`
-//! (`source/engine/yaneuraou-engine/yaneuraou-search.cpp`,
-//! lines 748-772 and 5284-5414 at the pinned submodule).
+//! History-table **update** machinery — a port of the reference
+//! `update_all_stats`, `update_quiet_histories`,
+//! `update_continuation_histories` and `update_correction_history`
+//! (`yaneuraou-search.cpp`).
 //!
-//! # Shape
-//!
-//! The functions here are decoupled from the search body: they operate on a
+//! These functions are decoupled from the search body: they operate on a
 //! self-contained [`WorkerHistories`] bundle and a slice of
 //! [`SearchStackCell`]s, with the reference's `(ss-N)->continuationHistory`
 //! pointers modelled as flat indices into the continuation tables. `qsearch`
 //! reconciles [`SearchStackCell`] with its live search stack and supplies the
 //! real plane indices.
-//!
-//! Line numbers in the comments point into the reference file above; all
-//! arithmetic is integer (division truncates toward zero, as Rust's `/` does),
-//! matching the C++ exactly.
 
 use std::sync::Arc;
 
@@ -38,15 +31,14 @@ const CONTINUATION_CORRECTION_INIT: i16 = 6;
 const PAWN_HISTORY_INIT: i16 = -1238;
 
 /// Capacity of a searched-move list (`SEARCHEDLIST_CAPACITY`,
-/// `yaneuraou-search.cpp`): both `quietsSearched` and `capturesSearched`
-/// hold at most 32 moves.
+/// `yaneuraou-search.cpp`): both `quietsSearched` and `capturesSearched` hold
+/// at most 32 moves.
 pub const SEARCHED_LIST_CAPACITY: usize = 32;
 
 /// A fixed-capacity list of the moves tried at a node (the reference's
-/// `SearchedList quietsSearched` / `capturesSearched`, `movepick.h`). Backed by
-/// an inline `[Move; SEARCHED_LIST_CAPACITY]` array so it lives on the search
-/// stack with **no** per-node heap allocation; the search only ever
-/// pushes while `moveCount <= SEARCHED_LIST_CAPACITY`, so it never overflows.
+/// `SearchedList quietsSearched` / `capturesSearched`, `movepick.h`), inline so
+/// it costs no per-node heap allocation. The search only pushes while
+/// `move_count <= SEARCHED_LIST_CAPACITY`, so it never overflows.
 #[derive(Clone)]
 pub struct SearchedList {
     moves: [Move; SEARCHED_LIST_CAPACITY],
@@ -84,15 +76,12 @@ impl SearchedList {
 }
 
 /// The full set of history tables an update touches — the reference's
-/// per-worker tables plus a handle to the node-shared correction / pawn tables
-/// ([`SharedHistories`]). Bundled so the update functions can borrow
-/// them together. [`WorkerHistories::new`] applies the reference `clear()` init.
+/// per-worker tables plus a handle to the node-shared correction / pawn tables.
 ///
-/// The pawn and correction tables are not part of this bundle: they are SHARED
-/// between the worker threads of one NUMA node and reached through
-/// [`Self::shared`], a cheap [`Arc`] clone the driver hands each worker. At
-/// `thread_count == 1` the shared tables are byte-identical to per-worker
-/// copies, so single-thread search is unaffected by the sharing.
+/// The pawn and correction tables are shared between the worker threads of one
+/// NUMA node and reached through [`Self::shared`]. At `thread_count == 1` they
+/// are byte-identical to per-worker copies, so single-thread search is
+/// unaffected by the sharing.
 pub struct WorkerHistories {
     /// `mainHistory[us][move.raw16]` (init `0`).
     pub main: ButterflyHistory,
@@ -121,11 +110,9 @@ impl Default for WorkerHistories {
 }
 
 impl WorkerHistories {
-    /// A fresh bundle with its own single-thread [`SharedHistories`] and the
-    /// reference `clear()` init values applied. This is the single-worker /
-    /// test path; the shared tables are sized `thread_count == 1`, exactly the
-    /// former per-worker shape. The driver's multi-thread path uses
-    /// [`Self::with_shared`] to hand each worker its node's shared tables.
+    /// A fresh bundle with its own single-thread [`SharedHistories`]. The
+    /// driver's multi-thread path uses [`Self::with_shared`] instead, to hand
+    /// each worker its node's shared tables.
     pub fn new() -> Self {
         Self::with_shared(Arc::new(SharedHistories::new(1)))
     }
@@ -157,19 +144,13 @@ impl WorkerHistories {
     /// worker's **private** tables, in declaration order.
     ///
     /// Exists for NUMA placement: when a bundle is built by one thread and then
-    /// handed to a worker pinned to a different node — which is exactly what
-    /// happens to the coordinator's session-owned bundle, allocated and
-    /// `fill`ed on the USI/master thread — first-touch has already happened and
-    /// only an explicit `mbind` can still move the pages. The driver feeds these
-    /// regions to `yorkie_numa::mempolicy::migrate_region_to_node` at pool
-    /// (re)build time. Every block comes from `yorkie_storage`'s large-page
-    /// allocator, so each address is 2 MiB-aligned and each length is the
-    /// rounded allocation size — the shape `mbind` wants.
+    /// handed to a worker pinned to a different node, first-touch has already
+    /// happened and only an explicit `mbind` can still move the pages. Every
+    /// block comes from the large-page allocator, so each address is 2
+    /// MiB-aligned and each length is the rounded allocation size.
     ///
-    /// [`Self::shared`] is deliberately absent: the correction / pawn tables are
-    /// shared by every worker of a node and are placed by whoever builds them,
-    /// not by an individual worker. [`TtMoveHistory`] is absent too — a single
-    /// `i16` living inline in this struct, with no block of its own.
+    /// [`Self::shared`] is deliberately absent: those tables are shared by every
+    /// worker of a node and placed by whoever builds them.
     pub fn backing_regions(&self) -> Vec<(usize, usize)> {
         let mut regions = Vec::with_capacity(5);
         regions.extend(self.main.backing_region());
@@ -190,14 +171,11 @@ impl WorkerHistories {
 }
 
 /// One cell of the search stack, holding exactly the fields the update /
-/// correction functions read across plies. The search body writes these during
-/// search; the reference defaults let the update functions be exercised in
-/// isolation.
+/// correction functions read across plies.
 ///
 /// `cont_hist` / `cont_corr` are the flat plane indices the reference stores as
-/// `continuationHistory` / `continuationCorrectionHistory` *pointers*. Their
-/// pre-root defaults are the `[0][0][NO_PIECE][0]` / `[NO_PIECE][0]` sentinel
-/// planes (both index `0`).
+/// `continuationHistory` / `continuationCorrectionHistory` *pointers*, and
+/// default to the sentinel planes.
 #[derive(Clone, Debug)]
 pub struct SearchStackCell {
     /// `ss->currentMove` — the move played from this ply (`Move::none()` when
@@ -277,14 +255,12 @@ fn is_capture(pos: &Position, m: Move) -> bool {
 }
 
 /// `update_continuation_histories(ss, pc, to, bonus)`
-/// (`yaneuraou-search.cpp`): fold `bonus` into the continuation
-/// planes of the previous plies formed with the current `(pc, to)`.
+/// (`yaneuraou-search.cpp`): fold `bonus` into the continuation planes of the
+/// previous plies formed with the current `(pc, to)`.
 ///
-/// `ss` is the index of the *current* cell in `stack`; `(ss - i)` cells are
-/// earlier plies. Each write is guarded by `(ss - i)->currentMove` being an ok
-/// move; the `i > 2` plies are skipped entirely when the current cell is in
-/// check. The caller must ensure `ss >= 6` so `stack[ss - i]` is in range (the
-/// reference guarantees this with its `stack + 7` sentinel base).
+/// `ss` is the index of the *current* cell in `stack`. The caller must ensure
+/// `ss >= 6` so `stack[ss - i]` is in range; the reference guarantees this with
+/// its `stack + 7` sentinel base.
 pub fn update_continuation_histories(
     hist: &mut WorkerHistories,
     stack: &[SearchStackCell],
@@ -307,9 +283,9 @@ pub fn update_continuation_histories(
     }
 }
 
-/// `update_quiet_histories(pos, ss, w, move, bonus)`
-/// (`yaneuraou-search.cpp`): the reference's quiet-move heuristic
-/// bump. `ss` is the current cell index in `stack`.
+/// `update_quiet_histories(pos, ss, w, move, bonus)` (`yaneuraou-search.cpp`):
+/// the reference's quiet-move heuristic bump. `ss` is the current cell index
+/// in `stack`.
 pub fn update_quiet_histories(
     hist: &mut WorkerHistories,
     pos: &Position,
@@ -340,12 +316,10 @@ pub fn update_quiet_histories(
 /// `update_all_stats(...)` (`yaneuraou-search.cpp`): the post-search
 /// history-statistics update run when a best move is found.
 ///
-/// `ss` is the current cell index in `stack` (`ss >= 7`, so the refutation
-/// penalty's `update_continuation_histories(ss - 1, …)` stays in range).
-/// `prev_sq` is the previous move's destination (`None` for `SQ_NONE`).
-/// `prior_capture` mirrors `pos.captured_piece() != NO_PIECE` — whether the
-/// move that reached this node captured. It is a caller argument because this
-/// module does not model the Position's captured-piece stack.
+/// `ss` must be at least `7`, so the refutation penalty's
+/// `update_continuation_histories(ss - 1, …)` stays in range. `prior_capture`
+/// is a caller argument because this module does not model the Position's
+/// captured-piece stack.
 #[allow(clippy::too_many_arguments)]
 pub fn update_all_stats(
     hist: &mut WorkerHistories,
@@ -415,9 +389,9 @@ pub fn update_all_stats(
     }
 }
 
-/// `update_correction_history(pos, ss, w, bonus)`
-/// (`yaneuraou-search.cpp`): fold `bonus` into the correction channels.
-/// `ss` is the current cell index in `stack` (`ss >= 4`).
+/// `update_correction_history(pos, ss, w, bonus)` (`yaneuraou-search.cpp`):
+/// fold `bonus` into the correction channels. `ss` is the current cell index
+/// in `stack` (`ss >= 4`).
 pub fn update_correction_history(
     hist: &mut WorkerHistories,
     pos: &Position,
@@ -482,7 +456,7 @@ mod tests {
     /// `miri, ignore`: the bundle allocates ~68 MiB across five large-page
     /// blocks and `with_shared` fills every entry, which miri walks one element
     /// at a time. Nothing here is a UB question — it is pointer arithmetic the
-    /// allocator already proves — so the gate loses no coverage.
+    /// allocator already proves — so skipping it loses no coverage.
     #[cfg_attr(miri, ignore)]
     #[test]
     fn backing_regions_cover_every_private_table_exactly_once() {
@@ -540,8 +514,8 @@ mod tests {
 
     // ---- gravity primitive ------------------------------------------------
 
-    /// A small deterministic xorshift64* (the workspace bans `Math.random`-style
-    /// nondeterminism).
+    /// A small deterministic xorshift64* — kept dependency-free and
+    /// deterministic.
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> u64 {
@@ -624,11 +598,9 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn worker_histories_new_applies_reference_init_values() {
-        // The tables live on the shared huge-page allocator; this pins that the
-        // `clear()`-init values a fresh bundle exposes are byte-for-byte the
-        // reference constants across every table, i.e. that the allocation path
-        // does not disturb them. A representative index per table is sampled
-        // (uniform fills make any index representative).
+        // The tables live on the shared huge-page allocator, so this pins that
+        // the allocation path does not disturb the init values. Uniform fills
+        // make any index representative.
         let hist = WorkerHistories::new();
 
         let bp = Piece::new(PieceKind::Pawn, Color::Black);

@@ -10,20 +10,16 @@
 //! | `info-diag` | — | yes | yes |
 //! | `info-output` | yes | yes | yes |
 //!
-//! The positive side (what an `info-output` build emits, to the byte) is pinned
-//! by `tests/depth1_session.rs`, `tests/limit_session.rs` and
-//! `tests/multipv_session.rs`; this file pins the NEGATIVE side, which is the
-//! claim the tournament build rests on and which no other test can make.
+//! The positive side is pinned by the session tests; this file pins the negative
+//! side, which no other test can make.
 //!
-//! Deliberately NOT `usi-extras`-gated: the search here is driven by a
-//! clock-bounded `go`, the only `go` a rated game issues, so the file runs in
-//! every build shape.
+//! Deliberately not `usi-extras`-gated: the search here is driven by a
+//! clock-bounded `go`, so the file runs in every build shape.
 //!
 //! **One test on purpose.** The first half needs the package-root working
-//! directory (no `eval/nn.bin`, so the load fails), the second half stages a
-//! synthetic network and enters a fixture root. Working directory is
-//! process-global, so the two halves are one sequential test rather than two
-//! that could interleave under a threaded `cargo test`.
+//! directory so the network load fails, and the second stages a synthetic
+//! network and enters a fixture root. The working directory is process-global,
+//! so the two halves must not interleave under a threaded `cargo test`.
 
 mod common;
 

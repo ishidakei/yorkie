@@ -1,40 +1,19 @@
 //! Layer-stack forward pass, bucket selection, and the public `evaluate` entry
 //! point.
 //!
-//! Ported from the read-only Rust NNUE reference implementation:
-//! `network.rs` (`per_layer_flow` / `forward`) and `bucket.rs`
-//! (`select`). The per-layer affine /
-//! clipped-ReLU / squared-clipped-ReLU kernels come from [`crate::simd`]; when
-//! the build enables AVX-512 VNNI the whole `fc_0 … fc_2` chain runs through
-//! [`crate::simd::avx512_post_ft::fused_fc_chain`] instead, which is
-//! bit-identical to the per-layer flow. The C++ ground truth is
-//! `eval/nnue/architectures/sfnn-1536.h`
-//! (`Network::Propagate`, including the shortcut term) and
-//! `eval/nnue/evaluate_nnue.cpp`
-//! (`ComputeScore`, `stack_index_for_nnue`).
+//! Ported from `Network::Propagate` (`sfnn-1536.h`) and `ComputeScore` /
+//! `stack_index_for_nnue` (`evaluate_nnue.cpp`). The accumulator lives in
+//! [`crate::transformer`], the kernels in [`crate::simd`].
 //!
-//! This module owns the layer-stack forward pass, layer-stack (bucket)
-//! selection, and the full-refresh `evaluate`. The accumulator and its
-//! incremental update live in [`crate::transformer`], the kernels in
-//! [`crate::simd`].
+//! The prose here follows the reference's naming: the **FT layer** is the
+//! feature transformer, and **L1 / L2 / L3** are the dense layers after it.
+//! The FT layer is never called "L1". In the identifiers below, L1 is `fc_0`,
+//! L2 is `fc_1` and L3 is `fc_2`.
 //!
-//! ## Layer naming
-//!
-//! Prose in this crate follows the upstream naming: the **FT layer** is the
-//! feature transformer (input features → accumulator, see
-//! [`crate::transformer`]), and **L1 / L2 / L3** are the dense layers that
-//! follow it. The FT layer is never called "L1". Mapping to the identifiers
-//! used here: L1 = `fc_0`, L2 = `fc_1`, L3 = `fc_2`.
-//!
-//! ## Forward pass (`sfnn-1536.h::Propagate`)
-//!
-//! L1 (`fc_0`) is a sparse-input affine with `FC_0_OUTPUT_DIMS = 16` outputs.
-//! The first `HIDDEN1_DIMS = 15` outputs feed two activations —
-//! [`clipped_relu`] and [`sqr_clipped_relu`] — whose results are concatenated
-//! `[sqr(15) | relu(15)]` into L2 (`fc_1`)'s input. L2 (→ 32) is followed by a
-//! clipped ReLU, then L3 (`fc_2`) (→ 1). The 16th L1 output is raw (pre-ReLU)
-//! and is added to L3's single output as the shortcut term. The final network
-//! output is divided by the compiled-in [`FV_SCALE`] to produce the score.
+//! L1 is a sparse-input affine with 16 outputs. The first 15 feed two
+//! activations whose results concatenate into L2's input; the 16th is raw,
+//! pre-ReLU, and is added to L3's single output as a shortcut term. The network
+//! output is then divided by the compiled-in [`FV_SCALE`].
 
 use yorkie_state::{Color, Position, Square};
 
@@ -48,18 +27,13 @@ use crate::types::{
 };
 
 /// The fixed-point scale applied to the network output to produce the final
-/// score — the reference's mutable global `NNUE::FV_SCALE`
-/// (`evaluate_nnue.cpp`), compiled in.
-///
-/// It is the `fv_scale` key of the TOML config this binary was built from (see
-/// [`crate::config`]), whose reference default is `16` — the condition the eval
-/// fixtures were captured under. There is no setter: the engine carries no
-/// runtime configuration, so the single consumption site in [`evaluate_with`]
-/// divides by a literal.
+/// score — the reference's mutable global `NNUE::FV_SCALE`, compiled in from
+/// the `fv_scale` config key. There is no setter: the engine carries no runtime
+/// configuration.
 pub const FV_SCALE: i32 = crate::config::FV_SCALE as i32;
 
-// The build script range-checks `fv_scale` against the schema; this repeats the
-// only bound the division actually depends on, in a `const` context.
+// The build script range-checks `fv_scale`; this restates the one bound the
+// division depends on, in a `const` context.
 const _: () = assert!(FV_SCALE >= 1, "FV_SCALE must be at least 1");
 
 /// `k*ToIndex` tables from `stack_index_for_nnue`: the own-king rank contributes
@@ -67,12 +41,9 @@ const _: () = assert!(FV_SCALE >= 1, "FV_SCALE must be at least 1");
 const F_RANK_TO_INDEX: [usize; 9] = [0, 0, 0, 3, 3, 3, 6, 6, 6];
 const E_RANK_TO_INDEX: [usize; 9] = [0, 0, 0, 1, 1, 1, 2, 2, 2];
 
-/// Select the layer-stack (bucket) index for `pos`.
-///
-/// Byte-for-byte equivalent to `stack_index_for_nnue`: the own-king rank is
-/// taken in the side-to-move's forward frame (Black as-is, White vertically
-/// flipped) and the enemy-king rank in the opposite frame, then combined
-/// through the `k*ToIndex` tables and clamped to `[0, LAYER_STACKS)`.
+/// Select the layer-stack index for `pos` (`stack_index_for_nnue`). The
+/// own-king rank is taken in the side-to-move's forward frame and the
+/// enemy-king rank in the opposite one.
 ///
 /// # Panics
 /// Panics if either king is missing.
@@ -81,8 +52,8 @@ pub fn layer_stack_index(pos: &Position) -> usize {
     let f_king = king_square(pos, stm);
     let e_king = king_square(pos, stm.flip());
 
-    // Black views ranks as-is; White flips them (rank r -> 8 - r), so both
-    // colours reason in an own-side-forward frame.
+    // White flips its ranks, so both colours reason in an own-side-forward
+    // frame.
     let flip = |sq: Square| (Square::RANKS - 1 - sq.rank()) as usize;
     let f_rank = match stm {
         Color::Black => f_king.rank() as usize,
@@ -96,37 +67,27 @@ pub fn layer_stack_index(pos: &Position) -> usize {
     (F_RANK_TO_INDEX[f_rank] + E_RANK_TO_INDEX[e_rank]).min(LAYER_STACKS - 1)
 }
 
-/// Static NNUE evaluation of `pos`, from the side-to-move perspective.
+/// Static NNUE evaluation of `pos` from the side-to-move perspective, positive
+/// meaning that side is better. Rebuilds both accumulator halves from scratch
+/// (`Eval::evaluate`).
 ///
-/// Full refresh: rebuilds both accumulator halves from scratch, runs the
-/// output transform for the side to move, feeds the byte buffer through the
-/// selected layer stack, and divides the network output by [`FV_SCALE`].
-/// Positive means the side to move is better. Equivalent to
-/// `Eval::evaluate(pos)` / `ComputeScore(pos, refresh=true)`.
-///
-/// The network is passed explicitly: there is no global network registry, so
-/// the caller owns the loaded parameters and the Evaluation layer never reaches
-/// up to Protocol for them.
+/// The network is passed explicitly: there is no global registry, and the
+/// Evaluation layer never reaches up to Protocol for the loaded parameters.
 ///
 /// # Panics
-/// Panics if `pos` is missing either king (via feature extraction and bucket
-/// selection).
+/// Panics if `pos` is missing either king.
 pub fn evaluate(net: &NnueNetwork, pos: &Position) -> i32 {
     let mut acc = Accumulator::new();
     acc.refresh(net, pos);
     evaluate_with(net, &acc, pos)
 }
 
-/// Static NNUE evaluation of `pos` from an already-computed accumulator.
-///
-/// Identical to [`evaluate`] but skips the full refresh, consuming `acc`
-/// instead — the entry point for search, which threads an incrementally-updated
-/// accumulator ([`Accumulator::update_after_move`]) through the tree. `acc` must
-/// be the accumulator for `pos` (both perspectives current); `pos` still
-/// supplies the side to move and the king ranks for bucket selection.
+/// [`evaluate`] consuming an already-computed accumulator instead of
+/// refreshing. `acc` must be the accumulator for `pos`, both perspectives
+/// current; `pos` still supplies the side to move and the king ranks.
 ///
 /// # Panics
-/// Panics if `pos` is missing either king (via bucket selection).
+/// Panics if `pos` is missing either king.
 pub fn evaluate_with(net: &NnueNetwork, acc: &Accumulator, pos: &Position) -> i32 {
     let bucket = layer_stack_index(pos);
     debug_assert!(bucket < net.stacks.len());
@@ -135,19 +96,16 @@ pub fn evaluate_with(net: &NnueNetwork, acc: &Accumulator, pos: &Position) -> i3
     acc.output_transform(pos.side_to_move(), &mut transformed);
 
     let score = per_layer_flow(&transformed, &net.stacks[bucket]);
-    // The single FV_SCALE consumption site (reference `evaluate_nnue.cpp`):
-    // divide the raw network output by the compiled-in scale.
+    // The one site that consumes `FV_SCALE`.
     score / FV_SCALE
 }
 
-/// Layer-stack forward pass over the transformed byte buffer.
+/// Layer-stack forward pass over the transformed byte buffer, returning the raw
+/// network output before [`FV_SCALE`].
 ///
-/// When the build enables AVX-512 F + BW + VNNI the whole chain runs through
-/// the fused kernel ([`crate::simd::avx512_post_ft::fused_fc_chain`]); otherwise
-/// the per-layer flow below runs, with each element-wise kernel selected — also
-/// at compile time — through [`crate::simd`]. Both are byte-for-byte equivalent
-/// to `sfnn-1536.h::Propagate` and the reference `per_layer_flow`. Returns the
-/// raw network output (pre-`FV_SCALE`).
+/// A build with AVX-512 VNNI runs the whole chain through one fused kernel;
+/// otherwise the per-layer flow below runs. The two are byte-for-byte
+/// equivalent.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -155,15 +113,14 @@ pub fn evaluate_with(net: &NnueNetwork, acc: &Accumulator, pos: &Position) -> i3
     target_feature = "avx512vnni"
 ))]
 fn per_layer_flow(transformed: &[u8; FC_0_INPUT_DIMS], stack: &NetworkStack) -> i32 {
-    // Imported here, not at module scope: the fused chain is this arm's only
-    // user, so a top-level `use` would be unused on a non-VNNI build.
+    // Imported here rather than at module scope, where the `use` would be
+    // unused on a non-VNNI build.
     use crate::simd;
 
-    // SAFETY: this arm is compiled only into a build that enables avx512f +
-    // avx512bw + avx512vnni — exactly the features `fused_fc_chain`'s
-    // `#[target_feature]` attribute names — and such a build only ever runs on a
-    // host providing them (`-C target-cpu=native`; build and run happen on the
-    // same machine). The stack slices carry the SFNN-1536 layer-stack shapes.
+    // SAFETY: this arm is compiled only into a build enabling exactly the
+    // features `fused_fc_chain`'s `#[target_feature]` names, and such a build
+    // is `-C target-cpu=native`, so it only ever runs on a host providing them.
+    // The stack slices carry the layer-stack shapes the kernel expects.
     unsafe {
         simd::avx512_post_ft::fused_fc_chain(
             transformed,
@@ -189,12 +146,9 @@ fn per_layer_flow(transformed: &[u8; FC_0_INPUT_DIMS], stack: &NetworkStack) -> 
     per_layer_flow_unfused(transformed, stack)
 }
 
-/// The per-layer (unfused) layer-stack forward pass — what [`per_layer_flow`]
-/// runs when the build lacks the VNNI fused chain.
-///
-/// Kept compiled unconditionally, like the kernels in [`crate::simd`], so the
-/// equivalence tests can hold it against the fused chain; on a VNNI build it has
-/// no caller outside `cfg(test)`, hence the `allow(dead_code)`.
+/// The unfused layer-stack forward pass. Compiled unconditionally so the tests
+/// can hold it against the fused chain, which is why a VNNI build needs the
+/// `allow(dead_code)`.
 #[allow(dead_code)]
 fn per_layer_flow_unfused(transformed: &[u8; FC_0_INPUT_DIMS], stack: &NetworkStack) -> i32 {
     let mut fc_0_out = [0i32; FC_0_OUTPUT_DIMS];
@@ -207,8 +161,7 @@ fn per_layer_flow_unfused(transformed: &[u8; FC_0_INPUT_DIMS], stack: &NetworkSt
         FC_0_PADDED_INPUT_DIMS,
     );
 
-    // The first HIDDEN1_DIMS outputs feed both activations; fc_0_out[HIDDEN1_DIMS]
-    // is reserved for the post-fc_2 shortcut.
+    // `fc_0_out[HIDDEN1_DIMS]` is reserved for the post-`fc_2` shortcut.
     let mut ac_0 = [0u8; HIDDEN1_DIMS];
     post_ft_kernel::clipped_relu(&fc_0_out[..HIDDEN1_DIMS], &mut ac_0);
     let mut ac_sqr_0 = [0u8; HIDDEN1_DIMS];
@@ -242,7 +195,7 @@ fn per_layer_flow_unfused(transformed: &[u8; FC_0_INPUT_DIMS], stack: &NetworkSt
         FC_2_PADDED_INPUT_DIMS,
     );
 
-    // Shortcut: fc_0_out[HIDDEN1_DIMS] is raw (pre-ReLU) and can be negative.
+    // The shortcut term is raw, pre-ReLU, and can be negative.
     fc_2_out[0].wrapping_add(fc_0_out[HIDDEN1_DIMS])
 }
 
@@ -260,10 +213,8 @@ mod tests {
         }
     }
 
-    /// A single-stack builder with the standard FC dims but a tiny
-    /// feature-transformer (`num_features == 1`), so the FC forward pass is
-    /// exercised without a 215 MiB FT allocation. The FC arrays keep their
-    /// standard shapes, so `per_layer_flow` runs unchanged.
+    /// A single-stack builder with the standard FC dims but a one-feature
+    /// transformer, so the FC forward pass runs without a 215 MiB allocation.
     fn builder_1stack_std() -> NnueNetworkBuilder {
         let dims = NetDims {
             layer_stacks: 1,
@@ -280,10 +231,9 @@ mod tests {
 
     #[test]
     fn replicate_is_byte_identical_deep_copy() {
-        // A replica (per-NUMA-node cloning) must be byte-for-byte
-        // identical to the source, with a freshly allocated arena (distinct
-        // pointers), so the two instances evaluate any position the same while
-        // living on different NUMA nodes.
+        // A per-NUMA-node replica must be byte-for-byte identical to its source
+        // in a freshly allocated arena, so the two evaluate alike while living
+        // on different nodes.
         let dims = NetDims {
             layer_stacks: 1,
             num_features: 1,
@@ -311,23 +261,14 @@ mod tests {
         assert_eq!(&*copy.stacks[0].fc_0_biases, &*net.stacks[0].fc_0_biases);
         assert_eq!(&*copy.stacks[0].fc_0_weights, &*net.stacks[0].fc_0_weights);
         assert_eq!(&*copy.stacks[0].fc_2_weights, &*net.stacks[0].fc_2_weights);
-        // Deep copy: the arena is a distinct allocation, not an aliased pointer
-        // into the source.
         assert_ne!(copy.ft_weights.as_ptr(), net.ft_weights.as_ptr());
         assert_eq!(net.allocation_disclosure().0, 1);
         assert_eq!(copy.allocation_disclosure().0, 1);
     }
 
-    // The affine / clipped-ReLU / squared-clipped-ReLU kernels moved to the
-    // `simd` backend modules, which own their boundary-vector and SIMD-vs-scalar
-    // parity tests; the forward-pass tests below exercise them end-to-end.
-
-    // --- Forward pass ------------------------------------------------------
-
     #[test]
     fn zero_network_evaluates_to_zero() {
-        // `per_layer_flow` ignores the feature transformer, so a single-stack
-        // net with the standard FC dims (tiny FT) exercises the chain.
+        // `per_layer_flow` ignores the feature transformer.
         let net = zero_net_1stack();
         let transformed = [0u8; FC_0_INPUT_DIMS];
         assert_eq!(per_layer_flow(&transformed, &net.stacks[0]), 0);
@@ -335,11 +276,11 @@ mod tests {
 
     #[test]
     fn forward_wires_shortcut_and_chain() {
-        // Mirrors the reference `classic_chain_with_ewm_and_shortcut` wiring:
+        // The reference's `classic_chain_with_ewm_and_shortcut` wiring:
         // transformed[0]=39 drives fc_0_out[0]=50+3*39=167 and the shortcut
         // fc_0_out[15]=100+4*39=256. ac_0[0]=167>>6=2, ac_sqr_0 all 0.
         // fc_1_in[15]=2 -> fc_1_out[0]=30+7*2=44; ac_1[0]=44>>6=0.
-        // fc_2_out[0]=1000+shortcut 256 = 1256.
+        // fc_2_out[0]=1000+256=1256.
         let mut b = builder_1stack_std();
         b.fc_0_biases_mut(0)[0] = 50;
         b.fc_0_weights_mut(0)[0] = 3;
@@ -355,17 +296,15 @@ mod tests {
         transformed[0] = 39;
 
         assert_eq!(per_layer_flow(&transformed, stack), 1_256);
-        // Whole-pipeline division by the configured FV_SCALE: 1_256 / 16 = 78.
+        // The whole-pipeline division by the configured `FV_SCALE`.
         assert_eq!(per_layer_flow(&transformed, stack) / FV_SCALE, 78);
     }
 
     #[test]
     fn selected_forward_path_matches_the_unfused_reference() {
-        // Whichever layer-stack path this build compiled, it must agree
-        // bit-for-bit with the per-layer flow. On a VNNI build that pits the
-        // fused AVX-512 chain against the unfused one; on a scalar build the two
-        // are the same code and the check is a tautology — harmless, and it
-        // keeps the unfused form exercised on every build.
+        // On a VNNI build this pits the fused chain against the unfused one; on
+        // any other build the two are the same code, and the check merely keeps
+        // the unfused form exercised.
         let mut b = builder_1stack_std();
         for (i, w) in b.fc_0_weights_mut(0).iter_mut().enumerate() {
             *w = ((i as i32 * 7) % 61 - 30) as i8;
@@ -403,22 +342,16 @@ mod tests {
 
     #[test]
     fn evaluate_zero_network_is_zero_for_both_sides() {
-        // 9-stack all-zero network: evaluate() must return 0 regardless of the
-        // side to move or the selected bucket. Full-size (zeroed) FT weights are
-        // needed so refresh's feature-column indexing stays in bounds; the
-        // calloc pages the sparse position touches keep it cheap.
+        // Full-size zeroed FT weights, so the refresh's feature-column indexing
+        // stays in bounds; the sparse positions below touch few pages.
         let net = NnueNetworkBuilder::new(synthetic_header(), [0u8; 32]).build();
-        // Sparse king-only positions, one per side to move.
         for sfen in ["8K/9/9/9/9/9/9/9/8k b - 1", "8K/9/9/9/9/9/9/9/8k w - 1"] {
             let pos = parse_sfen(sfen).unwrap();
             assert_eq!(evaluate(&net, &pos), 0, "sfen `{sfen}`");
         }
     }
 
-    // --- Bucket selection --------------------------------------------------
-
-    /// Independent SFEN-parsing oracle for the bucket index (mirrors the
-    /// reference `bucket.rs` test oracle), deliberately not sharing code with
+    /// An SFEN-parsing form of the bucket index, sharing no code with
     /// [`layer_stack_index`].
     fn oracle_bucket(sfen: &str) -> usize {
         let mut parts = sfen.split_whitespace();

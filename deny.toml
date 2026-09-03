@@ -1,80 +1,54 @@
-# cargo-deny configuration — the dependency-audit gate (`cargo deny check`).
-#
-# All four checks are active: advisories / licenses / bans / sources. This file
-# is the policy half of that gate; how the gate is wired into CI alongside the
-# format / lint / test / miri gates is covered by the project's CI and
-# quality-gate policy.
+# cargo-deny configuration (`cargo deny check`).
 
 [graph]
-# The engine only ships for x86-64 Linux — its sole supported platform — but the
-# audit deliberately keeps every target in the graph: pruning to one would hide
-# a vulnerable or wrongly-licensed Windows-only crate that is still resolved into
-# `Cargo.lock`, and the lockfile is what we distribute.
+# The engine only ships for x86-64 Linux, but this configuration deliberately
+# keeps every target in the graph: pruning to one would hide a vulnerable or
+# wrongly-licensed Windows-only crate that is still resolved into `Cargo.lock`.
 all-features = true
-# Dev-dependencies are part of the audited surface: proptest & friends run on
-# this machine and on the dev VM, so an advisory against them is our problem.
+# Dev-dependencies are part of the checked surface.
 exclude-dev = false
 
 [output]
 feature-depth = 1
 
-# ---------------------------------------------------------------------------
-# advisories — RustSec DB. Vulnerabilities are a hard error (cargo-deny denies
-# them unconditionally); unmaintained and yanked crates are errors too, so the
-# tree stays free of dead dependencies rather than accumulating warnings nobody
-# reads.
-# ---------------------------------------------------------------------------
+# Unmaintained and yanked crates are errors, not warnings, so the tree stays free
+# of dead dependencies.
 [advisories]
 db-urls = ["https://github.com/rustsec/advisory-db"]
 unmaintained = "all"
 yanked = "deny"
 ignore = []
 
-# ---------------------------------------------------------------------------
-# licenses — Yorkie is distributed under GPL-3.0 (see `LICENSE`, inherited from
-# the YaneuraOu lineage). The allowlist is therefore restricted to licenses that
-# are GPL-3.0-compatible *and* actually present in the dependency tree; adding a
-# dependency under anything else must be a conscious edit of this list.
-# ---------------------------------------------------------------------------
+# Yorkie is distributed under GPL-3.0, so the allowlist is restricted to licenses
+# that are GPL-3.0-compatible *and* actually present in the dependency tree;
+# adding a dependency under anything else must be a conscious edit of this list.
 [licenses]
-#
-# The list is enumerated from the resolved tree (`cargo deny list`), not copied
-# from a template: every entry below is a license some crate in `Cargo.lock`
-# actually resolves to. Dual-licensed crates are satisfied here by MIT
-# (memchr's `Unlicense OR MIT`, zerocopy's `BSD-2-Clause OR ...`, r-efi's
-# `... OR LGPL-2.1-or-later`), which is why those licenses are absent.
+# Enumerated from the resolved tree, not copied from a template. Dual-licensed
+# crates are satisfied here by MIT, which is why their other licenses are absent.
 allow = [
     "MIT",
     "Apache-2.0",
     "Unicode-3.0",
 ]
-# The workspace crates carry no `license` field (they are `publish = false` and
-# covered by the repo-root GPL-3.0 `LICENSE`), so skip the private ones instead
-# of stamping SPDX metadata on unpublishable crates.
+# The workspace crates carry no `license` field, being `publish = false` and
+# covered by the repo-root GPL-3.0 `LICENSE`.
 private = { ignore = true }
 confidence-threshold = 0.8
-# The license check defaults to the distributed graph only. Dev- and
-# build-dependencies are pulled in too, so the allowlist below is the complete
-# set of licenses this repository touches, not just the ones it ships.
+# The license check defaults to the distributed graph only; including dev- and
+# build-dependencies makes the allowlist the complete set of licenses this
+# repository touches.
 include-dev = true
 include-build = true
 
-# ---------------------------------------------------------------------------
-# bans — duplicate versions are a warning: transitive minor-version skew is
-# normal churn and blocking on it would make unrelated slices red.
+# Duplicate versions are only a warning: transitive minor-version skew is normal
+# churn.
 #
-# The `deny` list below is the machine-checkable half of the project's
-# no-network-socket rule ("the engine MUST NOT open a network socket"), stated
-# in the architecture and repository-layout policy. A shogi engine that can
-# reach the network is disqualifiable at a tournament, and the failure mode is
-# silent — a transitive dependency pulls in an async runtime and nothing looks
-# different locally. So the async/HTTP/TLS runtimes are named here and the audit
-# fails if any of them enters the graph, directly or transitively. cargo-deny
-# matches exact crate names; the ecosystem-level rule ("no networking
-# transitive at all") is the documented one and this list is its enforcement, so
-# extend it when a new runtime shows up rather than treating the list as
-# exhaustive.
-# ---------------------------------------------------------------------------
+# The `deny` list below enforces the rule that the engine must not open a network
+# socket. Its failure mode is silent — a transitive dependency pulls in an async
+# runtime and nothing looks different locally — so the async/HTTP/TLS runtimes
+# are named here and the check fails if any of them enters the graph. cargo-deny
+# matches exact crate names, so extend the list when a new runtime shows up
+# rather than treating it as exhaustive.
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
@@ -97,11 +71,7 @@ deny = [
 ]
 skip = []
 
-# ---------------------------------------------------------------------------
-# sources — crates.io only. No git dependencies, no alternate registries: the
-# one non-crates.io input to the build is the YaneuraOu submodule, which is
-# vendored through git directly and never through Cargo.
-# ---------------------------------------------------------------------------
+# crates.io only: no git dependencies and no alternate registries.
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

@@ -4,37 +4,26 @@ members = ["crates/yorkie", "crates/yorkie-eval", "crates/yorkie-numa", "crates/
 
 [workspace.package]
 edition = "2024"
-# One version for every workspace member. The number is this repository's
-# generation number, matching `CHANGELOG.md`: `2.0.0` was the apery_rust-based
-# generation and the `3.x` generation is the current tree (this YaneuraOu Rust
-# port). It does NOT encode the upstream YaneuraOu baseline the port tracks —
-# that stays documented in `README.md`. The USI `id name` derives from it
-# (`Yorkie 3.1.0`).
+# One version for every workspace member. The number is this project's own
+# generation number, matching `CHANGELOG.md`; it does not encode the upstream
+# YaneuraOu baseline the port tracks, which `README.md` documents instead. The
+# USI `id name` derives from it.
 version = "3.1.0"
 
-# Module-file layout is enforced, not just documented: every member crate opts
-# in with `[lints] workspace = true`, and the gates run clippy with
-# `-D warnings`, so a stray `src/**/mod.rs` fails the build. The lint only sees
-# workspace members, so vendored non-member sources are out of its reach by
-# construction. It also leaves the `tests/<name>/mod.rs` integration-test
-# helper form alone — verified against
-# `crates/yorkie-protocol/tests/common/mod.rs`, which draws no warning while a
-# `src/**/mod.rs` in the same run does — so no `allow` carve-out is needed. If
-# a future clippy tightens that, add `#![allow(clippy::mod_module_files)]` to
-# the test roots rather than dropping the lint.
+# The lint only sees workspace members, so vendored non-member sources are out of
+# its reach by construction, and it leaves the `tests/<name>/mod.rs`
+# integration-test helper form alone. If a future clippy tightens that, add
+# `#![allow(clippy::mod_module_files)]` to the test roots rather than dropping
+# the lint.
 [workspace.lints.clippy]
 mod_module_files = "warn"
 
-# Release profile is the standing build for benches, A/B NPS tables, and the
-# eventual tournament binary — bake full optimization in so no manual RUSTFLAGS
-# is ever required. Fat LTO + a single codegen unit trade link time for run-time
-# speed (~+7% NPS measured together with `-C target-cpu=native` from
-# `.cargo/config.toml`). `panic = "abort"` matches the reference build, which is
-# compiled `-fno-exceptions -fno-rtti` (see `source/Makefile`):
-# it strips unwind edges, cleanup landing pads and `drop_in_place` chains from the
-# hot search code, shrinking the text segment (this machine is I-cache sensitive).
+# Fat LTO and a single codegen unit trade link time for run-time speed.
+# `panic = "abort"` matches the reference build, which is compiled
+# `-fno-exceptions -fno-rtti`: it strips unwind edges, cleanup landing pads and
+# `drop_in_place` chains from the hot search code, shrinking the text segment.
 # Cargo ignores `panic` when building test targets, so `cargo test --release`
-# keeps unwinding and works unchanged. `strip` stays unset — perf work needs
+# keeps unwinding and works unchanged. `strip` stays unset, since perf work needs
 # symbols.
 [profile.release]
 lto = "fat"

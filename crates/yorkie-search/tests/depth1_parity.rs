@@ -1,21 +1,14 @@
-//! Depth-1 search parity gate (blocking).
+//! Depth-1 search parity test.
 //!
 //! Runs the `go depth 1` root search ([`QSearch::run_root`]) against the six
-//! reference-captured fixtures under `tests/fixtures/search-depth1/` and asserts
-//! that **bestmove, score, and nodes** all match exactly. These three are one
-//! inseparable set: the `(nodes & 14)` root tie-break means a single-node drift
-//! can cascade into a different score and a flipped bestmove, so a mismatch on
-//! any of them signals a divergence in the search itself.
+//! reference-captured fixtures under `tests/fixtures/search-depth1/` and
+//! asserts **bestmove, score, and nodes** as one inseparable set: the
+//! `(nodes & 14)` root tie-break means a single-node drift can cascade into a
+//! different score and a flipped bestmove.
 //!
 //! The fixtures were captured with Threads=1, no book, `usinewgame` before each
-//! position, `go depth 1`, USI_Hash default 1024 MiB, FV_SCALE=16 — reproduced
-//! here by resizing the transposition table to 1024 MiB, clearing it per
-//! fixture (the `usinewgame` equivalent), and letting `run_root` bump the
-//! generation (the `go` equivalent).
-//!
-//! Like the other real-network tests, this is skipped with a notice when
-//! `nn.bin` is absent (a checkout without it staged), so the default
-//! `cargo test` run stays green everywhere.
+//! position, USI_Hash 1024 MiB and FV_SCALE 16, reproduced here. Skipped with a
+//! notice when `nn.bin` is absent.
 
 use std::path::PathBuf;
 
@@ -106,8 +99,8 @@ fn is_decisive(v: i32) -> bool {
 }
 
 /// Format a search value the way the reference USI layer does (`score.cpp` /
-/// `usi.cpp` `format_score`): a mate distance for decisive scores, else
-/// `100 * v / PawnValue` centipawns (C++ truncating division).
+/// `usi.cpp` `format_score`): a mate distance for decisive scores, else `100 *
+/// v / PawnValue` centipawns (C++ truncating division).
 fn format_score(v: i32) -> ScoreJson {
     if is_decisive(v) {
         let distance = VALUE_MATE - v.abs();
@@ -180,7 +173,7 @@ fn depth1_search_matches_reference_fixtures() {
     let path = nn_bin_path();
     if !path.exists() {
         eprintln!(
-            "skipping depth1_search_matches_reference_fixtures: {} is not present (staged only on the dev VM)",
+            "skipping depth1_search_matches_reference_fixtures: {} is not present (obtained out-of-band)",
             path.display()
         );
         return;

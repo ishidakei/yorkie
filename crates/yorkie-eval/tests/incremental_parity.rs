@@ -1,25 +1,13 @@
-//! Gate: the incremental accumulator update must equal a from-scratch refresh
+//! The incremental accumulator update must equal a from-scratch refresh
 //! **exactly** (i16 equality) after every do and every undo, and both eval
 //! paths must agree.
 //!
-//! Two drivers exercise [`yorkie_eval::Accumulator::update_after_move`]:
+//! Two drivers: the recorded fixture lines, replayed move by move and then
+//! unwound, and a deterministic pseudo-random legal game from each fixture
+//! SFEN, with terminal positions unwound and restarted from the root.
 //!
-//! 1. **Fixture lines** — every `tests/fixtures/eval/*.json` with a `moves`
-//!    array is replayed move-by-move, then fully unwound.
-//! 2. **Randomized playouts** — from each of the six fixture SFENs, a
-//!    deterministic pseudo-random legal game of ≥ 30 plies (via the real
-//!    movegen), with terminal positions unwound and restarted from the root.
-//!
-//! At each ply the incremental accumulator (threaded through a do/undo stack) is
-//! compared bit-for-bit against a fresh [`Accumulator::refresh`], and
-//! [`evaluate_with`] over the incremental accumulator is checked against the
-//! full-refresh [`evaluate`] — at the child (after the do) and again at the
-//! parent (after the undo).
-//!
-//! The network file is staged locally at
-//! `eval/nn.bin` and is never committed. When it is
-//! absent the test prints a notice and passes, so the default `cargo test` run
-//! stays green everywhere.
+//! The network file is staged locally and never committed, so when it is absent
+//! the test prints a notice and passes.
 
 use std::path::PathBuf;
 
@@ -108,7 +96,7 @@ fn incremental_accumulator_matches_refresh_on_fixture_lines() {
     let nn_bin = nn_bin_path();
     if !nn_bin.exists() {
         eprintln!(
-            "skipping incremental_accumulator_matches_refresh_on_fixture_lines: {} is not present (staged only on the dev VM)",
+            "skipping incremental_accumulator_matches_refresh_on_fixture_lines: {} is not present (obtained out-of-band)",
             nn_bin.display()
         );
         return;
@@ -174,8 +162,7 @@ fn incremental_accumulator_matches_refresh_on_fixture_lines() {
     assert!(any_moves, "no fixture had a `moves` array to exercise");
 }
 
-/// Small deterministic xorshift64* — no external RNG crate, and
-/// `Math.random`-style nondeterminism is banned in this workspace.
+/// Deterministic xorshift64*, so a failing playout replays.
 struct Rng(u64);
 
 impl Rng {
@@ -199,7 +186,7 @@ fn incremental_accumulator_matches_refresh_on_random_playouts() {
     let nn_bin = nn_bin_path();
     if !nn_bin.exists() {
         eprintln!(
-            "skipping incremental_accumulator_matches_refresh_on_random_playouts: {} is not present (staged only on the dev VM)",
+            "skipping incremental_accumulator_matches_refresh_on_random_playouts: {} is not present (obtained out-of-band)",
             nn_bin.display()
         );
         return;
@@ -211,8 +198,6 @@ fn incremental_accumulator_matches_refresh_on_random_playouts() {
     for (fi, sfen) in FIXTURE_SFENS.iter().enumerate() {
         let mut pos = parse_sfen(sfen).expect("fixture sfen parses");
         let root = refreshed(&net, &pos);
-        // Seed derived from the fixture index so each game is distinct yet
-        // fully reproducible run-to-run.
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ (fi as u64).wrapping_add(1));
 
         let mut frames: Vec<Frame> = Vec::new();
@@ -223,8 +208,7 @@ fn incremental_accumulator_matches_refresh_on_random_playouts() {
             legal.clear();
             pos.generate_legal_all(&mut legal);
             if legal.is_empty() {
-                // Terminal (mate/stalemate): unwind fully and restart from root,
-                // exercising the undo path along the way.
+                // Terminal: unwind fully and restart from the root.
                 while let Some(frame) = frames.pop() {
                     let usi = format_usi_move(frame.mv);
                     let parent = frames.last().map_or(&root, |f| &f.acc);

@@ -1,32 +1,22 @@
 # The engine's compile-time configuration — the config the engine plays with,
 # and the one a build reads when nothing selects another.
 #
-# The engine carries NO runtime configuration. Every setting below is read by
-# `crates/yorkie-protocol/build.rs` at build time and emitted as a `pub const`
-# into `yorkie_protocol::config`; every build reads those constants and nothing
-# else. Changing a setting means rebuilding.
+# The engine carries no runtime configuration. Every setting below is read at
+# build time and emitted as a `pub const`, so changing one means rebuilding.
 #
 # Select a different config with the `YORKIE_CONFIG` environment variable, whose
-# value is a path to a TOML file (relative paths resolve against the repository
-# root):
+# value is a path to a TOML file, resolved against the repository root when
+# relative:
 #
 #     YORKIE_CONFIG=configs/test.toml cargo nextest run --all-features
 #
-# Unset, the build reads this file, so `cargo build --release` on a fresh clone
-# produces a binary ready to play.
-#
-# Format rules, enforced by the build script — every one of them is a hard build
-# error, never a silent fallback:
+# Format rules, each a hard build error and never a silent fallback:
 #
 #   * flat `key = value` pairs only; no `[table]` headers, no arrays;
 #   * every key in the schema must be present, exactly once;
 #   * no key outside the schema may appear;
 #   * each value must have the declared type (integer / boolean / string) and
 #     sit inside the declared range or choice list.
-#
-# Event-specific values — hash size, thread count, book selection, clock margins,
-# sized against the machine the engine will actually run on — are written here,
-# or into a copy of this file selected with `YORKIE_CONFIG`.
 #
 # `configs/test.toml` is the config the test suite runs against.
 
@@ -63,17 +53,13 @@ stochastic_ponder = false
 # ---------------------------------------------------------------------------
 # Opening book
 #
-# `book_options_v2` selects which of the two book-option groups is live, the job
-# `engine_option_profile.txt`'s `BOOK_OPTIONS` selector does in the reference
-# implementation and that no build of this engine reads. `false` selects the V1
-# surface; `true` swaps in the black/white-split filters.
+# `book_options_v2` selects which of the two book-option groups is live: `false`
+# the V1 surface, `true` the black/white-split filters.
 #
-# The V1-only and V2-only keys below are BOTH always present — the schema is one
-# fixed key set — and the profile decides which half is live. A key the selected
-# profile does not register reads as its type's zero (integer `0`, boolean
-# `false`), exactly as an unregistered option does in the reference
-# implementation. That is why `book_depth_white_limit` carries `5` (the V2
-# default) while this file selects V1: under V1 it is inert.
+# The V1-only and V2-only keys below are both always present, since the schema is
+# one fixed key set, and a key the selected profile does not register reads as
+# its type's zero. That is why `book_depth_white_limit` carries the V2 default
+# while this file selects V1 — under V1 it is inert.
 # ---------------------------------------------------------------------------
 
 book_options_v2 = false

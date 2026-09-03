@@ -4,15 +4,12 @@
 #     YORKIE_CONFIG=configs/test.toml cargo nextest run --all-features
 #
 # No build has a runtime option surface, so a test cannot dial a setting in with
-# `setoption`: the values below ARE the values every session test sees. Three of
-# them are therefore chosen for the suite rather than for play — a small
-# `usi_hash`, a single worker, and an unthrottled PV — and each says so at its
-# own key. Everything else is `configs/default.toml`'s value.
+# `setoption`: the values below are the values every session test sees. Three are
+# chosen for the suite rather than for play, and each says so at its own key;
+# everything else is `configs/default.toml`'s value.
 #
-# The schema and its rules are identical to `configs/default.toml` — see that
-# file for the per-key commentary. Every key must be present exactly once, no
-# key outside the schema may appear, and every value is type- and range-checked
-# at build time.
+# The schema and its rules are identical to `configs/default.toml`, which carries
+# the per-key commentary.
 
 # ---------------------------------------------------------------------------
 # Engine core

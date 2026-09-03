@@ -1,89 +1,14 @@
-//! Search-oriented move generation and predicates: the reference-ordered
-//! `CAPTURES` / `EVASIONS` candidate lists the qsearch `MovePicker` consumes,
-//! plus the `gives_check` / `in_check` / `is_legal` predicates it (and qsearch)
-//! consult.
+//! Search-oriented move generation: the `CAPTURES` / `QUIETS` / `EVASIONS` /
+//! `NON_EVASIONS` candidate lists the `MovePicker` consumes, plus the
+//! `gives_check` / `in_check` / `is_legal` predicates. Ports
+//! `generate_general` / `generate_evasions` / `generate<LEGAL_ALL>`
+//! (`movegen.cpp`); the emission order is reproduced move-for-move because
+//! node-count parity depends on it.
 //!
-//! # The generators, and the unified legal list built on them
-//!
-//! The per-stage generators ([`Position::generate_captures`] /
-//! [`Position::generate_quiets`] / [`Position::generate_evasions`] /
-//! [`Position::generate_non_evasions`]) emit **pseudo-legal** candidates in the
-//! reference `MovePicker` order — the `MoveList<CAPTURES>` / `MoveList<EVASIONS>`
-//! / `MoveList<NON_EVASIONS>` produced by upstream's `generate_general` /
-//! `generate_evasions` (`source/movegen.cpp`),
-//! piece-type-major with ascending from- then to-square and the
-//! `make_move_target` promotion/non-promotion suppression. Because move
-//! ordering drives search cutoffs, node-count parity depends on reproducing
-//! that emission order, so this module ports it directly.
-//!
-//! The single all-legal entry point, [`Position::generate_legal_all`], is built
-//! on the same generators — it is the `generate<LEGAL_ALL>` port
-//! (`movegen.cpp`): pick the check-state generator (evasions when in
-//! check, else non-evasions) with `all == true`, then retain the candidates
-//! passing [`Position::is_legal`]. It is the sole legal-move generator in the
-//! engine; perft, USI `position ... moves` validation, book widening, and the
-//! test oracles all route through it. It is **repetition-blind**, exactly like
-//! the reference (no sennichite / perpetual-check term).
-//!
-//! The per-stage generators produce **pseudo-legal** moves (king-safety is not
-//! checked), exactly like the reference's `MoveList`. The `MovePicker` filters
-//! each with [`Position::is_legal`] as it yields it — equivalent to the
-//! reference qsearch skipping illegal moves without counting a node.
-//!
-//! # `CAPTURES` at the pin (`generate_general<CAPTURES, Us, false>`)
-//!
-//! `target = pos.pieces(Them)` — destinations are exactly the enemy-occupied
-//! squares (`movegen.cpp`); there are no drops (`movegen.cpp`, drops
-//! are only generated for `QUIETS` / `NON_EVASIONS`) and no non-capturing pawn
-//! promotions (that is `CAPTURES_PRO_PLUS`, a different generator). Piece-type
-//! order (`movegen.cpp`): PAWN, LANCE, KNIGHT, SILVER, then
-//! bishop+rook (`GPM_BR`, unpromoted only, interleaved by square), then
-//! gold-likes+horse+dragon+king (`GPM_GHDK`, interleaved by square).
-//!
-//! With `All == false` (the option default, `generate_all_legal_moves`), the
-//! `make_move_target` rules (`movegen.cpp`) suppress various
-//! non-promoting variants:
-//!
-//! * PAWN — inside the promotion zone only the promotion is generated
-//!   (`movegen.cpp`).
-//! * LANCE — every capture into the enemy field promotes; the non-promotion is
-//!   suppressed on the enemy first/second rank (kept from the third rank back)
-//!   (`movegen.cpp`).
-//! * KNIGHT — promotes where it can; the non-promotion is suppressed on the
-//!   enemy first/second ranks where a non-promoted knight would be stuck
-//!   (`movegen.cpp`).
-//! * SILVER — always emits both promotion and non-promotion when a promotion
-//!   is available (`movegen.cpp`).
-//! * BISHOP / ROOK — promote-only when entering or leaving the zone; the
-//!   non-promotion is `All`-only (`movegen.cpp`).
-//! * GOLD-likes / horse / dragon / king — never promote (`movegen.cpp`).
-//!
-//! # `EVASIONS` at the pin (`generate_evasions<Us, false>`)
-//!
-//! King moves first (`movegen.cpp`), then — for a single check —
-//! non-king moves in the same piece-type order as `CAPTURES` (but the
-//! gold-group excludes the king, already emitted) restricted to the
-//! block/capture squares, then interposition drops (`movegen.cpp`).
-//! This port target-restricts generation exactly as the pin does:
-//! the king steps are pre-masked by the union of every checker's attack rays
-//! (`sliderAttacks`); on a single check the non-king pieces are masked to
-//! `target2 = between(checksq, ksq) | checksq` (interpose or capture the
-//! checker) and the drops to `target1 = between(checksq, ksq)` (interpose only);
-//! on a double check only king moves are emitted, matching `checkersCnt <= 1`
-//! (`movegen.cpp`). Every emitted move is a subsequence of what an
-//! unrestricted emission would produce, so the [`Position::is_legal`]-filtered
-//! output — and its order — is byte-identical to generating everything and then
-//! filtering; the remaining suicide king steps (ray squares behind the king) are
-//! caught by `is_legal`, as the pin's comment notes.
-//!
-//! One deliberate, output-preserving deviation from the pin: `sliderAttacks` is
-//! accumulated under the *current* occupancy (king still on the board) rather
-//! than the pin's king-removed `occ = pieces() ^ ksq`. With the king in the
-//! occupancy a slider's ray stops at the king, so the square directly behind the
-//! king survives the king-step mask instead of being pruned at generation; it is
-//! a suicide step, which `is_legal` (vacating the king's from-square) rejects
-//! anyway. Both forms therefore yield the identical legal king-move set, in the
-//! identical ascending order.
+//! The per-stage generators emit **pseudo-legal** moves — king safety is not
+//! checked, and callers filter with [`Position::is_legal`].
+//! [`Position::generate_legal_all`] is the engine's only legal-move generator,
+//! and is repetition-blind like the reference (no sennichite term).
 
 use crate::bitboard::Bitboard;
 use crate::board::Board;
@@ -97,30 +22,23 @@ use crate::piece::{Piece, PieceKind};
 use crate::position::Position;
 use crate::square::Square;
 
-/// A move paired with its ordering score, matching the reference `ExtMove`
-/// (`struct ExtMove : public Move`, `movegen.h`). The search-side generators
-/// emit `ExtMove` **directly** into the `MovePicker`'s buffer — `value` is
-/// initialised to `0` and the picker fills it in later at its scoring stage —
-/// mirroring the reference's `ExtMove* generateMoves(const Position&, ExtMove*)`
-/// layering (`movegen.h`), which writes the picker's array in place. There
-/// is therefore no intermediate `Move` → `ExtMove` restaging pass.
+/// A move paired with its ordering score (reference `ExtMove`, `movegen.h`).
+/// Generators emit into the `MovePicker`'s buffer with `value` at `0`; the
+/// picker fills it in at its scoring stage.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ExtMove {
     pub mv: Move,
     pub value: i32,
 }
 
-/// `#[cfg(test)]` scanning oracles for the piece-set move generators:
-/// scan-based twins of the four search generators, built from
-/// [`emit_group_scan`] / [`reachable_scan`], against which the production
-/// generators are pinned move-for-move by the sequence-equality gate.
+/// Scan-based twins of the four search generators, derived independently of the
+/// bitboard tables, against which the production generators are pinned
+/// move-for-move.
 #[cfg(test)]
 mod scan_oracle;
 
-/// The seven droppable piece kinds in the order the reference's
-/// `GenerateDropMoves` lays them into its `drops[]` array
-/// (`movegen.cpp`): knight, lance, then silver, gold, bishop, rook.
-/// Pawn drops are generated separately (and first).
+/// Droppable kinds in the order `GenerateDropMoves` (`movegen.cpp`) lays them
+/// into `drops[]`. Pawn drops are generated separately, and first.
 const DROP_ORDER: [PieceKind; 6] = [
     PieceKind::Knight,
     PieceKind::Lance,
@@ -130,11 +48,8 @@ const DROP_ORDER: [PieceKind; 6] = [
     PieceKind::Rook,
 ];
 
-/// Apply `m` to a bare `board` for `mover`, mirroring the board half of
-/// [`Position::do_move`] (no keys / hands / history). Used only by the
-/// `#[cfg(test)]` copy-apply-scan oracles (`leaves_own_king_safe`,
-/// `gives_check_reference`, `is_legal_reference`), which need the resulting
-/// occupancy; the production predicates are board-mutation-free.
+/// Apply `m` to a bare `board` for `mover` — the board half of
+/// [`Position::do_move`], with no keys, hands or history.
 #[cfg(test)]
 fn apply_to_board(board: &mut Board, m: Move, mover: Color) {
     let to = m.to_sq();
@@ -146,42 +61,24 @@ fn apply_to_board(board: &mut Board, m: Move, mover: Color) {
     }
 }
 
-/// The all-81-squares mask — the identity for the evasion destination
-/// restriction, passed by every generator that imposes no `target2` / `target1`
-/// mask (`CAPTURES`, `QUIETS`, `NON_EVASIONS`, and the unrestricted scan twins).
+/// The identity for the evasion destination restriction, passed by every
+/// generator that imposes no mask.
 const ALL_SQUARES: Bitboard = Bitboard::FULL;
 
-/// Which destination squares a move generator keeps, mirroring the reference
-/// `generate_general` `target` bitboard: `CAPTURES` = enemy-occupied squares
-/// only, `QUIETS` = empty squares only, and the `EVASIONS` block-or-capture
-/// target = both (empty interposition squares and the checker's square).
+/// Which destination squares a generator keeps — the `generate_general`
+/// `target` bitboard.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Target {
-    /// `pos.pieces(Them)` — enemy pieces only (`CAPTURES`).
+    /// Enemy pieces only (`CAPTURES`).
     Captures,
-    /// `pos.empties()` — empty squares only (`QUIETS`).
+    /// Empty squares only (`QUIETS`).
     Quiets,
     /// Empty *and* enemy squares — the `EVASIONS` block-or-capture set.
     BlockOrCapture,
 }
 
 /// The pseudo-legal destinations of the piece standing on `from`, ascending by
-/// square index (mirroring the reference's `bb.pop()` / `foreach` iteration,
-/// least-significant square first). `target` selects which squares are kept
-/// (see [`Target`]).
-///
-/// Reads the piece's attack set straight off the occupancy-limited bitboard
-/// queries ([`attacks_bb`]) instead of re-walking the movement rays, then masks
-/// it with the piece sets: `Captures` keeps the enemy-occupied destinations,
-/// `Quiets` the empty ones, and `BlockOrCapture` every non-own-occupied
-/// destination (empty interposition squares plus enemy captures). The attack set
-/// already stops each slider at (and including) the first blocker, so an
-/// own-piece blocker square is present in the raw set and dropped by every mask.
-/// The masked bitboard is returned directly (no intermediate `Vec<Square>`); its
-/// `.squares()` yields the survivors in ascending-index order, and the emit
-/// helpers iterate it in place. An independent movement-walk form is kept as the
-/// `#[cfg(test)]` oracle [`reachable_scan`], and the sequence-equality test pins
-/// the two together.
+/// square index.
 fn reachable(board: &Board, from: Square, piece: Piece, target: Target) -> Bitboard {
     let occ = board.occupied();
     let attacks = attacks_bb(from, piece, occ);
@@ -193,7 +90,7 @@ fn reachable(board: &Board, from: Square, piece: Piece, target: Target) -> Bitbo
 }
 
 /// A movement-walk form of [`reachable`], derived independently of the bitboard
-/// tables so it can serve as the sequence-equivalence oracle for the emitters.
+/// tables.
 #[cfg(test)]
 fn reachable_scan(board: &Board, from: Square, piece: Piece, target: Target) -> Vec<Square> {
     let mut out: Vec<Square> = Vec::new();
@@ -264,11 +161,9 @@ fn last_rank(color: Color) -> u8 {
     }
 }
 
-/// Non-promotion is allowed for a knight landing on `to`: suppressed on the
-/// enemy first and second ranks (Black `rank >= 2`, White `rank <= 6`), where a
-/// non-promoted knight would be stuck. Mirrors the knight guard
-/// (`movegen.cpp`); this is `All`-independent (a stuck knight is never
-/// generated regardless of the option).
+/// Non-promotion is allowed for a knight landing on `to` — suppressed on the
+/// enemy first two ranks, where a non-promoted knight would be stuck
+/// (`movegen.cpp`). Unlike the other guards this one carries no `All` term.
 fn nonpromote_rank_ok(to: Square, color: Color) -> bool {
     match color {
         Color::Black => to.rank() >= 2,
@@ -276,12 +171,9 @@ fn nonpromote_rank_ok(to: Square, color: Color) -> bool {
     }
 }
 
-/// Non-promotion is allowed for a lance landing on `to`. With `All == false`
-/// (the default) the non-promotion is suppressed on the enemy first and second
-/// ranks (`movegen.cpp`, `ForwardRanksBB[…][RANK_2]`), coinciding with the
-/// knight mask. With `All == true` only the very last rank — where the lance
-/// would be stuck — is suppressed (`movegen.cpp`, `ForwardRanksBB[…][RANK_1]`),
-/// so the enemy second rank's non-promotion is additionally generated.
+/// Non-promotion is allowed for a lance landing on `to`. `All == false`
+/// suppresses the enemy first two ranks, `All == true` only the last rank where
+/// the lance would be stuck (`movegen.cpp`, `ForwardRanksBB`).
 fn lance_nonpromote_rank_ok(to: Square, color: Color, all: bool) -> bool {
     if all {
         match color {
@@ -293,9 +185,7 @@ fn lance_nonpromote_rank_ok(to: Square, color: Color, all: bool) -> bool {
     }
 }
 
-/// Emit a pawn's move to its single forward `to` (`movegen.cpp`). With
-/// `All == true` a pawn pushing into the promotion zone additionally emits its
-/// non-promotion, except on the last rank where it would be stuck (`249`).
+/// Emit a pawn's move to its single forward `to` (`movegen.cpp`).
 fn emit_pawn(from: Square, targets: Bitboard, piece: Piece, all: bool, out: &mut Vec<ExtMove>) {
     for to in targets.squares() {
         if is_in_promotion_zone(to, piece.color) {
@@ -310,8 +200,7 @@ fn emit_pawn(from: Square, targets: Bitboard, piece: Piece, all: bool, out: &mut
 }
 
 /// Emit a lance's moves: all promotions into the enemy field first, then the
-/// rank-masked non-promotions (`movegen.cpp`). The non-promotion rank mask
-/// widens under `All` (see [`lance_nonpromote_rank_ok`]).
+/// rank-masked non-promotions (`movegen.cpp`).
 fn emit_lance(from: Square, targets: Bitboard, piece: Piece, all: bool, out: &mut Vec<ExtMove>) {
     for to in targets.squares() {
         if is_in_promotion_zone(to, piece.color) {
@@ -325,9 +214,7 @@ fn emit_lance(from: Square, targets: Bitboard, piece: Piece, all: bool, out: &mu
     }
 }
 
-/// Emit a knight's moves, per destination: promotion where legal, then the
-/// non-promotion where a non-promoted knight is not stuck (`movegen.cpp`).
-/// `All`-independent: the reference knight guard carries no `All` term.
+/// Emit a knight's moves (`movegen.cpp`).
 fn emit_knight(from: Square, targets: Bitboard, piece: Piece, out: &mut Vec<ExtMove>) {
     for to in targets.squares() {
         if is_in_promotion_zone(to, piece.color) {
@@ -339,11 +226,9 @@ fn emit_knight(from: Square, targets: Bitboard, piece: Piece, out: &mut Vec<ExtM
     }
 }
 
-/// Emit a silver's moves (`movegen.cpp`). A silver always keeps its
-/// non-promotion; it additionally promotes whenever a promotion is available
-/// (`from` or `to` in the enemy field). When `from` is not in the enemy field
-/// the reference emits the promotable (into-zone) destinations first, then the
-/// plain ones — reproduced here as two passes.
+/// Emit a silver's moves (`movegen.cpp`). When `from` is outside the enemy
+/// field the reference emits the into-zone destinations before the rest, so
+/// this runs as two passes.
 fn emit_silver(from: Square, targets: Bitboard, piece: Piece, out: &mut Vec<ExtMove>) {
     if is_in_promotion_zone(from, piece.color) {
         for to in targets.squares() {
@@ -365,12 +250,9 @@ fn emit_silver(from: Square, targets: Bitboard, piece: Piece, out: &mut Vec<ExtM
     }
 }
 
-/// Emit a bishop's / rook's moves (`movegen.cpp`). These always promote
-/// when they can (`from` or `to` in the enemy field); the non-promotion is
-/// `All`-only. With `All == false` it is emitted only for moves that stay
-/// entirely outside the zone; with `All == true` the in-zone non-promotion is
-/// additionally emitted, interleaved right after each promotion (matching the
-/// reference `if (All) *mlist++ = make_move(...)` per destination, `154`/`162`).
+/// Emit a bishop's / rook's moves (`movegen.cpp`). The in-zone non-promotion is
+/// `All`-only, and is interleaved right after each promotion rather than
+/// batched into the second pass.
 fn emit_bishop_rook(
     from: Square,
     targets: Bitboard,
@@ -402,7 +284,7 @@ fn emit_bishop_rook(
     }
 }
 
-/// Emit a never-promoting piece's moves (gold-likes, horse, dragon, king)
+/// Emit a never-promoting piece's moves — gold-likes, horse, dragon, king
 /// (`movegen.cpp`).
 fn emit_plain_only(from: Square, targets: Bitboard, piece: Piece, out: &mut Vec<ExtMove>) {
     for to in targets.squares() {
@@ -415,10 +297,8 @@ fn emit_plain_only(from: Square, targets: Bitboard, piece: Piece, out: &mut Vec<
 /// (`GPM_GHDK`), but not for `EVASIONS` (`GPM_GHD` — the king was emitted
 /// first).
 ///
-/// This is the runtime, `match`-dispatched form. The hot search generators no
-/// longer use it — they name a compile-time [`GroupSpec`] type so `pieces` /
-/// `emit` resolve statically (see that trait). `Group` survives only as the
-/// `#[cfg(test)]` membership / emit oracle for the scanning [`emit_group_scan`].
+/// The runtime, `match`-dispatched counterpart of [`GroupSpec`], kept as the
+/// oracle for [`emit_group_scan`].
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Group {
@@ -432,12 +312,8 @@ enum Group {
 
 #[cfg(test)]
 impl Group {
-    /// Does `piece` (already known to be the side to move's) belong to this
-    /// group? The groups partition the moving side's pieces exactly as the
-    /// reference bitboards `pieces(Us, PAWN)`, …, `pieces(Us, BISHOP, ROOK)`,
-    /// `pieces(Us, GOLDS, HDK)` do — the same partition [`group_pieces`] reads
-    /// off the board's pattern sets. Retained as the membership oracle for the
-    /// scanning [`emit_group_scan`].
+    /// Does `piece`, already known to be the side to move's, belong to this
+    /// group?
     #[cfg(test)]
     fn contains(self, piece: Piece) -> bool {
         match self {
@@ -477,37 +353,22 @@ impl Group {
     }
 }
 
-/// Compile-time specialization of one piece group's emit pipeline. Each search
-/// generator names a concrete zero-sized `GroupSpec` type per call site, so the
-/// piece-set read ([`GroupSpec::pieces`]) and the per-piece emitter
-/// ([`GroupSpec::emit`]) resolve to a direct call inside each monomorphized
-/// [`emit_group`] / [`emit_group_masked`] instantiation — no runtime `match` on a
-/// [`Group`] value, hence no jump-table load and no indirect branch in the
-/// per-from-square loop. This mirrors the reference's template specializations
-/// `GeneratePieceMoves<…, Pt, …>` / `make_move_target<Pt, …>`
-/// (`movegen.cpp`), as opposed to the runtime `make_move_target_general`
-/// switch (`movegen.cpp`) the hot generators never take. The runtime `Group`
-/// enum survives only as the `#[cfg(test)]` oracle for [`emit_group_scan`].
+/// Compile-time specialization of one piece group's emit pipeline, mirroring
+/// the reference's `GeneratePieceMoves<…, Pt, …>` template specializations
+/// (`movegen.cpp`). Naming a concrete type per call site keeps the
+/// per-from-square loop free of an indirect branch.
 trait GroupSpec {
-    /// The side-to-move's pieces belonging to this group, as a bitboard read
-    /// from the board's incrementally maintained pattern sets — the reference
-    /// bitboards `pieces(Us, PAWN)`, …, `pieces(Us, BISHOP, ROOK)`,
-    /// `pieces(Us, GOLDS, HDK)`. Iterated ascending it yields the same
-    /// from-squares, in the same order, as a 0..81 scan filtered by
-    /// `Group::contains`: each pattern slot holds exactly the pieces of that
-    /// group (the four promoted minors collapse into the GOLD slot, horse /
-    /// dragon are distinct, the king is its own slot).
+    /// The side-to-move's pieces belonging to this group, read from the board's
+    /// incrementally maintained pattern sets.
     fn pieces(board: &Board, stm: Color) -> Bitboard;
 
-    /// Emit one `from`-square piece's pseudo-moves onto `targets` — the static
-    /// counterpart of `Group::emit`, resolving to the single per-piece emitter.
+    /// Emit one `from`-square piece's pseudo-moves onto `targets`.
     fn emit(from: Square, targets: Bitboard, piece: Piece, all: bool, out: &mut Vec<ExtMove>);
 }
 
-/// Zero-sized group markers, one per emission group. `GoldHdk` is const-generic
-/// over whether the group carries the king (it does for `CAPTURES` / `QUIETS` /
-/// `NON_EVASIONS`, the `GPM_GHDK` case, but not for `EVASIONS`, the `GPM_GHD`
-/// case where the king was emitted first).
+/// `KING` says whether the gold group carries the king: it does for `CAPTURES` /
+/// `QUIETS` / `NON_EVASIONS`, but not for `EVASIONS`, where the king was emitted
+/// first.
 enum PawnG {}
 enum LanceG {}
 enum KnightG {}
@@ -575,12 +436,9 @@ impl<const KING: bool> GroupSpec for GoldHdkG<KING> {
     }
 }
 
-/// Iterate the side-to-move's group-`G` pieces by ascending square and emit their
-/// pseudo-moves onto the `target` squares (see [`Target`]). `all` is the
-/// `GenerateAllLegalMoves` flag, widening the suppressed non-promotions. The
-/// generating pieces come from [`GroupSpec::pieces`] (the board's piece sets)
-/// rather than an 81-square scan; the scan form is kept as the sequence oracle
-/// [`emit_group_scan`].
+/// Iterate the side-to-move's group-`G` pieces by ascending square and emit
+/// their pseudo-moves onto the `target` squares. `all` is the
+/// `GenerateAllLegalMoves` flag, widening the suppressed non-promotions.
 fn emit_group<G: GroupSpec>(
     board: &Board,
     stm: Color,
@@ -592,11 +450,9 @@ fn emit_group<G: GroupSpec>(
 }
 
 /// [`emit_group`] with the reachable destinations additionally intersected with
-/// `restrict` — the reference `target2` mask the evasion generator threads in
-/// (interpose-or-capture-the-checker). The non-evasion generators pass
-/// [`ALL_SQUARES`], an identity intersection. Because `restrict` only removes
-/// destinations, the emitted moves stay a subsequence of the unrestricted
-/// emission, preserving the ascending square / promotion order.
+/// `restrict` — the reference `target2` mask the evasion generator threads in.
+/// Because `restrict` only removes destinations, the emission stays a
+/// subsequence of the unrestricted one and so keeps its order.
 fn emit_group_masked<G: GroupSpec>(
     board: &Board,
     stm: Color,
@@ -614,9 +470,8 @@ fn emit_group_masked<G: GroupSpec>(
     }
 }
 
-/// A 0..81 scan form of [`emit_group`], the sequence oracle for the piece-set
-/// emitter. Uses [`reachable_scan`] so it shares no code with the production
-/// destination path.
+/// A 0..81 scan form of [`emit_group`]. Uses [`reachable_scan`], so it shares
+/// no code with the production destination path.
 #[cfg(test)]
 fn emit_group_scan(
     board: &Board,
@@ -641,14 +496,7 @@ fn emit_group_scan(
 }
 
 /// `file → the side to move already holds an own un-promoted pawn on it` — the
-/// nifu (二歩) mask. Reads the un-promoted-pawn pattern set (a promoted pawn /
-/// tokin lives in the GOLD slot and does not count) ANDed against each file
-/// mask. [`Position::emit_drops_masked`] folds the same pawn bitboard into a
-/// full-file exclusion mask inline; this per-file bool
-/// form is a `#[cfg(test)]` helper for the drop-emitter oracle
-/// [`Position::emit_drops_masked_scan`] and the equivalence gates, pinned equal
-/// to the `#[cfg(test)]` scan oracle [`nifu_blocked_files_scan`] along the
-/// fixture playouts.
+/// nifu (二歩) mask. A promoted pawn lives in the GOLD slot and does not count.
 #[cfg(test)]
 fn nifu_blocked_files(board: &Board, stm: Color) -> [bool; Square::FILES as usize] {
     use crate::bitboard::file_mask;
@@ -660,8 +508,7 @@ fn nifu_blocked_files(board: &Board, stm: Color) -> [bool; Square::FILES as usiz
     blocked
 }
 
-/// A nine-rank-per-file scan form of [`nifu_blocked_files`], the equivalence
-/// oracle for the file-mask form.
+/// A nine-rank-per-file scan form of [`nifu_blocked_files`].
 #[cfg(test)]
 fn nifu_blocked_files_scan(board: &Board, stm: Color) -> [bool; Square::FILES as usize] {
     let mut blocked = [false; Square::FILES as usize];
@@ -681,44 +528,19 @@ fn nifu_blocked_files_scan(board: &Board, stm: Color) -> [bool; Square::FILES as
     blocked
 }
 
-// ===========================================================================
-// Per-position-state check info (reference `Position::set_check_info`)
-// ===========================================================================
-//
-// The reference precomputes, once per position STATE (in `do_move` /
-// `set_check_info`, `position.cpp` non-STOCKFISH branch ~242-284), the data the
-// per-move predicates `gives_check` / `gives_direct_check` / `legal` consult:
-//
-//   * `checkSquares[pt]` — the destination squares from which a piece of type
-//     `pt` of the side to move would check the enemy king, under the *current*
-//     occupancy. The predicates then reduce to a table lookup AND the move's
-//     destination.
-//   * `blockersForKing[c]` — the single blockers between `c`'s king and an
-//     enemy slider (the pin set), reused verbatim from the SEE module's
-//     [`crate::see::slider_blockers`] rather than duplicated.
-//
-// This module caches that per-state info on [`Position`] (recomputed on
-// `do_move` / `undo_move` / `set`; see `position.rs`) so the three predicates
-// below are constant-time lookups rather than a copy-apply-scan.
+// Per-position-state check info, ported from `Position::set_check_info`
+// (`position.cpp`).
 
 /// The number of distinct check-attack patterns keyed by [`check_pattern`].
 const CHECK_PATTERN_COUNT: usize = crate::board::PATTERN_COUNT;
 
-/// Map a concrete piece to its `checkSquares` pattern slot — the shared
-/// [`crate::board::pattern_of`] partition (the four promoted minors collapse to
-/// GOLD, horse / dragon are distinct, KING has its own slot), exactly the SEE
-/// attacker-bucket partition and the [`crate::board`] piece-set partition.
+/// Map a concrete piece to its `checkSquares` pattern slot.
 fn check_pattern(piece: Piece) -> usize {
     crate::board::pattern_of(piece)
 }
 
-/// The set of squares `piece` (standing on `from`) attacks under occupancy
-/// `occ`. Steppers land on their fixed offsets (from the foundation tables);
-/// sliders walk to (and including) the first occupied square (the occupancy-
-/// limited [`crate::bitboard`] queries). Used to fill `checkSquares` via the
-/// reverse-attack trick and so, like the reference's `bishopEffect(ksq, occ)`
-/// etc., it is computed against the current occupancy. A board-scanning form is
-/// kept as the `#[cfg(test)]` oracle [`attack_set_from_scan`].
+/// The set of squares `piece`, standing on `from`, attacks under occupancy
+/// `occ`. A slider's ray stops at and includes the first occupied square.
 fn attacks_bb(from: Square, piece: Piece, occ: Bitboard) -> Bitboard {
     use crate::bitboard::{
         bishop_attacks, dragon_attacks, gold_attacks, horse_attacks, king_attacks, knight_attacks,
@@ -743,7 +565,7 @@ fn attacks_bb(from: Square, piece: Piece, occ: Bitboard) -> Bitboard {
 }
 
 /// A board-scanning form of [`attacks_bb`], derived independently of the
-/// bitboard tables so it can serve as their equivalence oracle.
+/// bitboard tables.
 #[cfg(test)]
 fn attack_set_from_scan(board: &Board, from: Square, piece: Piece) -> Bitboard {
     let mut set = Bitboard::empty();
@@ -771,18 +593,14 @@ fn attack_set_from_scan(board: &Board, from: Square, piece: Piece) -> Bitboard {
 }
 
 /// The unit ray direction from `king` to `sq` when the two lie on one of the
-/// eight queen-lines, else `None`. Mirrors `Effect8::directions_of`. A table
-/// lookup into the precomputed [`crate::bitboard`] direction table, which
-/// `bitboard`'s tests pin exhaustively against the arithmetic derivation.
+/// eight queen-lines, else `None` (`Effect8::directions_of`).
 fn ray_dir(king: Square, sq: Square) -> Option<(i8, i8)> {
     crate::bitboard::ray_dir(king, sq)
 }
 
-/// The reference `aligned(s1, s2, ksq)` (`types.h`): are `s1` and `s2` on
-/// the same ray *emanating from* `ksq` — the same one of the eight directions,
-/// on the same side (a straight line passing through the king does not count)?
-/// Used to decide whether moving a pinned / blocking piece stays on its pin ray
-/// (so it neither exposes its own king nor un-blocks a discovered check).
+/// The reference `aligned(s1, s2, ksq)` (`types.h`): are `s1` and `s2` on the
+/// same ray *emanating from* `king`? A straight line passing through the king
+/// does not count — the two must be on the same side of it.
 fn aligned(king: Square, s1: Square, s2: Square) -> bool {
     match (ray_dir(king, s1), ray_dir(king, s2)) {
         (Some(a), Some(b)) => a == b,
@@ -791,11 +609,7 @@ fn aligned(king: Square, s1: Square, s2: Square) -> bool {
 }
 
 /// The reference `between_bb(a, b)`: the squares strictly between `a` and `b`
-/// when the two lie on one of the eight queen-lines, else empty. Endpoints are
-/// excluded. Used by [`Position::pseudo_legal`] to test whether an in-check move
-/// interposes on the checker's ray. A table lookup into the precomputed
-/// [`crate::bitboard`] between-table, which `bitboard`'s tests pin exhaustively
-/// against a per-call `step_signed` walk.
+/// when the two lie on one of the eight queen-lines, else empty.
 fn between_set(a: Square, b: Square) -> Bitboard {
     crate::bitboard::between(a, b)
 }
@@ -806,11 +620,9 @@ fn is_non_promotable_piece(pc: Piece) -> bool {
     pc.promoted || matches!(pc.kind, PieceKind::Gold | PieceKind::King)
 }
 
-/// The per-position-state check info cached on [`Position`], ported from the
-/// reference's `StateInfo::{checkSquares, blockersForKing}` (filled by
-/// `Position::set_check_info`). Recomputed wherever the state changes — see
-/// `Position::do_move` / `undo_move` / `refresh_keys` in `position.rs` — so the
-/// predicates that read it are constant-time.
+/// The per-position-state check info cached on [`Position`], ported from
+/// `StateInfo::{checkSquares, blockersForKing}`. Recomputed wherever the state
+/// changes, so the predicates that read it are constant-time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CheckInfo {
     /// The `board_key` this info was computed against; a debug guard against a
@@ -830,25 +642,16 @@ pub(crate) struct CheckInfo {
     /// `color`'s king. Indexed by [`Color::index`].
     blockers: [Bitboard; Color::COUNT],
     /// `pinners[color]`: the enemy sliders pinning a `color`-blocker to
-    /// `color`'s king. Indexed by [`Color::index`], mirroring the reference
-    /// `StateInfo::pinners[2]`. `slider_blockers(c)` returns
-    /// `(blockersForKing[c], pinners[~c])`, so the value returned alongside
-    /// `blockersForKing[c]` is stored at `pinners[~c]`.
+    /// `color`'s king. Indexed by [`Color::index`].
     pinners: [Bitboard; Color::COUNT],
     /// `checkersBB`: the squares of the enemy pieces giving check to the side to
-    /// move's king. Empty unless [`Self::in_check`]. Read by
-    /// [`Position::pseudo_legal`] to decide the single-checker interposition /
-    /// double-check rules the reference `pseudo_legal_s` applies.
+    /// move's king. Empty unless [`Self::in_check`].
     checkers: Bitboard,
 }
 
 impl CheckInfo {
-    /// The check info of the empty board (`board_key == 0`, no kings, no
-    /// attacks) — the value [`Position::empty`] seeds its `check_info` field
-    /// with. Matches `compute_check_info` on an empty board: both kings absent,
-    /// so every `check_squares` slot, both `blockers`/`pinners`, and `checkers`
-    /// are empty and `in_check` is false. Recomputed eagerly on the first state
-    /// change (SFEN parse via `refresh_keys`, or `do_move`).
+    /// The check info of the empty board — what [`Position::empty`] seeds its
+    /// `check_info` field with, recomputed on the first state change.
     pub(crate) const EMPTY: CheckInfo = CheckInfo {
         board_key: 0,
         enemy_king: None,
@@ -860,46 +663,33 @@ impl CheckInfo {
         checkers: Bitboard::EMPTY,
     };
 
-    /// The enemy (opponent-of-side-to-move) king square, if present. Equal to
-    /// `try_find_king(board, side_to_move.flip())`.
+    /// The enemy (opponent-of-side-to-move) king square, if present.
     pub(crate) fn enemy_king(&self) -> Option<Square> {
         self.enemy_king
     }
 
-    /// The side-to-move's own king square, if present. Equal to
-    /// `try_find_king(board, side_to_move)`.
+    /// The side-to-move's own king square, if present.
     pub(crate) fn own_king(&self) -> Option<Square> {
         self.own_king
     }
 
     /// `blockersForKing[color]`: the pieces singly blocking a slider check on
-    /// `color`'s king (the `.0` of [`crate::see::slider_blockers`]).
+    /// `color`'s king.
     pub(crate) fn blockers(&self, color: Color) -> Bitboard {
         self.blockers[color.index()]
     }
 
     /// `pinners[color]`: the enemy sliders pinning a `color`-blocker to
-    /// `color`'s king. `slider_blockers(c)` returns `pinners[~c]` as its `.1`,
-    /// so `pinners(c)` equals `slider_blockers(c.flip()).1`.
+    /// `color`'s king.
     pub(crate) fn pinners(&self, color: Color) -> Bitboard {
         self.pinners[color.index()]
     }
 }
 
-/// A by-value snapshot of a position's `checkSquares` table, the
-/// cross-crate analogue of the reference `StateInfo::checkSquares`. Copied out
-/// of the cached [`CheckInfo`] with a single `check_info()` borrow (mirroring
-/// how the SEE blockers/pinners were lifted out of the `Ref` guard), so the
-/// per-move direct-check test needs no `RefCell` borrow-flag check, no `Option`
-/// probe, and no `Position` access at all.
-///
-/// `checkSquares` is a pure function of the position, and the position is
-/// unchanged for a [`MovePicker`]'s entire lifetime (each subtree
-/// `do_move`/`undo_move` pair restores the board before the next scoring call),
-/// so a snapshot taken once at `QUIET_INIT` stage entry orders moves exactly as
-/// the reference's per-move `pos.check_squares(pt) & to` does (`movepick.cpp`)
-/// — the same output-equivalence argument documented for evaluating SEE at
-/// stage entry.
+/// A by-value snapshot of a position's `checkSquares` table, taken once so the
+/// per-move direct-check test touches no `Position`. `checkSquares` is a pure
+/// function of the position, and the position is unchanged for a `MovePicker`'s
+/// whole lifetime.
 #[derive(Clone, Copy, Debug)]
 pub struct CheckSquares {
     /// The snapshotted `checkSquares[pattern]` table, keyed by [`check_pattern`].
@@ -907,10 +697,8 @@ pub struct CheckSquares {
 }
 
 impl CheckSquares {
-    /// True iff `m` gives a **direct** check by the moved piece — identical to
-    /// [`Position::gives_direct_check`] but reading the snapshot table rather
-    /// than re-entering the lazy `check_info()` accessor: the exact reference
-    /// term `check_squares(type_of(moved_piece(m))) & to` (`movepick.cpp`).
+    /// True iff `m` gives a **direct** check by the moved piece —
+    /// [`Position::gives_direct_check`] read off the snapshot.
     pub fn gives_direct_check(&self, m: Move) -> bool {
         self.table[check_pattern(m.moved_piece_after())].test(m.to_sq())
     }
@@ -918,34 +706,23 @@ impl CheckSquares {
 
 impl Position {
     /// Compute this position's [`CheckInfo`] from scratch — the port of
-    /// `Position::set_check_info` (`position.cpp` ~242-284). Called once per
-    /// position state by the maintenance in `do_move` / `undo_move` /
-    /// `refresh_keys`; never on the per-move hot path.
-    /// Fully self-derived check info: `in_check` is probed from the board. Used
-    /// by the cold entry points (`set` / `refresh_keys` / direct setters / the
-    /// empty-stack undo fallback) that have no pre-computed check flag.
+    /// `Position::set_check_info` (`position.cpp`), with `in_check` probed from
+    /// the board. Called once per position state, never on the per-move path.
     pub(crate) fn compute_check_info(&self) -> CheckInfo {
         self.compute_check_info_impl(None, None)
     }
 
     /// Check info for the child position reached by a move whose check status is
     /// already known — `in_check` is taken from `gives_check` instead of a fresh
-    /// `is_attacked_by` probe (a null move injects `false`). The tables are built
-    /// exactly as [`Self::compute_check_info`]; only the `in_check` derivation is
-    /// replaced. A debug-only oracle pins the injected flag against the full
-    /// probe in the same one-directional style as the `do_move` `ASSERT_LV3`
-    /// mirror (`position.cpp`).
+    /// `is_attacked_by` probe (a null move injects `false`).
     pub(crate) fn compute_check_info_with_in_check(&self, in_check: bool) -> CheckInfo {
         self.compute_check_info_impl(Some(in_check), None)
     }
 
     /// Like [`Self::compute_check_info_with_in_check`], but the child
-    /// `checkersBB` is *also* supplied by the caller — built differentially from
-    /// the parent check info and the move (the reference's `do_move_impl`
-    /// `st->checkersBB` update, `position.cpp`) — instead of
-    /// re-derived here by a full reverse-attack probe. Used by the
-    /// `do_move_with_check` check-giving path; the caller owns the debug oracle
-    /// pinning the injected set against that probe.
+    /// `checkersBB` is also supplied by the caller — built differentially from
+    /// the parent check info and the move — instead of re-derived here by a full
+    /// reverse-attack probe.
     pub(crate) fn compute_check_info_with_in_check_and_checkers(
         &self,
         in_check: bool,
@@ -967,30 +744,15 @@ impl Position {
 
         // checkSquares[pt]: an enemy-coloured `pt` piece placed on the enemy
         // king attacks exactly the squares from which a side-to-move `pt` piece
-        // checks that king (attack reverse-symmetry). The sliders are computed
-        // once and HORSE / DRAGON derived from them (`HORSE = BISHOP | king
-        // ring`, `DRAGON = ROOK | king ring`, mirroring `set_check_info`), which
-        // avoids re-walking the bishop / rook rays. The promoted minors reuse
-        // the GOLD slot via [`check_pattern`], so only ten slots are stored.
+        // checks that king (attack reverse-symmetry).
         //
-        // Slot 9 (KING) holds the actual king ring rather than the reference's
-        // hard `0`: a king move can never be a *legal* check, but the ring keeps
-        // `gives_check` / `gives_direct_check` byte-identical to the
-        // scratch-scan oracle on every pseudo-legal king move the generators
-        // emit (a king stepping next to the enemy king is pseudo-legal though
-        // illegal). The pin zeroes it because such moves never reach
-        // `gives_check` in real search; this port preserves the oracle's
-        // observable behaviour instead — a deliberate, unobservable-in-legal-play
-        // deviation.
+        // The KING slot holds the actual king ring where the reference has a
+        // hard `0`. A king move is never a legal check, so the two agree in real
+        // search, but the ring also matches the scratch-scan oracle on the
+        // pseudo-legal king steps the generators emit next to the enemy king.
         let occ = board.occupied();
         let mut check_squares = [Bitboard::EMPTY; CHECK_PATTERN_COUNT];
         if let Some(eks) = enemy_king {
-            // Call the effect primitives directly with the constant piece kinds,
-            // mirroring the reference `set_check_info` (`position.cpp`)
-            // — bit-identical to an `attacks_bb(eks, Piece { kind, … })`
-            // per-kind dispatch (these are the exact match arms `attacks_bb`
-            // selects for each constant kind/promoted), but straight-line with no
-            // shared-symbol re-dispatch on every call.
             use crate::bitboard::{
                 bishop_attacks, gold_attacks, king_attacks, knight_attacks, lance_attacks,
                 pawn_attacks, rook_attacks, silver_attacks,
@@ -1017,12 +779,8 @@ impl Position {
             check_squares[check_pattern(Piece::new(PieceKind::King, enemy))] = king_ring;
         }
 
-        // blockersForKing[c] and pinners[~c] for both kings — reused from the
-        // SEE module. `slider_blockers(c)` returns `(blockersForKing[c],
-        // pinners[~c])`, so the pinners half from `slider_blockers(Black)` is
-        // `pinners[White]` and vice versa (mirroring the reference StateInfo,
-        // which holds `blockersForKing[2]` and `pinners[2]`). `see_ge` /
-        // `legal_drop` read both halves back from here instead of recomputing.
+        // `slider_blockers(c)` returns `(blockersForKing[c], pinners[~c])`, so
+        // the pinners half from `slider_blockers(Black)` is `pinners[White]`.
         let (blk_black, pin_white) = crate::see::slider_blockers(board, Color::Black);
         let (blk_white, pin_black) = crate::see::slider_blockers(board, Color::White);
         let mut blockers = [Bitboard::EMPTY; Color::COUNT];
@@ -1032,14 +790,10 @@ impl Position {
         pinners[Color::Black.index()] = pin_black;
         pinners[Color::White.index()] = pin_white;
 
-        // `in_check` for the side to move. The cold path probes it from the
-        // board; the do_move path injects the caller's `gives_check` (equal to
-        // this probe in legal play, since a move gives check iff the resulting
-        // side to move is in check). The debug-only oracle is one-directional
-        // for the same reason the `do_move` `ASSERT_LV3` mirror is: a claimed
-        // check must be a real check, but the reverse legitimately differs on
-        // the illegal scratch / fixture positions where the side to move was
-        // already in check before the move that reached here.
+        // The debug oracle is one-directional: a claimed check must be a real
+        // check, but the reverse legitimately differs on the illegal scratch and
+        // fixture positions where the side to move was already in check before
+        // the move that reached here.
         let in_check = match injected_in_check {
             Some(v) => {
                 #[cfg(debug_assertions)]
@@ -1056,13 +810,7 @@ impl Position {
             None => own_king.is_some_and(|k| is_attacked_by(board, k, enemy)),
         };
 
-        // `checkersBB`: only meaningful (and only needed by `pseudo_legal`) when
-        // the side to move is in check. The `do_move_with_check` check-giving
-        // path supplies it pre-built (differentially, from the parent info + the
-        // move — the reference's `do_move_impl` update), so the full probe is
-        // skipped there. Cold entry points inject nothing and fall back to the
-        // reverse-attack lookup from the king square (`attackers_bb`), gated on
-        // `in_check` so the common not-in-check path stays a no-op.
+        // `checkersBB` is only meaningful when the side to move is in check.
         let checkers = match injected_checkers {
             Some(c) => c,
             None => {
@@ -1087,30 +835,11 @@ impl Position {
         }
     }
 
-    /// Build the child state's `checkersBB` differentially from the PARENT check
-    /// info (`parent`) and the move just played, mirroring the reference
-    /// `do_move_impl` (`position.cpp` — board moves, then drops).
-    /// Called only on the `gives_check` path, with `self` already advanced to
-    /// the post-move position (board and side final) but `parent` still the
-    /// pre-move check info — whose `enemy_king` / `check_squares` / `blockers`
-    /// describe the mover's frame (`mover` = the side that just moved, `Us` in
-    /// the reference; its `blockers[~mover]` = `blockersForKing[them]`).
-    ///
-    /// * **Direct part**: `{to}` iff `to` lies in the parent's
-    ///   `check_squares[check_pattern(moved_piece_after)]` — the identical test
-    ///   the [`Position::gives_check`] predicate performs
-    ///   (`prevSt->checkSquares[type_of(moved_after_pc)] & to`), KING-slot
-    ///   semantics included, so the built set matches `attackers_bb` on every
-    ///   position real search reaches.
-    /// * **Discovered part** (board moves only): iff the from-square singly
-    ///   blocks one of the mover's sliders aimed at the enemy king
-    ///   (`blockersForKing[them] & from`) and the move leaves that ray
-    ///   (`!aligned`), add the revealed slider — the first mover piece on the
-    ///   enemy-king→from ray over the POST-move occupancy. The reference walks
-    ///   `directEffect(from, direct_of(ksq, from), pieces())` from `from` away
-    ///   from the king; equivalently, the occupancy-limited slider attack *from*
-    ///   the king (the between-squares are empty because `from` was the sole
-    ///   blocker) restricted to that single ray finds the same square.
+    /// Build the child state's `checkersBB` differentially from the parent check
+    /// info and the move just played, mirroring `do_move_impl`
+    /// (`position.cpp`). `self` is already advanced to the post-move position
+    /// while `parent` is still the pre-move info, so `parent`'s `enemy_king` /
+    /// `check_squares` / `blockers` describe `mover`'s frame.
     pub(crate) fn differential_child_checkers(
         &self,
         m: Move,
@@ -1151,58 +880,33 @@ impl Position {
         checkers
     }
 
-    /// True iff the side to move's king is currently attacked — the reference's
-    /// `Position::in_check()`. Used by the `MovePicker` constructor to pick
-    /// between the capture and evasion stages.
-    ///
-    /// Reads the per-state check info: the search calls this once at node entry
-    /// (before any per-move predicate), so it warms the cache the `is_legal` /
-    /// `gives_check` / `gives_direct_check` calls at that node then reuse.
+    /// True iff the side to move's king is currently attacked
+    /// (`Position::in_check`).
     pub fn in_check(&self) -> bool {
         self.check_info().in_check
     }
 
     /// True iff `sq` is attacked by any piece of `attacker`, with `discount`
-    /// treated as empty — the reference's `effected_to(attacker, sq, discount)`
-    /// (`position.h`), used by the try-rule entering-king declaration.
+    /// treated as empty — `effected_to(attacker, sq, discount)` (`position.h`).
     ///
-    /// Removing `discount` from the occupancy models the moving king vacating
-    /// its from-square: it both drops the king itself as a (would-be) defender
-    /// and reveals any enemy slider the king was blocking. `discount == sq` is
-    /// harmless — an enemy piece already on the try square is a capture target,
-    /// not a defender, and clearing it only prevents it from "attacking itself".
+    /// Removing `discount` models the moving king vacating its from-square: it
+    /// drops the king as a defender and reveals any enemy slider the king was
+    /// blocking.
     pub fn is_attacked_discounting(&self, sq: Square, attacker: Color, discount: Square) -> bool {
         let mut board = *self.board();
         board.set(discount, None);
         is_attacked_by(&board, sq, attacker)
     }
 
-    /// True iff playing `m` would leave the opponent's king in check — the
-    /// reference's `Position::gives_check(m)` (direct checks, discovered
-    /// checks, and checking drops). Faithful to the definition "a move that
-    /// leaves the opponent king in check": `m` is applied to a scratch board
-    /// and the opponent king is tested against the full attacker scan, so a
-    /// slider uncovered by the move (discovered check) is detected the same way
-    /// as a piece that directly attacks the king.
-    ///
-    /// Matches, by construction, the post-`do_move` `gives_check` flag recorded
-    /// on the move history (both decide the same predicate); that flag is the
-    /// oracle the unit test checks this against. If `m` captures the opponent's
-    /// king (a pseudo-legal probe move, never a real move) there is no king to
+    /// True iff playing `m` would leave the opponent's king in check —
+    /// `Position::gives_check` (`position.cpp`), covering direct checks,
+    /// discovered checks and checking drops. If `m` captures the opponent's king
+    /// — a pseudo-legal probe move, never a real one — there is no king left to
     /// check and the result is `false`.
-    ///
-    /// Ported to the reference's constant-time form (`position.cpp`):
-    /// a **direct** check iff the moved piece's destination lies in
-    /// `checkSquares[type_of(moved_piece_after(m))]`; else, for a board move, a
-    /// **discovered** check iff the from-square singly blocks one of our sliders
-    /// aimed at the enemy king (`blockersForKing(~stm) & from`) and the move does
-    /// not slide along that ray (`!aligned(from, to, enemy_king)`).
     pub fn gives_check(&self, m: Move) -> bool {
         let ci = self.check_info();
         let to = m.to_sq();
 
-        // Capturing the enemy king (a pseudo-legal probe move only) leaves no
-        // king to check — the scratch-board oracle finds no enemy king here.
         if ci.enemy_king == Some(to) {
             return false;
         }
@@ -1226,102 +930,34 @@ impl Position {
         ci.blockers[enemy.index()].test(from) && !aligned(eks, from, to)
     }
 
-    /// True iff `m` gives a **direct** check by the moved piece — the reference
-    /// main-search quiet-ordering term `check_squares(type_of(moved_piece(m))) &
-    /// to` (`movepick.cpp`).
-    ///
-    /// The reference precomputes, per position, `checkSquares[pt]` = the squares
-    /// from which a `pt` piece of the side to move attacks the enemy king under
-    /// the *current* occupancy (`position.cpp`), then ANDs it with the
-    /// move's destination. This reproduces that pointwise: a piece of type
-    /// `moved_piece_after(m)` (the after-promotion piece — the reference's
-    /// `pos.moved_piece(m)`) is imagined on `to`, and it checks iff the enemy
-    /// king lies on one of its steps, or on a slider ray from `to` unobstructed
-    /// by the current board. Like `checkSquares`, this is computed against the
-    /// occupancy *before* the move (the mover still on `from`), so a slider
-    /// whose own vacated `from` square lay on the ray is not counted — matching
-    /// the reference's approximation. Discovered checks are deliberately *not*
-    /// detected (they are not direct checks). Used only to score quiet moves, so
-    /// `to` is empty; a drop's dropped piece is handled the same way.
-    ///
-    /// Now a single lookup into the cached `checkSquares` — the exact
-    /// `check_squares(type_of(moved_piece(m))) & to` term (`movepick.cpp`).
+    /// True iff `m` gives a **direct** check by the moved piece — the
+    /// quiet-ordering term `check_squares(type_of(moved_piece(m))) & to`
+    /// (`movepick.cpp`). Computed against the occupancy *before* the move, so a
+    /// slider whose vacated from-square lay on the ray does not count, and
+    /// discovered checks are not detected.
     pub fn gives_direct_check(&self, m: Move) -> bool {
         let ci = self.check_info();
         ci.check_squares[check_pattern(m.moved_piece_after())].test(m.to_sq())
     }
 
-    /// Snapshot the cached `checkSquares` table by value into a [`CheckSquares`]
-    /// — one `check_info()` borrow, no `Position` access
-    /// thereafter. Taken once at the picker's `QUIET_INIT` stage entry so the
-    /// per-quiet check bonus becomes a bare table lookup
-    /// ([`CheckSquares::gives_direct_check`]) instead of re-entering the lazy
-    /// `RefCell` accessor per scored move — the reference reads the precomputed
-    /// `StateInfo::checkSquares` field with the same zero ceremony
-    /// (`movepick.cpp`). See [`CheckSquares`] for the output-equivalence
-    /// argument.
+    /// Snapshot the cached `checkSquares` table by value into a
+    /// [`CheckSquares`].
     pub fn check_squares(&self) -> CheckSquares {
         CheckSquares {
             table: self.check_info().check_squares,
         }
     }
 
-    /// True iff `m` is legal for the side to move in the sense the reference
-    /// qsearch uses (`pos.legal(m)`): after the move, the mover's own king is
-    /// not left in check. This covers moving a pinned piece off its pin ray and
-    /// a king stepping into an attacked square.
+    /// True iff `m` leaves the mover's own king out of check — the reference
+    /// `Position::legal` (`position.cpp`). Repetition-blind, like the reference;
+    /// uchifuzume is enforced at generation instead, so no drop-pawn-mate ever
+    /// reaches this predicate.
     ///
-    /// It is repetition-blind — no perpetual-check or sennichite term, exactly
-    /// like the reference search-move generators (`MoveList`) and the
-    /// [`Position::generate_legal_all`] list built on them. The uchifuzume
-    /// (drop-pawn-mate) rule, however, *is* enforced — but at
-    /// generation, inside [`Position::generate_evasions`] /
-    /// [`Position::generate_captures`] (captures carry no drops), exactly as the
-    /// reference's `GenerateDropMoves` does; so no uchifuzume move ever reaches
-    /// this predicate.
-    ///
-    /// # Structure (reference `Position::legal`, `position.cpp`)
-    ///
-    /// This is now the pin's O(1), board-mutation-free `legal` — the same three
-    /// arms in and out of check (the reference has no in-check special case):
-    ///
-    /// * **King move** — legal iff the destination is unattacked with the king's
-    ///   from-square vacated (`!effected_to(~us, to, from)`), i.e.
-    ///   [`Position::is_attacked_discounting`]. Valid in and out of check.
-    /// * **Drop** — legal (`return true`). A drop adds a piece and can never
-    ///   expose the own king. When in check this leans on the entry contract:
-    ///   the restricted [`Position::generate_evasions`] only emits interposition
-    ///   drops, and [`Position::pseudo_legal`] (`pseudo_legal_s`) rejects any
-    ///   other in-check drop (single-checker interposition only; every drop
-    ///   under double check), so every drop reaching here already resolves the
-    ///   check.
-    /// * **Other board move** — legal iff the moving piece does not singly block
-    ///   a slider aimed at the own king, or it slides along that ray
-    ///   (`!(blockersForKing(us) & from) || aligned(from, to, own_king)`). When
-    ///   in check this again leans on the contract: generation (and
-    ///   `pseudo_legal_s` for a TT candidate) restricts an in-check board move to
-    ///   capture-the-checker-or-interpose, so the only remaining way it can be
-    ///   illegal is by leaving a pin ray — exactly this pinned-blocker test.
-    ///
-    /// # Contract (audited call sites)
-    ///
-    /// The argument must come from one of the search move generators for the
+    /// **Contract.** `m` must come from a search move generator matching the
     /// current check state (evasions when in check, captures / quiets /
-    /// non-evasions when not), or have passed [`Position::pseudo_legal`]. Every
-    /// non-test caller honours this:
-    ///
-    /// * `MovePicker` (`movepick.rs`): the capture/evasion and quiet stages emit
-    ///   only their generators' moves (evasions when `in_check`); the TT and
-    ///   probcut stages gate on `pseudo_legal` first. The quiet stages run only
-    ///   when not in check.
-    /// * `generate_root_moves` (`root.rs`): evasions when in check, else
-    ///   non-evasions.
-    /// * `qsearch` PV / probcut (`qsearch.rs`): PV extension gates on
-    ///   `pseudo_legal`; probcut is skipped in check (Steps 6b–11 are bypassed
-    ///   when `in_check`), so its moves are the not-in-check capture generator's.
-    ///
-    /// No non-test caller can hand this predicate an in-check move that neither
-    /// resolves the check nor passed `pseudo_legal`.
+    /// non-evasions when not), or have passed [`Position::pseudo_legal`]. Both
+    /// restrict an in-check move to capture-the-checker-or-interpose, which is
+    /// what lets the drop and board-move arms below skip re-testing that.
     pub fn is_legal(&self, m: Move) -> bool {
         let us = self.side_to_move();
 
@@ -1330,15 +966,13 @@ impl Position {
             return !self.is_attacked_discounting(m.to_sq(), us.flip(), m.from_sq());
         }
 
-        // A drop adds a piece and can never expose the king. In check this holds
-        // by the entry contract (only interposition drops reach here).
+        // A drop adds a piece and can never expose the king.
         if m.is_drop() {
             return true;
         }
 
         // A board move exposes the king only by moving a sole slider-blocker
-        // off its pin ray. In check the destination is contract-restricted to
-        // capture-or-interpose, so this pin test is the only remaining illegality.
+        // off its pin ray.
         let (own_king, pinned) = {
             let ci = self.check_info();
             (ci.own_king, ci.blockers[us.index()])
@@ -1352,10 +986,7 @@ impl Position {
     }
 
     /// True iff playing `m` leaves the side to move's own king unattacked — a
-    /// copy-apply-scan `is_legal`, kept purely as a `#[cfg(test)]`
-    /// equivalence oracle (the restricted-evasion sequence gate filters the
-    /// unrestricted oracle twin with it, and the predicate-equivalence gate pins
-    /// `is_legal` against [`Self::is_legal_reference`], its verbatim copy).
+    /// copy-apply-scan form of [`Self::is_legal`].
     #[cfg(test)]
     fn leaves_own_king_safe(&self, m: Move) -> bool {
         let mover = self.side_to_move();
@@ -1367,54 +998,35 @@ impl Position {
         }
     }
 
-    /// Widen a stored 16-bit TT fragment into a full [`Move`] in **O(1)** — the
-    /// reference `Position::to_move(Move16)` (`position.cpp`). This
-    /// attaches the moving-piece bits the `move16` layout drops, without
-    /// generating any move list and without proving
-    /// legality (that is [`Self::pseudo_legal`] + [`Self::is_legal`]'s job).
+    /// Widen a stored 16-bit TT fragment into a full [`Move`] — the reference
+    /// `Position::to_move(Move16)` (`position.cpp`). Attaches the moving-piece
+    /// bits the `move16` layout drops; it does not prove legality.
     ///
-    /// * `MOVE_NONE` (fragment `0`) → `None`.
-    /// * A non-`is_ok` fragment (`MOVE_WIN` / from == to) → returned verbatim as
-    ///   `Some`, mirroring the pin's `if (!m.is_ok()) return m;`. It is never a
-    ///   legal move, so [`Self::pseudo_legal`] rejects it downstream; keeping it
-    ///   `Some` (rather than folding it to `None`) matches the pin's
-    ///   `ttData.move` being non-`MOVE_NONE` for such a value, so the search's
-    ///   `tt_move.is_none()` gates agree with the reference `!ttData.move`.
-    /// * A drop attaches `make_piece(stm, dropped)`; a board move requires
-    ///   `piece_on(from)` to be the mover's own piece (else `None`); a promotion
-    ///   of a non-promotable piece yields `None`, else the promoted piece is
-    ///   attached.
+    /// A non-`is_ok` fragment (`MOVE_WIN`, `from == to`) comes back verbatim as
+    /// `Some` rather than folding to `None`, so the search's `tt_move.is_none()`
+    /// gates agree with the reference's `!ttData.move`.
     ///
-    /// **Totality.** The pin trusts the stored dropped-piece bits ("we wrote
-    /// them"); this engine's TT admits torn fragments, so this stays total —
-    /// an out-of-range dropped-piece field returns `None` instead of indexing a
-    /// table or panicking. Every returned `Move` is well-formed (built through
-    /// the `Move` constructors), so [`Move::moved_piece_after`] on the result
-    /// never panics.
+    /// The TT admits torn fragments, so unlike the reference this is total: an
+    /// out-of-range field returns `None` rather than indexing a table.
     pub fn to_move(&self, m16: u16) -> Option<Move> {
         if m16 == 0 {
             return None;
         }
         let m = Move::from_bits(m16 as u32);
         if !m.is_ok() {
-            // MOVE_WIN / MOVE_NULL / a from == to fragment: the pin returns the
-            // move unchanged and lets `pseudo_legal` reject it.
             return Some(m);
         }
         let stm = self.side_to_move();
 
-        // Totality: a torn fragment can carry a to-square in 81..127, which
-        // `Move::to_sq` would panic on — validate it up front.
+        // A torn fragment can carry a to-square in 81..127, which `Move::to_sq`
+        // would panic on.
         let to = Square::from_index((m16 & 0x7f) as u8)?;
 
         if m.is_drop() {
-            // Totality: an out-of-range dropped-piece field is not a real drop.
             let kind = m.dropped_piece_kind_checked()?;
             return Some(Move::make_drop(kind, stm, to));
         }
 
-        // Board move: the from-square must be on the board and hold the mover's
-        // own piece.
         let from = Square::from_index(((m16 >> 7) & 0x7f) as u8)?;
         let moved = self.board().get(from)?;
         if moved.color != stm {
@@ -1429,25 +1041,16 @@ impl Position {
         Some(Move::make(from, to, moved))
     }
 
-    /// True iff `m` is pseudo-legal for the side to move — the reference
-    /// `Position::pseudo_legal(m, generate_all_legal_moves)` =
-    /// `pseudo_legal_s<All>` (`position.cpp`). Pseudo-legal allows a
-    /// king-suicide (that is [`Self::is_legal`]'s job); it is the pre-`do_move`
-    /// guard for a TT / killer move, deciding whether the fragment is even
-    /// well-shaped for this position.
+    /// True iff `m` is pseudo-legal for the side to move — `pseudo_legal_s<All>`
+    /// (`position.cpp`). Pseudo-legal still allows a king suicide; it is the
+    /// pre-`do_move` guard for a TT or killer move, deciding whether the
+    /// fragment is even well-shaped for this position.
     ///
-    /// `all` is the per-`go` `GenerateAllLegalMoves` flag: with `all == false`
-    /// the generator's non-promotion bans apply (a pawn/bishop/rook must promote
-    /// when touching the enemy field, a lance must promote into the enemy first
-    /// two ranks); with `all == true` only the cannot-move-otherwise bans remain
-    /// (a pawn/lance may not sit on the last rank un-promoted).
-    ///
-    /// Guaranteed to return `false` for a non-`is_ok` move (`MOVE_WIN` etc.),
-    /// mirroring the pin's contract, and total (never panics) on any well-formed
-    /// move produced by [`Self::to_move`] or the generators.
+    /// `all` is the `GenerateAllLegalMoves` flag, widening which non-promotions
+    /// are banned. Always `false` for a non-`is_ok` move, and total on any
+    /// well-formed move.
     pub fn pseudo_legal(&self, m: Move, all: bool) -> bool {
-        // The pin guarantees `pseudo_legal(m) == false` for `!is_ok(m)`; this
-        // also keeps `moved_piece_after` below off the sentinel bit patterns.
+        // Also keeps `moved_piece_after` below off the sentinel bit patterns.
         if !m.is_ok() {
             return false;
         }
@@ -1460,11 +1063,9 @@ impl Position {
                 Some(k) => k,
                 None => return false,
             };
-            // The stored after-move piece must be `make_piece(us, pr)`.
             if m.moved_piece_after() != Piece::new(pr, us) {
                 return false;
             }
-            // The target must be empty and the piece held in hand.
             if board.get(to).is_some() || self.hand(us).count(pr) == 0 {
                 return false;
             }
@@ -1487,20 +1088,16 @@ impl Position {
                     return false;
                 }
             }
-            // A pawn drop must pass the nifu + drop-pawn-mate predicate.
             if pr == PieceKind::Pawn && !self.legal_pawn_drop(us, to) {
                 return false;
             }
             return true;
         }
 
-        // Board move.
         let pc = match board.get(m.from_sq()) {
             Some(p) if p.color == us => p,
             _ => return false,
         };
-        // `to` must be reachable by `pc` from `from` under the current occupancy
-        // (`effects_from`), and must not hold one of our own pieces.
         if !attacks_bb(m.from_sq(), pc, board.occupied()).test(to) {
             return false;
         }
@@ -1560,9 +1157,7 @@ impl Position {
             }
         }
 
-        // In check with a non-king mover: reject double check; else the move must
-        // capture the checker or interpose on its ray. King moves fall through —
-        // their suicide check is [`Self::is_legal`]'s job.
+        // King moves fall through: their suicide check is [`Self::is_legal`]'s.
         if pc.kind != PieceKind::King {
             let (in_check, checkers, own_king) = {
                 let ci = self.check_info();
@@ -1621,10 +1216,9 @@ impl Position {
         true
     }
 
-    /// Append the reference-ordered pseudo-legal `CAPTURES` candidates (see the
-    /// module docs) to `out`. Piece-type-major, ascending from- then to-square,
-    /// with the `make_move_target` promotion/non-promotion rules; no drops.
-    /// The caller filters legality with [`Position::is_legal`].
+    /// Append the pseudo-legal `CAPTURES` candidates to `out`
+    /// (`generate_general<CAPTURES>`, `movegen.cpp`). No drops, and no
+    /// non-capturing pawn promotion — that is `CAPTURES_PRO_PLUS`.
     pub fn generate_captures(&self, all: bool, out: &mut Vec<ExtMove>) {
         let board = self.board();
         let stm = self.side_to_move();
@@ -1636,20 +1230,11 @@ impl Position {
         emit_group::<GoldHdkG<true>>(board, stm, Target::Captures, all, out);
     }
 
-    /// Append the reference-ordered pseudo-legal `QUIETS` candidates to `out`:
-    /// non-capturing piece moves (every side-to-move piece to an empty square,
-    /// same piece-type-major order and `make_move_target` promotion rules as
-    /// [`Position::generate_captures`], with the gold-group including the king),
-    /// then every pseudo-legal drop on an empty square. This is
-    /// `generate_general<QUIETS, Us, false>` at the pin (`movegen.cpp`):
-    /// the move target is `pos.empties()` and the drop target is `pos.empties()`.
-    /// The caller filters legality with [`Position::is_legal`].
-    ///
-    /// Non-capturing pawn promotions (a pawn pushing into the enemy field onto
-    /// an empty square) belong here, not to `generate_captures`: at the pin the
-    /// main-search capture stage uses plain `CAPTURES` (target `pieces(Them)`),
-    /// not `CAPTURES_PRO_PLUS`, so the two generators partition the destinations
-    /// (enemy vs empty) with no overlap.
+    /// Append the pseudo-legal `QUIETS` candidates to `out`
+    /// (`generate_general<QUIETS>`, `movegen.cpp`) — piece moves onto empty
+    /// squares, then every drop. Non-capturing pawn promotions belong here, not
+    /// to [`Position::generate_captures`], so the two generators partition the
+    /// destinations with no overlap.
     pub fn generate_quiets(&self, all: bool, out: &mut Vec<ExtMove>) {
         let board = self.board();
         let stm = self.side_to_move();
@@ -1662,16 +1247,13 @@ impl Position {
         self.emit_drops(out);
     }
 
-    /// Append the reference-ordered pseudo-legal `EVASIONS` candidates (see the
-    /// module docs) to `out`: king moves first, then — on a single check — the
-    /// non-king piece moves (gold-group excluding the king) restricted to
-    /// capture-or-interpose, then interposition drops. The caller filters
-    /// legality with [`Position::is_legal`], which removes the remaining suicide
-    /// king steps.
+    /// Append the pseudo-legal `EVASIONS` candidates to `out`
+    /// (`generate_evasions`, `movegen.cpp`): king moves first, then — on a
+    /// single check — the non-king moves restricted to capture-or-interpose,
+    /// then interposition drops. [`Position::is_legal`] removes the remaining
+    /// suicide king steps.
     ///
-    /// **Entry contract:** the side to move is in check (the reference
-    /// `generate_evasions` asserts `pos.in_check()`). The `MovePicker` /
-    /// `generate_root_moves` only call this when [`Position::in_check`] holds.
+    /// **Entry contract:** the side to move is in check.
     pub fn generate_evasions(&self, all: bool, out: &mut Vec<ExtMove>) {
         let board = self.board();
         let stm = self.side_to_move();
@@ -1691,9 +1273,11 @@ impl Position {
         let king = board.get(ksq).unwrap();
 
         // sliderAttacks: the union of every checker's attack rays, so the king
-        // cannot step onto a still-attacked square (movegen.cpp). Under
-        // the *current* occupancy (king in) rather than the pin's king-removed
-        // occupancy — an output-preserving deviation, see the module docs.
+        // cannot step onto a still-attacked square. Accumulated under the
+        // current occupancy rather than the reference's king-removed one, so a
+        // ray stops at the king and the square directly behind it survives this
+        // mask; that step is a suicide, which `is_legal` rejects anyway, leaving
+        // both forms with the same legal king moves in the same order.
         let occ = board.occupied();
         let mut slider_attacks = Bitboard::empty();
         for checksq in checkers.squares() {
@@ -1703,19 +1287,16 @@ impl Position {
             slider_attacks |= attacks_bb(checksq, cp, occ);
         }
 
-        // King moves first: king steps onto neither own pieces nor sliderAttacks
-        // (movegen.cpp). Ascending square order.
         let king_targets = reachable(board, ksq, king, Target::BlockOrCapture) & !slider_attacks;
         for to in king_targets.squares() {
             push_plain(ksq, to, king, out);
         }
 
-        // Double check: only king moves evade (movegen.cpp).
+        // Double check: only king moves evade.
         if checkers.popcount() >= 2 {
             return;
         }
 
-        // Single check: capture the checker or interpose (movegen.cpp).
         let checksq = checkers
             .squares()
             .next()
@@ -1723,8 +1304,7 @@ impl Position {
         let target1 = crate::bitboard::between(checksq, ksq); // interposition squares
         let target2 = target1 | Bitboard::from_square(checksq); // + capture the checker
 
-        // Non-king piece moves, same order as CAPTURES but the gold-group
-        // excludes the king, masked to target2.
+        // The gold group excludes the king, which was emitted above.
         emit_group_masked::<PawnG>(board, stm, Target::BlockOrCapture, target2, all, out);
         emit_group_masked::<LanceG>(board, stm, Target::BlockOrCapture, target2, all, out);
         emit_group_masked::<KnightG>(board, stm, Target::BlockOrCapture, target2, all, out);
@@ -1732,30 +1312,15 @@ impl Position {
         emit_group_masked::<BishopRookG>(board, stm, Target::BlockOrCapture, target2, all, out);
         emit_group_masked::<GoldHdkG<false>>(board, stm, Target::BlockOrCapture, target2, all, out);
 
-        // Interposition drops last, masked to target1 (movegen.cpp).
         self.emit_drops_masked(target1, out);
     }
 
-    /// Append the reference-ordered pseudo-legal `NON_EVASIONS` candidates to
-    /// `out` — `generate_general<NON_EVASIONS, Us, false>` at the pin
-    /// (`movegen.cpp`). This is the generator behind `MoveList<LEGAL>`
-    /// for a not-in-check position (`movegen.cpp`), and thus the source of
-    /// the root-move list the depth-1 root search consumes.
-    ///
-    /// The single move target is `~pos.pieces(Us)` (empty *and* enemy squares
-    /// together, i.e. [`Target::BlockOrCapture`]), so — unlike the
-    /// captures/quiets split — captures and quiets are **interleaved per piece
-    /// and per destination square**: each side-to-move piece (in the
-    /// [`Position::generate_captures`] piece-type order, gold-group *including*
-    /// the king) emits all of its reachable squares in ascending order,
-    /// whatever they hold, with the `make_move_target` promotion suppression.
-    /// Drops (on empty squares) come last, in the shared `emit_drops` order.
-    ///
-    /// The moves are pseudo-legal; the caller filters king-safety with
-    /// [`Position::is_legal`]. Reproducing the interleaved order (rather than
-    /// concatenating `generate_captures` then `generate_quiets`, which would put
-    /// every capture ahead of every quiet) is what makes the *first* legal move
-    /// — the root search's TT move — match the reference.
+    /// Append the pseudo-legal `NON_EVASIONS` candidates to `out`
+    /// (`generate_general<NON_EVASIONS>`, `movegen.cpp`). The single target
+    /// `~pieces(Us)` interleaves captures and quiets per piece and per
+    /// destination; concatenating [`Position::generate_captures`] and
+    /// [`Position::generate_quiets`] would put every capture first and change
+    /// which move the root search sees as its first legal one.
     pub fn generate_non_evasions(&self, all: bool, out: &mut Vec<ExtMove>) {
         let board = self.board();
         let stm = self.side_to_move();
@@ -1768,25 +1333,13 @@ impl Position {
         self.emit_drops(out);
     }
 
-    /// Append every legal move for the side to move to `out`, stripped from
-    /// `ExtMove` to bare [`Move`]. The buffer is **not** cleared first (the
-    /// caller may pre-allocate or reuse it across calls) — the same contract the
-    /// former `Position::generate_legal_moves` exposed.
+    /// Append every legal move for the side to move to `out` — the reference
+    /// `generate<LEGAL_ALL>` (`movegen.cpp`). The buffer is **not** cleared
+    /// first, so a caller may reuse it across calls.
     ///
-    /// This is exactly the reference `generate<LEGAL_ALL>`
-    /// (`source/movegen.cpp`): pick the check-state
-    /// generator (evasions when [`Position::in_check`], else non-evasions) with
-    /// the `All == true` flag, then drop every candidate failing
-    /// [`Position::is_legal`]. The `is_legal` entry contract
-    /// (check-state-appropriate generator output) is satisfied by construction.
-    ///
-    /// **Repetition-blind**, exactly like the reference: there is no sennichite
-    /// or perpetual-check (連続王手の千日手) term. Plain 4-fold makes the *game*
-    /// drawn, not the move illegal, and a perpetual-check repetition is scored
-    /// by the search (and adjudicated by the server in real games), never
-    /// removed here. Uchifuzume (打ち歩詰め) and nifu (二歩) are excluded at
-    /// drop-generation time inside the generators (mirroring the reference
-    /// `GenerateDropMoves` / `legal_drop`), so they never reach `is_legal`.
+    /// Repetition-blind, like the reference: a repetition makes the game drawn
+    /// rather than the move illegal, and the search scores it. Uchifuzume and
+    /// nifu are excluded at drop generation instead.
     pub fn generate_legal_all(&self, out: &mut Vec<Move>) {
         let mut buf: Vec<ExtMove> = Vec::with_capacity(64);
         if self.in_check() {
@@ -1801,25 +1354,16 @@ impl Position {
         }
     }
 
-    /// Emit the pseudo-legal drops on empty squares in the reference
-    /// `GenerateDropMoves` order (`movegen.cpp`): pawn drops (ascending
-    /// square) first, then the other kinds in rank bands. Shared by
-    /// [`Position::generate_evasions`] (where the caller's legality filter keeps
-    /// only the check-blocking drops) and [`Position::generate_quiets`] (where
-    /// every drop is a genuine quiet); the reference passes `pos.empties()` as
-    /// the drop target in both the `EVASIONS` and `QUIETS` paths, so the same
-    /// nifu / last-rank / uchifuzume-filtered generation serves both.
+    /// Emit the pseudo-legal drops on empty squares in `GenerateDropMoves` order
+    /// (`movegen.cpp`): pawn drops first, then the other kinds in rank bands.
     fn emit_drops(&self, out: &mut Vec<ExtMove>) {
         self.emit_drops_masked(ALL_SQUARES, out);
     }
 
     /// [`Position::emit_drops`] with the empty-square drop target additionally
-    /// intersected with `restrict` — the reference `target1` (interposition
-    /// squares only) the evasion generator threads in (`movegen.cpp`). The
-    /// quiets / non-evasions paths pass [`ALL_SQUARES`], an identity
-    /// intersection. Because `restrict` only removes candidate squares, the
-    /// emitted drops stay a subsequence of the unrestricted emission, preserving
-    /// the reference rank-band order.
+    /// intersected with `restrict` — the reference `target1` the evasion
+    /// generator threads in. Because `restrict` only removes squares, the
+    /// emission stays a subsequence of the unrestricted one.
     fn emit_drops_masked(&self, restrict: Bitboard, out: &mut Vec<ExtMove>) {
         use crate::bitboard::rank_mask;
 
@@ -1827,42 +1371,27 @@ impl Position {
         let stm = self.side_to_move();
         let hand = self.hand(stm);
 
-        // Base droppable target: the restriction intersected with the empty
-        // squares. Every drop pass narrows this further; popping a resulting
-        // bitboard yields ascending square indices — the same sequence the
-        // former 81-square scan walked (`movegen.cpp` drives the whole
-        // `GenerateDropMoves` off bitboards this way).
         let base = restrict & !board.occupied();
 
         let (back_rank, second_rank): (u8, u8) = if stm == Color::Black { (0, 1) } else { (8, 7) };
 
-        // --- Pawn drops: empty, not the last rank, not a nifu file, and not
-        // uchifuzume (打ち歩詰め). A dropped pawn checks only the single square
-        // directly ahead of it, so the *only* drop square that can be
-        // pawn-drop-mate is the one from which our pawn would attack the enemy
-        // king; that square is tested for mate and excluded, mirroring the
-        // reference `GenerateDropMoves`' `legal_drop` (`movegen.cpp`, pawn-drop
-        // branch). Emitting it would hand the caller an illegal move (the
-        // qsearch legality filter [`Position::is_legal`] is uchifuzume-blind).
+        // Pawn drops: empty, not the last rank, not a nifu file, and not
+        // uchifuzume. `is_legal` is uchifuzume-blind, so a pawn-drop-mate
+        // emitted here would reach the caller as an illegal move.
         if hand.count(PieceKind::Pawn) > 0 {
-            // Nifu (二歩) file exclusion: fold the side's own un-promoted-pawn
-            // bitboard into a full-file mask (a promoted pawn / tokin lives in
-            // the GOLD slot and does not count), then subtract it from the
-            // target — the bitboard form of the per-file `nifu_blocked_files`.
+            // Nifu (二歩): a promoted pawn lives in the GOLD slot and does not
+            // block its file.
             let own_pawns = board.pieces_pattern(stm, crate::board::pat::PAWN);
             let mut nifu_files = Bitboard::empty();
             for psq in own_pawns.squares() {
                 nifu_files |= crate::bitboard::file_mask(psq.file());
             }
-            // Last rank (from which a dropped pawn can never move) is removed too.
             let mut pawn_target = base & !rank_mask(back_rank) & !nifu_files;
 
-            // The unique square a dropped pawn could deliver mate from: directly
-            // "behind" the enemy king along our pawn's line of advance (Black
-            // advances toward rank 0, so it is one rank above the king; White
-            // one rank below). Probe it for uchifuzume only when it survives as
-            // a genuine pawn-drop square, and remove it if it mates — at most one
-            // probe per node, matching the scan twin's short-circuit.
+            // A dropped pawn checks only the square directly ahead of it, so the
+            // one square it could ever mate from is the one directly behind the
+            // enemy king along our line of advance. Probing just that square
+            // keeps uchifuzume at one mate probe per node.
             let uchi_candidate = try_find_king(board, stm.flip()).and_then(|ek| {
                 let dr: i16 = if stm == Color::Black { 1 } else { -1 };
                 let r = ek.rank() as i16 + dr;
@@ -1887,11 +1416,8 @@ impl Position {
             }
         }
 
-        // --- Other kinds, laid into `drops` in the reference order, then
-        // emitted in rank bands so lance / knight are excluded from the ranks
-        // on which they would be stuck.
-        // Fixed-capacity scratch (at most the six [`DROP_ORDER`] kinds); avoids a
-        // per-node heap allocation.
+        // The other kinds go out in rank bands, so that lance and knight are
+        // excluded from the ranks on which they would be stuck.
         let mut drops_buf = [PieceKind::Knight; DROP_ORDER.len()];
         let mut drops_len = 0usize;
         for &kind in &DROP_ORDER {
@@ -1904,15 +1430,14 @@ impl Position {
         if drops.is_empty() {
             return;
         }
-        // Index just past the leading knight / knight+lance entries (they lead
-        // `DROP_ORDER`), matching the reference's `nextToKnight` / `nextToLance`.
+        // The reference's `nextToKnight` / `nextToLance`: an index just past the
+        // leading knight / knight+lance entries.
         let next_to_knight = usize::from(drops.first() == Some(&PieceKind::Knight));
         let next_to_lance =
             next_to_knight + usize::from(drops.get(next_to_knight) == Some(&PieceKind::Lance));
 
         if next_to_lance == 0 {
-            // No lance or knight in hand: every kind can go on every empty
-            // square (movegen.cpp).
+            // No lance or knight in hand: every kind goes on every empty square.
             for sq in base.squares() {
                 for &kind in drops {
                     out.push(ExtMove {
@@ -1924,8 +1449,7 @@ impl Position {
             return;
         }
 
-        // Band 1 — own back rank: the kinds that may sit there (silver, gold,
-        // bishop, rook — i.e. from `next_to_lance`), movegen.cpp.
+        // Band 1 — own back rank: neither lance nor knight may sit there.
         for sq in (base & rank_mask(back_rank)).squares() {
             for &kind in &drops[next_to_lance..] {
                 out.push(ExtMove {
@@ -1934,8 +1458,7 @@ impl Position {
                 });
             }
         }
-        // Band 2 — own second rank: lance too, but not knight (from
-        // `next_to_knight`), movegen.cpp.
+        // Band 2 — own second rank: lance too, but not knight.
         for sq in (base & rank_mask(second_rank)).squares() {
             for &kind in &drops[next_to_knight..] {
                 out.push(ExtMove {
@@ -1944,8 +1467,7 @@ impl Position {
                 });
             }
         }
-        // Band 3 — the remaining ranks (all but the back and second ranks):
-        // every kind, movegen.cpp.
+        // Band 3 — the remaining ranks: every kind.
         let band3 = base & !(rank_mask(back_rank) | rank_mask(second_rank));
         for sq in band3.squares() {
             for &kind in drops {
@@ -1957,11 +1479,7 @@ impl Position {
         }
     }
 
-    /// An 81-square band-scanning form of [`Position::emit_drops_masked`], the
-    /// `#[cfg(test)]` equivalence oracle for the bitboard-driven emitter — the
-    /// same discipline as [`nifu_blocked_files_scan`] and the `see_ge` reference
-    /// twin. The bitboard emitter must produce the byte-identical move Vec on
-    /// every restriction mask.
+    /// An 81-square band-scanning form of [`Position::emit_drops_masked`].
     #[cfg(test)]
     fn emit_drops_masked_scan(&self, restrict: Bitboard, out: &mut Vec<Move>) {
         let board = self.board();
@@ -2059,28 +1577,19 @@ impl Position {
     }
 
     /// True iff dropping a side-to-move pawn on `sq` is uchifuzume (打ち歩詰め)
-    /// — an immediate, unanswerable checkmate against the enemy king, which the
-    /// rules forbid. This is now answered in place by the ported
-    /// [`crate::movegen::drop_is_uchifuzume`] / [`Position::legal_drop`] — no
-    /// board clone, no inner move generation — the same drop-legality port the
-    /// drop generators enforce at generation time, so the two surfaces agree by
-    /// construction. Callers restrict this to the single
-    /// geometric candidate square, so the probe fires at most once per node.
+    /// — the unanswerable pawn-drop mate the rules forbid.
     fn pawn_drop_is_uchifuzume(&self, sq: Square) -> bool {
         let m = Move::make_drop(PieceKind::Pawn, self.side_to_move(), sq);
         crate::movegen::drop_is_uchifuzume(self, m)
     }
 }
 
-/// Copy-apply-scan implementations of the three predicates, derived
-/// independently of the cached check info so they can serve as its equivalence
-/// oracles (the same discipline as `see_ge_reference`). The cached
-/// predicates must agree with these on every move the engine's own generators
-/// emit, along a deterministic playout; the `equivalence` test below enforces it.
+/// Copy-apply-scan forms of the three predicates, derived independently of the
+/// cached check info.
 #[cfg(test)]
 impl Position {
-    /// Oracle: apply `m` to a scratch board and test the enemy king against the
-    /// full attacker scan (direct, discovered and dropping checks alike).
+    /// Apply `m` to a scratch board and test the enemy king against the full
+    /// attacker scan.
     pub(crate) fn gives_check_reference(&self, m: Move) -> bool {
         let mover = self.side_to_move();
         let mut board = *self.board();
@@ -2091,8 +1600,8 @@ impl Position {
         }
     }
 
-    /// Oracle: does a piece of the moved type, standing on `to`, attack the
-    /// enemy king under the pre-move occupancy (direct checks only)?
+    /// Does a piece of the moved type, standing on `to`, attack the enemy king
+    /// under the pre-move occupancy?
     pub(crate) fn gives_direct_check_reference(&self, m: Move) -> bool {
         let board = self.board();
         let stm = self.side_to_move();
@@ -2127,8 +1636,8 @@ impl Position {
         false
     }
 
-    /// Oracle: apply `m` to a scratch board and test that the mover's own king
-    /// is not left in check.
+    /// Apply `m` to a scratch board and test that the mover's own king is not
+    /// left in check.
     pub(crate) fn is_legal_reference(&self, m: Move) -> bool {
         let mover = self.side_to_move();
         let mut board = *self.board();
@@ -2150,8 +1659,6 @@ mod tests {
         parse_sfen(sfen).expect("valid SFEN")
     }
 
-    /// Unwrap the [`ExtMove`]s the generators emit into a plain `Move` Vec, so
-    /// the assertions below (written against `Move`) stay unchanged.
     fn unwrap_ext(v: Vec<ExtMove>) -> Vec<Move> {
         v.into_iter().map(|e| e.mv).collect()
     }
@@ -2194,10 +1701,6 @@ mod tests {
         moves.iter().map(|&m| format_usi_move(m)).collect()
     }
 
-    // ---- gives_check / in_check / is_legal --------------------------------
-
-    /// The six perft-fixture SFENs (matching `tests/fixtures/perft/*.json`),
-    /// reused for the seeded-playout oracle gate.
     const FIXTURE_SFENS: &[&str] = &[
         "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
         "4k4/9/4r4/9/9/9/4K3B/9/9 b RG2gs2n3p 1",
@@ -2207,8 +1710,7 @@ mod tests {
         "9/4k4/9/9/9/9/9/4K4/9 b 9P9p 1",
     ];
 
-    /// Small deterministic xorshift64* (banned `Math.random`-style
-    /// nondeterminism), mirroring the driver used elsewhere in this crate.
+    /// Deterministic xorshift64*, so a failing playout replays.
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> u64 {
@@ -2224,9 +1726,8 @@ mod tests {
         }
     }
 
-    /// The oracle: whether the position is in check *after* `m` is played — the
-    /// same post-`do_move` fact the move-history machinery records. Computed
-    /// via a `do_move`/`undo_move` round trip so it shares no code with
+    /// Whether the position is in check after `m` is played, via a
+    /// `do_move`/`undo_move` round trip so it shares no code with
     /// `gives_check`'s bare-board application.
     fn gives_check_oracle(p: &Position, m: Move) -> bool {
         let mut scratch = p.clone();
@@ -2253,7 +1754,6 @@ mod tests {
                     }
                     continue;
                 }
-                // Every legal move's `gives_check` must equal the oracle.
                 for &m in &legal {
                     assert_eq!(
                         p.gives_check(m),
@@ -2270,13 +1770,8 @@ mod tests {
         }
     }
 
-    /// Every pseudo-legal move each of the engine's own generators can emit at
-    /// `p`, across both `all` settings and every generator, concatenated. Used
-    /// by the cached-check-info equivalence gate so the `gives_check` /
-    /// `gives_direct_check` predicates are exercised on the exact moves the
-    /// search would hand them. The target-restricted `generate_evasions` asserts
-    /// `in_check` at entry, so it is only invoked on genuine
-    /// in-check positions.
+    /// Every pseudo-legal move the generators can emit at `p`, across both `all`
+    /// settings, concatenated.
     fn all_generator_moves(p: &Position) -> Vec<Move> {
         let mut ext: Vec<ExtMove> = Vec::new();
         for all in [false, true] {
@@ -2292,13 +1787,10 @@ mod tests {
         v
     }
 
-    /// The moves `is_legal` may legitimately be handed at `p` — its O(1)
-    /// contract: the check-state-appropriate search generator's
-    /// output (evasions when in check, else captures / quiets / non-evasions),
-    /// plus every candidate that passes `pseudo_legal` (the TT / probcut path).
-    /// Outside this set the O(1) `is_legal` may legitimately disagree with the
-    /// copy-apply-scan oracle (e.g. a non-check-resolving in-check drop), so the
-    /// equivalence gate must not exercise it there — no non-test caller does.
+    /// The moves `is_legal`'s contract admits at `p`. Outside this set it may
+    /// legitimately disagree with the copy-apply-scan form — a
+    /// non-check-resolving in-check drop, say — so the test must not exercise it
+    /// there.
     fn is_legal_contract_moves(p: &Position) -> Vec<Move> {
         let mut ext: Vec<ExtMove> = Vec::new();
         for all in [false, true] {
@@ -2311,9 +1803,8 @@ mod tests {
             }
         }
         let mut v = unwrap_ext(ext);
-        // Every all-generator move that passes `pseudo_legal` also meets the
-        // contract — this covers the TT-widened candidates the search validates
-        // through `pseudo_legal` before calling `is_legal`.
+        // The TT-widened candidates the search validates through `pseudo_legal`
+        // before calling `is_legal`.
         for m in all_generator_moves(p) {
             if p.pseudo_legal(m, false) || p.pseudo_legal(m, true) {
                 v.push(m);
@@ -2322,10 +1813,6 @@ mod tests {
         v
     }
 
-    /// The cached-check-info predicates (`gives_check`,
-    /// `gives_direct_check`, `is_legal`) must agree with the verbatim scratch
-    /// oracles for *every* move produced by *every* generator, at each fixture
-    /// and along a deterministic playout of at least 30 plies from each.
     /// `is_legal` is exercised only over its contract set (see
     /// [`is_legal_contract_moves`]).
     #[cfg_attr(miri, ignore)]
@@ -2378,20 +1865,17 @@ mod tests {
 
     #[test]
     fn in_check_true_only_when_king_attacked() {
-        // White rook on the 5-file gives check to the black king below it.
+        // A white rook on the 5-file, then the same board with it one file over.
         let checked = pos("4r4/9/9/9/9/9/9/9/4K4 b - 1");
         assert!(checked.in_check());
-        // Same board, rook shifted one file: no check.
         let quiet = pos("3r5/9/9/9/9/9/9/9/4K4 b - 1");
         assert!(!quiet.in_check());
     }
 
     #[test]
     fn is_legal_agrees_with_legal_set_for_pin_and_king_step() {
-        // Black king 5a, black silver 5b, white rook 5i on the open 5-file; the
-        // silver is pinned. A diagonal silver step exposes the king (illegal); a
-        // sideways black-king step to an unattacked square is legal. `is_legal`
-        // must agree with the full legal-move set on both.
+        // Black king 5a, black silver 5b, white rook 5i on the open 5-file, so
+        // the silver is pinned.
         let p = pos("4K3k/4S4/9/9/9/9/9/9/4r4 b - 1");
         let legal: std::collections::HashSet<Move> = legal_moves(&p).into_iter().collect();
 
@@ -2413,12 +1897,9 @@ mod tests {
         assert!(legal.contains(&king_step));
     }
 
-    // ---- CAPTURES generator -----------------------------------------------
-
     #[test]
     fn pawn_capture_in_zone_is_promotion_only() {
-        // Black pawn 5c captures a white pawn 5b (rank 1, inside the zone).
-        // Only the promotion is generated; the non-promotion is suppressed.
+        // Black pawn 5c captures a white pawn 5b, inside the zone.
         let p = pos("k8/4p4/4P4/9/9/9/9/9/8K b - 1");
         let caps = captures(&p);
         assert_eq!(caps.len(), 1, "expected one capture, got {:?}", usi(&caps));
@@ -2432,8 +1913,7 @@ mod tests {
 
     #[test]
     fn lance_capture_on_enemy_second_rank_is_promotion_only() {
-        // Black lance 5d captures a white piece on 5b (rank 1). Promotion only:
-        // the non-promotion is suppressed on the enemy first/second rank.
+        // Black lance 5d captures a white piece on the enemy second rank.
         let p = pos("k8/4p4/9/4L4/9/9/9/9/8K b - 1");
         let caps = captures(&p);
         assert_eq!(caps.len(), 1, "got {:?}", usi(&caps));
@@ -2443,23 +1923,16 @@ mod tests {
 
     #[test]
     fn lance_capture_on_enemy_third_rank_keeps_both_variants() {
-        // Black lance 5e captures a white piece on 5c (rank 2). Both the
-        // promotion and the non-promotion are generated (rank 2 keeps the
-        // non-promotion), promotion first.
+        // Black lance 5e captures a white piece on the enemy third rank.
         let p = pos("k8/9/4p4/9/4L4/9/9/9/8K b - 1");
         let caps = captures(&p);
         assert_eq!(usi(&caps), vec!["5e5c+".to_string(), "5e5c".to_string()]);
     }
 
-    // ---- GenerateAllLegalMoves (all == true) ------------------------------
-
     #[test]
     fn all_pawn_capture_in_zone_adds_nonpromotion() {
-        // Same position as `pawn_capture_in_zone_is_promotion_only`: a Black pawn
-        // 5c captures a white pawn on 5b (rank 1, inside the zone). With the flag
-        // OFF only the promotion is generated; with the flag ON the non-promotion
-        // is additionally generated (rank 1 is not the last rank), promotion
-        // first (`movegen.cpp`).
+        // The `pawn_capture_in_zone_is_promotion_only` position, on the enemy
+        // second rank rather than the last.
         let p = pos("k8/4p4/4P4/9/9/9/9/9/8K b - 1");
         assert_eq!(usi(&captures(&p)), vec!["5c5b+".to_string()]);
         assert_eq!(
@@ -2471,10 +1944,8 @@ mod tests {
 
     #[test]
     fn all_lance_capture_on_enemy_second_rank_adds_nonpromotion() {
-        // `lance_capture_on_enemy_second_rank_is_promotion_only`: Black lance 5d
-        // captures on 5b (rank 1). The default suppresses the non-promotion on
-        // the enemy first/second rank; `all` widens the mask so only the very
-        // last rank is suppressed, so the rank-1 non-promotion now appears.
+        // The `lance_capture_on_enemy_second_rank_is_promotion_only` position;
+        // `all` narrows the suppression to the last rank alone.
         let p = pos("k8/4p4/9/4L4/9/9/9/9/8K b - 1");
         assert_eq!(usi(&captures(&p)), vec!["5d5b+".to_string()]);
         assert_eq!(
@@ -2486,9 +1957,8 @@ mod tests {
 
     #[test]
     fn all_pawn_last_rank_push_is_still_promotion_only() {
-        // A Black pawn on 5b pushing to the empty 5a (rank 0, the last rank): a
-        // non-promotion there would be a stuck pawn, so it is suppressed even
-        // with `all` on (`movegen.cpp`, `rank_of(to) != T_RANK1`).
+        // A Black pawn pushing onto the last rank, where a non-promotion would
+        // be a stuck pawn.
         let p = pos("k8/4P4/9/9/9/9/9/9/8K b - 1");
         let promo = "5b5a+".to_string();
         assert_eq!(
@@ -2503,11 +1973,7 @@ mod tests {
 
     #[test]
     fn all_bishop_promotion_interleaves_nonpromotion() {
-        // A Black bishop on 5e capturing into the zone: with the flag off only
-        // the promotion is generated for an in-zone destination; with the flag on
-        // the non-promotion is emitted right after the promotion, per destination
-        // (`movegen.cpp`). Bishop 5e, white pawn on 3c (a diagonal in the
-        // zone).
+        // Black bishop 5e, white pawn 3c on a diagonal inside the zone.
         let p = pos("k8/9/6p2/9/4B4/9/9/9/8K b - 1");
         let off: Vec<String> = usi(&captures(&p));
         let on: Vec<String> = usi(&captures_all(&p));
@@ -2515,7 +1981,6 @@ mod tests {
             off.contains(&"5e3c+".to_string()) && !off.contains(&"5e3c".to_string()),
             "default: promotion only, got {off:?}",
         );
-        // In all-mode the non-promotion follows its promotion immediately.
         let i = on
             .iter()
             .position(|s| s == "5e3c+")
@@ -2529,16 +1994,11 @@ mod tests {
 
     #[test]
     fn captures_are_piece_type_major_and_carry_no_drops() {
-        // Three independent captures outside the promotion zone (so each is a
-        // single non-promoting move): white victims on rank e (our rank 4),
-        // black attackers directly behind on rank f (our rank 5).
-        //   USI file 9 (our file 0): pawn victim / pawn attacker
-        //   USI file 7 (our file 2): silver victim / silver attacker
-        //   USI file 5 (our file 4): gold victim / gold attacker
-        // Black also holds a pawn in hand — CAPTURES must emit no drop.
+        // Pawn-, silver- and gold-on-gold captures on files 9, 7 and 5, all
+        // outside the promotion zone so each is a single non-promoting move.
+        // Black also holds a pawn in hand.
         let p = pos("k8/9/9/9/p1s1g4/P1S1G4/9/9/7K1 b P 1");
         let caps = captures(&p);
-        // Expected piece-type-major order: pawn, then silver, then gold.
         assert_eq!(
             usi(&caps),
             vec!["9f9e".to_string(), "7f7e".to_string(), "5f5e".to_string()],
@@ -2552,9 +2012,6 @@ mod tests {
 
     #[test]
     fn captures_equal_legal_captures_when_none_are_promotions() {
-        // Sanity cross-check on a middlegame fixture: every generated capture is
-        // a capture (lands on an enemy piece), and the legal ones are a subset
-        // of the full legal move list.
         let p =
             pos("l7l/1r1sg2k1/2nppgsp1/p1p3p1p/1p2N4/2P1P1P2/PPSP1PB1P/3GG1SR1/LN2K3L b BNPp 1");
         let board = p.board();
@@ -2577,16 +2034,10 @@ mod tests {
         }
     }
 
-    // ---- EVASIONS generator -----------------------------------------------
-
     #[test]
     fn evasions_are_generated_only_when_in_check() {
-        // `generate_evasions` asserts `in_check` at entry: the
-        // picker only calls it when `in_check()` holds, so this position is
-        // never handed to it.
         let quiet = pos("4k4/9/9/9/9/9/9/9/4K4 b - 1");
         assert!(!quiet.in_check());
-        // In check: there is at least one legal evasion.
         let checked = pos("4r4/9/9/9/9/9/9/9/4K4 b - 1");
         assert!(checked.in_check());
         let legal_ev: Vec<Move> = evasions(&checked)
@@ -2601,10 +2052,8 @@ mod tests {
 
     #[test]
     fn evasion_king_moves_come_first_and_set_matches_legal() {
-        // Black king 5i is checked by the white rook on the 5-file. Evasions:
-        // king steps off the file (the rook can be neither captured nor
-        // blocked here). Every legal evasion is a king move, emitted first, and
-        // the legal-filtered evasion set equals the full legal move set.
+        // Black king 5i checked by a white rook down the 5-file, which can here
+        // be neither captured nor blocked.
         let p = pos("4r4/9/9/9/9/9/9/9/4K4 b - 1");
         let legal_ev: Vec<Move> = evasions(&p)
             .into_iter()
@@ -2616,7 +2065,6 @@ mod tests {
             ev_set, legal_all,
             "legal evasions must equal the legal move set"
         );
-        // All are king moves (from 5i), and king moves lead the emission.
         let king_from = Square::new(4, 8).unwrap();
         assert!(
             legal_ev
@@ -2630,8 +2078,7 @@ mod tests {
     #[test]
     fn evasions_include_blocking_drops_in_check() {
         // Black king 5i, white rook 5a checking down the open 5-file, black
-        // holds a gold. The seven interposition gold-drops on the 5-file are
-        // legal evasions; they appear after the king moves.
+        // holding a gold — seven interposition squares.
         let p = pos("4r4/9/9/9/9/9/9/9/4K4 b G 1");
         let legal_ev: Vec<Move> = evasions(&p)
             .into_iter()
@@ -2651,7 +2098,6 @@ mod tests {
             "gold drops must interpose on the 5-file: {:?}",
             usi(&drops),
         );
-        // King moves precede every drop in the emission order.
         let first_drop = legal_ev.iter().position(|m| m.is_drop()).unwrap();
         assert!(
             legal_ev[..first_drop].iter().all(|m| !m.is_drop()),
@@ -2662,16 +2108,9 @@ mod tests {
 
     #[test]
     fn drop_generation_excludes_uchifuzume() {
-        // A Black pawn dropped at (8,1) — directly in front of the White king on
-        // 8a — is uchifuzume (unanswerable pawn-drop mate). The shared drop
-        // generator [`Position::emit_drops`] (fed by both `generate_evasions`
-        // and `generate_quiets`) must exclude it at generation, exactly as the
-        // reference `GenerateDropMoves`' `legal_drop` does; the qsearch legality
-        // filter `is_legal` is uchifuzume-blind, so leaving it in would surface
-        // an illegal move. Black is not in check here, so the shared filter is
-        // exercised through the quiets path (the restricted `generate_evasions`
-        // now asserts `in_check`, but shares the same `emit_drops`).
-        // (Same mating shape as `movegen::tests::uchifuzume_filters_pawn_drop_mate`.)
+        // A Black pawn dropped at (8,1), directly in front of the White king on
+        // 8a, is an unanswerable pawn-drop mate. `is_legal` is uchifuzume-blind,
+        // so leaving it in would surface an illegal move.
         let p = pos("k8/9/G1N6/9/9/9/9/9/8K b P 1");
         assert!(!p.in_check());
         let qs = quiets(&p);
@@ -2684,8 +2123,6 @@ mod tests {
             usi(&qs),
         );
 
-        // The exclusion is surgical: an ordinary pawn drop elsewhere on the same
-        // (non-nifu) file is still emitted.
         let other_drop = Move::make_drop(PieceKind::Pawn, Color::Black, Square::new(8, 3).unwrap());
         assert!(
             qs.contains(&other_drop),
@@ -2693,8 +2130,6 @@ mod tests {
             usi(&qs),
         );
     }
-
-    // ---- QUIETS generator -------------------------------------------------
 
     fn quiets(p: &Position) -> Vec<Move> {
         let mut v = Vec::new();
@@ -2704,12 +2139,10 @@ mod tests {
 
     #[test]
     fn quiets_land_only_on_empty_squares_and_include_drops() {
-        // Black rook 5e (quiet lifts to empty squares), a black pawn in hand
-        // (drops), and a lone enemy pawn on 5g the rook could capture — the
-        // capture must NOT appear among the quiets.
+        // Black rook 5e, a black pawn in hand, and an enemy pawn on 5g the rook
+        // could capture.
         let p = pos("k8/9/9/9/4R4/9/4p4/9/8K b P 1");
         let qs = quiets(&p);
-        // No quiet lands on an occupied square.
         for &m in &qs {
             if !m.is_drop() {
                 assert!(
@@ -2719,14 +2152,12 @@ mod tests {
                 );
             }
         }
-        // The rook's capture of the 5g pawn is a capture, not a quiet.
         let cap = Move::make(
             Square::new(4, 4).unwrap(),
             Square::new(4, 6).unwrap(),
             Piece::new(PieceKind::Rook, Color::Black),
         );
         assert!(!qs.contains(&cap), "a capture leaked into QUIETS");
-        // Some pawn drops are generated.
         assert!(
             qs.iter().any(|m| m.is_drop()),
             "expected pawn drops among the quiets"
@@ -2735,9 +2166,8 @@ mod tests {
 
     #[test]
     fn quiets_include_non_capturing_pawn_promotion() {
-        // Black pawn 5d pushes to the empty 5c (rank 2, inside the zone): a
-        // non-capturing promotion, which belongs to QUIETS (plain CAPTURES,
-        // targeting enemy pieces only, would miss it).
+        // Black pawn 5d pushes onto the empty 5c inside the zone. Plain
+        // CAPTURES, targeting enemy pieces only, would miss it.
         let p = pos("k8/9/9/4P4/9/9/9/9/8K b - 1");
         let qs = quiets(&p);
         let promo = Move::make_promote(
@@ -2768,12 +2198,9 @@ mod tests {
         assert_eq!(union, legal, "captures ∪ quiets must equal the legal set");
     }
 
-    // ---- gives_direct_check ----------------------------------------------
-
     #[test]
     fn gives_direct_check_true_for_quiet_rook_check() {
-        // Black rook 9c; a quiet move 9c→5c gives a direct check to the white
-        // king on 5a along the (empty) 5-file.
+        // Black rook 9c, white king 5a, the 5-file empty.
         let p = pos("4k4/9/R8/9/9/9/9/9/8K b - 1");
         let check = Move::make(
             Square::new(8, 2).unwrap(),
@@ -2782,7 +2209,6 @@ mod tests {
         );
         assert_eq!(format_usi_move(check), "9c5c");
         assert!(p.gives_direct_check(check));
-        // A sideways lift that does not reach the king's file is not a check.
         let quiet = Move::make(
             Square::new(8, 2).unwrap(),
             Square::new(7, 2).unwrap(),
@@ -2793,10 +2219,8 @@ mod tests {
 
     #[test]
     fn gives_direct_check_ignores_discovered_checks() {
-        // Black rook 5e behind a black gold 5c, white king 5a on the same file.
-        // Moving the gold off the file (5c→4c) uncovers the rook → a discovered
-        // check, but NOT a *direct* one by the gold, so gives_direct_check is
-        // false (it models `check_squares(pt) & to`, direct checks only).
+        // Black rook 5e behind a black gold 5c, white king 5a on the same file,
+        // so moving the gold off the file uncovers the rook.
         let p = pos("4k4/9/4G4/9/4R4/9/9/9/8K b - 1");
         let discover = Move::make(
             Square::new(4, 2).unwrap(),
@@ -2809,16 +2233,9 @@ mod tests {
             !p.gives_direct_check(discover),
             "a discovered check is not a direct check"
         );
-        // Sanity: the full gives_check (direct + discovered) does see it.
         assert!(p.gives_check(discover));
     }
 
-    // ---- generate_non_evasions --------------------------------------------
-
-    /// The pseudo-legal `NON_EVASIONS` list holds exactly the union of the
-    /// `CAPTURES` and `QUIETS` lists (same moves, no duplicates) — the single
-    /// `~pieces(Us)` target is the union of the enemy-only and empty-only
-    /// targets — for the not-in-check fixtures.
     #[test]
     fn non_evasions_set_equals_captures_union_quiets() {
         for sfen in FIXTURE_SFENS {
@@ -2848,8 +2265,6 @@ mod tests {
                 ne_set, cq_set,
                 "{sfen}: NON_EVASIONS set must equal CAPTURES ∪ QUIETS"
             );
-            // And the legal subsets agree (the set the root move list / picker
-            // ultimately search).
             let ne_legal: std::collections::HashSet<Move> =
                 non_ev.into_iter().filter(|&m| p.is_legal(m)).collect();
             let cq_legal: std::collections::HashSet<Move> = caps
@@ -2864,11 +2279,7 @@ mod tests {
         }
     }
 
-    /// `NON_EVASIONS` interleaves captures and quiets per piece and per
-    /// destination square, so — for a position that offers both — its order is
-    /// *not* the captures-then-quiets concatenation, even though the underlying
-    /// set is identical. This is exactly the distinction that fixes the root
-    /// search's TT move (`rootMoves[0]`).
+    /// The interleaved order is what fixes the root search's `rootMoves[0]`.
     #[test]
     fn non_evasions_interleaves_rather_than_concatenating() {
         let p =
@@ -2899,11 +2310,8 @@ mod tests {
     }
 }
 
-// ===========================================================================
-// Bitboard-rewrite gates: piece-set consistency and attack-query equivalence
-// ===========================================================================
 #[cfg(test)]
-mod gate_262 {
+mod attack_query_equivalence {
     use super::{CHECK_PATTERN_COUNT, attack_set_from_scan, attacks_bb, check_pattern};
     use crate::bitboard::Bitboard;
     use crate::board::{Board, PATTERN_COUNT, pattern_of};
@@ -2914,9 +2322,6 @@ mod gate_262 {
     use crate::sfen::parse_sfen;
     use crate::square::Square;
 
-    /// The fixtures the gates sweep — the perft parity positions plus the bench
-    /// set: startpos-like, midgame-tactical, promotion-zone edges, drop-heavy,
-    /// check-evasion, and the move-generation "festival" position.
     const FIXTURES: &[&str] = &[
         "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
         "l7l/1r1sg2k1/2nppgsp1/p1p3p1p/1p2N4/2P1P1P2/PPSP1PB1P/3GG1SR1/LN2K3L b BNPp 1",
@@ -2934,8 +2339,7 @@ mod gate_262 {
         (0..Square::COUNT as u8).map(|i| Square::from_index(i).unwrap())
     }
 
-    /// Rebuild `(occupied, by_color, by_pattern)` from scratch by scanning the
-    /// board — the equivalence oracle for the incrementally maintained sets.
+    /// Rebuild `(occupied, by_color, by_pattern)` by scanning the board.
     fn scan_sets(board: &Board) -> (Bitboard, [Bitboard; 2], [[Bitboard; PATTERN_COUNT]; 2]) {
         let mut occ = Bitboard::empty();
         let mut by_color = [Bitboard::empty(); 2];
@@ -2972,8 +2376,7 @@ mod gate_262 {
         }
     }
 
-    /// A checkers scan (reverse-of-`attack_set_from_scan`), the oracle for the
-    /// `attackers_bb`-based checkers query.
+    /// A checkers scan, the reverse of `attack_set_from_scan`.
     fn checkers_scan(board: &Board, king: Square, enemy: Color) -> Bitboard {
         let king_bb = Bitboard::from_square(king);
         let mut set = Bitboard::empty();
@@ -2993,7 +2396,6 @@ mod gate_262 {
         let board = pos.board();
         let occ = board.occupied();
 
-        // 2a: is_attacked_by == scan, all squares × both colours.
         for sq in all_squares() {
             for attacker in [Color::Black, Color::White] {
                 assert_eq!(
@@ -3004,8 +2406,6 @@ mod gate_262 {
             }
         }
 
-        // 2b: is_attacked_discounting == the scan with `discount` vacated, over
-        // every occupied square as the discount square.
         for discount in all_squares() {
             if board.get(discount).is_none() {
                 continue;
@@ -3023,8 +2423,6 @@ mod gate_262 {
             }
         }
 
-        // 2c: attacks_bb == attack_set_from_scan for every piece on the board,
-        // and for each check-pattern piece imagined on the enemy king square.
         for from in all_squares() {
             if let Some(p) = board.get(from) {
                 assert_eq!(
@@ -3036,8 +2434,7 @@ mod gate_262 {
         }
         for enemy in [Color::Black, Color::White] {
             if let Some(eks) = try_find_king(board, enemy) {
-                // The ten check-pattern representative pieces the check-info fill
-                // imagines on the enemy king.
+                // The ten pieces the check-info fill imagines on the enemy king.
                 let reps = [
                     Piece::new(PieceKind::Pawn, enemy),
                     Piece::new(PieceKind::Lance, enemy),
@@ -3060,7 +2457,6 @@ mod gate_262 {
             }
         }
 
-        // Checkers rewrite: attackers_bb from each king equals the scan.
         for color in [Color::Black, Color::White] {
             if let Some(king) = try_find_king(board, color) {
                 assert_eq!(
@@ -3071,7 +2467,6 @@ mod gate_262 {
             }
         }
 
-        // The pattern maps line up (defends the numeric slots against drift).
         assert_eq!(CHECK_PATTERN_COUNT, PATTERN_COUNT);
         for p in [
             Piece::new(PieceKind::Gold, Color::Black),
@@ -3082,14 +2477,12 @@ mod gate_262 {
         }
     }
 
-    /// Run both gates at `pos`.
     fn assert_all(pos: &Position, ctx: &str) {
         assert_sets_consistent(pos, ctx);
         assert_attack_equiv(pos, ctx);
     }
 
-    /// A tiny deterministic LCG so the playout is reproducible without a `rand`
-    /// dependency.
+    /// Deterministic LCG, so a failing playout replays.
     struct Lcg(u64);
     impl Lcg {
         fn next(&mut self) -> u64 {
@@ -3113,8 +2506,6 @@ mod gate_262 {
                 let ctx = format!("fx{fx} ply{ply}");
                 assert_all(&pos, &ctx);
 
-                // Null-move do/undo at positions not in check (board unchanged →
-                // sets must be untouched, and restored after undo).
                 if !pos.in_check() {
                     pos.do_null_move();
                     assert_sets_consistent(&pos, &format!("{ctx} post-null"));
@@ -3129,45 +2520,29 @@ mod gate_262 {
                 }
                 let m = buf[(rng.next() >> 33) as usize % buf.len()];
 
-                // do/undo round trip: sets consistent after do AND restored
-                // after undo.
                 let undo = pos.do_move(m);
                 assert_sets_consistent(&pos, &format!("{ctx} post-do {m:?}"));
                 pos.undo_move(m, undo);
                 assert_sets_consistent(&pos, &format!("{ctx} post-undo {m:?}"));
 
-                // Commit the move and walk on.
                 pos.do_move(m);
             }
         }
     }
 }
 
-// ===========================================================================
-// Move-generator emission-sequence equivalence
-// ===========================================================================
-//
-// The binding constraint on the piece-set generators is the *emission
-// sequence*: node-count parity depends on the exact order moves come out, so the
-// production generators (piece-set bitboards) must emit the byte-identical move
-// Vec the scanning oracles do. This gate compares them
-// move-for-move — for every parity fixture, along a deterministic playout that
-// visits in-check positions (exercising the evasion path), across every
-// generator and BOTH `all` settings — and pins the file-mask nifu mask against
-// its scanning oracle.
+// Node-count parity depends on the exact order moves come out, so the piece-set
+// generators must emit the byte-identical move Vec the scanning twins do.
 #[cfg(test)]
-mod gate_267 {
+mod nifu_files_equivalence {
     use super::{ExtMove, nifu_blocked_files, nifu_blocked_files_scan};
     use crate::color::Color;
     use crate::move_::{Move, format_usi_move};
     use crate::position::{Position, Undo};
     use crate::sfen::parse_sfen;
 
-    /// The six perft / bench parity fixtures (all two-king, so the playout's
-    /// `generate_legal_all` is well-defined). The second — a black king on 5a
-    /// checked by a white rook on 5c — starts *in check*, so the evasion
-    /// generator is exercised on a genuine in-check state from ply 0; the random
-    /// playouts visit further checks along the way.
+    /// The second fixture starts in check, so the evasion generator runs from
+    /// ply 0.
     const FIXTURE_SFENS: &[&str] = &[
         "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
         "4k4/9/4r4/9/9/9/4K3B/9/9 b RG2gs2n3p 1",
@@ -3192,9 +2567,7 @@ mod gate_267 {
         }
     }
 
-    /// The four search generators, keyed by index, run for a given `all`. The
-    /// generators emit [`ExtMove`]; this oracle unwraps `.mv` so
-    /// the move-for-move gate comparisons below are unchanged.
+    /// The four search generators, keyed by index, run for a given `all`.
     fn production(p: &Position, which: usize, all: bool) -> Vec<Move> {
         let mut v: Vec<ExtMove> = Vec::new();
         match which {
@@ -3222,15 +2595,9 @@ mod gate_267 {
 
     const GEN_NAMES: [&str; 4] = ["captures", "quiets", "evasions", "non_evasions"];
 
-    /// Every generator × both `all` settings emits the exact same move Vec as
-    /// its scanning oracle; the nifu mask agrees with its scan for both colours.
-    ///
-    /// The evasion generator (index 2) is target-restricted, so its
-    /// *raw* emission is a subsequence of the unrestricted scan twin. The binding
-    /// invariant there is that the **legal-filtered** sequences match element-for-
-    /// element: production filtered by the O(1) `is_legal`, the unrestricted twin
-    /// filtered by the copy-apply-scan oracle `leaves_own_king_safe`. It is only
-    /// compared on genuine in-check positions (its entry contract).
+    /// The evasion generator is target-restricted, so its raw emission is only a
+    /// subsequence of the unrestricted scan twin; the two are compared after
+    /// legality filtering instead.
     fn assert_all_generators_match(p: &Position, ctx: &str) {
         for (which, name) in GEN_NAMES.iter().enumerate() {
             let is_evasions = which == 2;
@@ -3293,7 +2660,7 @@ mod gate_267 {
                 let mut legal = Vec::new();
                 p.generate_legal_all(&mut legal);
                 if legal.is_empty() {
-                    // Terminal (mate/stalemate) — unwind and continue the walk.
+                    // Terminal — unwind and continue the walk.
                     match stack.pop() {
                         Some((m, u)) => {
                             p.undo_move(m, u);
@@ -3315,20 +2682,10 @@ mod gate_267 {
     }
 }
 
-// ===========================================================================
-// Drop-emitter gate: bitboard-driven `emit_drops_masked` == its scan twin
-// ===========================================================================
-//
-// The drop emitter iterates droppable-target bitboards rather than walking the
-// 81 square indices four times. Node-count parity depends on the exact emission
-// order, so the bitboard emitter must produce the byte-identical move Vec the
-// band scan does — on both restriction masks it is
-// called with (the unrestricted `ALL_SQUARES` quiets/non-evasions path, and the
-// single-checker interposition `target1` the evasion path threads in), and in
-// positions where the nifu and uchifuzume exclusions actually fire. This gate
-// pins the production emitter move-for-move against the retained scan oracle.
+// `emit_drops_masked` against its scan twin, on both restriction masks and in
+// positions where the nifu and uchifuzume exclusions fire.
 #[cfg(test)]
-mod gate_280 {
+mod drop_emitter_equivalence {
     use super::{ALL_SQUARES, ExtMove, nifu_blocked_files};
     use crate::bitboard::Bitboard;
     use crate::move_::{Move, format_usi_move};
@@ -3336,11 +2693,6 @@ mod gate_280 {
     use crate::position::{Position, Undo};
     use crate::sfen::parse_sfen;
 
-    /// Reuses the six perft / bench parity fixtures (mirrors `gate_267`): the
-    /// second starts in check, so the evasion `target1` mask is exercised from
-    /// ply 0, and the last is a pawns-in-hand-heavy position (`9P9p`). A seventh
-    /// hand-crafted fixture supplies lance + knight in hand (the perft six never
-    /// carry those for the side to move) so every rank band pass runs.
     const FIXTURE_SFENS: &[&str] = &[
         "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
         "4k4/9/4r4/9/9/9/4K3B/9/9 b RG2gs2n3p 1",
@@ -3348,9 +2700,9 @@ mod gate_280 {
         "l7l/1r1sg2k1/2nppgsp1/p1p3p1p/1p2N4/2P1P1P2/PPSP1PB1P/3GG1SR1/LN2K3L b BNPp 1",
         "4k4/3P3+PL/2N2PR2/1L2BNS2/4N4/9/9/9/4K4 b - 1",
         "9/4k4/9/9/9/9/9/4K4/9 b 9P9p 1",
-        // Lance + knight + pawn in hand with an own pawn already on file 5 — from
-        // ply 0 this drives every band pass (`next_to_lance != 0`) and fires the
-        // nifu file exclusion, coverage the six perft fixtures never reach.
+        // Lance + knight + pawn in hand with an own pawn already on file 5, so
+        // every rank band pass runs and the nifu exclusion fires. The perft
+        // fixtures above never carry a lance or knight for the side to move.
         "4k4/9/9/9/4P4/9/9/9/4K4 b LN2P 1",
     ];
 
@@ -3370,7 +2722,7 @@ mod gate_280 {
     }
 
     /// Coverage witnesses accumulated across the playouts, asserted non-zero at
-    /// the end so the gate can never silently skip a required exclusion path.
+    /// the end so the test can never silently skip a required exclusion path.
     #[derive(Default)]
     struct Coverage {
         with_pawn: usize,
@@ -3382,7 +2734,7 @@ mod gate_280 {
     }
 
     /// Assert the bitboard emitter and the scan twin emit the identical Vec for
-    /// `restrict`, and return the production Vec for further inspection.
+    /// `restrict`, and return it.
     fn assert_drops_match(p: &Position, restrict: Bitboard, ctx: &str) -> Vec<Move> {
         let mut prod_ext: Vec<ExtMove> = Vec::new();
         p.emit_drops_masked(restrict, &mut prod_ext);
@@ -3427,8 +2779,8 @@ mod gate_280 {
         Some(crate::bitboard::between(checksq, ksq))
     }
 
-    /// Record which exclusion / hand conditions this position exercises, so the
-    /// end-of-test assertions can prove every required path was visited.
+    /// Record which exclusion and hand conditions this position exercises, so
+    /// the end-of-test assertions can prove every path was visited.
     fn note_coverage(p: &Position, cov: &mut Coverage) {
         let stm = p.side_to_move();
         let hand = p.hand(stm);
@@ -3447,8 +2799,6 @@ mod gate_280 {
         if interposition_mask(p).is_some() {
             cov.single_check += 1;
         }
-        // Nifu "fired" iff a pawn is in hand and some file is nifu-blocked, so at
-        // least one candidate pawn-drop square is removed by the file mask.
         if hand.count(PieceKind::Pawn) > 0 {
             let blocked = nifu_blocked_files(p.board(), stm);
             if blocked.iter().any(|&b| b) {
@@ -3479,9 +2829,7 @@ mod gate_280 {
             let mut plies = 0usize;
             while plies < MIN_PLIES {
                 note_coverage(&p, &mut cov);
-                // Unrestricted mask — the quiets / non-evasions drop path.
                 assert_drops_match(&p, ALL_SQUARES, &format!("fixture {fi} ply {plies} [all]"));
-                // Interposition mask — the evasion drop path (single check only).
                 if let Some(target1) = interposition_mask(&p) {
                     assert_drops_match(
                         &p,
@@ -3518,13 +2866,9 @@ mod gate_280 {
         assert!(cov.nifu_fired > 0, "nifu exclusion never fired");
     }
 
-    /// Dedicated positions where the nifu and uchifuzume exclusions each remove a
-    /// genuine candidate square, checked to (a) still match the scan twin and (b)
-    /// actually drop the offending square from the emission.
     #[test]
     fn nifu_and_uchifuzume_exclusions_fire_and_match() {
-        // Nifu: a black pawn already on file 5 (5e) with a pawn in hand — no pawn
-        // drop may land on file 5.
+        // A black pawn already on file 5, with a pawn in hand.
         let p = parse_sfen("4k4/9/9/9/4P4/9/9/9/4K4 b P 1").expect("valid SFEN");
         let drops = assert_drops_match(&p, ALL_SQUARES, "nifu fixture");
         assert!(
@@ -3538,8 +2882,7 @@ mod gate_280 {
             "nifu exclusion failed: a pawn drop landed on the occupied file",
         );
 
-        // Uchifuzume: dropping a pawn in front of the cornered white king is mate,
-        // so that one square must be excluded while the emitter otherwise matches.
+        // Dropping a pawn in front of the cornered white king is mate.
         let p = parse_sfen("k8/9/G1N6/9/9/9/9/9/8K b P 1").expect("valid SFEN");
         let mate_sq = crate::square::Square::new(8, 1).unwrap(); // 9b, in front of 9a king
         let drops = assert_drops_match(&p, ALL_SQUARES, "uchifuzume fixture");
@@ -3547,9 +2890,6 @@ mod gate_280 {
             !drops.iter().any(|&m| m.is_drop() && m.to_sq() == mate_sq),
             "uchifuzume exclusion failed: the pawn-drop-mate square was emitted",
         );
-        // Sanity: the exclusion actually removed a square the geometry allows —
-        // the scan twin agrees (asserted above) and a non-mating pawn drop nearby
-        // is still present, proving pawns are otherwise generated.
         assert!(
             drops.iter().any(|&m| m.is_drop()
                 && m.dropped_piece_kind() == PieceKind::Pawn

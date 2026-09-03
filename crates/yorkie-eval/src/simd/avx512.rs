@@ -1,23 +1,15 @@
 //! AVX-512 (F + BW) feature-transformer accumulate/update kernels.
 //!
-//! Ported from the read-only Rust NNUE reference implementation's
-//! `avx512.rs`. Every kernel is guaranteed
-//! bit-identical to its [`crate::simd::scalar`] counterpart (the parity tests
-//! below run only on a CPU that actually has the features).
+//! Every kernel here is bit-identical to its [`crate::simd::scalar`]
+//! counterpart.
 //!
-//! Like the reference, [`crate::simd`] decides at compile time whether these
-//! kernels or the scalar ones are called — but unlike the reference, which
-//! cfg-gates the whole module on `target_feature = "avx512f,avx512bw"`, this
-//! module is *compiled* on every `x86_64` target so the parity tests below can
-//! hold it against the scalar baseline on any AVX-512-capable host. Each entry
-//! point is an `unsafe fn` carrying `#[target_feature(enable =
-//! "avx512f,avx512bw")]`; that attribute does *not* impose a whole-binary
-//! requirement, it only makes the compiler emit AVX-512 code for that one
-//! function. Calling one is sound only when the CPU has the named features,
-//! which the wrappers in [`crate::simd`] guarantee by being compiled only into a
-//! build that enables them (and which the tests below check with
-//! `is_x86_feature_detected!`). On a build that selects the scalar path these
-//! kernels have no caller and the linker drops them.
+//! Unlike the reference, which `cfg`-gates the whole module on the target
+//! features, this module is *compiled* on every `x86_64` target so the parity
+//! tests below can hold it against the scalar baseline on any AVX-512-capable
+//! host. `#[target_feature]` imposes no whole-binary requirement; it only makes
+//! the compiler emit AVX-512 code for that one function. On a build that
+//! selects the scalar path these kernels have no caller and the linker drops
+//! them.
 
 use std::arch::x86_64::{
     __m512i, _mm512_add_epi16, _mm512_loadu_si512, _mm512_storeu_si512, _mm512_sub_epi16,
@@ -42,8 +34,9 @@ pub unsafe fn add_features(out: &mut [i16], weights: &[i16], indices: &[FeatureI
         let col_ptr = col.as_ptr();
         for chunk in 0..NUM_CHUNKS {
             let offset = chunk * LANES;
-            // SAFETY: chunk*LANES+LANES <= HIDDEN_SIZE = out.len() = col.len();
-            // the unaligned 512-bit ops impose no alignment requirement.
+            // SAFETY: `chunk * LANES + LANES <= HIDDEN_SIZE`, which is both
+            // `out.len()` and `col.len()`; the unaligned 512-bit ops impose no
+            // alignment requirement.
             unsafe {
                 let o = _mm512_loadu_si512(out_ptr.add(offset).cast::<__m512i>());
                 let w = _mm512_loadu_si512(col_ptr.add(offset).cast::<__m512i>());
@@ -162,9 +155,8 @@ mod tests {
     use super::*;
     use crate::simd::scalar;
 
-    /// Skip the body unless the CPU actually has the features these kernels
-    /// need, so the parity checks run wherever they can and are skipped, not
-    /// failed, elsewhere.
+    /// Skip the body unless the CPU has the features these kernels need, so a
+    /// host without them skips rather than fails.
     macro_rules! require_avx512bw {
         () => {
             if !(std::arch::is_x86_feature_detected!("avx512f")

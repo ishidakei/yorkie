@@ -1,54 +1,35 @@
-//! Zobrist position hashing for [`crate::position::Position`].
+//! Zobrist position hashing for [`crate::position::Position`], mirroring the
+//! reference's `board_key` / `hand_key` split (`position.h`).
 //!
-//! The scheme mirrors the YaneuraOu reference split
-//! (`source/position.h` around the `board_key` / `hand_key`
-//! members, and the Zobrist table initialisation in `position.cpp`):
+//! `board_key` accumulates by XOR, which is its own inverse, so one operation
+//! both places and removes a term. `hand_key` accumulates by **addition** of a
+//! per-`(color, kind)` step, so `n` held copies contribute `n` steps and a hand
+//! change is a single add or subtract.
 //!
-//! - `key = board_key ^ hand_key`.
-//! - `board_key` accumulates by **XOR** of a per-`(piece, square)` table
-//!   ([`psq`]), plus a **side-to-move** term ([`side`]) that is XORed in while
-//!   White is to move. XOR is its own inverse, so the same operation both
-//!   places and removes a term.
-//! - `hand_key` accumulates by **addition** of a per-`(color, piece-kind)` step
-//!   ([`hand_step`]): holding `n` copies of a kind contributes `n` steps, so
-//!   hand counts compose arithmetically (wrapping addition) rather than by XOR.
-//!   This is what makes the incremental update in `do_move` / `undo_move` a
-//!   single add / subtract per hand change.
-//!
-//! The concrete 64-bit constants **must** equal the reference's. The pawn
-//! history (`pawnHistory`, 8192 planes) and the four correction histories are
-//! *hash tables* indexed by `pawn_key`/`non_pawn_key`/`minor_piece_key` masked
-//! to a handful of low bits (`history.h`), so their collision structure —
-//! and therefore the move ordering and node counts they drive — depends on the
-//! actual Zobrist values, not just on the key *structure*. A private table
-//! aliases differently from the reference and diverges the search on the first
-//! pawn-history collision that flips a quiet's ordering. The
-//! tables are therefore reproduced bit-for-bit from the reference's Zobrist
-//! initialisation (`Position::init`, `position.cpp`): the same
-//! `xorshift64*` PRNG (seed `20151225`), the same `set_rand` (four draws, keep
-//! the first — `SET_HASH` for the 64-bit key config), and the same draw order
-//! (`side`, `noPawns`, `psq[pc][sq]` over `Piece() × SQ`, then `hand[c][pr]`).
-//! Generation stays at compile time, so there is no run-to-run nondeterminism.
+//! **The 64-bit constants must equal the reference's**, not merely share its
+//! structure. The pawn and correction histories are hash tables indexed by these
+//! keys masked to a few low bits, so a different table aliases differently and
+//! diverges the search at the first collision that flips a quiet's ordering.
+//! They are therefore reproduced from `Position::init` (`position.cpp`): the
+//! same `xorshift64*` PRNG and seed, the same four-draws-keep-the-first
+//! `set_rand`, and the same draw order.
 
 use crate::color::Color;
 use crate::piece::{Piece, PieceKind};
 use crate::square::Square;
 
-/// Distinct piece codes: `promoted(2) × color(2) × kind(8)`. Some combinations
-/// are never realised on a board (a promoted King or Gold), but reserving a
-/// slot for them keeps [`piece_code`] a branch-free index computation.
+/// Distinct piece codes: `promoted × color × kind`. A promoted king or gold is
+/// never realised, but reserving a slot keeps [`piece_code`] branch-free.
 const PIECE_CODES: usize = 2 * Color::COUNT * PieceKind::COUNT;
 
-/// The reference Zobrist PRNG seed (`position.cpp`): the 電王トーナメント
-/// 2015 start date, `20151225`.
+/// The reference Zobrist PRNG seed (`position.cpp`).
 const REF_SEED: u64 = 20151225;
 
 /// The `xorshift64*` output multiplier (`misc.h`).
 const REF_MULT: u64 = 2685821657736338717;
 
-/// One `PRNG::rand64()` step (`misc.h`): advance the 64-bit state with
-/// the three xorshift stages, then return `state * MULT`. Returns
-/// `(next_state, value)`; the next draw consumes `next_state`, **not** `value`.
+/// One `PRNG::rand64()` step (`misc.h`), returning `(next_state, value)`. The
+/// next draw consumes `next_state`, **not** `value`.
 const fn rand64(s: u64) -> (u64, u64) {
     let mut x = s;
     x ^= x >> 12;
@@ -58,9 +39,7 @@ const fn rand64(s: u64) -> (u64, u64) {
 }
 
 /// The reference `set_rand` (`position.cpp`): draw four words and keep the
-/// first. `SET_HASH` for the 64-bit key config (`key128.h`) assigns the key
-/// the first word and discards the other three, but all four still advance the
-/// stream. Returns `(next_state, value)`.
+/// first. The other three are discarded but still advance the stream.
 const fn set_rand(s: u64) -> (u64, u64) {
     let (s, v) = rand64(s);
     let (s, _) = rand64(s);
@@ -69,14 +48,12 @@ const fn set_rand(s: u64) -> (u64, u64) {
     (s, v)
 }
 
-/// Map a reference `Piece` code (`types.h`) to this port's [`piece_code`]
-/// slot, or `None` for a code that is never realised on a board — the unnamed
-/// `16` gap between `B_GOLDS` and `W_PAWN`, and the `GOLDS` (`15`/`31`)
-/// gold-equivalent meta pieces. `None` codes are still *drawn* (to keep the PRNG
-/// stream aligned) but not stored. The reference `PieceType` order
-/// (`PAWN, LANCE, KNIGHT, SILVER, BISHOP, ROOK, GOLD, KING` = `1..=8`) differs
-/// from this port's [`PieceKind`] ordering (`Gold` precedes `Bishop`), so the
-/// kind is remapped explicitly.
+/// Map a reference `Piece` code (`types.h`) to this port's [`piece_code`] slot,
+/// or `None` for a code never realised on a board. A `None` code is still
+/// *drawn*, to keep the PRNG stream aligned, but not stored.
+///
+/// The reference's `PieceType` order puts `BISHOP` before `GOLD` where
+/// [`PieceKind`] does the reverse, so the kind is remapped explicitly.
 const fn ref_code_to_slot(pc: usize) -> Option<usize> {
     if pc == 16 {
         return None;
@@ -134,8 +111,8 @@ const fn build() -> Zobrist {
     let mut psq = [[0u64; Square::COUNT]; PIECE_CODES];
     let mut hand = [[0u64; PieceKind::COUNT]; Color::COUNT];
 
-    // `Zobrist::zero` is set from literal zeros (`SET_HASH`, no draw). The first
-    // two live draws are `side` then `noPawns` (`USE_PARTIAL_KEY`).
+    // The reference's `Zobrist::zero` takes no draw, so the first two are
+    // `side` then `noPawns`.
     let mut s = REF_SEED;
     let r = set_rand(s);
     s = r.0;
@@ -144,11 +121,8 @@ const fn build() -> Zobrist {
     s = r.0;
     let no_pawns = r.1;
 
-    // psq: reference `for (pc : Piece()) for (sq : SQ) if (pc) set_rand(...)`
-    // (`position.cpp`). `pc` runs `1..=31` (`0` is skipped by `if (pc)`);
-    // every non-zero code consumes four words per square even when it never
-    // lands on a board (the `16` gap and the `GOLDS` meta pieces), so the stream
-    // stays aligned with the reference.
+    // Every non-zero code consumes four words per square even when it never
+    // lands on a board, keeping the stream aligned with the reference.
     let mut pc = 1;
     while pc <= 31 {
         let mut sq = 0;
@@ -163,9 +137,7 @@ const fn build() -> Zobrist {
         pc += 1;
     }
 
-    // hand: `for (c : COLOR) for (pr = 1; pr < PIECE_HAND_NB; ++pr) set_rand`
-    // (`position.cpp`). `PIECE_HAND_NB == KING == 8`, so `pr` runs
-    // `1..=7` (`PAWN..GOLD`); no king in hand.
+    // `pr` runs over the seven hand kinds: there is no king in hand.
     let mut c = 0;
     while c < Color::COUNT {
         let mut pr = 1;
@@ -190,10 +162,8 @@ const fn build() -> Zobrist {
 
 static ZOBRIST: Zobrist = build();
 
-/// Compile-time copy of the `noPawns` seed, for the `const` contexts
-/// ([`crate::position::Position::empty`]) that cannot read the `static`
-/// [`ZOBRIST`]. Recomputing `build()` here happens only at compile time and
-/// yields the identical value (same fixed seed).
+/// The `noPawns` seed for the `const` contexts that cannot read the `static`
+/// [`ZOBRIST`]. Recomputing `build()` happens at compile time only.
 pub(crate) const NO_PAWNS_SEED: u64 = build().no_pawns;
 
 /// Encode a piece into its Zobrist table index (`0..PIECE_CODES`).
@@ -220,14 +190,11 @@ pub(crate) fn side() -> u64 {
     ZOBRIST.side
 }
 
-/// Whether `piece` is a *minor piece* for the `minor_piece_key`: lance, knight,
-/// silver, gold, or a promoted pawn/lance/knight/silver. Mirrors the reference
-/// `minor_piece_table` (`position.cpp`): bishop, rook, horse, dragon,
-/// king and pawn are **not** minor.
+/// Whether `piece` is a *minor piece* for the `minor_piece_key`
+/// (`minor_piece_table`, `position.cpp`). Bishop, rook, horse, dragon, king and
+/// pawn are **not** minor.
 pub(crate) fn is_minor_piece(piece: Piece) -> bool {
     if piece.promoted {
-        // Promoted pawn/lance/knight/silver are minor; horse (promoted bishop)
-        // and dragon (promoted rook) are not. Gold/king never promote.
         matches!(
             piece.kind,
             PieceKind::Pawn | PieceKind::Lance | PieceKind::Knight | PieceKind::Silver
@@ -244,10 +211,8 @@ pub(crate) fn is_minor_piece(piece: Piece) -> bool {
 mod tests {
     use super::*;
 
-    /// Every piece that can actually occupy a board square has a non-zero psq
-    /// term on every square. The four never-realised promoted-Gold / promoted-
-    /// King codes (`20`, `23`, `28`, `31`) are intentionally left zero: the
-    /// reference never draws them, and this port never reads them.
+    /// The four never-realised promoted-gold and promoted-king codes stay zero:
+    /// the reference never draws them, and this port never reads them.
     #[test]
     fn all_reachable_table_entries_are_nonzero() {
         const KINDS: [PieceKind; 8] = [
@@ -262,9 +227,7 @@ mod tests {
         ];
         for color in [Color::Black, Color::White] {
             for kind in KINDS {
-                // Unpromoted piece: always realisable.
                 let mut pieces = vec![Piece::new(kind, color)];
-                // Promoted form, when the kind can promote (not gold/king).
                 if let Some(p) = Piece::promoted(kind, color) {
                     pieces.push(p);
                 }
@@ -277,7 +240,6 @@ mod tests {
                         );
                     }
                 }
-                // Hand: every kind except the king is a hand piece.
                 if kind != PieceKind::King {
                     assert_ne!(
                         ZOBRIST.hand[color.index()][kind.index()],
@@ -296,8 +258,6 @@ mod tests {
     #[test]
     fn is_minor_piece_matches_reference_table() {
         use Color::Black;
-        // Unpromoted: lance, knight, silver, gold are minor; pawn, bishop, rook,
-        // king are not.
         assert!(!is_minor_piece(Piece::new(PieceKind::Pawn, Black)));
         assert!(is_minor_piece(Piece::new(PieceKind::Lance, Black)));
         assert!(is_minor_piece(Piece::new(PieceKind::Knight, Black)));
@@ -306,8 +266,6 @@ mod tests {
         assert!(!is_minor_piece(Piece::new(PieceKind::Bishop, Black)));
         assert!(!is_minor_piece(Piece::new(PieceKind::Rook, Black)));
         assert!(!is_minor_piece(Piece::new(PieceKind::King, Black)));
-        // Promoted: pawn/lance/knight/silver are minor; horse (bishop) and
-        // dragon (rook) are not.
         for kind in [
             PieceKind::Pawn,
             PieceKind::Lance,

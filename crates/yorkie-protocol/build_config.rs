@@ -1,18 +1,13 @@
 // The engine config's schema, parser and code generator — the pure half of
 // `build.rs`.
 //
-// It lives in its own file, outside `src/`, because it is `include!`d from two
-// places: `build.rs`, which feeds it the real config file and turns any error
-// into a build failure, and `tests/config_schema.rs`, which feeds it hand-built
-// inputs and asserts on the errors. Nothing here touches the environment, the
-// filesystem, or the process — every failure is a returned `Err(String)`, which
-// is what makes the fail-loud behaviour testable at all instead of only being
-// observable by breaking a build on purpose.
+// Nothing here touches the environment, the filesystem, or the process; every
+// failure is a returned `Err(String)`, which is what lets
+// `tests/config_schema.rs` assert on the fail-loud behaviour instead of only
+// observing it by breaking a build on purpose.
 //
-// `include!` rather than a shared crate: a build script cannot depend on a
-// member of the workspace it is building, and adding a third-party TOML crate
-// to compile the engine's own settings would be a dependency the engine does
-// not otherwise need.
+// It is `include!`d rather than shared as a crate because a build script cannot
+// depend on a member of the workspace it is building.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -207,14 +202,13 @@ impl Value {
     }
 }
 
-/// Parse the accepted TOML subset into `key -> entry`.
+/// Parse the accepted TOML subset into `key -> entry`: flat `key = value` pairs
+/// whose values are integers, booleans or basic strings, plus `#` comments and
+/// blank lines.
 ///
-/// The subset is deliberate: flat `key = value` pairs whose values are
-/// integers, booleans, or basic strings, plus `#` comments and blank lines.
-/// Anything else — a table header, an array, an escape sequence, a duplicate key
-/// — is an error rather than something quietly skipped, because a line the
-/// engine config does not understand is a setting the operator believes they
-/// made.
+/// Anything else is an error rather than something quietly skipped, because a
+/// line the engine config does not understand is a setting the operator believes
+/// they made.
 ///
 /// `label` is the file name used in messages.
 fn parse_config(contents: &str, label: &str) -> Result<BTreeMap<String, Entry>, String> {
@@ -429,21 +423,19 @@ fn compile_config(contents: &str, label: &str, source: &str, name: &str) -> Resu
     generate(&entries, label, source, name)
 }
 
-// --- Where the config file comes from -------------------------------------
-//
-// Kept here, and kept pure (the environment is read by the caller), so the
-// resolution rule is covered by the same tests as the schema. Getting this wrong
-// is the quiet failure mode the whole mechanism has to avoid: a build that
+// The config-path resolution is kept here, and kept pure — the caller reads the
+// environment — so it is covered by the same tests as the schema. Getting it
+// wrong is the quiet failure mode the whole mechanism has to avoid: a build that
 // silently reads a config the operator did not mean to select.
 
-/// Resolve the config file to read from the raw `YORKIE_CONFIG` value.
+/// Resolve the config file to read from the raw `YORKIE_CONFIG` value. Unset
+/// selects the checked-in play config.
 ///
-/// Unset selects the checked-in play config. A relative path is taken against
-/// the repository root, so `YORKIE_CONFIG=configs/test.toml` means
-/// the same thing from any working directory — cargo runs a build script with
-/// the package directory as its cwd, so a cwd-relative rule would name a
-/// different file depending on which crate triggered the build. An absolute path
-/// is used as given.
+/// A relative path is taken against the repository root, so
+/// `YORKIE_CONFIG=configs/test.toml` means the same thing from any working
+/// directory: cargo runs a build script with the package directory as its cwd,
+/// so a cwd-relative rule would name a different file depending on which crate
+/// triggered the build.
 fn config_path(repo_root: &Path, raw: Option<OsString>) -> PathBuf {
     let raw = raw
         .map(PathBuf::from)

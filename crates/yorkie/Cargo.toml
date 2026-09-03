@@ -4,9 +4,7 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
-# `src/main.rs` is auto-discovered and takes the package name, so the binary is
-# `target/<profile>/yorkie` without an explicit `[[bin]]` override. The `[[test]]`
-# below is NOT auto-discovered — it lives one directory down.
+# The `[[test]]` below is not auto-discovered, since it lives one directory down.
 [[test]]
 name = "parity_perft"
 path = "tests/parity/perft.rs"
@@ -19,18 +17,10 @@ yorkie-state = { path = "../yorkie-state" }
 serde = { version = "~1.0", features = ["derive"] }
 serde_json = "~1.0"
 
-# Re-exported so `cargo build -p yorkie --features usi-extras` (and the
-# workspace-wide `--all-features` gate runs) reach the Protocol-layer feature.
-# Off by default: the tournament binary is built without it.
-#
-# `tt-entry16` reaches the Storage-layer 16-byte TT entry the same way. It is
-# likewise off by default — without it a build keeps the reference's 10-byte
-# entry — and it composes with `usi-extras` rather than excluding it.
-# `info-diag` / `info-output` reach the Protocol-layer `info`-line features the
-# same way. Both are off by default: the tournament binary's only search output
-# is `bestmove`, and the only `info string`s it can print are the
-# initialisation-phase ones, which no feature gates. `info-output` implies
-# `info-diag` (declared in `yorkie-protocol`), and any measurement build — the
+# Re-exports of the Protocol- and Storage-layer features, so a build of this
+# binary can reach them. All are off by default: the tournament binary's only
+# search output is `bestmove`, and the only `info string`s it can print are the
+# initialisation-phase ones, which no feature gates. A measurement build — the
 # one that reads `nodes` / `nps` back out of the transcript — wants
 # `usi-extras,info-output`.
 [features]

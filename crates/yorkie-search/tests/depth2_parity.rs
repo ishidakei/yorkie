@@ -1,26 +1,19 @@
-//! Depth-2 search parity gate — the pawn-history-aliasing regression.
+//! Depth-2 search parity test — the pawn-history-aliasing regression.
 //!
 //! Runs the `go depth 2` root search ([`QSearch::run_root`]) against a single
 //! reference-captured fixture — `position startpos moves 7g7f` — and asserts
 //! **bestmove, score, and nodes** exactly.
 //!
-//! This is the minimal position at which Zobrist-table aliasing is observable:
-//! a one-node divergence (1752 against the reference's 1753) that the
-//! `(nodes & 14)` root tie-break amplifies into a flipped bestmove by depth 8.
-//! The pawn history (`pawnHistory`, 8192 planes) and the correction histories
-//! are hash tables indexed by `pawn_key & (size - 1)`, so their collision
-//! structure — and therefore the quiet move ordering they drive — depends on the
-//! concrete key values, not just on the key *structure*. A privately seeded
-//! table aliases differently from the reference and flips a quiet's ordering on
-//! the first colliding pawn structure, which cascades through PVS re-search
-//! bounds into the node count. `crates/yorkie-state/src/key.rs` reproduces the
-//! reference's Zobrist bit-for-bit so the aliasing matches; this fixture is what
-//! catches a regression in that.
+//! This is the minimal position at which Zobrist-table aliasing is observable.
+//! The pawn and correction histories are hash tables indexed by
+//! `key & (size - 1)`, so their collision structure — and the quiet move
+//! ordering it drives — depends on the concrete key *values*, not just the key
+//! structure. A privately seeded table aliases differently from the reference
+//! and flips a quiet's ordering on the first colliding pawn structure, which
+//! cascades through PVS re-search bounds into the node count.
 //!
-//! Captured with Threads=1, no book, `usinewgame`, `go depth 2`, USI_Hash 1024
-//! MiB, FV_SCALE 16 — reproduced here by resizing the transposition table to
-//! 1024 MiB and clearing it (the `usinewgame` equivalent). Skipped with a notice
-//! when `nn.bin` is absent, like the other real-network tests.
+//! Captured with Threads=1, no book, `usinewgame`, USI_Hash 1024 MiB and
+//! FV_SCALE 16, reproduced here. Skipped with a notice when `nn.bin` is absent.
 
 use std::path::PathBuf;
 
@@ -120,7 +113,7 @@ fn depth2_startpos_7g7f_matches_reference() {
     let path = nn_bin_path();
     if !path.exists() {
         eprintln!(
-            "skipping depth2_startpos_7g7f_matches_reference: {} is not present (staged only on the dev VM)",
+            "skipping depth2_startpos_7g7f_matches_reference: {} is not present (obtained out-of-band)",
             path.display()
         );
         return;

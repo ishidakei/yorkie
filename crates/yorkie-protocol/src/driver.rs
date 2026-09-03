@@ -35,20 +35,17 @@ use crate::tt_command::{
     TtCommand, TtPosition, TtStoreArgs, bound_name, parse_tt, value_from_tt, value_to_tt,
 };
 
-/// The decided public values used in the `id name` / `id author` lines. They
-/// must remain free of event-specific terms.
+/// The public values used in the `id name` / `id author` lines.
 ///
-/// The version part is this repository's generation number (see
-/// `CHANGELOG.md`), not an upstream-tracking number: `2.0.0` was the
-/// apery_rust-based generation and the `3.x` generation is the current tree.
-/// The upstream YaneuraOu baseline the port tracks is documented in `README.md`
-/// instead.
+/// The version part is this project's own generation number (see
+/// `CHANGELOG.md`), not an upstream-tracking number; the upstream YaneuraOu
+/// baseline is documented in `README.md` instead.
 pub const ENGINE_NAME: &str = "Yorkie 3.1.0";
 pub const ENGINE_AUTHOR: &str = "Kei Ishida <ishida.kei@gmail.com>";
 
 // The transposition table is sized from the `usi_hash` config constant (the
-// reference's `USI_Hash` option, `yaneuraou-search.cpp` — the depth-1
-// fixture capture condition): the first successful `isready` sizes it if still
+// reference's `USI_Hash` option, `yaneuraou-search.cpp` — the depth-1 fixture
+// capture condition): the first successful `isready` sizes it if still
 // unsized, and nothing resizes it thereafter, because nothing can change the
 // constant. The `usi-extras` `bench` command is the one exception: it carries
 // its own table size as a command argument. See
@@ -66,23 +63,20 @@ const SEARCH_MAX_DEPTH: i32 = 245;
 /// `isready` initialisation runs (reference: `sleep_for(100ms)`, engine.cpp).
 const KEEP_ALIVE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How many polls elapse between bare keep-alive newlines: `50 * 100ms = 5s`
-/// (reference: `if (++count >= 50 /* 5秒 */)`, engine.cpp). A GUI
-/// (Shogidokoro / ShogiGUI) reads the periodic empty line as a sign the engine
-/// is alive and does not time out while a big `USI_Hash` allocation and the
-/// ~215 MiB `nn.bin` load run between `isready` and `readyok`.
+/// (reference: `if (++count >= 50 /* 5秒 */)`, engine.cpp). A GUI (Shogidokoro
+/// / ShogiGUI) reads the periodic empty line as a sign the engine is alive and
+/// does not time out while a big `USI_Hash` allocation and the ~215 MiB
+/// `nn.bin` load run between `isready` and `readyok`.
 const KEEP_ALIVE_TICKS_PER_NEWLINE: u32 = 50;
 
-// --- Reference USI score conversion (score.cpp / usi.cpp `format_score`). ---
-// The three constants and `format_score` are `pub(crate)` because the
-// `usi-extras` `tt` commands speak the same score surface as an `info … score`
-// line and must not grow a second copy of the scale (see `crate::tt_command`).
+// Reference USI score conversion (`score.cpp`, `usi.cpp`). These are
+// `pub(crate)` so the `usi-extras` `tt` commands, which speak the same score
+// surface, do not grow a second copy of the scale.
 //
-// The mate scale is only ever needed to RENDER a score, and both surfaces that
-// render one are optional — the `info … score` lines (`info-output`) and the
-// `tt` command output (`usi-extras`) — so the default build compiles neither the
-// two constants nor `push_score` / `format_score`. `PAWN_VALUE` is
-// unconditional: `to_cp` (the `ResignValue` decision) and the draw-contempt
-// scaling read it in every build.
+// The mate scale is only needed to *render* a score, and both surfaces that
+// render one are optional, so the default build compiles neither the two
+// constants nor `push_score` / `format_score`. `PAWN_VALUE` is unconditional:
+// `to_cp` and the draw-contempt scaling read it in every build.
 /// `VALUE_MATE` (`types.h`).
 #[cfg(any(feature = "usi-extras", feature = "info-output"))]
 pub(crate) const VALUE_MATE: Value = 32000;
@@ -95,22 +89,20 @@ pub(crate) const PAWN_VALUE: Value = 90;
 /// the `ResignValue` guard excludes (`yaneuraou-search.cpp`).
 const VALUE_INFINITE: Value = 32001;
 
-/// The reference `USIEngine::to_cp` (`usi.cpp`): `100 * v / NormalizeToPawnValue`,
-/// with C++-style truncating division (Rust truncates toward zero, matching). Used
-/// by the `ResignValue` check; unlike [`format_score`] it does not special-case
-/// mate scores (the reference `to_cp` applies the same linear map to all values).
+/// The reference `USIEngine::to_cp` (`usi.cpp`): `100 * v /
+/// NormalizeToPawnValue`, with C++-style truncating division (Rust truncates
+/// toward zero, matching). Used by the `ResignValue` check; unlike
+/// [`format_score`] it does not special-case mate scores (the reference
+/// `to_cp` applies the same linear map to all values).
 fn to_cp(v: Value) -> Value {
     100 * v / PAWN_VALUE
 }
 
 /// Append a search value to `out` the way the reference USI layer formats it: a
-/// mate distance for decisive scores, else `100 * v / PawnValue` centipawns with
-/// C++-style truncating division (Rust integer division truncates toward zero,
-/// matching).
+/// mate distance for decisive scores, else centipawns.
 ///
-/// Appending in place — with the one integer field written through a
-/// [`NumBuffer`] — keeps the `info` PV path free of the `String` temporary
-/// [`format_score`] hands back. [`format_score`] itself stays for the two book
+/// Appending in place keeps the `info` PV path free of the `String` temporary
+/// [`format_score`] hands back; [`format_score`] itself stays for the two book
 /// call sites that need an owned value.
 #[cfg(any(feature = "usi-extras", feature = "info-output"))]
 fn push_score(out: &mut String, v: Value) {
@@ -138,22 +130,14 @@ pub(crate) fn format_score(v: Value) -> String {
 ///
 /// The path is retained so `isready` is idempotent: a repeat with the same
 /// `<EvalDir>/nn.bin` reuses the already-loaded [`Search`] instead of parsing
-/// the file (and re-allocating the network) again. The [`Search`] is held behind
-/// an [`Arc`] so a `go` can hand a cheap clone to its search worker thread while
-/// the driver keeps its own reference (the network is read-only during search).
+/// the file again.
 ///
-/// # Per-NUMA-node replication
-///
-/// When NUMA thread binding is active *and* the config
-/// [`requires_memory_replication`](NumaConfig::requires_memory_replication), the
-/// single shared network is replaced by one on-node copy per *system* NUMA node
-/// touched by the binding assignment (the in-process analog of the reference
-/// `LazyNumaReplicatedSystemWide<Networks>`, minus its POSIX shared-memory layer
-/// — a declared scope reduction). Each worker then reads its own node's copy.
-/// The replica granularity is the system NUMA node, not the (possibly
-/// L3-bundled) logical node: logical nodes that share a system node share one
-/// copy (`get_discriminator`, `numa.h`;
-/// [`NumaConfig::system_node_of_logical`]).
+/// When NUMA thread binding is active *and*
+/// [`requires_memory_replication`](NumaConfig::requires_memory_replication),
+/// the single shared network is replaced by one on-node copy per *system* NUMA
+/// node touched by the binding assignment. The granularity is the system node,
+/// not the possibly L3-bundled logical node, so logical nodes that share a
+/// system node share one copy.
 struct LoadedEval {
     path: PathBuf,
     /// The instance the file was loaded into (the reference's replication
@@ -177,19 +161,16 @@ enum IsreadyOutcome {
     LoadFailed(String),
 }
 
-/// The opened opening books plus the `IgnoreBookPly` value captured at load time.
+/// The opened opening books plus the `IgnoreBookPly` value captured at load
+/// time.
 ///
-/// `books` is the Multiple Book priority list (`memory_books`, `book.h`):
-/// the numbered `stem-000…` series in ascending order followed by the plain base
-/// name, restricted to the names that actually opened. A probe consults them in
-/// this order and takes the first hit (`book.cpp`).
+/// `books` is the Multiple Book priority list, and a probe consults it in order
+/// and takes the first hit. The reference captures `IgnoreBookPly` into the
+/// book at `read_book` time, so changing it requires a reload.
 ///
-/// The reference captures `IgnoreBookPly` into the book at `read_book` time
-/// (`book.cpp`); changing it requires a reload. The list is held behind
-/// an [`Arc`] so a `go` hands its coordinator a cheap clone. Only the
-/// coordinator probes (once per `go`, before helpers start) — the on-the-fly
-/// read path is not thread-safe by design (`book.h`), and this
-/// single-prober discipline preserves that invariant.
+/// Only the coordinator probes, once per `go` before helpers start: the
+/// on-the-fly read path is not thread-safe by design, and this single-prober
+/// discipline is what preserves that.
 struct LoadedBook {
     books: Vec<Book>,
     ignore_book_ply: bool,
@@ -217,50 +198,37 @@ struct ActiveSearch {
     /// is on the wire.
     ///
     /// [`JoinHandle::is_finished`] is not that moment: the coordinator emits
-    /// `bestmove` and only then unwinds (reclaiming its histories, dropping its
-    /// `Arc`s), so a host that reads `bestmove` and immediately sends the next
-    /// command can land in the window where the thread has not yet returned. A
-    /// flag stamped under the output lock closes it — any reader that has seen
-    /// the `bestmove` line took the same lock afterwards, so it cannot see this
-    /// as unset.
-    ///
-    /// Its one reader is the `usi-extras` `tt` handler, so a default build
-    /// stamps the flag (the coordinator does that unconditionally) and never
-    /// asks. Kept in every build rather than `cfg`-ed away: it is written on the
-    /// search thread's output path, which must not grow a second shape.
+    /// `bestmove` and only then unwinds, so a host that reads `bestmove` and
+    /// immediately sends the next command can land in the window where the
+    /// thread has not yet returned. A flag stamped under the output lock closes
+    /// it — any reader that has seen the `bestmove` line took the same lock
+    /// afterwards, so it cannot see this as unset.
     #[cfg_attr(not(feature = "usi-extras"), allow(dead_code))]
     bestmove_sent: Arc<AtomicBool>,
-    /// The root game ply this search ran at (`rootPos.game_ply()`), carried so a
-    /// completed real search updates the driver's `last_game_ply`
+    /// The root game ply this search ran at (`rootPos.game_ply()`), carried so
+    /// a completed real search updates the driver's `last_game_ply`
     /// (`yaneuraou-search.cpp`).
     game_ply: i32,
 }
 
 /// The session-owned search state a `go` lends to its worker and reclaims when
-/// the worker finishes: the game-scoped worker history tables (they persist
-/// across `go`s within one game and are reset by `usinewgame`,
-/// matching the reference `search_clear`).
+/// the worker finishes: the game-scoped worker history tables, which persist
+/// across `go`s within one game and are reset by `usinewgame`.
 ///
-/// The transposition table is not part of this take-and-return handover: it
-/// lives behind an [`Arc`] (`&self` probe / write path), so the worker gets a
-/// cheap `Arc` clone instead and never hands it back.
+/// The transposition table is not part of this handover — it lives behind an
+/// [`Arc`], so the worker gets a clone and never hands it back.
 struct SearchState {
     histories: WorkerHistories,
     /// The chosen worker's reported score / average score and the main worker's
     /// final `timeReduction`, carried back so the driver seeds the next `go`'s
-    /// time management (the reference `MainManager` fields set at the end of
-    /// `start_searching`, `yaneuraou-search.cpp`).
+    /// time management.
     ///
-    /// Always `Some` now: the reference runs the `1249-1253` bookkeeping on *every*
-    /// path, including the SKIP_SEARCH short-circuits (book / declaration / resign /
-    /// no-legal-move), where `bestThread->rootMoves[0]` is the unsearched default
-    /// (`score == averageScore == -VALUE_INFINITE`, `search.h`) and
-    /// `lastGamePly = rootPos.game_ply()`. The short-circuits therefore carry
-    /// `(-VALUE_INFINITE, -VALUE_INFINITE, …)` and the current ply. The third
-    /// element is `Some(tr)` only when a real search produced a fresh
-    /// `timeReduction`; `None` on a short-circuit, where the reference never touches
-    /// `previousTimeReduction` (`iterative_deepening` did not run), so the driver's
-    /// persisted value is left unchanged.
+    /// Always `Some`: the reference runs this bookkeeping on *every* path,
+    /// including the search-skipping short-circuits, which carry the unsearched
+    /// `-VALUE_INFINITE` defaults and the current ply. The third element is
+    /// `Some(tr)` only when a real search produced a fresh `timeReduction`; on a
+    /// short-circuit the reference never touches `previousTimeReduction`, so the
+    /// driver's persisted value is left unchanged.
     time_state: Option<(Value, Value, Option<f64>)>,
 }
 
@@ -277,15 +245,13 @@ pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
     /// The loaded network holder, present only after a successful `isready`.
     /// `go` before this is set replies `bestmove resign`.
     eval: Option<LoadedEval>,
-    /// The shared transposition table the root search runs against, behind an
-    /// [`Arc`]. Sized from the `usi_hash` config constant the first time
-    /// `isready` succeeds (and from its own argument by `bench`),
-    /// cleared on `usinewgame`, and advanced per `go` by `run_root`
-    /// itself (`tt.new_search()`) — the driver never bumps the generation. A
-    /// `go` hands its worker a cheap `Arc` clone; the driver keeps this one.
-    /// `resize` / `clear` reach the table via [`Arc::get_mut`], which succeeds
-    /// only once every worker clone has been dropped (refcount 1) — the
-    /// lifecycle-exclusivity contract documented on [`TranspositionTable`].
+    /// The shared transposition table the root search runs against.
+    ///
+    /// Sized from the `usi_hash` config constant the first time `isready`
+    /// succeeds, cleared on `usinewgame`, and advanced per `go` by the search
+    /// itself — the driver never bumps the generation. `resize` / `clear` reach
+    /// the table via [`Arc::get_mut`], which succeeds only once every worker
+    /// clone has been dropped.
     tt: Arc<TranspositionTable>,
     /// Game-scoped worker histories. `None` only while a worker
     /// holds them mid-search.
@@ -295,48 +261,43 @@ pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
     /// every listed book failed / was unsupported). Behind an [`Arc`] so a `go`
     /// hands its coordinator a cheap clone.
     book: Option<Arc<LoadedBook>>,
-    /// The `(resolved-name-list, on-the-fly, ignore-book-ply)` signature of the
-    /// last book load — the Multiple Book priority list, not a single name.
-    /// `isready` reloads only when this changes — the reference's reload-skip
-    /// (`book.cpp`).
+    /// The `(resolved-name-list, on-the-fly, ignore-book-ply)` signature of
+    /// the last book load — the Multiple Book priority list, not a single
+    /// name. `isready` reloads only when this changes — the reference's
+    /// reload-skip (`book.cpp`).
     book_signature: Option<(Vec<PathBuf>, bool, bool)>,
-    /// A session-scoped seed advanced per `go` (an LCG step), driving both the
-    /// book-selection PRNG and the `rtime` PRNG. Seeded from process entropy by
-    /// default ([`UsiDriver::new`], mirroring the reference's default-constructed
-    /// `AsyncPRNG` / `PRNG`), so book / `rtime` randomness varies across process
-    /// runs; tests pin it via [`UsiDriver::with_book_seed`] for reproducibility.
+    /// A session-scoped seed advanced per `go`, driving both the book-selection
+    /// PRNG and the `rtime` PRNG. Seeded from process entropy by default; tests
+    /// pin it via [`UsiDriver::with_book_seed`].
     book_seed: u64,
     /// The in-flight search worker, if any.
     search: Option<ActiveSearch>,
-    /// Time-management state that persists across `go`s within a game (reset by
-    /// `usinewgame`, the reference `search_clear`, `yaneuraou-search.cpp`):
-    /// the previous move's reported score / average score (`VALUE_INFINITE` for
-    /// the first move) and the previous move's final `timeReduction` (`0.85`
-    /// initially). Fed into each `go`'s [`TimeControl`] and refreshed on join.
+    /// Time-management state that persists across `go`s within a game and is
+    /// reset by `usinewgame`: the previous move's reported score / average score
+    /// and its final `timeReduction`. Fed into each `go`'s [`TimeControl`] and
+    /// refreshed on join.
     best_previous_score: Value,
     best_previous_average_score: Value,
     previous_time_reduction: f64,
     /// The root game ply of the last completed real search
-    /// (`main_manager()->lastGamePly`, `yaneuraou-search.cpp`). Reset to `0`
-    /// on `usinewgame` (`:292`) and set after every non-short-circuited search. At
-    /// the next search start, an odd `last_game_ply - game_ply` (the side to move
-    /// alternated — e.g. a Stochastic_Ponder rewind / re-issue) flips the sign of
-    /// the persisted previous scores before they seed the next search (`:1470-1483`).
+    /// (`main_manager()->lastGamePly`), reset to `0` on `usinewgame`.
+    ///
+    /// At the next search start an odd `last_game_ply - game_ply` means the side
+    /// to move alternated, which flips the sign of the persisted previous scores
+    /// before they seed the next search.
     last_game_ply: i32,
     /// The last `position` command in parsed form (`last_position_cmd_string`,
     /// `usi.h`), retained so a Stochastic_Ponder `go ponder` can rewind it by
-    /// one move and a Stochastic_Ponder `ponderhit` can re-apply the real position.
+    /// one move and a Stochastic_Ponder `ponderhit` can re-apply the real
+    /// position.
     last_position: (PositionSfen, Vec<String>),
-    /// The last `go` command's limits (`last_go_cmd_string`, `usi.h`), retained
-    /// so a Stochastic_Ponder `ponderhit` can re-issue it with `ponder` stripped.
+    /// The last `go` command's limits (`last_go_cmd_string`, `usi.h`),
+    /// retained so a Stochastic_Ponder `ponderhit` can re-issue it with
+    /// `ponder` stripped.
     last_go: Option<GoLimits>,
-    /// The worker thread pool: a main-worker slot plus
-    /// `Threads − 1` persistent helper threads. Each `go` dispatches a search job
-    /// to every helper (the reference `idle_loop`: park → receive job → run →
-    /// report → park); the main worker is the per-`go` coordinator thread
-    /// [`Self::handle_go`] spawns. Each helper owns game-scoped histories that
-    /// persist across `go`s and are reset by recreating the pool on `usinewgame`
-    /// / a `bench` thread count.
+    /// The worker thread pool: a main-worker slot plus `Threads − 1` persistent
+    /// helper threads, each parked until a `go` dispatches it a job. The main
+    /// worker is the per-`go` coordinator thread [`Self::handle_go`] spawns.
     pool: ThreadPool,
     /// The pool size the next (re)build uses. Always the `threads` config
     /// constant, except while a `usi-extras` `bench` runs its own thread count
@@ -347,52 +308,34 @@ pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
     /// the engine default policy (`NumaConfig::from_system(BundledL3{32}, true)`).
     /// Never replaced: the mapping policy is the `numa_policy` config constant.
     numa_config: NumaConfig,
-    /// The current worker → NUMA-node binding assignment. Empty when binding is
-    /// inactive (`numa_policy = "none"`, or the single-node CI/VM case where `auto`
-    /// never suggests binding). Recomputed at every pool (re)build and stable
-    /// until the next one. Index `i` is worker `i` (slot 0 = per-`go`
-    /// coordinator; `1..` = helper threads).
+    /// The current worker → NUMA-node binding assignment, empty when binding is
+    /// inactive. Recomputed at every pool (re)build and stable until the next
+    /// one. Slot 0 is the per-`go` coordinator; `1..` are the helper threads.
     numa_bound: Vec<NumaIndex>,
-    /// The shareable form of the binding assignment: [`Self::numa_config`] plus
-    /// [`Self::numa_bound`] plus the worker → *system*-node map the memory
-    /// policy is indexed by. `None` when binding is inactive. Rebuilt with the
-    /// pool and handed (as an [`Arc`] clone) to every helper thread at spawn and
-    /// to each `go`'s coordinator, so the sysfs read behind the system-node map
-    /// happens once per pool rebuild rather than once per `go`.
+    /// The shareable form of the binding assignment, including the worker →
+    /// *system*-node map the memory policy is indexed by. `None` when binding is
+    /// inactive. Rebuilt with the pool, so the sysfs read behind the system-node
+    /// map happens once per pool rebuild rather than once per `go`.
     numa_plan: Option<Arc<NumaBindPlan>>,
-    /// Per-worker handles to the node-shared correction / pawn tables.
-    /// Index `i` is worker `i`'s [`SharedHistories`] — a cheap [`Arc`]
-    /// clone of its NUMA node's table set. Rebuilt at every pool (re)build from
-    /// [`Self::numa_bound`]: unbound → one table set (node 0, sized to the whole
-    /// pool) cloned to every worker; bound → one table set per node, each sized
-    /// to that node's thread count, and every worker points at its node's set.
-    /// Length equals the pool size, so `[0]` is the coordinator's and `[1..]` are
-    /// the helpers'.
+    /// Per-worker handles to the node-shared correction / pawn tables, rebuilt
+    /// at every pool (re)build from [`Self::numa_bound`]. Length equals the pool
+    /// size, so `[0]` is the coordinator's and `[1..]` the helpers'.
     worker_shared: Vec<Arc<SharedHistories>>,
-    /// Per-worker handles to the NNUE network the worker evaluates with.
-    /// Index `i` is worker `i`'s [`Search`] — a cheap [`Arc`] clone of its
-    /// *system* NUMA node's network copy. Empty until a network is loaded;
+    /// Per-worker handles to the NNUE network the worker evaluates with — a
+    /// clone of its *system* NUMA node's copy. Empty until a network is loaded;
     /// otherwise its length equals the pool size, so `[0]` is the coordinator's
-    /// and `[1..]` the helpers'. Rebuilt whenever the pool is rebuilt or a network
-    /// is (re)loaded ([`Self::rebuild_networks`]). When replication is inactive
-    /// every entry is a clone of the one loaded instance
-    /// ([`LoadedEval::source`]); when active each points at its node's replica, so
-    /// two workers on the same system node share one copy and workers on different
-    /// system nodes read distinct copies.
+    /// and `[1..]` the helpers'.
     worker_networks: Vec<Arc<Search>>,
-    /// Poll interval of the `isready` keep-alive helper thread
-    /// ([`KeepAlive`]). Defaults to the reference [`KEEP_ALIVE_POLL_INTERVAL`]
-    /// (100 ms → a bare newline every 5 s); overridable via
-    /// [`Self::with_keep_alive_poll`] so a test can drive the mechanism with a
-    /// short interval. Production behaviour is always the reference cadence.
+    /// Poll interval of the `isready` keep-alive helper thread ([`KeepAlive`]),
+    /// overridable via [`Self::with_keep_alive_poll`] so a test can drive the
+    /// mechanism with a short interval.
     keep_alive_poll: Duration,
 }
 
 impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// A driver whose book / `rtime` PRNG stream is seeded from process entropy,
-    /// like the reference's default-constructed `AsyncPRNG` / `PRNG` (`book.h`,
-    /// `timeman.cpp`) — every process run differs. Tests wanting reproducible
-    /// book selection or `rtime` budgets construct via [`Self::with_book_seed`].
+    /// so every process run differs. Tests wanting reproducible book selection
+    /// or `rtime` budgets construct via [`Self::with_book_seed`].
     pub fn new(reader: R, writer: Arc<Mutex<W>>) -> Self {
         Self::with_book_seed(reader, writer, Prng::random_seed())
     }
@@ -400,24 +343,15 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// A driver with an explicit book-PRNG session seed. The entropy default
     /// ([`Self::new`]) delegates here with [`Prng::random_seed`]; tests inject a
     /// fixed seed for deterministic book / `rtime` behaviour.
-    ///
-    /// No option file is opened on any path, in any build: there is no
-    /// `engine_option_profile.txt` read (the book-option profile is the
-    /// `book_options_v2` config key) and no option map to build before the `usi`
-    /// reply.
     pub fn with_book_seed(reader: R, writer: Arc<Mutex<W>>, book_seed: u64) -> Self {
         let settings = Settings::new();
         let threads = settings.threads();
-        // Detect the active NUMA layout once, from the engine default policy
-        // (`engine.cpp`: `from_system(BundledL3{32}, respect_affinity=true)`,
-        // the `NumaPolicy` default of `auto`). On the single-node CI/VM this is a
-        // one-node config, so the binding below is empty and no thread binds.
+        // Detect the active NUMA layout once, from the engine default policy.
         //
-        // A configured policy that does not resolve (an unparsable custom node
-        // string, or one yielding zero nodes) is a build the engine cannot run:
-        // the reference reaches `std::exit(EXIT_FAILURE)` on the same input
-        // (`engine.cpp`), and here it is a config error, so fail loudly
-        // at construction rather than silently searching on the wrong layout.
+        // A configured policy that does not resolve — an unparsable custom node
+        // string, or one yielding zero nodes — is a build the engine cannot
+        // run, so fail loudly at construction rather than silently searching on
+        // the wrong layout.
         let policy = settings.numa_policy();
         let numa_config = match numa_config_from_policy(policy, &real_sysfs_options()) {
             Ok(cfg) => cfg,
@@ -466,12 +400,10 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         }
     }
 
-    /// Override the `isready` keep-alive poll interval (default
-    /// [`KEEP_ALIVE_POLL_INTERVAL`]). A test injects a short interval so a
-    /// deliberately slowed heavy job elapses at least one keep-alive tick and
-    /// emits a bare newline before `readyok`; production always uses the
-    /// reference cadence. The newline still fires only after
-    /// [`KEEP_ALIVE_TICKS_PER_NEWLINE`] polls, so this scales the whole cadence.
+    /// Override the `isready` keep-alive poll interval, so a test can make a
+    /// deliberately slowed heavy job elapse at least one tick. The newline still
+    /// fires only after [`KEEP_ALIVE_TICKS_PER_NEWLINE`] polls, so this scales
+    /// the whole cadence.
     pub fn with_keep_alive_poll(mut self, poll: Duration) -> Self {
         self.keep_alive_poll = poll;
         self
@@ -521,21 +453,16 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 
     /// Emit one `info string <msg>` line.
     ///
-    /// This is the UNCONDITIONAL sink, reserved for the `isready` /
-    /// initialisation phase (the eval-load failure, the loader warnings, the book
-    /// load reports, `Using N threads`, the NUMA and table allocation reports)
-    /// and for the response payload of a `usi-extras` command. Those lines are
-    /// how a failed startup is diagnosed at all, so no feature may take them
-    /// away. Everything else goes through [`Self::info_string_diag`].
+    /// This is the unconditional sink, reserved for the initialisation phase and
+    /// for a `usi-extras` command's response payload: those lines are how a
+    /// failed startup is diagnosed at all, so no feature may take them away.
+    /// Everything else goes through [`Self::info_string_diag`].
     fn info_string(&self, msg: &str) -> io::Result<()> {
         Formatter::new(&mut *self.lock_writer()).info_string(msg)
     }
 
-    /// Emit one diagnostic `info string` line — the `info-diag` surface: every
-    /// `info string` produced OUTSIDE the initialisation phase (unknown command,
-    /// `command too long`, the `position` rejections, the gated-`go`-clause
-    /// refusal, `Error! : MaxMovesToDraw is too small.`, the `bench` argument
-    /// rejections).
+    /// Emit one diagnostic `info string` line — the `info-diag` surface, which
+    /// carries every `info string` produced outside the initialisation phase.
     ///
     /// Callers pass `format_args!`, not a `String`, so the message is composed
     /// only if it is going to be written.
@@ -564,15 +491,11 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     }
 
     /// If a search worker is running, request its stop and join it, reclaiming
-    /// the session-owned histories. Idempotent: a no-op when idle. Setting the
-    /// flag is harmless when the worker has already finished naturally (it has
-    /// emitted its `bestmove` and is only waiting to be joined); a short
-    /// fixed-depth search that never reached a `check_time` checkpoint completes
-    /// fully regardless, so its result is unperturbed.
+    /// the session-owned histories. Idempotent: a no-op when idle.
     ///
     /// Joining also drops the worker's `Arc` clone of the transposition table,
-    /// so afterwards the driver again holds the sole reference and `Arc::get_mut`
-    /// (used by `resize` / `clear`) succeeds.
+    /// so afterwards the driver holds the sole reference and `Arc::get_mut`
+    /// succeeds.
     fn finish_search_join(&mut self) {
         if let Some(active) = self.search.take() {
             active.stop.store(true, Ordering::Relaxed);
@@ -581,32 +504,29 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 .join()
                 .expect("search worker thread must not panic");
             self.histories = Some(state.histories);
-            // Carry the finished search's time-management outputs forward for the
-            // next `go` (`yaneuraou-search.cpp`). The reference runs this
-            // bookkeeping on every path, so the short-circuits (book / declaration /
-            // resign) carry too: `-VALUE_INFINITE` scores and the current ply, but
-            // `tr == None` because `previousTimeReduction` is only written by a real
-            // `iterative_deepening` run and must otherwise stay put.
+            // Carry the finished search's time-management outputs forward. The
+            // reference runs this bookkeeping on every path, so the
+            // short-circuits carry too, but with `tr == None`, since
+            // `previousTimeReduction` is only written by a real
+            // `iterative_deepening` run.
             if let Some((score, avg, tr)) = state.time_state {
                 self.best_previous_score = score;
                 self.best_previous_average_score = avg;
                 if let Some(tr) = tr {
                     self.previous_time_reduction = tr;
                 }
-                // Remember the ply this search ran at so the next search can detect a
-                // side-to-move flip (`yaneuraou-search.cpp`).
+                // Remember the ply this search ran at so the next search can
+                // detect a side-to-move flip (`yaneuraou-search.cpp`).
                 self.last_game_ply = active.game_ply;
             }
         }
     }
 
-    /// Resize the shared transposition table to `mb` MiB, mirroring the
-    /// reference `set_tt_size`
-    /// (`yaneuraou-search.cpp`: `wait_for_search_finished(); tt.resize`).
+    /// Resize the shared transposition table to `mb` MiB — the reference's
+    /// `set_tt_size`.
+    ///
     /// The caller must have run [`Self::finish_search_join`] first so the driver
-    /// holds the sole [`Arc`] and [`Arc::get_mut`] succeeds. [`TranspositionTable::resize`]
-    /// is itself a no-op when the requested size yields the current cluster count
-    /// (reallocate-and-clear otherwise), matching the pin.
+    /// holds the sole [`Arc`] and [`Arc::get_mut`] succeeds.
     fn resize_tt(&mut self, mb: usize) {
         Arc::get_mut(&mut self.tt)
             .expect("no search worker holds the TT during a table resize")
@@ -620,37 +540,30 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     }
 
     /// Recompute the worker → NUMA-node binding for the current pool size and
-    /// the configured mapping policy, and rebuild the worker pool with it. Every
-    /// pool (re)build routes through here so the stored [`Self::numa_bound`]
-    /// assignment stays consistent with the live pool (the reference recomputes
-    /// `boundThreadToNumaNode` on each `resize_threads`, `thread.cpp`).
-    /// Helper threads (worker `1..`) bind once at spawn inside the pool; the
-    /// per-`go` coordinator (worker 0) binds at each `go` (see
-    /// [`Self::prepare_coordinator_job`]).
+    /// the configured mapping policy, and rebuild the worker pool with it.
+    /// Every pool (re)build routes through here so [`Self::numa_bound`] stays
+    /// consistent with the live pool. Helper threads bind once at spawn; the
+    /// per-`go` coordinator binds at each `go`.
     ///
-    /// Callers must have joined any running search first (a resize destroys and
-    /// recreates the helper threads).
+    /// Callers must have joined any running search first, since a resize
+    /// destroys and recreates the helper threads.
     fn rebuild_pool(&mut self) {
         let requested = self.pool_threads;
         let policy = self.settings.numa_policy();
         self.numa_bound = compute_numa_binding(&self.numa_config, policy, requested);
         // Rebuild the per-node shared correction / pawn tables from the fresh
-        // binding assignment (the reference `sharedHistories.clear()` +
-        // per-node `try_emplace`, `thread.cpp`). Every pool rebuild
-        // (`usinewgame` / `Threads` / `NumaPolicy`) therefore resets the shared
-        // tables, matching the reference. Helpers pick their node's set up per
-        // `go` (via the coordinator job); the coordinator's own game-scoped
-        // per-worker tables persist, so only its shared handle is swapped.
+        // binding assignment, so every pool rebuild resets them as the
+        // reference does. The coordinator's own game-scoped per-worker tables
+        // persist, so only its shared handle is swapped.
         self.worker_shared = build_worker_shared(&self.numa_config, &self.numa_bound, requested);
         if let Some(h) = self.histories.as_mut() {
             h.set_shared(Arc::clone(&self.worker_shared[0]));
         }
         self.numa_plan = bind_plan(&self.numa_config, &self.numa_bound);
-        // The coordinator's per-worker tables outlive a pool rebuild (only their
-        // shared handle is swapped above) and were faulted on the USI thread, so
-        // re-assert their placement for the fresh assignment. Helpers need
-        // nothing here: `set_with_binding` respawns them, and each allocates its
-        // own bundle on-thread after pinning.
+        // The coordinator's per-worker tables outlive a pool rebuild and were
+        // faulted on the USI thread, so re-assert their placement for the fresh
+        // assignment. Helpers need nothing here: they are respawned and each
+        // allocates its own bundle on-thread after pinning.
         place_coordinator_histories(
             self.histories.as_ref(),
             coordinator_system_node(self.numa_plan.as_ref()),
@@ -667,22 +580,12 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// binding assignment touches, and resolve the per-worker
     /// [`Self::worker_networks`] handles.
     ///
-    /// This is the port's analog of the reference `ensure_network_replicated`
-    /// (`thread.cpp`), forced at configuration time so no replication ever
-    /// runs on the search path (`engine.cpp`). It runs after every pool
-    /// rebuild and after every successful `isready` load.
-    ///
-    /// When no network is loaded, or replication is not required (binding inactive
-    /// — the single-node CI/VM case — or [`NumaConfig::requires_memory_replication`]
-    /// is false), the one loaded instance is shared by every worker, byte-for-byte
-    /// the pre-replication behaviour. Otherwise one on-node copy is built per
-    /// distinct
-    /// system node, cloned from [`LoadedEval::source`] inside a thread bound to a
-    /// logical node of that system node ([`NumaConfig::execute_on_numa_node`], so
-    /// the copy's pages first-touch there); logical nodes that share a system node
-    /// share one copy. Replicas whose system node no longer appears are dropped;
-    /// existing replicas are reused (their content is source-independent — every
-    /// instance is byte-identical), so a plain pool rebuild that leaves the layout
+    /// Forced at configuration time so no replication ever runs on the search
+    /// path. When no network is loaded, or replication is not required, the one
+    /// loaded instance is shared by every worker. Otherwise one copy is built
+    /// per distinct system node, cloned inside a thread bound to that node so
+    /// its pages first-touch there. Existing replicas are reused — every
+    /// instance is byte-identical — so a pool rebuild that leaves the layout
     /// unchanged performs no cloning.
     fn rebuild_networks(&mut self) {
         let requested = self.pool.size().max(1);
@@ -737,8 +640,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 
     /// Emit each non-blank line of `text` as `info string <line>` through the
     /// single output sink, mirroring the reference `print_info_string`
-    /// (`usi.cpp`): the text is split on `'\n'` and whitespace-only lines
-    /// are skipped.
+    /// (`usi.cpp`): the text is split on `'\n'` and whitespace-only lines are
+    /// skipped.
     #[cfg(feature = "usi-extras")]
     fn emit_info_string_lines(&self, text: &str) -> io::Result<()> {
         for line in text.split('\n') {
@@ -785,9 +688,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 
     /// The absolute path a `<BookDir>/<BookFile>` pair resolves to.
     ///
-    /// Mirrors the reference `get_book_name` (`book.cpp`): join
-    /// `BookDir` onto the binary's folder, then `BookFile`. An absolute `BookDir`
-    /// (as tests use) wins over the binary folder — `Path::join` semantics match
+    /// Mirrors the reference `get_book_name` (`book.cpp`): join `BookDir` onto
+    /// the binary's folder, then `BookFile`. An absolute `BookDir` (as tests
+    /// use) wins over the binary folder — `Path::join` semantics match
     /// `Path::Combine`. `BookDir` / `BookFile` are data paths opened as-is via
     /// `std::fs`, with no shell or metacharacter interpretation.
     fn book_path(&self, book_dir: &str, book_file: &str) -> PathBuf {
@@ -798,22 +701,13 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         base.join(book_dir).join(book_file)
     }
 
-    /// (Re)load the opening books from the current options, mirroring the
-    /// reference `BookMoveSelector::read_book` invoked from `isready`
-    /// (`yaneuraou-search.cpp`). Reloads only when the
-    /// `(name list, on-the-fly, IgnoreBookPly)` capture changed
-    /// (`book.cpp`).
+    /// (Re)load the opening books from the current options — the reference's
+    /// `BookMoveSelector::read_book`. Reloads only when the `(name list,
+    /// on-the-fly, IgnoreBookPly)` capture changed.
     ///
-    /// The name list is the Multiple Book priority series
-    /// ([`book_names`]): `<stem>-000`, `<stem>-001`, … up to the first missing
-    /// index, then the plain base name last. Each name becomes its own book,
-    /// opened in the current read mode; the ones that open form the priority list
-    /// a probe walks (first hit wins).
-    ///
-    /// `no_book`, an unsupported (non-`.ybb`) format, or an open failure all
-    /// leave that name out of the list without panicking; a `.db` whose file is
-    /// absent falls back to the `.ybb` sibling with the pin's fallback info
-    /// string.
+    /// `no_book`, an unsupported format, or an open failure all leave that name
+    /// out of the list without panicking; a `.db` whose file is absent falls
+    /// back to the `.ybb` sibling with the reference's fallback info string.
     fn reload_book(&mut self) -> io::Result<()> {
         let book_file = self.settings.book_file().to_string();
         let book_dir = self.settings.book_dir().to_string();
@@ -840,17 +734,17 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         }
 
         // The "priority book file exists twice" notices from the enumeration,
-        // verbatim from the pin (`book.cpp`).
+        // verbatim from the reference (`book.cpp`).
         for notice in &notices {
             self.info_string(notice)?;
         }
 
         let mut books: Vec<Book> = Vec::new();
         for name in &names {
-            // Resolve a `.db` whose file is absent to its `.ybb` sibling. The pin
-            // applies this per name inside `MemoryBook::read_book`
-            // (`book.cpp`); for a numbered name it is always a no-op
-            // (the enumeration already proved the file exists).
+            // Resolve a `.db` whose file is absent to its `.ybb` sibling. The
+            // pin applies this per name inside `MemoryBook::read_book`
+            // (`book.cpp`); for a numbered name it is always a no-op (the
+            // enumeration already proved the file exists).
             let resolved = resolve_book_filename_with_ybb_fallback(name);
             if &resolved != name {
                 self.info_string(&format!(
@@ -860,11 +754,11 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 ))?;
             }
 
-            // SCOPE DIVERGENCE from the pin: only `.ybb` is supported. Anything
-            // else — including a `.db` the pin's two-extension resolution picked
-            // for a numbered slot — behaves as no-book after an info-string
-            // notice, never a panic and never a SILENT skip: a silent skip would
-            // hide a book the pin would have used.
+            // Divergence from the reference: only `.ybb` is supported. Anything
+            // else — including a `.db` the reference's two-extension resolution
+            // picked for a numbered slot — behaves as no-book after an
+            // info-string notice, never a panic and never a SILENT skip: a
+            // silent skip would hide a book the reference would have used.
             if !has_book_ext(&resolved, BOOK_EXT_YBB) {
                 self.info_string(&format!("unsupported book format : {}", resolved.display()))?;
                 continue;
@@ -882,7 +776,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                     self.info_string(&format!("book loaded : {count} positions"))?;
                 }
                 Err(e) => {
-                    // Mirrors the pin's open/validate failure → this name is left
+                    // Mirrors the reference's open/validate failure → this name is left
                     // out of the priority list.
                     self.info_string(&format!("book load failed : {e}"))?;
                 }
@@ -902,22 +796,17 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // Reclaim any worker before touching the table it may hold.
         self.finish_search_join();
         // The reference applies two option-override files here, before its own
-        // isready work (`USIEngine::isready`, `usi.cpp`):
-        // `engine_options.txt` in the current directory and
-        // `<EvalDir>/eval_options.txt`. This engine opens neither, in any build.
-        // Its settings are compiled in, so a file that claims to override one of
-        // them would be a lie on disk — and reading a file only to ignore what it
-        // says would be worse than not reading it.
+        // isready work (`USIEngine::isready`, `usi.cpp`): `engine_options.txt`
+        // in the current directory and `<EvalDir>/eval_options.txt`. This
+        // engine opens neither, in any build. Its settings are compiled in, so
+        // a file that claims to override one of them would be a lie on disk —
+        // and reading a file only to ignore what it says would be worse than
+        // not reading it.
 
-        // Wrap the heavy initialisation — the book reload, the `nn.bin`
-        // load/parse, and the transposition-table sizing/zeroing — in a
-        // keep-alive scope (reference `Engine::run_heavy_job`, engine.cpp):
-        // a helper thread emits a bare newline every 5 s so a GUI does not time
-        // out. The reference literally wraps only `Eval::load_eval`
-        // (yaneuraou-search.cpp); this port's heavy work is the whole block
-        // below, so the keep-alive brackets all of it. The guard's `Drop` sets
-        // the stop flag and joins the helper (the reference `SCOPE_EXIT`) whether
-        // the block returns normally or bails out early via `?`.
+        // Wrap the heavy initialisation in a keep-alive scope: a helper thread
+        // emits a bare newline every 5 s so a GUI does not time out. The guard's
+        // `Drop` stops and joins that helper whether the block returns normally
+        // or bails out early via `?`.
         let outcome = {
             let _keep_alive = KeepAlive::spawn(Arc::clone(&self.writer), self.keep_alive_poll);
             self.isready_heavy_job()?
@@ -977,10 +866,10 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                     // network) is dropped.
                     replicas: BTreeMap::new(),
                 });
-                // Force replication now (the reference `ensure_network_replicated`
-                // at `engine.cpp` after a network reload), so a replica exists
-                // for every bound system node before the next `go` and none is
-                // built on the search path.
+                // Force replication now (the reference
+                // `ensure_network_replicated` at `engine.cpp` after a network
+                // reload), so a replica exists for every bound system node
+                // before the next `go` and none is built on the search path.
                 self.rebuild_networks();
                 Ok(IsreadyOutcome::Ready)
             }
@@ -990,12 +879,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 
     /// `setoption name <N> value <V>`: the USI minimum, in every build.
     ///
-    /// There is no option to set. Every setting was fixed when the binary was
-    /// built, from the TOML config, and nothing at run time can change one — the
-    /// `usi` reply says so by advertising no options at all. USI requires no
-    /// reply to `setoption`, so the line is parsed, consumed and dropped: no
-    /// output, no state change, no crash, and the session continues exactly as
-    /// if the line had never arrived.
+    /// There is no option to set — every setting was fixed at build time from
+    /// the TOML config, and the `usi` reply advertises no options at all. USI
+    /// requires no reply, so the line is parsed, consumed and dropped.
     fn handle_setoption(&mut self, _name: &str, _value: &str) -> io::Result<()> {
         Ok(())
     }
@@ -1029,8 +915,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             scratch.do_move(parsed);
         }
         self.pos = scratch;
-        // Retain the parsed command for the Stochastic_Ponder rewind / re-issue
-        // (`last_position_cmd_string`, `usi.cpp`).
+        // Retain the parsed command for the Stochastic_Ponder rewind /
+        // re-issue (`last_position_cmd_string`, `usi.cpp`).
         self.last_position = (sfen, moves.to_vec());
         Ok(())
     }
@@ -1054,13 +940,13 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         self.histories = Some(WorkerHistories::with_shared(Arc::clone(
             &self.worker_shared[0],
         )));
-        // Reset the persistent time-management inputs to their first-move-of-a-game
-        // sentinels (`yaneuraou-search.cpp`).
+        // Reset the persistent time-management inputs to their
+        // first-move-of-a-game sentinels (`yaneuraou-search.cpp`).
         self.best_previous_score = VALUE_INFINITE;
         self.best_previous_average_score = VALUE_INFINITE;
         self.previous_time_reduction = 0.85;
         // Reset the side-flip detector and the retained command state
-        // (`yaneuraou-search.cpp`; the `last_position` default is the pin's
+        // (`yaneuraou-search.cpp`; the `last_position` default is the reference's
         // `"position startpos"`, `usi.h`).
         self.last_game_ply = 0;
         self.last_position = (PositionSfen::StartPos, Vec::new());
@@ -1079,9 +965,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// with [`LoadedBook`].
     ///
     /// Both profiles' fields are snapshotted; the probe picks between them from
-    /// `book_options_v2` and the root side to move. An option that the active
-    /// profile did not register reads as its type's zero (`spin` → 0, `check` →
-    /// false), which is inert on the leg that never consults it.
+    /// `book_options_v2` and the root side to move. An option the active profile
+    /// did not register reads as its type's zero, which is inert on the leg that
+    /// never consults it.
     fn book_config(&self) -> BookConfig {
         BookConfig {
             book_options_v2: self.settings.book_options_v2(),
@@ -1110,7 +996,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         self.last_go = Some(limits.clone());
 
         // Stochastic_Ponder `go ponder` (`usi.cpp`): ponder one move earlier
-        // than the retained position (drop its last move); `ponderMode` stays set.
+        // than the retained position (drop its last move); `ponderMode` stays
+        // set.
         if limits.ponder && self.settings.stochastic_ponder() {
             self.apply_stochastic_ponder_rewind();
         }
@@ -1152,16 +1039,12 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         Ok(())
     }
 
-    /// A `go` line carrying a clause that lives behind `usi-extras`
-    /// (`depth` / `nodes` / `mate` / `movetime` / `infinite` / `rtime`), seen by
-    /// a build without the feature: report it and start nothing.
+    /// A `go` line carrying a clause that lives behind `usi-extras`, seen by a
+    /// build without the feature: report it and start nothing.
     ///
-    /// Failing loud is deliberate. Ignoring the clause would silently change the
-    /// search's terms — `go depth 4` would become a clock-less `go` in the
-    /// middle of a game — and a rated game never issues these clauses in the
-    /// first place, so the line can only be a harness or bridge
-    /// misconfiguration. Any search already running is left alone: this `go` is
-    /// not a `go` at all.
+    /// Failing loud is deliberate — ignoring the clause would silently change
+    /// the search's terms, turning `go depth 4` into a clock-less `go` in the
+    /// middle of a game. Any search already running is left alone.
     #[cfg(not(feature = "usi-extras"))]
     fn handle_go_extra_clause(&mut self, clause: &str) -> io::Result<()> {
         self.info_string_diag(format_args!(
@@ -1170,9 +1053,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     }
 
     /// Stochastic_Ponder `go ponder` rewind (`usi.cpp`): reconstruct the
-    /// retained position with its last move dropped and install it as the search
-    /// root. A best-effort trim — an empty move list (nothing to rewind) or a
-    /// rebuild failure leaves the current position untouched.
+    /// retained position with its last move dropped and install it as the
+    /// search root. A best-effort trim — an empty move list (nothing to
+    /// rewind) or a rebuild failure leaves the current position untouched.
     fn apply_stochastic_ponder_rewind(&mut self) {
         let (sfen, moves) = &self.last_position;
         if moves.is_empty() {
@@ -1185,15 +1068,12 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     }
 
     /// Build the [`CoordinatorJob`] for one search — the shared preamble of both
-    /// `go` (asynchronous worker) and `bench` (synchronous per-position run). Seeds
-    /// the depth / node ceilings from options, snapshots every per-`go` search
-    /// option, takes the session histories, and hands back a self-contained job.
+    /// `go` and `bench`.
     ///
-    /// Returns `None` when no network is loaded (the caller emits the resign /
-    /// notice appropriate to its context). `disable_pv_interval` mirrors the
-    /// reference `limits.disablePvInterval` (`usi.cpp`): when true the
-    /// per-iteration PV interval is forced to zero so every iteration prints — set
-    /// only by `bench`, inert for a normal `go`.
+    /// Returns `None` when no network is loaded; the caller emits the resign or
+    /// notice appropriate to its context. `disable_pv_interval` forces the
+    /// per-iteration PV interval to zero so every iteration prints, and is set
+    /// only by `bench`.
     fn prepare_coordinator_job(
         &mut self,
         mut limits: GoLimits,
@@ -1206,12 +1086,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 
         // Seed the depth / node ceilings from the `DepthLimit` / `NodesLimit`
         // options when this `go` carries no explicit token, then let an explicit
-        // token stand (`usi.cpp`: `limits.depth = DepthLimit`, overwritten
-        // by an explicit `go depth`; likewise nodes). A `DepthLimit`-seeded depth
-        // also disables the parallel-search vote below, exactly like an explicit
-        // `go depth N` — the reference's `!limits.depth` guard
-        // (`yaneuraou-search.cpp`) keys off the final value regardless of its
-        // source, and `use_voting` is derived from `limits.depth` after this seed.
+        // token stand. A seeded depth also disables the parallel-search vote
+        // below, exactly like an explicit `go depth N`: the reference's
+        // `!limits.depth` guard keys off the final value regardless of source.
         if limits.depth.is_none() {
             let dl = self.settings.depth_limit();
             if dl != 0 {
@@ -1232,11 +1109,12 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // `eval` always has a network for every worker.
         self.eval.as_ref()?;
 
-        // Map the `go` limits + time options onto the reference `TimeManagement`
-        // (`timeman.cpp`). `use_time_management()` (`search.h`) is true only
-        // for a real clock / `go rtime`; a `TimeControl` is installed on the main
-        // worker for those and for `go movetime`, and is `None` otherwise (fixed
-        // depth / nodes / infinite / mate), where the search runs unbounded by time.
+        // Map the `go` limits + time options onto the reference
+        // `TimeManagement` (`timeman.cpp`). `use_time_management()`
+        // (`search.h`) is true only for a real clock / `go rtime`; a
+        // `TimeControl` is installed on the main worker for those and for `go
+        // movetime`, and is `None` otherwise (fixed depth / nodes / infinite /
+        // mate), where the search runs unbounded by time.
         let us = self.pos.side_to_move();
         let now = Instant::now();
         let use_time_management = limits.mate.is_none()
@@ -1244,25 +1122,24 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             && limits.depth.is_none()
             && limits.nodes.is_none()
             && !limits.infinite;
-        // DELIBERATE DIVERGENCE (documented on the removed `timeman` module and in
-        // the parser): the pinned normal engine leaves `go mate`'s enforcement to a
-        // separate mate engine, but this port has none, so a concrete `go mate <ms>`
-        // budget is mapped onto a `movetime`-style time bound. A bare / `infinite`
-        // `go mate` (the `MATE_UNLIMITED_MS` sentinel) carries no bound and runs
-        // until `stop`.
+        // DELIBERATE DIVERGENCE (see `GoLimits::mate` in the parser): the reference
+        // leaves `go mate`'s enforcement to a separate mate engine, but this port has
+        // none, so a concrete `go mate <ms>` budget is mapped onto a `movetime`-style
+        // time bound. A bare / `infinite` `go mate` (the `MATE_UNLIMITED_MS`
+        // sentinel) carries no bound and runs until `stop`.
         let mate_budget = match limits.mate {
             Some(m) if m != MATE_UNLIMITED_MS => Some(m as i64),
             _ => None,
         };
         let movetime = limits.movetime.map(|m| m as i64).or(mate_budget);
 
-        // Side-flip continuity (`yaneuraou-search.cpp`): when the side to
-        // move alternated between the last completed search and this one — an odd
+        // Side-flip continuity (`yaneuraou-search.cpp`): when the side to move
+        // alternated between the last completed search and this one — an odd
         // `last_game_ply - game_ply`, as a Stochastic_Ponder rewind / re-issue
-        // produces — negate the persisted previous scores (each unless it is the
-        // `VALUE_INFINITE` first-move sentinel) before they seed `iterValue` /
-        // `fallingEval`. On the normal same-side case the parity is even and the
-        // scores pass through unchanged.
+        // produces — negate the persisted previous scores (each unless it is
+        // the `VALUE_INFINITE` first-move sentinel) before they seed
+        // `iterValue` / `fallingEval`. On the normal same-side case the parity
+        // is even and the scores pass through unchanged.
         let flip_previous = (self.last_game_ply - self.pos.ply() as i32) & 1 != 0;
         let best_prev_score = match self.best_previous_score {
             VALUE_INFINITE => VALUE_INFINITE,
@@ -1352,8 +1229,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         let use_voting = limits.depth.is_none() && multi_pv == 1 && !mate_mode;
 
         // PV-output config snapshot for this `go` (`yaneuraou-search.cpp`).
-        // `computed_pv_interval` is `0` (never suppress — every iteration prints)
-        // under `go infinite`, `ConsiderationMode`, or the bench-only
+        // `computed_pv_interval` is `0` (never suppress — every iteration
+        // prints) under `go infinite`, `ConsiderationMode`, or the bench-only
         // `disablePvInterval` (`usi.cpp`); else the `PvInterval` option [ms].
         let consideration_mode = self.settings.consideration_mode();
         let computed_pv_interval = if disable_pv_interval || limits.infinite || consideration_mode {
@@ -1416,41 +1293,36 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1);
         let book_seed = self.book_seed;
-        // Whether the coordinator holds its reply (book or searched) until `stop` /
-        // `ponderhit`: `go ponder` (until the ponder flag clears) or `go infinite`
-        // (the SKIP_SEARCH wait loop, `yaneuraou-search.cpp`).
+        // Whether the coordinator holds its reply (book or searched) until
+        // `stop` / `ponderhit`: `go ponder` (until the ponder flag clears) or
+        // `go infinite` (the SKIP_SEARCH wait loop, `yaneuraou-search.cpp`).
         let infinite = limits.infinite;
-        // The Stochastic_Ponder teardown flag: when set, the coordinator emits no
-        // `bestmove` (nor final PV) for this search (`usi.cpp`).
+        // The Stochastic_Ponder teardown flag: when set, the coordinator emits
+        // no `bestmove` (nor final PV) for this search (`usi.cpp`).
         let suppress_bestmove = Arc::new(AtomicBool::new(false));
         // Raised when this `go`'s reply reaches the output sink; the driver reads
         // it to decide whether a search is still in flight.
         let bestmove_sent = Arc::new(AtomicBool::new(false));
 
         // Snapshot the entering-king rule for this `go` and precompute its
-        // per-side thresholds from the root position, mirroring the
-        // reference `set_ekr` on the root worker (`yaneuraou-search.cpp`).
-        // The material total is invariant across the search, so every worker
-        // shares this one snapshot.
+        // per-side thresholds from the root position, mirroring the reference
+        // `set_ekr` on the root worker (`yaneuraou-search.cpp`). The material
+        // total is invariant across the search, so every worker shares this
+        // one snapshot.
         let entering_king = EnteringKingConfig::new(
             EnteringKingRule::from_option(self.settings.entering_king_rule()),
             &pos,
         );
 
-        // Snapshot the `MaxMovesToDraw` horizon for this `go`,
-        // applying the pin's `0 → 100000` remap (`yaneuraou-search.cpp`): a
-        // set value of 0 means unlimited. Passed per `go`, like the entering-king
-        // config, so every worker shares one value and no global is touched.
+        // Snapshot the `MaxMovesToDraw` horizon for this `go`, applying the
+        // reference's `0 → 100000` remap (`yaneuraou-search.cpp`): a set value of 0
+        // means unlimited. Passed per `go`, like the entering-king config, so
+        // every worker shares one value and no global is touched.
         let max_moves_to_draw = remap_max_moves_to_draw(self.settings.max_moves_to_draw());
 
-        // Behavior-option snapshots for this `go`, read per
-        // `go` like the other search options — no global.
-        //
-        // Draw contempt: `drawValueTable[REPETITION_DRAW][us]` for the root side
-        // to move, `draw_value = option[us] * PawnValue / 100`
-        // (`yaneuraou-search.cpp`). The search's `draw_value(Draw, us)`
-        // returns `+draw_contempt` for the root side and `-draw_contempt` for the
-        // opponent, exactly the reference's symmetric `±draw_value`.
+        // Draw contempt is `drawValueTable[REPETITION_DRAW][us]` for the root
+        // side to move; the search returns `+draw_contempt` for the root side
+        // and `-draw_contempt` for the opponent.
         let draw_option = match self.pos.side_to_move() {
             yorkie_state::Color::Black => self.settings.draw_value_black(),
             yorkie_state::Color::White => self.settings.draw_value_white(),
@@ -1466,12 +1338,13 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // (`yaneuraou-search.cpp`). Every worker shares the flag.
         let generate_all_legal_moves = self.settings.generate_all_legal_moves();
 
-        // The per-`go` coordinator (worker slot 0) binds itself to its assigned
-        // NUMA node — and points its allocations at that node's memory — at the
-        // start of every `go` when binding is active. The reference binds pool
-        // thread 0 once at creation (`thread.cpp`); the port's coordinator
-        // is spawned per `go`, so it re-binds each time — same target node,
-        // idempotent. `None` (single-node CI/VM) → no bind, no policy.
+        // The per-`go` coordinator (worker slot 0) binds itself to its
+        // assigned NUMA node — and points its allocations at that node's
+        // memory — at the start of every `go` when binding is active. The
+        // reference binds pool thread 0 once at creation (`thread.cpp`); the
+        // port's coordinator is spawned per `go`, so it re-binds each time —
+        // same target node, idempotent. `None` (single-node host) → no bind,
+        // no policy.
         let numa_bind = self.numa_plan.clone();
 
         Some(CoordinatorJob {
@@ -1507,14 +1380,12 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         })
     }
 
-    /// Run one `bench` position synchronously on the calling thread and return its
-    /// total searched node count (the sum across all workers at search end — the
-    /// value the reference `bench` accumulates from the final `info nodes`).
+    /// Run one `bench` position synchronously on the calling thread and return
+    /// its total searched node count across all workers.
     ///
-    /// The search emits its own per-iteration `info` / final `bestmove` exactly as
-    /// a `go` would; only the driving is synchronous (bench needs each position's
-    /// node total before moving on). `disablePvInterval` is set so every iteration
-    /// prints. A position with no network loaded resigns and contributes 0 nodes.
+    /// Only the driving is synchronous — bench needs each position's node total
+    /// before moving on. A position with no network loaded resigns and
+    /// contributes 0 nodes.
     #[cfg(feature = "usi-extras")]
     fn bench_run_one(&mut self, limits: GoLimits) -> io::Result<u64> {
         let Some(job) = self.prepare_coordinator_job(limits, true) else {
@@ -1530,27 +1401,16 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         Ok(outcome.nodes)
     }
 
-    /// `bench [ttSizeMB] [threads] [limit] [default|current|<fenFile>] [limitType]`
-    /// — a reproducible NPS benchmark ported from the reference `USIEngine::bench`
-    /// (`usi.cpp`) + `setup_bench` (`benchmark.cpp`).
+    /// `bench [ttSizeMB] [threads] [limit] [default|current|<fenFile>]
+    /// [limitType]` — a reproducible NPS benchmark ported from the reference's
+    /// `USIEngine::bench` (`usi.cpp`) and `setup_bench` (`benchmark.cpp`).
     ///
-    /// Mirrors the reference command replay: apply the requested thread count and
-    /// table size, run the `usinewgame` (`search_clear`) equivalent once, reset
-    /// the timer, then search each position with the requested limit through the
-    /// ordinary coordinator path — accumulating each position's final node count.
-    /// Ends with one machine-parsable summary line so optimization PRs can grep
-    /// it. A parse failure is reported as an `info string` and runs nothing,
-    /// never a panic.
+    /// Ends with one machine-parsable summary line. A parse failure is reported
+    /// as an `info string` and runs nothing, never a panic.
     ///
-    /// The reference replays those two values as `setoption` lines; here they are
-    /// `bench`'s own command arguments, applied directly. They are the only
-    /// worker count and table size in the engine that do not come from the config
-    /// constants, and they last as long as the session — a benchmark run says so
-    /// on its own summary line, and a build without `usi-extras` has no `bench`
-    /// at all.
-    ///
-    /// `usi-extras` only: a tournament game never benchmarks, so the default
-    /// build has neither this handler nor the command token.
+    /// The requested thread count and table size are the only ones in the engine
+    /// that do not come from the config constants, and they last as long as the
+    /// session.
     #[cfg(feature = "usi-extras")]
     fn handle_bench(&mut self, tokens: &[String]) -> io::Result<()> {
         // Reclaim any running search before touching the pool / the TT.
@@ -1563,8 +1423,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         };
 
         // The two values the reference replays as `setoption` lines
-        // (`benchmark.cpp`). The pool rebuild reports itself exactly as
-        // the reference `Threads` on_change callback does (`engine.cpp`,
+        // (`benchmark.cpp`). The pool rebuild reports itself exactly as the
+        // reference `Threads` on_change callback does (`engine.cpp`,
         // `usi.cpp`).
         self.pool_threads = config.threads.max(1) as usize;
         self.rebuild_pool();
@@ -1621,22 +1481,22 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     }
 
     /// `gameover [win|lose|draw]`: the game ended. Treated exactly like `stop`
-    /// (`usi.cpp`): set the same stop flag, releasing a held book reply
-    /// (`go ponder`/`go infinite`) or aborting a running search. Over a shogi GUI
+    /// (`usi.cpp`): set the same stop flag, releasing a held book reply (`go
+    /// ponder`/`go infinite`) or aborting a running search. Over a shogi GUI
     /// an opponent resign during `go ponder` arrives as `gameover` without a
-    /// preceding `stop`; unhandled, pondering would never stop. A no-op when idle.
+    /// preceding `stop`; unhandled, pondering would never stop. A no-op when
+    /// idle.
     fn handle_gameover(&mut self) {
         self.handle_stop();
     }
 
     /// `ponderhit`: the opponent played the predicted move (`usi.cpp`).
     ///
-    /// Plain path: `set_ponderhit(false)` clears the ponder flag so the pondering
-    /// search continues under time management (a held book reply's coordinator
-    /// wait loop polls the same flag, so this releases it). Stochastic_Ponder path:
-    /// tear the rewound ponder search down without emitting, restore the real
-    /// position, and re-issue the retained `go` with `ponder` stripped. A no-op
-    /// when idle.
+    /// Plain path: clear the ponder flag so the pondering search continues under
+    /// time management; a held book reply's coordinator wait loop polls the same
+    /// flag, so this releases it. Stochastic_Ponder path: tear the rewound
+    /// ponder search down without emitting, restore the real position, and
+    /// re-issue the retained `go` with `ponder` stripped.
     fn handle_ponderhit(&mut self) -> io::Result<()> {
         let stochastic = self.settings.stochastic_ponder()
             && self.search.as_ref().is_some_and(|a| a.ponder.is_some());
@@ -1656,12 +1516,13 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         Ok(())
     }
 
-    /// Stochastic_Ponder `ponderhit` (`usi.cpp`): suppress the rewound
-    /// ponder search's output, stop and join it, re-apply the real current
-    /// position, and re-issue the retained `go` without its `ponder` token — a
-    /// normal timed search of which exactly one `bestmove` reaches the GUI.
+    /// Stochastic_Ponder `ponderhit` (`usi.cpp`): suppress the rewound ponder
+    /// search's output, stop and join it, re-apply the real current position,
+    /// and re-issue the retained `go` without its `ponder` token — a normal
+    /// timed search of which exactly one `bestmove` reaches the GUI.
     fn stochastic_ponderhit(&mut self) -> io::Result<()> {
-        // Suppress the rewound search's bestmove before stopping it (`usi.cpp`).
+        // Suppress the rewound search's bestmove before stopping it
+        // (`usi.cpp`).
         if let Some(active) = &self.search {
             active.suppress.store(true, Ordering::Relaxed);
         }
@@ -1681,34 +1542,23 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         Ok(())
     }
 
-    // --- `usi-extras`: the `tt` command family. ---
-    //
-    // These exist only under the `usi-extras` cargo feature; the default
-    // (tournament) build contains neither the parser arm nor these handlers.
-    // The `usi-extras` reference documentation is the user-facing spec — output
-    // format, score convention, generation behaviour and the key16 caveat.
-    //
-    // Their `info string` lines are the commands' RESPONSE — a `tt probe` that
-    // printed nothing would be a command with no output, and `tt error: …` is
-    // that response's failure arm — so they go through the unconditional
-    // [`Self::info_string`] rather than the `info-diag` sink. `usi-extras` is
-    // already the gate that keeps the whole family out of a tournament build.
+    // The `tt` command family exists only under the `usi-extras` cargo feature.
+    // Its `info string` lines are the commands' response — a `tt probe` that
+    // printed nothing would be a command with no output — so they go through the
+    // unconditional [`Self::info_string`] rather than the `info-diag` sink.
 
     /// Dispatch one `tt …` line.
     ///
-    /// Refuses while a search is in flight (the commands read and write the very
-    /// table the workers are churning) and before the table has been allocated;
-    /// both are one clear `info string tt error: …` line, never a panic. A
-    /// worker that has already replied but not yet been joined does not count
-    /// as "searching": it is reclaimed first, so the natural
-    /// `go … → bestmove → tt probe` sequence works.
+    /// Refuses while a search is in flight and before the table has been
+    /// allocated; both are one `info string tt error: …` line, never a panic. A
+    /// worker that has already replied but not yet been joined is reclaimed
+    /// first rather than refused, so the natural `go … → bestmove → tt probe`
+    /// sequence works.
     ///
     /// "Already replied" is [`ActiveSearch::bestmove_sent`], not
     /// `JoinHandle::is_finished`: the coordinator writes `bestmove` and *then*
-    /// unwinds, so a host that sends this line the moment it reads `bestmove`
-    /// would otherwise be refused for as long as that unwinding takes.
-    /// `is_finished` still stands beside it for the searches that end without a
-    /// reply (a suppressed Stochastic_Ponder teardown).
+    /// unwinds. `is_finished` still stands beside it for the searches that end
+    /// without a reply.
     #[cfg(feature = "usi-extras")]
     fn handle_tt(&mut self, tokens: &[String]) -> io::Result<()> {
         if self.search.as_ref().is_some_and(|active| {
@@ -1748,11 +1598,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 
     /// Build the [`Position`] a `tt` command names.
     ///
-    /// SFEN diagnostics come from the same `parse_sfen` the `position` command
-    /// uses. The extra king check is this surface's own: `parse_sfen` happily
-    /// accepts a kingless board, but the move generators these commands then run
-    /// assume both kings are present, so a missing king is rejected up front
-    /// rather than reaching movegen.
+    /// The extra king check is this surface's own: `parse_sfen` accepts a
+    /// kingless board, but the move generators these commands then run assume
+    /// both kings are present.
     #[cfg(feature = "usi-extras")]
     fn tt_position(&self, position: &TtPosition) -> Result<Position, String> {
         use yorkie_state::Color;
@@ -1769,14 +1617,10 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 
     /// `tt store …` — write one entry for the named position.
     ///
-    /// The value is converted with `value_to_tt(v, 0)` (the named position is
-    /// the root, so this is the identity and the stored mate value is
-    /// position-absolute), and the write goes through the ordinary
-    /// probe-then-write path with the table's **current generation** — exactly
-    /// what a search storing that value at that depth would do. That includes
-    /// `TTEntry::save`'s replacement policy, which may decline the write; the
-    /// command re-probes afterwards and says which happened rather than
-    /// reporting a success it did not verify.
+    /// The write goes through the ordinary probe-then-write path at the table's
+    /// current generation, exactly as a search storing that value at that depth
+    /// would. That includes the replacement policy, which may decline the write,
+    /// so the command re-probes afterwards and reports which happened.
     #[cfg(feature = "usi-extras")]
     fn tt_store(&self, args: &TtStoreArgs) -> io::Result<()> {
         let pos = match self.tt_position(&args.position) {
@@ -1859,12 +1703,11 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// `tt children …` — probe every legal child of the named position, one ply
     /// deep.
     ///
-    /// Children are reported at `ply == 1`, i.e. their values are expressed
-    /// relative to the *named* position as root: a child holding "mate in 5 from
-    /// the child" prints as `mate 6` here, one ply further out than a
-    /// `tt probe` of that child's own SFEN would print. A child with no entry
-    /// produces no line; the closing `tt children end <n>` line tells a caller
-    /// driving the engine over a pipe that the list is complete.
+    /// Children are reported at `ply == 1`, so their values are expressed
+    /// relative to the *named* position: a child holding "mate in 5 from the
+    /// child" prints as `mate 6`, one ply further out than a `tt probe` of that
+    /// child's own SFEN would. A child with no entry produces no line, and the
+    /// closing `tt children end <n>` line marks the list complete.
     #[cfg(feature = "usi-extras")]
     fn tt_children(&self, position: &TtPosition) -> io::Result<()> {
         let mut pos = match self.tt_position(position) {
@@ -1909,21 +1752,15 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 /// The labelled body shared by `tt probe hit` and `tt child` lines:
 /// `move <usi|none> value <score> depth <d> bound <b> eval <score> pv <bool>`.
 ///
-/// Line-oriented with labelled fields on purpose — a later entry layout can add
-/// fields without breaking a parser that reads the ones it knows.
-///
 /// `legal` is the legal-move list of the position the entry belongs to, used to
-/// widen the stored 16-bit fragment exactly as the search does (`widen_tt_move`
-/// / `select_tt_move` in `yorkie-search`): a fragment with no matching legal
-/// move prints as `none` rather than being decoded into a nonsense square. That
-/// is also what a **key16 false positive** looks like from here — the table
-/// matches entries on the low 16 bits of the key, so a hit may belong to a
-/// different position that shares those bits, and the search lives with exactly
-/// the same risk (it validates the move and re-searches).
+/// widen the stored 16-bit fragment exactly as the search does: a fragment with
+/// no matching legal move prints as `none` rather than being decoded into a
+/// nonsense square. That is also what a **key16 false positive** looks like from
+/// here — the table matches entries on the low 16 bits of the key, so a hit may
+/// belong to a different position sharing those bits.
 ///
 /// `ply` is the entry's distance from the position the command named, so the
-/// value is reported in that position's frame (0 for `tt probe`, 1 for
-/// `tt children`).
+/// value is reported in that position's frame.
 #[cfg(feature = "usi-extras")]
 fn tt_entry_fields(data: &TTData, legal: &[Move], ply: i32) -> String {
     let mv = legal
@@ -1954,21 +1791,14 @@ fn tt_score_field(v: Value) -> String {
     }
 }
 
-/// Write one PV `info` line from a [`PvInfo`] — the reference `on_update_full`
-/// (`usi.cpp`) as this port surfaces it. The port omits the reference's
-/// nondeterministic `nps` / `time` / `hashfull` decorations (an established
-/// port-output decision — the fixed-depth comparison session tests rely on a
-/// deterministic `info` line), and always emits `seldepth` / `multipv`. The
-/// `lowerbound` / `upperbound` marker follows the reference's `isExact` gate.
+/// Write one PV `info` line from a [`PvInfo`] — the reference's
+/// `on_update_full` (`usi.cpp`) as this port surfaces it.
 ///
-/// Every integer field is written through a [`NumBuffer`] and appended, so the
-/// only allocation left is the body `String` itself; the earlier shape spent a
-/// `format!` temporary on the score and another on `nodes` every time the line
-/// was emitted. The bytes are unchanged — `tests::pv_info_line_is_byte_exact`
-/// pins the whole wire line for each branch.
+/// The reference's nondeterministic `nps` / `time` / `hashfull` decorations are
+/// omitted so the `info` line stays deterministic for the session tests, and
+/// `seldepth` / `multipv` are always emitted.
 ///
-/// `info-output` only: the default (tournament) build renders no PV line, so it
-/// does not compile the renderer.
+/// `info-output` only: the default build renders no PV line.
 #[cfg(feature = "info-output")]
 fn write_pv_info<W: Write + ?Sized>(w: &mut W, info: &PvInfo) -> io::Result<()> {
     let mut ply_digits = NumBuffer::new();
@@ -2003,14 +1833,12 @@ fn write_pv_info<W: Write + ?Sized>(w: &mut W, info: &PvInfo) -> io::Result<()> 
 }
 
 /// A [`PvSink`] that writes each per-iteration / fail-high-low PV line straight
-/// to the shared USI output. Installed on the main worker only (the reference
-/// `main_manager()->pv()` owner); helpers and the fixed-depth path get no sink
-/// and emit nothing.
+/// to the shared USI output. Installed on the main worker only; helpers and the
+/// fixed-depth path get no sink and emit nothing.
 ///
 /// `info-output` only. Without the feature the main worker is given no sink
-/// either, which is what makes the default build's search free of PV work: the
-/// search's own emission sites are all behind `pv_sink.is_some()`, so no PV is
-/// collected, no aggregate node count is folded, and no line is formatted.
+/// either, which is what keeps the default build's search free of PV work: the
+/// search's emission sites are all behind `pv_sink.is_some()`.
 #[cfg(feature = "info-output")]
 struct WriterPvSink<W: Write + Send> {
     writer: Arc<Mutex<W>>,
@@ -2024,8 +1852,8 @@ impl<W: Write + Send> PvSink for WriterPvSink<W> {
     }
 }
 
-/// Apply the reference's `MaxMovesToDraw` remap (`yaneuraou-search.cpp`):
-/// a set option value of `0` means "unlimited" and is rewritten to `100000`
+/// Apply the reference's `MaxMovesToDraw` remap (`yaneuraou-search.cpp`): a
+/// set option value of `0` means "unlimited" and is rewritten to `100000`
 /// internally; any other value passes through. The option itself still reports
 /// `0` — only the search-side horizon uses the remapped value.
 fn remap_max_moves_to_draw(option_value: i64) -> i32 {
@@ -2036,17 +1864,15 @@ fn remap_max_moves_to_draw(option_value: i64) -> i32 {
     }
 }
 
-/// The two book extensions the pin's name resolution knows about.
+/// The two book extensions the reference's name resolution knows about.
 const BOOK_EXT_YBB: &str = "ybb";
 const BOOK_EXT_DB: &str = "db";
 
 /// True when `path` carries extension `ext`.
 ///
-/// The pin compares the raw suffix, so it is case-SENSITIVE
-/// (`is_ybb_book` / `is_db_book`, `book.cpp`). This port has used a
-/// case-insensitive extension test since the first book child (see
-/// [`resolve_book_filename_with_ybb_fallback`]); the new Multiple Book helpers
-/// keep that one convention rather than mixing two rules inside one module.
+/// The reference compares the raw suffix, so it is case-sensitive; this port
+/// matches case-insensitively throughout, rather than mixing two rules inside
+/// one module.
 fn has_book_ext(path: &Path, ext: &str) -> bool {
     path.extension()
         .is_some_and(|e| e.eq_ignore_ascii_case(ext))
@@ -2055,8 +1881,9 @@ fn has_book_ext(path: &Path, ext: &str) -> bool {
 /// Strip a trailing `.db` / `.ybb` from a book name, returning the stem
 /// (`book_name_without_extension`, `book.cpp`).
 ///
-/// Any OTHER name — notably the `no_book` sentinel — yields `None`, which is the
-/// pin's empty stem and means "this name has no numbered priority series".
+/// Any OTHER name — notably the `no_book` sentinel — yields `None`, which is
+/// the reference's empty stem and means "this name has no numbered priority
+/// series".
 fn book_name_without_extension(name: &Path) -> Option<PathBuf> {
     if has_book_ext(name, BOOK_EXT_DB) || has_book_ext(name, BOOK_EXT_YBB) {
         Some(name.with_extension(""))
@@ -2065,10 +1892,9 @@ fn book_name_without_extension(name: &Path) -> Option<PathBuf> {
     }
 }
 
-/// `<stem>-<index zero-padded to 3><extension>`
-/// (`priority_book_filename`, `book.cpp`). An index past 999 simply
-/// grows past three digits, exactly as the pin's `while (number.size() < 3)`
-/// padding does.
+/// `<stem>-<index zero-padded to 3><extension>` (`priority_book_filename`,
+/// `book.cpp`). An index past 999 simply grows past three digits, exactly as
+/// the reference's `while (number.size() < 3)` padding does.
 fn priority_book_filename(stem: &Path, index: usize, extension: &str) -> PathBuf {
     let mut name = stem.as_os_str().to_os_string();
     name.push(format!("-{index:03}.{extension}"));
@@ -2078,11 +1904,9 @@ fn priority_book_filename(stem: &Path, index: usize, extension: &str) -> PathBuf
 /// Resolve priority book `index` for `base` (`resolve_priority_book_filename`,
 /// `book.cpp`).
 ///
-/// The primary extension is the base name's own; the secondary is the other one.
-/// The primary wins when both files exist — and that case also produces the
-/// pin's `priority book file exists twice. use : <primary>` notice, returned to
-/// the caller as the second tuple element (this helper does no I/O beyond
-/// existence checks and emits nothing itself).
+/// The primary extension is the base name's own and wins when both files exist,
+/// which also produces the reference's `priority book file exists twice` notice,
+/// returned as the second tuple element for the caller to emit.
 ///
 /// `None` means neither extension exists at this index, which ends the series.
 fn resolve_priority_book_filename(base: &Path, index: usize) -> Option<(PathBuf, Option<String>)> {
@@ -2111,13 +1935,13 @@ fn resolve_priority_book_filename(base: &Path, index: usize) -> Option<(PathBuf,
     None
 }
 
-/// The Multiple Book priority list for `base` (`get_book_names`,
-/// `book.cpp`): `<stem>-000`, `<stem>-001`, … stopping at the FIRST
-/// index where neither extension exists (a gap ends the series — a `-003` after
-/// a missing `-002` is never reached), then the plain `base` appended LAST.
+/// The Multiple Book priority list for `base` (`get_book_names`, `book.cpp`):
+/// `<stem>-000`, `<stem>-001`, … stopping at the first index where neither
+/// extension exists, so a gap ends the series and a `-003` after a missing
+/// `-002` is never reached, then the plain `base` appended last.
 ///
 /// The second tuple element carries the `info string` bodies the enumeration
-/// produced (the "exists twice" notices), in list order, for the caller to emit.
+/// produced, in list order, for the caller to emit.
 fn book_names(base: &Path) -> (Vec<PathBuf>, Vec<String>) {
     let mut names = Vec::new();
     let mut notices = Vec::new();
@@ -2148,10 +1972,10 @@ fn resolve_book_filename_with_ybb_fallback(requested: &Path) -> PathBuf {
     requested.to_path_buf()
 }
 
-/// Rebuild a [`Position`] from a parsed `position` command (start / SFEN plus a
-/// USI-move list), returning `None` on any parse or legality failure. Used by the
-/// Stochastic_Ponder rewind / re-issue paths (`usi.cpp`),
-/// which reconstruct a position from the retained [`UsiDriver::last_position`]
+/// Rebuild a [`Position`] from a parsed `position` command (start / SFEN plus
+/// a USI-move list), returning `None` on any parse or legality failure. Used
+/// by the Stochastic_Ponder rewind / re-issue paths (`usi.cpp`), which
+/// reconstruct a position from the retained [`UsiDriver::last_position`]
 /// without the diagnostic side effects of [`UsiDriver::handle_position`].
 fn build_position_from(sfen: &PositionSfen, moves: &[String]) -> Option<Position> {
     let mut pos = match sfen {
@@ -2172,12 +1996,11 @@ fn build_position_from(sfen: &PositionSfen, moves: &[String]) -> Option<Position
 }
 
 /// Emit a bare `bestmove <mv>` for the resign / declaration-win short-circuits,
-/// which produce no `info` line (best-effort: a broken pipe must not panic the
-/// coordinator).
+/// which produce no `info` line. Best-effort: a broken pipe must not panic the
+/// coordinator.
 ///
 /// `sent` is raised before the lock is released, so the reply becoming visible
-/// and this search counting as finished are one indivisible step for anyone
-/// downstream.
+/// and this search counting as finished are one indivisible step downstream.
 fn emit_bestmove<W: Write>(writer: &Arc<Mutex<W>>, sent: &AtomicBool, mv: &str) {
     let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
     let _ = Formatter::new(&mut *guard).bestmove(mv);
@@ -2198,13 +2021,10 @@ fn emit_info_string_diag<W: Write>(writer: &Arc<Mutex<W>>, msg: &str) {
 fn emit_info_string_diag<W: Write>(_writer: &Arc<Mutex<W>>, _msg: &str) {}
 
 /// A running keep-alive: a helper thread that emits a bare newline every
-/// [`KEEP_ALIVE_TICKS_PER_NEWLINE`] polls (5 s at the default poll) so a GUI does
-/// not time out while the heavy `isready` initialisation runs. Dropping the guard
-/// stops the thread and joins it — the RAII equivalent of the reference
-/// `SCOPE_EXIT` (engine.cpp), so the join runs whether the wrapped work
-/// returns normally or bails out early via `?`.
-///
-/// Reference: `Engine::run_heavy_job` (engine.cpp).
+/// [`KEEP_ALIVE_TICKS_PER_NEWLINE`] polls so a GUI does not time out while the
+/// heavy `isready` initialisation runs — the reference's `Engine::run_heavy_job`
+/// (`engine.cpp`). Dropping the guard stops and joins the thread, so the join
+/// runs whether the wrapped work returns normally or bails out early via `?`.
 struct KeepAlive {
     /// Set on drop to stop the helper (`thread_end`, engine.cpp).
     stop: Arc<AtomicBool>,
@@ -2215,13 +2035,12 @@ struct KeepAlive {
 impl KeepAlive {
     /// Spawn the helper thread and block until it has actually started, then
     /// return the guard. The heavy work must run *after* this returns so a
-    /// CPU-bound job cannot delay the helper's first tick (engine.cpp):
-    /// the reference spins on a `thread_started` flag for exactly this reason.
+    /// CPU-bound job cannot delay the helper's first tick; the reference spins
+    /// on a `thread_started` flag for the same reason.
     ///
-    /// The bare newline is emitted through the shared writer `Mutex` (the
-    /// reference `sync_cout << sync_endl`, engine.cpp): the guard holds the
-    /// lock for the whole line, so a keep-alive newline can never interleave
-    /// mid-line with any `info string …` the heavy work emits concurrently.
+    /// The guard holds the shared writer lock for the whole newline, so a
+    /// keep-alive tick can never interleave mid-line with an `info string …` the
+    /// heavy work emits concurrently.
     fn spawn<W: Write + Send + 'static>(writer: Arc<Mutex<W>>, poll: Duration) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let started = Arc::new(AtomicBool::new(false));
@@ -2245,10 +2064,10 @@ impl KeepAlive {
                 }
             }
         });
-        // Wait until the helper is running (reference `Tools::sleep(100)` spin on
+        // Wait until the helper is running (reference `Tools::sleep` spin on
         // `thread_started`, engine.cpp). We poll finer than the reference's
-        // 100 ms so wrapping a *fast* `isready` adds no perceptible latency; the
-        // 5 s keep-alive cadence itself is unaffected.
+        // 100 ms so wrapping a *fast* `isready` adds no perceptible latency;
+        // the 5 s keep-alive cadence itself is unaffected.
         while !started.load(Ordering::Acquire) {
             thread::sleep(Duration::from_millis(1));
         }
@@ -2279,17 +2098,16 @@ fn pv_string(pv: &[Move]) -> String {
 }
 
 /// Emit a book hit's output the way the reference does on `search_skipped`
-/// (`yaneuraou-search.cpp`): one `info` line per surviving candidate
-/// (`multipv`, `score cp`, `depth`, book `pv`), then — after the ponder/infinite
-/// hold — a final depth-0 `info` line and the `bestmove [ponder]`.
+/// (`yaneuraou-search.cpp`): one `info` line per surviving candidate, then —
+/// after the ponder/infinite hold — a final depth-0 `info` line and the
+/// `bestmove [ponder]`.
 ///
 /// Under `go ponder` / `go infinite` the final line and `bestmove` are held
-/// until `stop` (or `ponderhit`) sets `stop`, reusing the async-stop machinery
-/// rather than busy-waiting on the engine's behalf (the SKIP_SEARCH wait loop,
-/// `1162-1199`).
+/// until `stop` or `ponderhit`, reusing the async-stop machinery rather than
+/// busy-waiting.
 ///
-/// Both `info` blocks are `info-output`; the hold and the `bestmove` are not. A
-/// default build answers a book hit with the move and nothing else.
+/// Both `info` blocks are `info-output`; the hold and the `bestmove` are not, so
+/// a default build answers a book hit with the move and nothing else.
 fn emit_book_hit<W: Write>(
     writer: &Arc<Mutex<W>>,
     hit: &BookHit,
@@ -2299,7 +2117,7 @@ fn emit_book_hit<W: Write>(
     suppress_bestmove: &AtomicBool,
     sent: &AtomicBool,
 ) {
-    // Per-candidate multipv info lines (emitted immediately, like the pin's
+    // Per-candidate multipv info lines (emitted immediately, like the reference's
     // in-probe isRoot block).
     #[cfg(feature = "info-output")]
     {
@@ -2377,8 +2195,8 @@ struct HelperJob {
     /// Per-worker node counters; the helper publishes `nodes` to `node_slots[index]`.
     node_slots: Arc<Vec<AtomicU64>>,
     /// Per-worker best-move-change counters; the helper `fetch_add`s its own
-    /// `bmc_slots[index]` at the root, and the main worker folds every slot each
-    /// iteration (`yaneuraou-search.cpp`).
+    /// `bmc_slots[index]` at the root, and the main worker folds every slot
+    /// each iteration (`yaneuraou-search.cpp`).
     bmc_slots: Arc<Vec<AtomicU64>>,
     /// This helper's index into `node_slots` / `bmc_slots` (`>= 1`; index 0 is the
     /// main worker).
@@ -2495,9 +2313,9 @@ fn helper_loop(slot: Arc<HelperSlot>) {
         };
 
         // Attach this helper's node-shared tables on the first job (they are
-        // stable within a pool lifetime), then run with the persistent histories.
-        // A helper's control is stop-only (no deadlines, no node ceiling): the
-        // reference runs `check_time` on the main worker alone (2403-2404);
+        // stable within a pool lifetime), then run with the persistent
+        // histories. A helper's control is stop-only (no deadlines, no node
+        // ceiling): the reference runs `check_time` on the main worker alone;
         // helpers merely poll the shared stop flag.
         let histories_in =
             histories.unwrap_or_else(|| WorkerHistories::with_shared(Arc::clone(&job.shared)));
@@ -2529,15 +2347,12 @@ fn helper_loop(slot: Arc<HelperSlot>) {
         // Release every shared-`Arc` clone this helper holds — the transposition
         // table above all — BEFORE publishing `Finished`. `finish_search_join`
         // joins only the coordinator thread, yet `isready` / `usinewgame` then
-        // call `Arc::get_mut(&mut self.tt)` on the assumption that the driver is
-        // again the sole owner. That holds only once every *re-parking* helper
-        // has also dropped its `job.tt` clone. Dropping it at the loop-body end,
-        // *after* the `Finished` store and `notify`, would leave a window in
-        // which an oversubscribed helper is descheduled, the coordinator's
-        // `collect()` returns, and the main thread's `get_mut` fails and panics
-        // (killing the engine). Dropping here, before the
-        // `Finished` store the coordinator's `collect()` synchronizes on, makes
-        // the release happen-before the reclaim rather than racing it.
+        // call `Arc::get_mut(&mut self.tt)`, which succeeds only once every
+        // re-parking helper has dropped its clone too. Dropping at the loop-body
+        // end instead would leave a window in which an oversubscribed helper is
+        // descheduled, the coordinator's `collect()` returns, and `get_mut`
+        // panics. Dropping here, before the `Finished` store that `collect()`
+        // synchronizes on, makes the release happen-before the reclaim.
         drop(job.tt);
         drop(job.search);
         drop(job.stop);
@@ -2548,15 +2363,12 @@ fn helper_loop(slot: Arc<HelperSlot>) {
     }
 }
 
-/// The engine's worker thread pool.
+/// The engine's worker thread pool — the reference `ThreadPool` (`thread.cpp`):
+/// a main-worker slot plus `size − 1` persistent helper threads, each parked in
+/// [`helper_loop`] until a `go` dispatches it a [`HelperJob`].
 ///
-/// Models the reference `ThreadPool` (`source/thread.*`): a
-/// main-worker slot plus `size − 1` persistent helper threads, each parked in
-/// [`helper_loop`] until a `go` dispatches it a [`HelperJob`]. Each helper owns
-/// game-scoped histories that persist across `go`s; the pool is recreated to
-/// reset them. `go` runs the main worker on the coordinator thread
-/// [`UsiDriver::handle_go`] spawns, and that coordinator dispatches to and
-/// collects from these helper slots.
+/// Each helper owns game-scoped histories that persist across `go`s, so the
+/// pool is recreated to reset them.
 struct ThreadPool {
     /// One coordination slot per helper (`size − 1` of them). Shared with the
     /// coordinator (which dispatches / collects) via [`Self::helper_slots`].
@@ -2576,8 +2388,8 @@ impl ThreadPool {
 
     /// Build a pool of `size` slots with an optional NUMA binding plan. Each
     /// helper thread (worker `1..`) binds itself to its assigned node once at
-    /// spawn (mirroring the reference `thread.cpp` per-thread
-    /// bind at creation) before it parks.
+    /// spawn (mirroring the reference `thread.cpp` per-thread bind at
+    /// creation) before it parks.
     fn with_binding(size: usize, plan: Option<Arc<NumaBindPlan>>) -> Self {
         let mut pool = ThreadPool {
             slots: Vec::new(),
@@ -2593,25 +2405,20 @@ impl ThreadPool {
         self.set_with_binding(size, None);
     }
 
-    /// Resize to `size` slots. Mirrors the reference `ThreadPool::set`: it never
-    /// diffs — it always joins and destroys the current helpers (dropping their
-    /// histories), then recreates the requested number with fresh histories.
-    /// Callers wait for any running search to finish first (see
-    /// [`UsiDriver::rebuild_pool`]), so every helper is parked when this runs.
+    /// Resize to `size` slots, mirroring the reference `ThreadPool::set`: it
+    /// never diffs, always joining and destroying the current helpers and then
+    /// recreating the requested number with fresh histories. Callers wait for
+    /// any running search to finish first, so every helper is parked when this
+    /// runs.
     ///
-    /// When `plan` is `Some` and its assignment is non-empty, each helper thread
-    /// binds itself to its assigned NUMA node (worker index `1..size`) at spawn
-    /// — and, in the same breath, makes that node its preferred allocation
-    /// target — before entering [`helper_loop`].
-    ///
-    /// The memory half matters because the pin alone does not place anything:
-    /// under `numactl --interleave=all` the inherited process policy would still
-    /// spread this helper's private history tables across every node. Setting the
-    /// preference *here*, at spawn, is what makes [`helper_loop`]'s lazy
-    /// `WorkerHistories::with_shared` — the helper's ~68 MiB of private tables,
-    /// allocated and filled on this very thread when its first job arrives —
-    /// land node-locally. It is a per-thread policy, so the shared transposition
-    /// table's interleave is untouched.
+    /// When `plan` is `Some` and its assignment is non-empty, each helper binds
+    /// itself to its assigned NUMA node at spawn and makes that node its
+    /// preferred allocation target. The memory half matters because the
+    /// affinity pin alone places nothing: under `numactl --interleave=all` the inherited
+    /// process policy would still spread the helper's private history tables
+    /// across every node. Setting the preference at spawn is what makes
+    /// [`helper_loop`]'s lazy allocation land node-locally, and it is per-thread,
+    /// so the shared transposition table's interleave is untouched.
     fn set_with_binding(&mut self, size: usize, plan: Option<Arc<NumaBindPlan>>) {
         self.shutdown();
         let size = size.max(1);
@@ -2705,10 +2512,9 @@ fn real_sysfs_options() -> SysfsOptions {
 /// * `none` → the default single all-threads node;
 /// * anything else → a custom node string via [`NumaConfig::from_string`].
 ///
-/// A custom string that fails to parse (duplicate CPU) or that yields ZERO nodes
-/// is a fail-loud `Err` (the reference reaches `std::exit(EXIT_FAILURE)`; the
-/// port surfaces the empty-config case as an explicit checked error). The
-/// `opts` are injectable so tests drive the detection paths with fixture trees.
+/// A custom string that fails to parse, or that yields zero nodes, is a
+/// fail-loud `Err`. The `opts` are injectable so tests drive the detection paths
+/// with fixture trees.
 fn numa_config_from_policy(policy: &str, opts: &SysfsOptions) -> Result<NumaConfig, String> {
     let cfg = match policy {
         "auto" | "system" => NumaConfig::from_sysfs(&DEFAULT_POLICY, true, opts),
@@ -2726,12 +2532,7 @@ fn numa_config_from_policy(policy: &str, opts: &SysfsOptions) -> Result<NumaConf
 }
 
 /// The worker → NUMA-node assignment for `requested` threads under `policy`
-/// (`thread.cpp`).
-///
-/// `do_bind` is `false` for `none`, `suggests_binding_threads(requested)` for
-/// `auto`, and `true` otherwise (`system` / `hardware` / a custom string). When
-/// binding is off the assignment is empty; otherwise it is
-/// [`NumaConfig::distribute_threads_among_numa_nodes`].
+/// (`thread.cpp`). When binding is off the assignment is empty.
 fn compute_numa_binding(config: &NumaConfig, policy: &str, requested: usize) -> Vec<NumaIndex> {
     let do_bind = match policy {
         "none" => false,
@@ -2747,14 +2548,13 @@ fn compute_numa_binding(config: &NumaConfig, policy: &str, requested: usize) -> 
 }
 
 /// Wrap a non-empty binding assignment into a shareable [`NumaBindPlan`]; an
-/// empty assignment yields `None` (no thread binds).
+/// empty assignment yields `None`, and no thread binds.
 ///
-/// The worker → *system* node map is resolved here, once per pool (re)build, and
-/// never on the search path: it reads sysfs, and the kernel's memory policy is
-/// indexed by system node while `bound` holds *logical* nodes that L3-aware
-/// bundling may have renumbered. Building it alongside `bound` keeps the two
-/// vectors the same length by construction, which is what lets every worker
-/// index both with one id.
+/// The worker → *system* node map is resolved here, once per pool (re)build and
+/// never on the search path, because it reads sysfs. The kernel's memory policy
+/// is indexed by system node while `bound` holds *logical* nodes that L3-aware
+/// bundling may have renumbered; building both together keeps them the same
+/// length, so one worker id indexes both.
 fn bind_plan(config: &NumaConfig, bound: &[NumaIndex]) -> Option<Arc<NumaBindPlan>> {
     if bound.is_empty() {
         None
@@ -2774,19 +2574,16 @@ fn coordinator_system_node(plan: Option<&Arc<NumaBindPlan>>) -> Option<NumaIndex
 
 /// Move the coordinator's session-owned history tables onto worker 0's node.
 ///
-/// The one per-worker bundle this engine does **not** allocate inside the worker
-/// that uses it: it is built (and `fill`ed, so every page is faulted) on the USI
-/// / master thread — at construction and again at `usinewgame` — and only then
-/// lent to the per-`go` coordinator thread. Under a many-core host's
-/// `numactl --interleave=all` those pages are spread across every node before
-/// the coordinator ever runs, and no per-thread policy can retroactively move
-/// them; `mbind(MPOL_BIND | MPOL_MF_MOVE)` can, so that is what this does. The
-/// helpers need none of this — each allocates its own bundle inside
-/// [`helper_loop`], after it has pinned itself and set its preferred node.
+/// This is the one per-worker bundle the engine does **not** allocate inside the
+/// worker that uses it: it is built and filled on the USI thread and only then
+/// lent to the per-`go` coordinator. Its pages are therefore already faulted
+/// wherever the process policy put them, and no per-thread policy can move them
+/// retroactively — `mbind(MPOL_BIND | MPOL_MF_MOVE)` can, so that is what this
+/// does. The helpers need none of this, each allocating its own bundle after it
+/// has pinned itself.
 ///
-/// Best-effort throughout: `node` is `None` when binding is inactive (the
-/// single-node CI/VM case), and every individual call degrades to leaving the
-/// placement alone. Runs at pool-(re)build time only — outside any clock.
+/// Best-effort throughout, and run at pool-(re)build time only, outside any
+/// clock.
 fn place_coordinator_histories(histories: Option<&WorkerHistories>, node: Option<NumaIndex>) {
     let (Some(histories), Some(node)) = (histories, node) else {
         return;
@@ -2797,26 +2594,14 @@ fn place_coordinator_histories(histories: Option<&WorkerHistories>, node: Option
 }
 
 /// Build the per-worker handles to the node-shared correction / pawn tables,
-/// mirroring the reference per-node construction
-/// (`thread.cpp`).
+/// mirroring the reference per-node construction (`thread.cpp`).
 ///
-/// The node → thread-count map comes from the binding assignment `bound`
-/// (`boundThreadToNumaNode`): when it is empty (binding inactive) the reference
-/// pretends every thread is on node 0 (`counts[0] = requested`); otherwise it
-/// counts the assignment. For each distinct node it constructs one
-/// [`SharedHistories`] sized `next_power_of_two(count)`. When binding is active
-/// the construction runs INSIDE a thread bound to that node
-/// ([`NumaConfig::execute_on_numa_node`]) so the pages are first-touched there;
-/// otherwise it runs inline.
+/// When `bound` is empty the reference pretends every thread is on node 0;
+/// otherwise it counts the assignment. When binding is active the construction
+/// runs *inside* a thread bound to that node so the pages first-touch there.
 ///
-/// Returns one [`Arc`] per worker (index `i` = worker `i`), each pointing at its
-/// node's table set: `[0]` is the coordinator's, `[1..]` the helpers'. The
-/// returned vector always has `requested.max(1)` entries.
-///
-/// `next_power_of_two`: the reference helper (`thread.cpp`,
-/// `count > 1 ? 2 << msb(count-1) : 1`) and Rust's `usize::next_power_of_two`
-/// agree on every `count >= 1` (round up to a power of two, identity on powers
-/// of two).
+/// Returns one [`Arc`] per worker, each pointing at its node's table set, always
+/// `requested.max(1)` entries long.
 fn build_worker_shared(
     config: &NumaConfig,
     bound: &[NumaIndex],
@@ -2824,8 +2609,8 @@ fn build_worker_shared(
 ) -> Vec<Arc<SharedHistories>> {
     let requested = requested.max(1);
     let counts = shared_node_counts(bound, requested);
-    // Binding active ⇒ allocate + fill each node's set on that node (first-touch,
-    // `thread.cpp`); otherwise (single-node) build inline.
+    // Binding active ⇒ allocate + fill each node's set on that node
+    // (first-touch, `thread.cpp`); otherwise (single-node) build inline.
     let binding_active = !bound.is_empty();
 
     let mut node_shared: std::collections::BTreeMap<NumaIndex, Arc<SharedHistories>> =
@@ -2851,9 +2636,9 @@ fn build_worker_shared(
 }
 
 /// The node → thread-count map for the shared-history construction
-/// (`thread.cpp`): when `bound` is empty every thread is pretended to be
-/// on node 0 (`counts[0] = requested`); otherwise the assignment is counted.
-/// Pure — no allocation or binding.
+/// (`thread.cpp`): when `bound` is empty every thread is pretended to be on
+/// node 0 (`counts[0] = requested`); otherwise the assignment is counted. Pure
+/// — no allocation or binding.
 fn shared_node_counts(
     bound: &[NumaIndex],
     requested: usize,
@@ -2870,9 +2655,9 @@ fn shared_node_counts(
     counts
 }
 
-/// The node each worker's shared table set belongs to (`search.h`):
-/// `bound[i]` when binding is active, else node 0 for every worker. Pure — no
-/// allocation or binding. Length is `requested.max(1)` (the pool size).
+/// The node each worker's shared table set belongs to (`search.h`): `bound[i]`
+/// when binding is active, else node 0 for every worker. Pure — no allocation
+/// or binding. Length is `requested.max(1)` (the pool size).
 fn worker_nodes(bound: &[NumaIndex], requested: usize) -> Vec<NumaIndex> {
     if bound.is_empty() {
         vec![0; requested.max(1)]
@@ -2881,23 +2666,18 @@ fn worker_nodes(bound: &[NumaIndex], requested: usize) -> Vec<NumaIndex> {
     }
 }
 
-/// Resolve the per-worker network handles for one pool configuration (the Arc
-/// bookkeeping of [`UsiDriver::rebuild_networks`]), factored out so
-/// it is unit-testable without a loaded network or a live `/sys` tree.
+/// Resolve the per-worker network handles for one pool configuration, factored
+/// out of [`UsiDriver::rebuild_networks`] so it is unit-testable without a
+/// loaded network or a live `/sys` tree.
 ///
 /// `sys_nodes[i]` is worker `i`'s *system* NUMA node; `rep_logical` maps each
 /// distinct system node to a representative logical node to clone on. When
 /// `replication_active` is false the one `source` instance is shared by every
-/// worker (the pre-replication behaviour) and any stale `replicas` are dropped —
-/// `clone_on_node` is never called. Otherwise a replica is built (via
-/// `clone_on_node`) for every system node not already present, replicas whose
-/// system node no longer appears are dropped, and each worker gets a cheap
-/// [`Arc`] clone of its system node's replica. Reuse of an existing replica is
-/// sound because every instance is byte-identical, so a plain rebuild that leaves
-/// the layout unchanged clones nothing.
+/// worker and `clone_on_node` is never called. Reuse of an existing replica is
+/// sound because every instance is byte-identical, so a rebuild that leaves the
+/// layout unchanged clones nothing.
 ///
-/// Generic over the payload so the tests can exercise the identity / drop / reuse
-/// logic with a trivial stand-in.
+/// Generic over the payload so tests can drive it with a trivial stand-in.
 fn resolve_worker_networks<T>(
     source: &Arc<T>,
     replicas: &mut BTreeMap<NumaIndex, Arc<T>>,
@@ -2929,18 +2709,16 @@ fn resolve_worker_networks<T>(
         .collect()
 }
 
-// The engine's own diagnostic about thread allocation is emitted by the
-// `usi-extras` `bench` command and nowhere else — it is the only command that
-// changes the worker count. The NUMA layout and the match-path worker count are
-// compile-time constants: there is no moment at which their numbers could
-// change, and (by the byte-identity contract) no new line may appear on a
-// default build's output.
+// The thread-allocation diagnostic is emitted by the `usi-extras` `bench`
+// command and nowhere else, since that is the only command that can change the
+// worker count; everything else about the layout is a compile-time constant.
 /// The `(bound_count, cpus_in_node)` pairs per node (`thread.cpp` +
 /// `engine.cpp`).
 ///
 /// Empty when nothing is bound. Otherwise the pairs cover nodes
-/// `0..=highest_bound_node`, then — since at least one thread is bound — extend
-/// with `(0, cpus_in_node)` for the remaining nodes up to `num_numa_nodes`.
+/// `0..=highest_bound_node`, then — since at least one thread is bound —
+/// extend with `(0, cpus_in_node)` for the remaining nodes up to
+/// `num_numa_nodes`.
 #[cfg(feature = "usi-extras")]
 fn bound_thread_counts(cfg: &NumaConfig, bound: &[NumaIndex]) -> Vec<(usize, usize)> {
     if bound.is_empty() {
@@ -2963,8 +2741,8 @@ fn bound_thread_counts(cfg: &NumaConfig, bound: &[NumaIndex]) -> Vec<(usize, usi
     ratios
 }
 
-/// The `a/x:b/y:...` per-node `bound/total` string (`engine.cpp`); empty
-/// when nothing is bound.
+/// The `a/x:b/y:...` per-node `bound/total` string (`engine.cpp`); empty when
+/// nothing is bound.
 #[cfg(feature = "usi-extras")]
 fn thread_binding_information_as_string(cfg: &NumaConfig, bound: &[NumaIndex]) -> String {
     bound_thread_counts(cfg, bound)
@@ -3078,20 +2856,13 @@ struct CoordinatorJob<W: Write + Send + 'static> {
     writer: Arc<Mutex<W>>,
 }
 
-/// The Lazy-SMP coordinator (the reference main worker's `start_searching`,
-/// yaneuraou-search.cpp). Runs on the per-`go` thread the driver spawns:
-/// bumps the TT generation once, short-circuits resign / declaration win,
-/// dispatches a job to every helper, runs the main worker's own iterative
-/// deepening, then stops and collects the helpers, votes for a single result,
-/// ponder-extends it, and emits one `info` / `bestmove`. Returns the main
-/// worker's histories for the driver to reclaim, paired with the aggregate
-/// searched-node total (0 for the resign / declaration / book short-circuits) —
-/// the latter feeds the `bench` per-position accumulation.
-/// What [`run_coordinated`] hands back: the main worker's histories (reclaimed by
-/// the driver), the aggregate searched-node total (for `bench`), and the
-/// time-management carry-forward (the third tuple element is `None` for a
-/// short-circuited `go`, whose `previousTimeReduction` the reference leaves
-/// untouched — see [`SearchState::time_state`]).
+/// The Lazy-SMP coordinator — the reference main worker's `start_searching`
+/// (`yaneuraou-search.cpp`), running on the per-`go` thread the driver spawns.
+///
+/// Hands back the main worker's histories for the driver to reclaim, the
+/// aggregate searched-node total (0 for the short-circuits, and what `bench`
+/// accumulates), and the time-management carry-forward, whose third element is
+/// `None` for a short-circuited `go`.
 struct CoordinatedOutcome {
     histories: WorkerHistories,
     /// `bench` is the only reader (the async `go` path takes its node total off
@@ -3103,17 +2874,13 @@ struct CoordinatedOutcome {
     time_state: Option<(Value, Value, Option<f64>)>,
 }
 
-/// The time-management carry-forward for a SKIP_SEARCH short-circuit (book hit,
-/// declaration win, resign / no-legal-move). The reference reaches the same
-/// `1249-1253` bookkeeping on these paths as on a real search
-/// (`yaneuraou-search.cpp` `SKIP_SEARCH:` falls straight through to it), and
-/// there `bestThread->rootMoves[0]` is the unsearched default whose `score` and
-/// `averageScore` are `-VALUE_INFINITE` (`search.h`) — the book probe
-/// never writes `rootMoves` (its score goes only into the emitted `info` line).
-/// So both carried scores are `-VALUE_INFINITE`. `lastGamePly` is still updated
-/// (from `active.game_ply` in [`UsiDriver::finish_search_join`]); only
-/// `previousTimeReduction` is left untouched (`None`), since `iterative_deepening`
-/// — its sole writer — did not run.
+/// The time-management carry-forward for a search-skipping short-circuit — a
+/// book hit, declaration win, resign or no legal move.
+///
+/// The reference's `SKIP_SEARCH:` falls straight through to the same bookkeeping
+/// a real search reaches, where `rootMoves[0]` is still the unsearched default,
+/// so both carried scores are `-VALUE_INFINITE`. Only `previousTimeReduction` is
+/// left untouched, since `iterative_deepening` — its sole writer — did not run.
 fn skip_search_carry() -> Option<(Value, Value, Option<f64>)> {
     Some((-VALUE_INFINITE, -VALUE_INFINITE, None))
 }
@@ -3152,24 +2919,20 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     } = job;
     let multi_pv = pv_config.multi_pv.max(1);
 
-    // Bind this coordinator (worker slot 0) to its assigned NUMA node before any
-    // search work, when binding is active, and make that node's memory its
-    // allocation preference — everything this thread allocates from here on (the
-    // search stack, the root move list, the move buffers) then stays node-local
-    // instead of following the launcher's process-wide interleave. Idempotent
-    // across the per-`go` coordinator respawns — the target node is stable until
-    // the next pool rebuild. No-op when binding is inactive (single-node CI/VM)
-    // or off Linux. The bundle in `histories` is placed separately, at pool
-    // (re)build time, because it was already faulted on the USI thread by then
-    // (`place_coordinator_histories`).
+    // Bind this coordinator to its assigned NUMA node before any search work,
+    // and make that node's memory its allocation preference, so everything this
+    // thread allocates from here on stays node-local instead of following the
+    // launcher's process-wide interleave. Idempotent across the per-`go`
+    // coordinator respawns. The bundle in `histories` is placed separately, at
+    // pool (re)build time, because it was already faulted on the USI thread.
     if let Some(plan) = &numa_bind {
         plan.config
             .bind_current_thread_with_local_memory(plan.bound[0], plan.system_nodes[0]);
     }
 
     // One TT generation bump per `go`, on the main worker, BEFORE any helper
-    // starts (pin line 980), so the observable single-thread sequence is the
-    // reference's: bump, then search.
+    // starts, so the observable single-thread sequence is the reference's:
+    // bump, then search.
     tt.new_search();
 
     // Build the root-move list once (the reference `start_thinking`). The resign
@@ -3185,7 +2948,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         };
     }
     // Rule-aware declaration shortcut. Point / `None` rules yield
-    // `Move::win()` (emitted as the bare `win` token, as before); `TryRule`
+    // `Move::win()` (emitted as the bare `win` token); `TryRule`
     // yields the actual king move onto the try square, which must be emitted
     // verbatim so the host plays it.
     if let Some(mv) = declaration_win(&pos, &entering_king) {
@@ -3202,10 +2965,10 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     }
 
     // Opening-book probe — once, on the coordinator, BEFORE any helper starts
-    // (the on-the-fly read path is not thread-safe by design; pin
-    // `book.h` and `yaneuraou-search.cpp`). The `USI_OwnBook` gate
-    // and a loaded book are both required. On a hit we emit and return without
-    // searching, holding the reply for `go ponder` / `go infinite`.
+    // (the on-the-fly read path is not thread-safe by design; pin `book.h` and
+    // `yaneuraou-search.cpp`). The `USI_OwnBook` gate and a loaded book are
+    // both required. On a hit we emit and return without searching, holding
+    // the reply for `go ponder` / `go infinite`.
     if own_book && let Some(loaded) = &book {
         let mut prng = Prng::new(book_seed);
         let probed = probe_book(
@@ -3241,8 +3004,8 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     let node_slots: Arc<Vec<AtomicU64>> =
         Arc::new((0..n_threads).map(|_| AtomicU64::new(0)).collect());
     // Per-worker best-move-change counters, same slot-per-worker shape: each
-    // worker bumps its own slot at the root, the main worker folds them all each
-    // iteration (`yaneuraou-search.cpp`). Fresh (all-zero) per `go`.
+    // worker bumps its own slot at the root, the main worker folds them all
+    // each iteration (`yaneuraou-search.cpp`). Fresh (all-zero) per `go`.
     let bmc_slots: Arc<Vec<AtomicU64>> =
         Arc::new((0..n_threads).map(|_| AtomicU64::new(0)).collect());
 
@@ -3269,19 +3032,13 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         });
     }
 
-    // The main worker searches with the full control and the node ceiling, and is
-    // the only worker given a PV sink (the reference `main_manager()->pv()`
-    // owner). Its per-iteration / fail-high-low PV lines are written directly to
-    // the shared output as the search runs.
-    //
-    // Without `info-output` it is given the `MultiPV` value alone and no sink.
-    // That is the whole default-build difference on the search path: `MultiPV`
-    // shapes the search, so it is installed in every build, while the rest of the
-    // PV-output configuration (interval, ConsiderationMode, OutputFailLHPV,
-    // start time) only decides which lines get printed. With no sink the search's
-    // emission sites short-circuit before they collect a PV or fold the
-    // cross-worker node total, so the node counts and the search itself are
-    // identical in all three build shapes.
+    // The main worker is the only one given a PV sink. Without `info-output` it
+    // is given the `MultiPV` value alone and no sink: `MultiPV` shapes the
+    // search, so it is installed in every build, while the rest of the PV-output
+    // configuration only decides which lines get printed. With no sink the
+    // search's emission sites short-circuit before they collect a PV or fold the
+    // cross-worker node total, so the search itself is identical in all three
+    // build shapes.
     let net = search.network();
     let mut qs = QSearch::with_histories(net, &tt, histories);
     qs.set_control(control);
@@ -3303,11 +3060,12 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     qs.set_multi_pv(multi_pv);
     let main_result = qs.run_worker(&pos, root_moves, depth);
 
-    // Ponder / infinite hold (the SKIP_SEARCH wait loop, `yaneuraou-search.cpp`):
-    // do not emit `bestmove` while still pondering or under `go infinite`. A plain
-    // `ponderhit` clears the ponder flag mid-search, so the main worker usually
-    // returns already un-pondering; this catches the case where the search finished
-    // (mate found / depth ceiling) while a `ponderhit` had not yet arrived.
+    // Ponder / infinite hold (the SKIP_SEARCH wait loop,
+    // `yaneuraou-search.cpp`): do not emit `bestmove` while still pondering or
+    // under `go infinite`. A plain `ponderhit` clears the ponder flag
+    // mid-search, so the main worker usually returns already un-pondering;
+    // this catches the case where the search finished (mate found / depth
+    // ceiling) while a `ponderhit` had not yet arrived.
     while !stop.load(Ordering::Relaxed)
         && (ponder.as_ref().is_some_and(|p| p.is_active()) || infinite)
     {
@@ -3356,9 +3114,9 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     );
 
     // Time-management outputs carried back for the next `go`
-    // (`yaneuraou-search.cpp`): the chosen worker's score /
-    // average score become the next move's `bestPrevious*`, and the main worker's
-    // final `timeReduction` becomes `previousTimeReduction`.
+    // (`yaneuraou-search.cpp`): the chosen worker's score / average score
+    // become the next move's `bestPrevious*`, and the main worker's final
+    // `timeReduction` becomes `previousTimeReduction`.
     let out_best_previous_score = chosen_result.best.score;
     let out_best_previous_average_score = chosen_result.best.average_score;
     let out_previous_time_reduction = results[0].time_reduction;
@@ -3371,17 +3129,11 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     #[cfg(feature = "info-output")]
     let ponder_extended = best.pv.len() != ponder_before;
 
-    // `ResignValue` (`yaneuraou-search.cpp`): decided *before* the
-    // final PV output, because a resign-by-value forces that PV out so the GUI
-    // can see the score the decision was made on. The reference judges on
-    // `rootMoves[0].uciScore` — the value it prints as `info score` — normalized
-    // to centipawns, not on the raw internal score; an unset `uciScore`
-    // (`-VALUE_INFINITE`, e.g. an iteration aborted before any PV line was
-    // scored) maps to `VALUE_ZERO` rather than resigning outright. The
-    // `!search_skipped` guard is implicit here: the book / declaration /
-    // no-legal-move short-circuits all returned above, so reaching this point
-    // means a real search ran. `score != -VALUE_INFINITE` is kept for
-    // faithfulness (a searched score is never that).
+    // `ResignValue` is decided *before* the final PV output, because a
+    // resign-by-value forces that PV out so the GUI can see the score behind the
+    // decision. The reference judges on `rootMoves[0].uciScore` normalized to
+    // centipawns, not on the raw internal score, and an unset `uciScore` maps to
+    // `VALUE_ZERO` rather than resigning outright.
     let resign_by_value = best.score != -VALUE_INFINITE && {
         let resign_score = if best.uci_score == -VALUE_INFINITE {
             0
@@ -3391,22 +3143,17 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         to_cp(resign_score) <= -resign_value
     };
 
-    // Final PV output before `bestmove` (1300-1312): emit when the last
-    // iteration's final PV was not already sent (throttled by `PvInterval`), the
-    // chosen worker is not the main one, or we are about to resign by value.
-    // `pv_idx == lines.len()` makes every line exact (no bound), matching the
-    // reference `pv()` after the MultiPV loop (`worker.pvIdx == multiPV`).
+    // Final PV output before `bestmove`. `pv_idx == lines.len()` makes every
+    // line exact, matching the reference's `pv()` after the MultiPV loop.
     //
-    // `info-output` only. `resign_by_value` above is NOT gated: it decides the
-    // reply itself, and the reference forces this PV out precisely so a GUI can
-    // see the score behind a resignation — a build that prints no PV still
-    // resigns on the same score.
+    // `info-output` only; `resign_by_value` above is not gated, since it decides
+    // the reply itself and a build that prints no PV still resigns on the same
+    // score.
     #[cfg(feature = "info-output")]
     {
-        // `uciPvSent` is the main worker's flag (index 0); it is cleared when the
-        // chosen PV was ponder-extended (its content changed vs. what was emitted
-        // during search, 1277-1280) or when the chosen worker is not the main one
-        // (its PV was never emitted).
+        // `uciPvSent` is the main worker's flag; it is cleared when the chosen
+        // PV was ponder-extended, or when the chosen worker is not the main one
+        // and so never emitted its PV.
         let uci_pv_sent = results[0].uci_pv_sent && !ponder_extended && chosen == 0;
         if !uci_pv_sent || resign_by_value {
             // Reflect the (possibly ponder-extended) chosen line back into line 0
@@ -3436,10 +3183,10 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         bm = "resign".to_string();
     }
 
-    // A Stochastic_Ponder teardown stops the rewound search without emitting its
-    // `bestmove` (`usi.cpp`); the fresh re-issued `go` produces the single
-    // reply the GUI sees. The `time_state` below is still returned so the rewound
-    // search's score / ply seed the re-issue's side-flip continuity.
+    // A Stochastic_Ponder teardown stops the rewound search without emitting
+    // its `bestmove` (`usi.cpp`); the fresh re-issued `go` produces the single
+    // reply the GUI sees. The `time_state` below is still returned so the
+    // rewound search's score / ply seed the re-issue's side-flip continuity.
     if !suppress_bestmove.load(Ordering::Relaxed) {
         emit_bestmove(&writer, &bestmove_sent, &bm);
     }
@@ -3881,8 +3628,8 @@ mod tests {
         );
     }
 
-    /// Feature off: the match clauses are untouched — a clock-bounded `go` runs
-    /// exactly as before (resign here, as no network is loaded).
+    /// Feature off: the match clauses are untouched — a clock-bounded `go` still
+    /// runs and emits one `bestmove` (resign here, as no network is loaded).
     #[cfg(not(feature = "usi-extras"))]
     #[cfg_attr(miri, ignore)]
     #[test]
@@ -4132,7 +3879,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn bind_plan_is_absent_when_binding_is_inactive() {
-        // The single-node CI/VM case: no assignment, so no plan, so no thread
+        // The single-node host case: no assignment, so no plan, so no thread
         // ever pins itself and nothing touches a memory policy.
         let cfg = NumaConfig::from_string("0-3").unwrap();
         assert!(bind_plan(&cfg, &[]).is_none());
@@ -4142,7 +3889,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn bind_plan_carries_one_system_node_per_worker() {
-        // A custom node string always suggests binding. Whatever the runner's
+        // A custom node string always suggests binding. Whatever the host's
         // real topology is, the map must be one entry per worker and every entry
         // must be a system node the machine actually has — this is the vector
         // both the pin site and the placement calls index with a worker id, so a
@@ -4167,21 +3914,17 @@ mod tests {
         );
     }
 
-    /// The remedy for the one bundle this engine builds off-worker, asserted
-    /// end-to-end through the driver: with a NUMA layout that forces binding,
-    /// every large-page block behind the coordinator's history tables must be
-    /// governed by an `MPOL_BIND` policy naming worker 0's system node.
+    /// With a NUMA layout that forces binding, every large-page block behind the
+    /// coordinator's history tables must be governed by an `MPOL_BIND` policy
+    /// naming worker 0's system node.
     ///
-    /// Meaningful on a single-node runner: the *placement* answer there is node
-    /// 0 either way, but the *policy* over those pages is `MPOL_DEFAULT` until
-    /// something binds it — which is precisely the before/after this change is
-    /// about. `cfg_attr(miri, ignore)`: the syscalls compile out under miri.
+    /// Still meaningful on a single-node host: the *placement* answer there is
+    /// node 0 either way, but the *policy* over those pages is `MPOL_DEFAULT`
+    /// until something binds it.
     ///
-    /// The layout is injected rather than selected: `numa_policy` is a
-    /// compile-time constant, and no config that a checked-in file could name
-    /// would force binding on an arbitrary runner. Everything downstream of the
-    /// layout — `rebuild_pool` and `place_coordinator_histories` — is the
-    /// production path, unmodified and un-`cfg`d.
+    /// The layout is injected rather than selected, since `numa_policy` is a
+    /// compile-time constant and no checked-in config would force binding on an
+    /// arbitrary host. Everything downstream of it is the production path.
     #[cfg(target_os = "linux")]
     #[cfg_attr(miri, ignore)]
     #[test]
@@ -4190,7 +3933,7 @@ mod tests {
         let mut driver = UsiDriver::new(&b""[..], Arc::clone(&output));
 
         // A custom node string always suggests binding, so this turns the
-        // binding on even on a single-node runner. The node is the one CPU the
+        // binding on even on a single-node host. The node is the one CPU the
         // process is certain to be allowed on, so the (fail-loud) pin the
         // rebuild's helper threads perform cannot hit a forbidden CPU.
         driver.numa_config =
@@ -4229,13 +3972,9 @@ mod tests {
         }
     }
 
-    // A book / declaration / resign short-circuit carries the reference's
-    // SKIP_SEARCH bookkeeping (`yaneuraou-search.cpp`): both persisted
-    // scores become `-VALUE_INFINITE` (the unsearched `rootMoves[0]` default),
-    // `last_game_ply` advances to the ply the (skipped) search ran at, and
-    // `previous_time_reduction` is left untouched (its only writer,
-    // `iterative_deepening`, did not run). This drives the real
-    // `finish_search_join` with exactly the carry every short-circuit returns.
+    // A short-circuit carries the reference's SKIP_SEARCH bookkeeping: both
+    // persisted scores become `-VALUE_INFINITE`, `last_game_ply` advances, and
+    // `previous_time_reduction` is left untouched.
     #[cfg_attr(miri, ignore)]
     #[test]
     fn skip_search_carry_updates_scores_and_ply_but_not_time_reduction() {
@@ -4310,13 +4049,9 @@ mod tests {
         assert_eq!(driver.last_game_ply, 3);
     }
 
-    // -- per-NUMA-node network replica-set construction -------------------
-    //
-    // These exercise the Arc bookkeeping of `resolve_worker_networks` — the
-    // core of `rebuild_networks` — with a trivial stand-in payload, so they need
-    // neither a loaded ~215 MiB network nor multi-node hardware. The fixture-
-    // driven logical→system-node mapping (`system_node_of_logical`) is tested in
-    // `yorkie-numa`'s `tests/sysfs.rs`.
+    // These exercise the Arc bookkeeping of `resolve_worker_networks` with a
+    // trivial stand-in payload, so they need neither a loaded network nor
+    // multi-node hardware.
 
     /// A `clone_on_node` stand-in that records each `(system, logical)` build and
     /// hands back a fresh `Arc` with a distinct value, so replicas are never
@@ -4660,7 +4395,7 @@ mod tests {
         let dir = book_name_fixture_dir("crossext");
 
         // `.ybb` base: primary `.ybb` wins over a co-existing `.db`, with the
-        // pin's verbatim notice.
+        // reference's verbatim notice.
         let ybb_base = dir.join("user_book1.ybb");
         touch(&ybb_base);
         touch(&dir.join("user_book1-000.ybb"));

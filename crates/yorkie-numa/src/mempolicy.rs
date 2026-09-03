@@ -1,57 +1,36 @@
 //! Linux NUMA **memory**-policy calls — the placement half of the NUMA work
 //! ([`NumaConfig`](crate::NumaConfig) owns the thread-pinning half).
 //!
-//! # Why this exists
-//!
 //! The recommended launch line on a many-core host wraps the engine in
-//! `numactl --interleave=all`. That process-wide policy is right
-//! for the one transposition table every worker shares, but it is inherited by
-//! every thread, so a worker's *private* working set — its history /
-//! continuation-history / capture-history tables, its search stack, its move
-//! buffers — is round-robined across all nodes even though
-//! [`NumaConfig::bind_current_thread_to_numa_node`](crate::NumaConfig::bind_current_thread_to_numa_node)
-//! pinned that worker to one node. Under `MPOL_INTERLEAVE` the kernel's
-//! first-touch rule does not apply: allocating on the "right" thread places
-//! nothing.
+//! `numactl --interleave=all`. That process-wide policy is right for the one
+//! transposition table every worker shares, but it is inherited by every thread,
+//! so a worker's *private* working set is round-robined across all nodes even
+//! though it was pinned to one. Under `MPOL_INTERLEAVE` the kernel's first-touch
+//! rule does not apply, so allocating on the "right" thread places nothing.
 //!
 //! The three-layer policy this module makes possible:
 //!
-//! 1. **Process default — untouched.** Nothing here changes the process policy,
-//!    so the TT keeps interleaving and the USI / search-master thread keeps the
-//!    launcher's policy.
-//! 2. **Explicit per-region placement** — [`migrate_region_to_node`]
-//!    (`mbind(MPOL_BIND | MPOL_MF_MOVE)`) for a block that was already allocated
-//!    *and faulted* by another thread, so first-touch is no longer available as
-//!    a lever.
-//! 3. **Worker-scope preference** — [`set_current_thread_preferred_node`]
-//!    (`set_mempolicy(MPOL_PREFERRED, <node>)`), set by a worker right after it
-//!    pins itself, so everything it allocates from then on lands on its node.
-//!    `set_mempolicy` is per-thread, so this can never disturb the TT's
-//!    interleave or another thread's placement.
+//! 1. **Process default — untouched**, so the TT keeps interleaving and the USI
+//!    thread keeps the launcher's policy.
+//! 2. **Explicit per-region placement** — [`migrate_region_to_node`], for a
+//!    block another thread already allocated *and faulted*, so first-touch is no
+//!    longer available as a lever.
+//! 3. **Worker-scope preference** — [`set_current_thread_preferred_node`], set
+//!    by a worker right after it pins itself. Being per-thread, it can never
+//!    disturb the TT's interleave or another thread's placement.
 //!
-//! # Node numbering
-//!
-//! The kernel's nodemask is indexed by **system** NUMA node. A [`NumaIndex`] as
-//! used by [`NumaConfig`](crate::NumaConfig) is a *logical* node, which L3-aware
-//! bundling can renumber — callers must map through
+//! The kernel's nodemask is indexed by **system** NUMA node, while a
+//! [`NumaIndex`] is a *logical* node that L3-aware bundling can renumber, so
+//! callers must map through
 //! [`NumaConfig::system_node_of_logical`](crate::NumaConfig::system_node_of_logical)
-//! (or the batch
-//! [`NumaConfig::system_nodes_for_binding`](crate::NumaConfig::system_nodes_for_binding))
 //! before calling anything here.
 //!
-//! # Best-effort by construction
+//! Every syscall wrapper returns a plain `bool` / `Option` and never panics: a
+//! kernel that refuses the call simply leaves today's placement in force.
 //!
-//! Every syscall wrapper here returns a plain `bool` / `Option` and never
-//! panics: a kernel that refuses the call (no `CONFIG_NUMA`, a seccomp filter, a
-//! cgroup restriction, a node that does not exist) simply leaves today's
-//! placement in force. Nothing in this module is on a search hot path, and no
-//! caller may surface a failure to USI.
-//!
-//! Off Linux the syscall wrappers are compiled-out no-ops (this port is
-//! Linux-only by design, see the crate docs), and so they are under miri, which
-//! models neither `set_mempolicy` nor `mbind`. The pure mask / page-rounding
-//! logic below is platform-independent and is what most of the unit tests cover,
-//! so they stay meaningful on a single-node CI runner.
+//! Off Linux the syscall wrappers are compiled-out no-ops, and so they are under
+//! miri, which models neither `set_mempolicy` nor `mbind`. The mask and
+//! page-rounding logic below is platform-independent.
 
 use crate::NumaIndex;
 
@@ -93,12 +72,8 @@ const MPOL_MF_MOVE: libc::c_ulong = 1 << 1;
 #[cfg(all(target_os = "linux", not(miri)))]
 const MPOL_F_ADDR: libc::c_ulong = 1 << 1;
 
-/// A memory policy as reported by `get_mempolicy`: the mode (one of the `MODE_*`
-/// constants) and the node set it names.
-///
-/// The read-back path — used by the tests, and by anyone diagnosing placement on
-/// a live engine — to assert what a [`set_current_thread_preferred_node`] or
-/// [`migrate_region_to_node`] call actually installed.
+/// A memory policy as reported by `get_mempolicy`: the mode and the node set it
+/// names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemPolicy {
     /// The policy mode: [`MODE_DEFAULT`], [`MODE_PREFERRED`], [`MODE_BIND`],
@@ -112,12 +87,11 @@ pub struct MemPolicy {
 /// Build the kernel nodemask naming exactly `node`, plus the `maxnode` argument
 /// that goes with it.
 ///
-/// The mask is `node / MASK_WORD_BITS + 1` words with one bit set. `maxnode` is
-/// `words * MASK_WORD_BITS + 1`, the convention libnuma uses (`mask->size + 1`):
-/// the kernel decrements the argument before deriving both the word count and
-/// the mask of valid bits in the final word, so passing the bit count itself
-/// would silently drop the mask's top bit — which, for a node sitting on a
-/// word boundary, is the only bit set.
+/// `maxnode` is `words * MASK_WORD_BITS + 1`, the convention libnuma uses: the
+/// kernel decrements the argument before deriving both the word count and the
+/// mask of valid bits in the final word, so passing the bit count itself would
+/// silently drop the mask's top bit — which, for a node on a word boundary, is
+/// the only bit set.
 ///
 /// Returns `None` for an index past [`MAX_NODE_INDEX`], which the kernel would
 /// reject anyway.
@@ -133,10 +107,6 @@ pub(crate) fn node_mask(node: NumaIndex) -> Option<(Vec<usize>, usize)> {
 
 /// Decode a kernel nodemask — the little-endian bit array `node_mask` builds and
 /// `get_mempolicy` fills — into ascending node indices.
-///
-/// Public because it is the documented inverse of the encoding [`MemPolicy`]
-/// exposes, and because it is the only piece of the readback path that is
-/// meaningful on the platforms where the syscalls compile out.
 pub fn nodes_from_mask(mask: &[usize]) -> Vec<NumaIndex> {
     let mut nodes = Vec::new();
     for (w, &word) in mask.iter().enumerate() {
@@ -152,11 +122,9 @@ pub fn nodes_from_mask(mask: &[usize]) -> Vec<NumaIndex> {
 /// The page-aligned span covering the byte range `[addr, addr + len)`, given a
 /// `page` size (a power of two). Returns `(start, length)`.
 ///
-/// `mbind` rejects a base that is not page-aligned (`EINVAL`) and rounds the
-/// length up internally; doing both explicitly here keeps the arithmetic in one
-/// testable place and makes the "the policy also covers whatever else shares the
-/// first and last page" consequence visible at the call site rather than buried
-/// in the kernel.
+/// `mbind` rejects a base that is not page-aligned and rounds the length up
+/// internally; doing both explicitly here makes visible at the call site that
+/// the policy also covers whatever else shares the first and last page.
 ///
 /// Returns `None` for an empty range, or one whose rounding would overflow.
 pub(crate) fn page_span(page: usize, addr: usize, len: usize) -> Option<(usize, usize)> {
@@ -194,15 +162,11 @@ pub fn page_size() -> usize {
 /// Make the **calling thread** prefer `system_node` for every subsequent
 /// allocation (`set_mempolicy(MPOL_PREFERRED, {system_node})`).
 ///
-/// This is layer 3 of the module-level policy: a worker calls it immediately
-/// after pinning itself, so its private tables, search stack and move buffers
-/// first-touch on the node it runs on even when the process default is
-/// `--interleave=all`. `MPOL_PREFERRED` (rather than `MPOL_BIND`) keeps it a
-/// preference: if the node runs out of memory the allocation still succeeds
-/// elsewhere instead of provoking an OOM kill mid-search.
+/// `MPOL_PREFERRED` rather than `MPOL_BIND` keeps it a preference: if the node
+/// runs out of memory the allocation still succeeds elsewhere instead of
+/// provoking an OOM kill mid-search.
 ///
-/// `system_node` is a **system** NUMA node index, not a logical [`NumaIndex`] —
-/// see the module docs.
+/// `system_node` is a **system** NUMA node index, not a logical [`NumaIndex`].
 ///
 /// Returns whether the kernel accepted the policy. A `false` is not an error:
 /// the thread simply keeps the policy it inherited.
@@ -217,24 +181,19 @@ pub fn set_current_thread_preferred_node(system_node: NumaIndex) -> bool {
 /// that are already faulted elsewhere
 /// (`mbind(MPOL_BIND, {system_node}, MPOL_MF_MOVE)`).
 ///
-/// This is layer 2 of the module-level policy: the remedy for a block that was
-/// allocated *and* first-touched by a thread other than the worker that will use
-/// it, where no amount of per-thread policy can fix the placement after the
-/// fact. `MPOL_MF_STRICT` is not passed, so a page that cannot be migrated is
-/// left in place and the call still succeeds.
+/// The remedy for a block another thread allocated *and* first-touched, where no
+/// per-thread policy can fix the placement after the fact. `MPOL_MF_STRICT` is
+/// not passed, so a page that cannot be migrated is left in place and the call
+/// still succeeds.
 ///
-/// The range is widened to whole pages ([`page_span`]). Callers pass
-/// large-page-backed blocks (`yorkie_storage`'s allocator aligns every one of
-/// them to a 2 MiB boundary and rounds the size up to a whole multiple of it),
-/// so in practice the widened span is the block itself.
+/// The range is widened to whole pages ([`page_span`]); callers pass
+/// large-page-backed blocks, which are already 2 MiB-aligned and -sized.
 ///
-/// `system_node` is a **system** NUMA node index — see the module docs. Returns
-/// whether the kernel accepted the call; `false` leaves the range exactly as it
-/// was.
+/// `system_node` is a **system** NUMA node index. Returns whether the kernel
+/// accepted the call; `false` leaves the range exactly as it was.
 ///
 /// No memory is read or written here: the address is handed to the kernel as a
-/// range descriptor, which is why this is a safe function despite taking a raw
-/// address.
+/// range descriptor, which is why this is safe despite taking a raw address.
 pub fn migrate_region_to_node(addr: usize, len: usize, system_node: NumaIndex) -> bool {
     let Some((mask, maxnode)) = node_mask(system_node) else {
         return false;
@@ -245,12 +204,8 @@ pub fn migrate_region_to_node(addr: usize, len: usize, system_node: NumaIndex) -
     sys_mbind(start, span, &mask, maxnode)
 }
 
-/// The calling thread's own memory policy (`get_mempolicy(…, NULL, 0)`).
-///
-/// The read-back counterpart of [`set_current_thread_preferred_node`]. On a
-/// single-node runner every *placement* question has the same answer, but the
-/// *policy* question does not — which is what keeps the tests over this
-/// meaningful there.
+/// The calling thread's own memory policy (`get_mempolicy(…, NULL, 0)`) — the
+/// read-back counterpart of [`set_current_thread_preferred_node`].
 pub fn current_thread_policy() -> Option<MemPolicy> {
     sys_get_mempolicy(None)
 }
@@ -478,18 +433,14 @@ mod tests {
 
     // -- live syscalls (best-effort; assert nothing changed when refused) --
 
-    /// The point of the two tests below on a single-node runner: every
-    /// *placement* question has the same answer there (node 0), but the *policy*
-    /// question does not — a thread's policy stays whatever it inherited until
-    /// something sets it, so reading it back is a real assertion.
-    ///
-    /// `cfg_attr(miri, ignore)`: the wrappers compile out under miri (it models
-    /// neither `set_mempolicy` nor `mbind`), so there would be nothing to read
-    /// back.
+    /// Still meaningful on a single-node host: every *placement* question has
+    /// the same answer there, but a thread's *policy* stays whatever it
+    /// inherited until something sets it, so reading it back is a real
+    /// assertion.
     #[cfg_attr(miri, ignore)]
     #[test]
     fn preferred_node_policy_is_installed_on_the_calling_thread_only() {
-        // Run in a spawned thread so the test runner's own policy is untouched.
+        // Run in a spawned thread so the test harness's own policy is untouched.
         std::thread::spawn(|| {
             let before = current_thread_policy();
             if !set_current_thread_preferred_node(0) {

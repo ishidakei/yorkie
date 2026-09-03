@@ -2,18 +2,13 @@
 //! `tt probe` round trips (including the mate convention and the centipawn
 //! quantisation), the one-ply `tt children` sweep, and the error surface.
 //!
-//! The whole file is gated on the feature — with `usi-extras` off it compiles to
-//! nothing, matching the default build where the `tt` token is not a command at
-//! all. The complementary "feature off" assertion lives in
-//! `src/parser.rs::tests::tt_is_not_a_command_without_usi_extras`, which is
-//! compiled only when the feature is OFF; run `cargo nextest run -p
-//! yorkie-protocol` (default features, i.e. without `--all-features`) to execute
-//! it.
+//! Gated on `usi-extras`, so with the feature off this file compiles to nothing.
+//! The complementary "feature off" assertion lives in `src/parser.rs`, compiled
+//! only when it is off.
 //!
-//! No network is needed for most of them: a `bench` carries its own table size
-//! as a command argument, so `bench 1 1 1 current movetime` allocates a 1 MiB
-//! table on its own and (finding no network loaded) resigns each position
-//! immediately. These sessions therefore never touch `isready` / `nn.bin`.
+//! No network is needed for most of them: `bench` carries its own table size as
+//! a command argument, so it allocates a table on its own and, finding no
+//! network loaded, resigns each position immediately.
 
 #![cfg(feature = "usi-extras")]
 
@@ -68,9 +63,7 @@ fn store_at(sfen: &str, rest: &str) -> String {
     format!("tt store sfen {sfen} {rest}")
 }
 
-// -------------------------------------------------------------------------
 // 1. `tt store` → `tt probe` round trip.
-// -------------------------------------------------------------------------
 
 #[cfg_attr(miri, ignore)]
 #[test]
@@ -106,21 +99,16 @@ fn omitting_pv_stores_a_non_pv_entry() {
     );
 }
 
-/// The entry format's quantisation, stated explicitly.
-///
 /// Two independent lossy steps sit between the command surface and the stored
 /// bits, and this pins both:
 ///
-/// 1. **The USI centipawn scale.** `cp` maps to the engine's internal value
-///    through `PawnValue == 90` (`v = cp * 90 / 100`, and back `cp = 100 * v /
-///    90`), with truncating division in each direction — so a `cp` argument is
-///    quantised to a multiple of the 9/10 ratio and small values collapse.
-/// 2. **`value16` / `eval16`.** Both are `i16` in the entry — in either entry
-///    layout, since `tt-entry16` spends its extra bytes entirely on the key and
-///    leaves the payload fields alone; every value that survives step 1 fits,
-///    so step 1 is the only *observable* loss here.
+/// 1. **The USI centipawn scale**, which truncates in each direction, so a `cp`
+///    argument quantises to a multiple of the 9/10 ratio and small values
+///    collapse.
+/// 2. **`value16` / `eval16`**, both `i16` in either entry layout. Every value
+///    that survives step 1 fits, so step 1 is the only *observable* loss.
 ///
-/// `mate` arguments are exact — they bypass the centipawn scale entirely.
+/// `mate` arguments bypass the centipawn scale entirely and are exact.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn centipawn_round_trip_quantises_to_the_usi_pawn_scale() {
@@ -144,9 +132,7 @@ fn centipawn_round_trip_quantises_to_the_usi_pawn_scale() {
     }
 }
 
-// -------------------------------------------------------------------------
 // 2. The mate / root-relative ply convention.
-// -------------------------------------------------------------------------
 
 #[cfg_attr(miri, ignore)]
 #[test]
@@ -227,9 +213,7 @@ fn children_do_not_shift_non_mate_values() {
     );
 }
 
-// -------------------------------------------------------------------------
 // 3. `tt children`.
-// -------------------------------------------------------------------------
 
 #[cfg_attr(miri, ignore)]
 #[test]
@@ -292,9 +276,7 @@ fn probe_of_an_untouched_position_is_a_miss() {
     assert_eq!(got, vec!["probe miss".to_string()]);
 }
 
-// -------------------------------------------------------------------------
 // 4. Error surface — every one a single line, none a panic.
-// -------------------------------------------------------------------------
 
 #[cfg_attr(miri, ignore)]
 #[test]
@@ -381,9 +363,7 @@ fn a_rejected_store_leaves_the_existing_entry_intact() {
     );
 }
 
-// -------------------------------------------------------------------------
 // 5. Replacement policy / generation.
-// -------------------------------------------------------------------------
 
 /// `tt store` goes through `TTEntry::save` exactly as a search would, so the
 /// replacement policy applies — and a write it declines is reported as skipped
@@ -409,9 +389,7 @@ fn a_declined_write_is_reported_not_silently_dropped() {
     );
 }
 
-// -------------------------------------------------------------------------
 // 6. Idle-only admission.
-// -------------------------------------------------------------------------
 
 /// Bring up a session with a synthetic (all-zero) network and the compiled-in
 /// table, blocking until `readyok`.
@@ -494,23 +472,14 @@ fn usinewgame_clears_stored_entries() {
     assert_eq!(got, vec!["store ok".to_string(), "probe miss".to_string()]);
 }
 
-// -------------------------------------------------------------------------
 // 6. `usi-extras` × `tt-entry16` — the command family over the wide table.
-// -------------------------------------------------------------------------
 
-/// The two features are independent and compose: with both on, the whole `tt`
-/// family drives a table of 16-byte, full-64-bit-key entries. Every test above
-/// already runs in that configuration under `--all-features`; this one exists to
-/// name the combination explicitly and to exercise all three subcommands over
-/// one wide table in a single session, at a scale (a dozen distinct positions,
-/// each with its own payload) that a single narrow assertion would not reach.
+/// Exercises all three subcommands over one wide table in a single session, at a
+/// scale a single narrow assertion would not reach.
 ///
-/// What it deliberately does *not* try to do is discriminate the two layouts.
-/// That takes hand-chosen colliding keys, which this surface cannot produce —
-/// a `tt` command names a position and the key falls out of it — so the
-/// aliasing proofs live at the Storage layer, in
-/// `yorkie-storage/tests/tt_basic.rs::wide_key_identity`, where keys are
-/// constructed bit by bit.
+/// It deliberately does *not* try to discriminate the two entry layouts: that
+/// takes hand-chosen colliding keys, which this surface cannot produce, so the
+/// aliasing proofs live at the Storage layer.
 #[cfg(feature = "tt-entry16")]
 #[cfg_attr(miri, ignore)]
 #[test]

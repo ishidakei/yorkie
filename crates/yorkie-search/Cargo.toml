@@ -4,12 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
-# Search layer. Dependency rules: Search may depend on Evaluation and State,
-# never on Protocol. The greedy 1-ply policy scores child positions with the
-# real NNUE network (Evaluation) over the legal moves produced by `yorkie-state`
-# (State). Search additionally owns the transposition table (Storage layer):
-# the `yorkie-storage` module docs state the Search layer owns the table and is
-# responsible for widening / validating stored moves against a `Position`.
+# Search layer: may depend on Evaluation and State, never on Protocol. It also
+# owns the Storage layer's transposition table, and with it the widening and
+# validation of stored moves against a `Position`.
 [dependencies]
 yorkie-eval = { path = "../yorkie-eval" }
 yorkie-state = { path = "../yorkie-state" }
@@ -19,12 +16,9 @@ yorkie-storage = { path = "../yorkie-storage" }
 serde = { version = "~1.0", features = ["derive"] }
 serde_json = "~1.0"
 
-# Re-exported from the Storage layer so this crate's own code and tests can
-# `cfg` on it: the wide TT changes which probes hit, so the reference-captured
-# search-parity gates in `tests/` cannot hold and are compiled out under it.
-# Cargo unifies features, so a workspace `--all-features` run turns this on here
-# and in `yorkie-storage` together — which is exactly what the gating relies on.
-# Off by default.
+# Re-exported from the Storage layer so this crate's code and tests can `cfg` on
+# it: the wide TT changes which probes hit, so the reference-captured parity
+# gates cannot hold and are compiled out under it. Off by default.
 [features]
 tt-entry16 = ["yorkie-storage/tt-entry16"]
 

@@ -1,25 +1,12 @@
-//! Compile-time `CHECK_CAND_BB` candidate-origin tables, ported verbatim from
-//! upstream YaneuraOu's `init_check_bb` (`mate1ply_without_effect.cpp`).
+//! Compile-time `CHECK_CAND_BB` candidate-origin tables, ported from
+//! `init_check_bb` (`mate1ply_without_effect.cpp`).
 //!
 //! For each enemy-king square, mover colour, and piece-kind, the entry is the
-//! **superset** of origin squares from which a mover piece of that kind could
-//! possibly deliver the relevant (possibly-promoting) check. The move-mate loops
-//! in [`super`] intersect the iterated origin set with the matching entry before
-//! their inner verification tests — most board pieces are excluded before any
-//! per-piece work, and because the table is a superset the *first* mate found
-//! (hence the returned move) is unchanged.
-//!
-//! Only the kinds the live code path consumes are built (the reference's `#if 0`
-//! slider blocks — `PIECE_TYPE_CHECK_BISHOP` / `ROOK` / `PRO_*` — are left
-//! unported, exactly as the reference leaves their table entries empty). The
-//! `PIECE_TYPE_CHECK_NON_SLIDER` entry is the union of the gold / knight / silver
-//! / pawn kinds, used for the early-out that skips the whole non-slider group
-//! when no such piece stands on a candidate square.
-//!
-//! The tables are `const`-built the same way as the `RAY` / `BETWEEN` tables in
-//! [`crate::bitboard`]; a `#[cfg(test)]` runtime reference (mirroring
-//! `init_check_bb` through the already-trusted runtime effect helpers) pins them
-//! entry-for-entry in [`super::scan_oracle`].
+//! **superset** of origins from which such a piece could deliver the relevant
+//! check. Only the kinds the live code path consumes are built; the reference
+//! leaves the slider entries empty too. The `NON_SLIDER` entry is the union of
+//! the gold, knight, silver and pawn kinds, for the early-out that skips the
+//! whole non-slider group.
 
 use super::Bb;
 use crate::bitboard::Bitboard;
@@ -37,10 +24,6 @@ pub(super) const NON_SLIDER: usize = 6;
 pub(super) const KIND_NB: usize = 7;
 
 const N: usize = 81;
-
-// --------------------------------------------------------------------------
-//  const geometry / effect helpers ([`Bitboard`] masks over Square indices)
-// --------------------------------------------------------------------------
 
 const fn c_file(idx: usize) -> i32 {
     (idx / 9) as i32
@@ -86,7 +69,7 @@ const fn c_step(idx: usize, deltas: &[(i32, i32)], sign: i32) -> Bitboard {
     m
 }
 
-/// Full ray to the board edge along `(df, dr)`, excluding `idx` (a `...StepEffect`).
+/// Full ray to the board edge along `(df, dr)`, excluding `idx`.
 const fn c_ray(idx: usize, df: i32, dr: i32) -> Bitboard {
     let mut f = c_file(idx);
     let mut r = c_rank(idx);
@@ -131,17 +114,13 @@ const fn c_lance_ray(idx: usize, color: usize) -> Bitboard {
     c_ray(idx, 0, dr)
 }
 
-// --------------------------------------------------------------------------
-//  per-kind candidate builders (verbatim `init_check_bb` cases)
-// --------------------------------------------------------------------------
-
-// In every builder `ksq` = enemy-king square, `mc` = mover colour, and
-// `kc = ~mc` = king colour; the reference's effects use `~c`.
+// In every builder below `ksq` is the enemy-king square, `mc` the mover colour,
+// and `kc` the king colour.
 
 const fn b_pawn_no_pro(ksq: usize, mc: usize) -> Bitboard {
     let kc = 1 - mc;
-    // to = pawnEffect(~c, sq) & ~enemy_field(c): the unique square in front of
-    // the king, unless that push would land in the promotion zone.
+    // The unique square in front of the king, unless the push would land in
+    // the promotion zone.
     let pe = c_pawn(ksq, kc);
     if pe.is_empty() {
         return Bitboard::EMPTY;
@@ -150,13 +129,12 @@ const fn b_pawn_no_pro(ksq: usize, mc: usize) -> Bitboard {
     if c_is_promo(to, mc) {
         return Bitboard::EMPTY;
     }
-    // bb = pawnEffect(~c, to): the pushing pawn's origin.
+    // The pushing pawn's origin.
     c_pawn(to, kc).without_index(ksq)
 }
 
 const fn b_pawn_pro(ksq: usize, mc: usize) -> Bitboard {
     let kc = 1 - mc;
-    // bb = pawnBbEffect(~c, goldEffect(~c, sq) & enemy_field(c)).
     let gold = c_gold(ksq, kc);
     let mut out = Bitboard::EMPTY;
     let mut to = 0;
@@ -198,8 +176,7 @@ const fn b_knight(ksq: usize, mc: usize) -> Bitboard {
         }
         to += 1;
     }
-    // Promote-to-gold checks: goldEffect(~c, sq) & enemy_field(c), then reverse
-    // by the knight hop.
+    // Promote-to-gold checks, reversed by the knight hop.
     let g = c_gold(ksq, kc);
     let mut to2 = 0;
     while to2 < N {
@@ -237,8 +214,7 @@ const fn b_silver(ksq: usize, mc: usize) -> Bitboard {
         }
         to += 1;
     }
-    // Promote-to-gold: goldEffect(~c, sq) & enemy_field(c), reversed by a silver
-    // step.
+    // Promote-to-gold checks, reversed by a silver step.
     let g = c_gold(ksq, kc);
     let mut to2 = 0;
     while to2 < N {
@@ -289,7 +265,6 @@ const fn build() -> [[[Bitboard; 2]; KIND_NB]; N] {
             t[sq][KNIGHT][mc] = k;
             t[sq][SILVER][mc] = s;
             t[sq][GOLD][mc] = g;
-            // NON_SLIDER = union of the non-slider kinds.
             t[sq][NON_SLIDER][mc] = g.or(k).or(s).or(p).or(pp).without_index(sq);
             mc += 1;
         }
@@ -298,8 +273,8 @@ const fn build() -> [[[Bitboard; 2]; KIND_NB]; N] {
     t
 }
 
-/// `CHECK_CAND_BB[sq_king][kind][color]`. A `static` (not `const`) so the
-/// ~9 KB table lives once in `.rodata`.
+/// `CHECK_CAND_BB[sq_king][kind][color]`. A `static` rather than a `const`, so
+/// the ~9 KB table lives once in `.rodata`.
 static TABLE: [[[Bitboard; 2]; KIND_NB]; N] = build();
 
 /// `check_cand_bb(us, kind, sq_king)` — the candidate-origin set.
@@ -332,9 +307,7 @@ impl Cands {
         }
     }
 
-    /// All-ones masks: the filter degenerates to the identity, reproducing the
-    /// pre-filter (twin) behaviour byte-for-byte. The oracle in the mate gate
-    /// compares [`Cands::for_king`] against this.
+    /// All-ones masks, so the filter degenerates to the identity.
     #[cfg(test)]
     pub(super) fn unfiltered() -> Cands {
         let full = super::full_board();
@@ -350,11 +323,9 @@ impl Cands {
     }
 }
 
-/// Fidelity gate: the `const`-built [`TABLE`] must equal a runtime reference
-/// that mirrors `init_check_bb` through the already-trusted runtime effect
-/// helpers in [`super`], entry-for-entry over all 81 king squares × 2 colours ×
-/// every ported kind. Independent of position sampling, so it pins the tables
-/// even where the mate-search playouts never reach.
+/// The `const`-built [`TABLE`] against a runtime rebuild through [`super`]'s
+/// effect helpers, over every king square, colour and ported kind. Independent
+/// of position sampling, so it reaches where the playouts do not.
 #[cfg(test)]
 mod tests {
     use super::super::{

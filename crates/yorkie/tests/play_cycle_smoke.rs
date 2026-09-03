@@ -45,12 +45,10 @@ fn multi_cycle_play_via_spawned_binary() {
         let stdin = child.stdin.as_mut().expect("stdin piped");
         stdin
             .write_all(
-                // Clock-clause `go`s, not `go depth 1`: the match-shaped surface
-                // is the one the DEFAULT build ships (`go depth` is
-                // `usi-extras`), and this smoke test has to keep
-                // covering the binary the tournament actually runs. The wiring it
-                // proves is the same either way — no network is loaded, so each
-                // `go` resigns immediately whatever bounds it carries.
+                // Clock-clause `go`s, not `go depth 1`, so this covers the
+                // surface the default build ships. The wiring it proves is the
+                // same either way: no network is loaded, so each `go` resigns
+                // immediately whatever bounds it carries.
                 b"usi\n\
                   isready\n\
                   position startpos\n\

@@ -5,15 +5,11 @@
 //! injectable [`SysfsOptions::root`] points at one, so no test touches the real
 //! machine topology (except the explicitly Linux-gated smoke test at the end).
 //!
-//! Every test in this file is `#[cfg_attr(miri, ignore)]`: reading a fixture is
-//! still a real `std::fs` call, and miri's isolation rejects it outright
-//! (`unsupported operation: `open` not available when isolation is enabled`).
-//! Lifting isolation with `-Zmiri-disable-isolation` is deliberately not done
-//! here — the repo's miri gate runs with isolation on, for the same reason the
-//! proptest-driven tests are ignored rather than un-isolated (see the project's
-//! CI and quality-gate policy). The parsing and topology logic these fixtures
-//! drive has no unsafe code; the crate's unit tests, which take their sysfs
-//! contents as in-memory strings, keep running under miri.
+//! Every test here is `#[cfg_attr(miri, ignore)]`: reading a fixture is a real
+//! `std::fs` call, which miri's isolation rejects outright. The parsing and
+//! topology logic these fixtures drive has no unsafe code, and the crate's unit
+//! tests take their sysfs contents as in-memory strings, so they keep running
+//! under miri.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -200,8 +196,8 @@ fn system_nodes_for_binding_resolves_a_whole_assignment() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn unassigned_cpu_falls_back_to_system_node_zero() {
-    // A custom logical config whose sole CPU (100) does not appear in the
-    // fixture's system topology; the lookup falls back to system node 0.
+    // A custom logical config whose sole CPU does not appear in the fixture's
+    // system topology; the lookup falls back to system node 0.
     let o = opts("two_node_l3", all_cpus(8), 8);
     let cfg = NumaConfig::from_string("100").expect("valid custom config");
     assert_eq!(cfg.system_node_of_logical(0, &o), 0);

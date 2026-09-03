@@ -1,14 +1,11 @@
-//! Parity gate for the `.ybb` opening-book reader (`yorkie-storage::book`).
+//! Parity test for the `.ybb` opening-book reader (`yorkie-storage::book`).
 //!
 //! Ground truth is a hand-authored `tests/fixtures/book/book.db`, converted to
-//! `sample.ybb` by `cargo xtask capture-book` (which packs each position with
-//! the workspace PackedSfen encoder — the same encoder pinned bit-for-bit
-//! against the reference's cshogi vectors in `yorkie-state`). The expected move
-//! lists live in `expected.json`, derived from the same `.db`.
+//! `sample.ybb` by `cargo xtask capture-book`; the expected move lists in
+//! `expected.json` are derived from the same `.db`.
 //!
-//! This test recomputes each query key from the SFEN via `sfen_pack`, so it
-//! exercises the full encoder → binary-search → decode path in both read modes,
-//! and confirms the two modes agree.
+//! Each query key is recomputed from the SFEN via `sfen_pack`, so this
+//! exercises the full encoder → binary-search → decode path in both read modes.
 
 use std::path::PathBuf;
 

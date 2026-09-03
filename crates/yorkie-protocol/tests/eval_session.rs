@@ -1,26 +1,19 @@
 //! Driver-level session tests against a **synthetic** SFNN-1536 network.
 //!
-//! These are hermetic: they build a byte-for-byte valid `nn.bin` (the same
-//! format `yorkie-eval`'s loader accepts) at the location this build's
-//! compiled-in `EvalDir` names, and drive a full `usi → isready → position → go`
-//! session in-process — so they run everywhere, not just where the real network
-//! is staged. `EvalDir` cannot be pointed anywhere at run time (no build has a
-//! runtime option surface), so the staging works the other way round: see
-//! [`common::stage_configured_eval_dir`].
+//! These are hermetic: they build a byte-for-byte valid `nn.bin` at the location
+//! this build's compiled-in `EvalDir` names and drive a full session in-process,
+//! so they run everywhere, not just where the real network is staged. `EvalDir`
+//! cannot be pointed anywhere at run time, so the staging works the other way
+//! round — see [`common::stage_configured_eval_dir`].
 //!
 //! The synthetic network is all zeros, so every position evaluates to the same
-//! constant. The chosen move is therefore fully deterministic, which lets the
-//! tests assert the driver's `bestmove` equals a direct
-//! [`QSearch::run_root`] call for the same network, position, and transposition
-//! table sizing — proving the driver drives the ported depth-1 root search. The
-//! comparison holds because the config compiles in a single worker; Lazy-SMP
+//! constant and the chosen move is fully deterministic. That lets the tests
+//! assert the driver's `bestmove` equals a direct [`QSearch::run_root`] call.
+//! The comparison holds because the config compiles in a single worker; Lazy-SMP
 //! with more is deliberately not reproducible move-for-move.
 //!
-//! **`usi-extras` gate.** These sessions drive the analysis-only `go` clauses
-//! (`depth` / `nodes` / `movetime` / `infinite`), which a default build refuses
-//! rather than reinterprets, so the whole file is gated on the feature and runs
-//! under the `--all-features` gate. See the `usi-extras` reference
-//! documentation.
+//! Gated on `usi-extras`: these sessions drive analysis-only `go` clauses, which
+//! a default build refuses rather than reinterprets.
 
 //!
 //! **`info-output` gate.** The search-report assertions read the `info depth …`
@@ -134,12 +127,9 @@ fn synthetic_network_session_matches_direct_search_choice() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn isready_keep_alive_emits_bare_newline_during_heavy_load() {
-    // The isready keep-alive (reference `Engine::run_heavy_job`): a helper thread
-    // emits a bare newline every `KEEP_ALIVE_TICKS_PER_NEWLINE` polls so a GUI
-    // does not time out while the heavy initialisation runs. With a very short
-    // injected poll the real heavy work here — the ~112 M-weight `nn.bin`
-    // load/parse and the 1024 MiB TT sizing/zeroing — spans many ticks and
-    // reliably emits at least one bare newline before `readyok`.
+    // With a very short injected poll interval, the real heavy work here — the
+    // `nn.bin` load and the TT sizing — spans many keep-alive ticks and reliably
+    // emits at least one bare newline before `readyok`.
     stage_configured_eval_dir();
 
     let input = "usi\nisready\nquit\n".to_string();

@@ -1,10 +1,9 @@
 //! Scalar output-transform and layer kernels (affine / clipped-ReLU /
 //! squared-clipped-ReLU / element-wise multiply).
 //!
-//! Ported from the read-only Rust NNUE reference implementation's
-//! `scalar_post_ft.rs`. These are the always-available
-//! baseline the AVX-512+VNNI kernels in [`crate::simd::avx512_post_ft`] must
-//! match bit-for-bit.
+//! The scalar backend, matching the reference engine's NNUE arithmetic. These
+//! are the always-available baseline the AVX-512+VNNI kernels in
+//! [`crate::simd::avx512_post_ft`] must match bit-for-bit.
 //!
 //! The reference exposes a whole-`Accumulator` `transformer_ewm`; because this
 //! crate's `Accumulator` keeps the two perspectives in colour-indexed buffers
