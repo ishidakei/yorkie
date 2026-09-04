@@ -3371,33 +3371,72 @@ mod tests {
             .count()
     }
 
+    /// Everything written to a shared test writer so far.
+    fn writer_snapshot(writer: &Arc<Mutex<Vec<u8>>>) -> String {
+        let bytes = writer.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        String::from_utf8(bytes).expect("utf-8")
+    }
+
+    /// Block until the shared writer holds at least `want` bare keep-alive
+    /// newlines, failing the test if that has not happened within `DEADLINE`.
+    ///
+    /// A test must wait for this rather than sleep a fixed time: the helper
+    /// promises a newline every [`KEEP_ALIVE_TICKS_PER_NEWLINE`] *polls*, not
+    /// every N ms of wall time, and each of those polls is a `thread::sleep`
+    /// that runs long on a loaded machine. A fixed sleep sized off the nominal
+    /// cadence therefore expires before the newline lands whenever the machine
+    /// is busy; this loop only bounds how long the helper may take to write
+    /// anything at all.
+    fn wait_for_bare_newlines(writer: &Arc<Mutex<Vec<u8>>>, want: usize) {
+        // Generous versus the ~50 ms nominal cadence of a 1 ms poll: this is a
+        // liveness backstop for a helper that never writes, not a cadence check.
+        const DEADLINE: Duration = Duration::from_secs(5);
+        let start = Instant::now();
+        loop {
+            let out = writer_snapshot(writer);
+            if bare_newline_count(&out) >= want {
+                return;
+            }
+            assert!(
+                start.elapsed() < DEADLINE,
+                "expected {want} bare keep-alive newline(s) within {DEADLINE:?}, got: {out:?}"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     #[test]
     fn keep_alive_emits_bare_newline_through_shared_writer() {
-        // Drive the keep-alive mechanism directly with a short poll interval and a
-        // deliberately slowed "heavy job" (a sleep). The job also writes a real
-        // line through the *same* shared writer, so this asserts both that at
-        // least one bare newline is emitted before the job finishes and that no
-        // keep-alive newline interleaves mid-line with that output.
+        // Drive the keep-alive mechanism directly with a short poll interval and
+        // a "heavy job" that stands in for slow initialisation by waiting for the
+        // helper to tick. The job also writes a real line through the *same*
+        // shared writer, between two ticks, so this asserts both that bare
+        // newlines are emitted while the job runs and that none of them
+        // interleaves mid-line with that output.
         let writer = Arc::new(Mutex::new(Vec::<u8>::new()));
         {
-            // 1 ms poll → a bare newline every 50 ms (KEEP_ALIVE_TICKS_PER_NEWLINE).
+            // 1 ms poll → a bare newline every 50 polls (KEEP_ALIVE_TICKS_PER_NEWLINE).
             let keep_alive = KeepAlive::spawn(Arc::clone(&writer), Duration::from_millis(1));
-            // Slow heavy job: sleep well past several newline ticks, and emit a
-            // real line partway through to probe for interleaving.
-            thread::sleep(Duration::from_millis(120));
+            // Heavy job, part one: run until the helper has ticked at least once.
+            wait_for_bare_newlines(&writer, 1);
+            // Then emit a real line partway through, to probe for interleaving.
             // Straight through the shared writer, not through a gated sink: this
             // test is about the keep-alive helper's interleaving, and must run in
-            // every build.
-            {
+            // every build. Count under the same lock, so the count cannot miss a
+            // tick that lands between the write and the read.
+            let seen = {
                 let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
                 Formatter::new(&mut *guard)
                     .info_string("busy")
                     .expect("write to Vec cannot fail");
-            }
-            thread::sleep(Duration::from_millis(120));
+                bare_newline_count(&String::from_utf8(guard.clone()).expect("utf-8"))
+            };
+            // Heavy job, part two: run until one *further* tick has landed, so the
+            // interleaving assertion has a keep-alive newline after that line too.
+            wait_for_bare_newlines(&writer, seen + 1);
             drop(keep_alive); // stop flag set + helper joined here.
         }
-        let out = String::from_utf8(writer.lock().unwrap().clone()).unwrap();
+        let out = writer_snapshot(&writer);
 
         assert!(
             bare_newline_count(&out) >= 1,
@@ -3420,17 +3459,30 @@ mod tests {
     fn keep_alive_stops_and_joins_when_job_finishes() {
         // A short-lived scope with a short poll: the guard's Drop must set the
         // stop flag and join the helper without hanging, and (the job being
-        // near-instant) emit no bare newline.
+        // near-instant) emit no bare newline. There is nothing to wait for here —
+        // the assertion is that the helper has *not* ticked — so the bound comes
+        // from measured wall time instead: the helper cannot have written before
+        // KEEP_ALIVE_TICKS_PER_NEWLINE polls elapsed, and on a machine loaded
+        // enough that this near-instant scope itself took that long, the count is
+        // allowed to rise exactly as far as the stolen time justifies. On an idle
+        // machine the scope takes a millisecond or two and the bound is zero.
         let writer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let poll = Duration::from_millis(1);
+        let start = Instant::now();
         {
-            let _keep_alive = KeepAlive::spawn(Arc::clone(&writer), Duration::from_millis(1));
-            // No sleep: the "job" finishes before the first newline tick.
+            let _keep_alive = KeepAlive::spawn(Arc::clone(&writer), poll);
+            // No wait: the "job" finishes before the first newline tick.
         }
-        let out = String::from_utf8(writer.lock().unwrap().clone()).unwrap();
-        assert_eq!(
-            bare_newline_count(&out),
-            0,
-            "a job that finishes before the first tick emits no newline: {out:?}"
+        // Returning from the scope at all is the stop-and-join property: a Drop
+        // that failed to set the stop flag would hang forever in the join.
+        let elapsed = start.elapsed();
+        let out = writer_snapshot(&writer);
+        let max_newlines =
+            (elapsed.as_nanos() / poll.as_nanos()) / u128::from(KEEP_ALIVE_TICKS_PER_NEWLINE);
+        assert!(
+            bare_newline_count(&out) as u128 <= max_newlines,
+            "a job that finishes before the first tick emits no newline \
+             ({elapsed:?} of polls allows at most {max_newlines}): {out:?}"
         );
     }
 

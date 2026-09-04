@@ -3437,8 +3437,8 @@ mod tests {
     /// Path to the real (never-committed) SFNN-1536 network, mirroring the
     /// `real_network.rs` integration test.
     fn real_nn_bin() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../eval/nn.bin")
+        let crate_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        crate_dir.join("../../eval/nn.bin")
     }
 
     /// Runs a real search with the accumulator self-check armed, so
