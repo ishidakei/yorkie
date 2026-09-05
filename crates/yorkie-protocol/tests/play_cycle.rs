@@ -5,15 +5,13 @@
 //! `go` must reply `bestmove resign` with the no-network notice rather than
 //! crashing.
 //!
-//! Gated on `usi-extras`: these sessions drive analysis-only `go` clauses, which
-//! a default build refuses rather than reinterprets.
+//! Gated on `verbose2`: these sessions drive analysis-only `go` clauses, which
+//! a build below that level refuses rather than reinterprets. The cycle is
+//! verified through the per-`go` no-network notice, a diagnostic line that
+//! arrives at `verbose1` — which `verbose2` contains, so the one gate covers
+//! both needs.
 
-//!
-//! **`info-diag` gate.** The cycle is verified through the per-`go` no-network
-//! notice, a diagnostic line only an `info-diag` build emits, so the file is
-//! gated on that feature too. `--all-features` carries both.
-
-#![cfg(all(feature = "usi-extras", feature = "info-diag"))]
+#![cfg(feature = "verbose2")]
 
 use std::sync::{Arc, Mutex};
 

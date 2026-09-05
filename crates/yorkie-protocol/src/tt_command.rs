@@ -1,7 +1,7 @@
-//! The `usi-extras` `tt` command family: the *semantic parse* of the argument
+//! The `verbose3` `tt` command family: the *semantic parse* of the argument
 //! tokens behind `tt store` / `tt probe` / `tt children`.
 //!
-//! The whole module exists only under the `usi-extras` cargo feature. With it
+//! The whole module exists only under the `verbose3` cargo feature. With it
 //! off, [`crate::parser::parse_line`] does not know the `tt` token at all and
 //! nothing here is compiled.
 //!

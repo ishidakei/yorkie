@@ -1,16 +1,16 @@
-//! Driver-level session tests for the `usi-extras` `tt` commands: `tt store` /
+//! Driver-level session tests for the `verbose3` `tt` commands: `tt store` /
 //! `tt probe` round trips (including the mate convention and the centipawn
 //! quantisation), the one-ply `tt children` sweep, and the error surface.
 //!
-//! Gated on `usi-extras`, so with the feature off this file compiles to nothing.
-//! The complementary "feature off" assertion lives in `src/parser.rs`, compiled
-//! only when it is off.
+//! Gated on `verbose3`, so below that level this file compiles to nothing. The
+//! complementary "command absent" assertion lives in `src/parser.rs`, compiled
+//! only below it.
 //!
 //! No network is needed for most of them: `bench` carries its own table size as
 //! a command argument, so it allocates a table on its own and, finding no
 //! network loaded, resigns each position immediately.
 
-#![cfg(feature = "usi-extras")]
+#![cfg(feature = "verbose3")]
 
 mod common;
 
@@ -472,7 +472,7 @@ fn usinewgame_clears_stored_entries() {
     assert_eq!(got, vec!["store ok".to_string(), "probe miss".to_string()]);
 }
 
-// 6. `usi-extras` × `tt-entry16` — the command family over the wide table.
+// 6. `verbose3` × `tt-entry16` — the command family over the wide table.
 
 /// Exercises all three subcommands over one wide table in a single session, at a
 /// scale a single narrow assertion would not reach.

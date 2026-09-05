@@ -22,10 +22,10 @@ fn drive(input: &str) -> String {
 }
 
 /// The transcript a diagnostic `info string <body>` contributes in this build —
-/// nothing without `info-diag`. (This file predates `tests/common`, and keeps
+/// nothing without `verbose1`. (This file predates `tests/common`, and keeps
 /// its own two-line harness so the handshake golden depends on nothing else.)
 fn diag_line(body: &str) -> String {
-    if cfg!(feature = "info-diag") {
+    if cfg!(feature = "verbose1") {
         format!("info string {body}\n")
     } else {
         String::new()

@@ -13,9 +13,9 @@ pub enum PositionSfen {
 /// All USI `go` sub-tokens captured verbatim, including the ones the driver does
 /// not act on, so the parse is lossless.
 ///
-/// The `usi-extras` gate sits on the parser *arms*, not on the fields: `depth`
+/// The `verbose2` gate sits on the parser *arms*, not on the fields: `depth`
 /// and `nodes` are also seeded from the `DepthLimit` / `NodesLimit` options, so
-/// a field-level gate would have to cut those too. With the feature off no `go`
+/// a field-level gate would have to cut those too. Below that level no `go`
 /// line can reach the gated fields.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GoLimits {
@@ -47,13 +47,13 @@ pub struct GoLimits {
 /// `usi.cpp`): `go mate infinite` and a bare `go mate` both map here.
 pub const MATE_UNLIMITED_MS: u64 = i32::MAX as u64;
 
-/// The `go` clauses that live behind `usi-extras`: everything here is analysis
+/// The `go` clauses that arrive at `verbose2`: everything here is analysis
 /// or tooling, not the clock clauses and `ponder` a game bridge sends.
 ///
-/// With the feature off these tokens are **rejected**, not ignored: silently
+/// Below that level these tokens are **rejected**, not ignored: silently
 /// dropping the clause would turn `go depth 4` into an unbounded, clock-less
 /// search in the middle of a game.
-#[cfg(not(feature = "usi-extras"))]
+#[cfg(not(feature = "verbose2"))]
 pub const EXTRA_GO_CLAUSES: [&str; 6] = ["depth", "nodes", "mate", "movetime", "infinite", "rtime"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,11 +71,11 @@ pub enum Command {
     },
     Go(GoLimits),
     /// A `go` line carrying one of the [`EXTRA_GO_CLAUSES`], parsed by a build
-    /// without `usi-extras`. Holds the offending clause token so the driver can
-    /// name it; **no search is started**. The variant exists only when the
-    /// feature is off — with it on, every one of those clauses parses into
+    /// below `verbose2`. Holds the offending clause token so the driver can
+    /// name it; **no search is started**. The variant exists only below that
+    /// level — from `verbose2` up, every one of those clauses parses into
     /// [`Command::Go`].
-    #[cfg(not(feature = "usi-extras"))]
+    #[cfg(not(feature = "verbose2"))]
     GoExtraClause(String),
     Stop,
     /// `gameover [win|lose|draw]` — the game ended. The optional result token
@@ -89,15 +89,15 @@ pub enum Command {
     /// [limitType]` — the reproducible NPS benchmark. The raw trailing tokens
     /// are carried verbatim; [`crate::bench::parse_bench`] gives them meaning.
     ///
-    /// `usi-extras` only, so the default build cannot even name the command.
-    #[cfg(feature = "usi-extras")]
+    /// `verbose3` only, so the default build cannot even name the command.
+    #[cfg(feature = "verbose3")]
     Bench(Vec<String>),
-    /// `tt <store|probe|children> …` — the feature-gated transposition-table
-    /// read/write commands (`usi-extras`). Like [`Command::Bench`] the trailing
+    /// `tt <store|probe|children> …` — the level-gated transposition-table
+    /// read/write commands (`verbose3`). Like [`Command::Bench`] the trailing
     /// tokens are carried verbatim; [`crate::tt_command::parse_tt`] gives them
-    /// meaning. The variant exists only when the feature is on, so the default
-    /// build cannot even name the command.
-    #[cfg(feature = "usi-extras")]
+    /// meaning. The variant exists only at that level, so a lower build cannot
+    /// even name the command.
+    #[cfg(feature = "verbose3")]
     Tt(Vec<String>),
     Quit,
     Unknown(String),
@@ -129,15 +129,15 @@ pub fn parse_line(input: &str) -> Command {
         "ponderhit" => Command::PonderHit,
         // The trailing `bench` tokens are preserved verbatim for the semantic
         // parse in `crate::bench` (which fills defaults and validates them).
-        // `usi-extras` only: with the feature off this arm does not exist and
+        // `verbose3` only: below that level this arm does not exist and
         // `bench …` falls through to `Command::Unknown`, exactly like `tt`.
-        #[cfg(feature = "usi-extras")]
+        #[cfg(feature = "verbose3")]
         "bench" => Command::Bench(parts.map(str::to_string).collect()),
-        // `usi-extras` only. With the feature off this arm does not exist, so
+        // `verbose3` only. Below that level this arm does not exist, so
         // `tt …` falls through to `Command::Unknown` like any other unrecognised
         // line — the default build's behaviour is byte-identical to before the
         // command existed.
-        #[cfg(feature = "usi-extras")]
+        #[cfg(feature = "verbose3")]
         "tt" => Command::Tt(parts.map(str::to_string).collect()),
         _ => Command::Unknown(trimmed.to_string()),
     }
@@ -176,13 +176,13 @@ fn parse_go<'a>(line: &str, parts: impl Iterator<Item = &'a str>) -> Command {
     let mut i = 0;
     while i < tokens.len() {
         let key = tokens[i];
-        // `usi-extras` gate. Checked before the clause is interpreted, so a
+        // `verbose2` gate. Checked before the clause is interpreted, so a
         // gated clause is reported by name whatever follows it (including a
         // missing or malformed value, which would otherwise be `Unknown`). The
         // match clauses ahead of it in the line have already been consumed into
         // `limits`, which is then dropped on the floor — the caller starts no
         // search.
-        #[cfg(not(feature = "usi-extras"))]
+        #[cfg(not(feature = "verbose2"))]
         if EXTRA_GO_CLAUSES.contains(&key) {
             return Command::GoExtraClause(key.to_string());
         }
@@ -429,7 +429,7 @@ mod tests {
         assert_eq!(parse_line("go"), Command::Go(GoLimits::default()));
     }
 
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose2")]
     #[test]
     fn parses_go_depth() {
         let expected = GoLimits {
@@ -439,7 +439,7 @@ mod tests {
         assert_eq!(parse_line("go depth 8"), Command::Go(expected));
     }
 
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose2")]
     #[test]
     fn parses_go_nodes_movetime_combined() {
         let expected = GoLimits {
@@ -453,7 +453,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose2")]
     #[test]
     fn parses_go_infinite() {
         let expected = GoLimits {
@@ -495,7 +495,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose2")]
     #[test]
     fn go_with_missing_value_is_unknown() {
         assert_eq!(
@@ -504,7 +504,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose2")]
     #[test]
     fn go_with_non_integer_value_is_unknown() {
         assert_eq!(
@@ -528,13 +528,13 @@ mod tests {
         assert_eq!(parse_line("gameover\n"), Command::GameOver);
     }
 
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose3")]
     #[test]
     fn parses_bare_bench() {
         assert_eq!(parse_line("bench"), Command::Bench(Vec::new()));
     }
 
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose3")]
     #[test]
     fn parses_bench_with_all_tokens() {
         assert_eq!(
@@ -577,7 +577,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose2")]
     #[test]
     fn parses_go_mate_with_budget() {
         let expected = GoLimits {
@@ -587,7 +587,7 @@ mod tests {
         assert_eq!(parse_line("go mate 5000"), Command::Go(expected));
     }
 
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose2")]
     #[test]
     fn parses_go_mate_bare_is_unlimited() {
         let expected = GoLimits {
@@ -597,7 +597,7 @@ mod tests {
         assert_eq!(parse_line("go mate"), Command::Go(expected));
     }
 
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose2")]
     #[test]
     fn parses_go_mate_infinite_is_unlimited() {
         let expected = GoLimits {
@@ -607,7 +607,7 @@ mod tests {
         assert_eq!(parse_line("go mate infinite"), Command::Go(expected));
     }
 
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose2")]
     #[test]
     fn go_mate_non_integer_budget_is_unknown() {
         assert_eq!(
@@ -616,12 +616,12 @@ mod tests {
         );
     }
 
-    /// Feature off — the default build: `bench` is not a command token at all,
-    /// so it reaches the `Unknown` catch-all like any other stray line, exactly
-    /// as `tt` does.
-    #[cfg(not(feature = "usi-extras"))]
+    /// Below `verbose3` — the default build: `bench` is not a command token at
+    /// all, so it reaches the `Unknown` catch-all like any other stray line,
+    /// exactly as `tt` does.
+    #[cfg(not(feature = "verbose3"))]
     #[test]
-    fn bench_is_not_a_command_without_usi_extras() {
+    fn bench_is_not_a_command_below_verbose3() {
         assert_eq!(parse_line("bench"), Command::Unknown("bench".to_string()));
         assert_eq!(
             parse_line("bench 16 1 6 default depth"),
@@ -629,11 +629,12 @@ mod tests {
         );
     }
 
-    /// Feature off: every gated `go` clause is rejected by name — loudly, so a
-    /// misconfigured harness cannot turn `go depth 4` into a clock-less search.
-    #[cfg(not(feature = "usi-extras"))]
+    /// Below `verbose2`: every gated `go` clause is rejected by name — loudly,
+    /// so a misconfigured harness cannot turn `go depth 4` into a clock-less
+    /// search.
+    #[cfg(not(feature = "verbose2"))]
     #[test]
-    fn gated_go_clauses_are_rejected_without_usi_extras() {
+    fn gated_go_clauses_are_rejected_below_verbose2() {
         for clause in EXTRA_GO_CLAUSES {
             assert_eq!(
                 parse_line(&format!("go {clause} 4")),
@@ -666,11 +667,11 @@ mod tests {
         );
     }
 
-    /// Feature off: the match clauses are untouched — the tournament surface
-    /// parses byte-identically to a build with the feature on.
-    #[cfg(not(feature = "usi-extras"))]
+    /// Below `verbose2`: the match clauses are untouched — the tournament
+    /// surface parses byte-identically to a build at or above that level.
+    #[cfg(not(feature = "verbose2"))]
     #[test]
-    fn match_go_clauses_still_parse_without_usi_extras() {
+    fn match_go_clauses_still_parse_below_verbose2() {
         assert_eq!(parse_line("go"), Command::Go(GoLimits::default()));
         assert_eq!(
             parse_line("go btime 60000 wtime 60000 binc 1000 winc 1000 byoyomi 5000"),
@@ -699,11 +700,11 @@ mod tests {
         );
     }
 
-    /// Feature off — the default build: `tt` is not a command token at all, so
-    /// it reaches the `Unknown` catch-all exactly like any other stray line.
-    #[cfg(not(feature = "usi-extras"))]
+    /// Below `verbose3` — the default build: `tt` is not a command token at all,
+    /// so it reaches the `Unknown` catch-all exactly like any other stray line.
+    #[cfg(not(feature = "verbose3"))]
     #[test]
-    fn tt_is_not_a_command_without_usi_extras() {
+    fn tt_is_not_a_command_below_verbose3() {
         assert_eq!(
             parse_line("tt probe startpos"),
             Command::Unknown("tt probe startpos".to_string())
@@ -711,11 +712,11 @@ mod tests {
         assert_eq!(parse_line("tt"), Command::Unknown("tt".to_string()));
     }
 
-    /// Feature on: `tt` splits into verbatim tokens for
+    /// At `verbose3`: `tt` splits into verbatim tokens for
     /// [`crate::tt_command::parse_tt`], mirroring how `bench` is handled.
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose3")]
     #[test]
-    fn parses_tt_tokens_verbatim_with_usi_extras() {
+    fn parses_tt_tokens_verbatim_at_verbose3() {
         assert_eq!(
             parse_line("tt probe startpos"),
             Command::Tt(vec!["probe".to_string(), "startpos".to_string()])

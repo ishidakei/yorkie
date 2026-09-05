@@ -5,15 +5,15 @@
 //! The determinism and multi-thread tests stage a synthetic all-zero network and
 //! run a small fixed-depth bench.
 //!
-//! Gated on `usi-extras`, so with the feature off this file compiles to nothing.
-//! The complementary "feature off" assertions live in `src/parser.rs` and
-//! `src/driver.rs`, compiled only when it is off.
+//! Gated on `verbose3`, so below that level this file compiles to nothing. The
+//! complementary "command absent" assertions live in `src/parser.rs` and
+//! `src/driver.rs`, compiled only below it.
 //!
 //! The `bench:` summary line is the command's result, not a diagnostic, so it is
 //! asserted unconditionally; the argument-rejection lines are diagnostics and
-//! are asserted only under `info-diag`.
+//! are asserted only under `verbose1`.
 
-#![cfg(feature = "usi-extras")]
+#![cfg(feature = "verbose3")]
 
 mod common;
 
@@ -72,14 +72,14 @@ fn bare_bench_runs_the_four_default_positions() {
 }
 
 /// An argument rejection is a diagnostic, so the line that names it is
-/// `info-diag`. What "loudly" protects — that a bad argument runs no positions
+/// `verbose1`. What "loudly" protects — that a bad argument runs no positions
 /// rather than benching something else — is asserted in every build.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn garbage_argument_fails_loudly_without_panicking() {
     // A non-integer TT size is a loud parse error, not a panic and not a search.
     let out = drive("bench notanumber\nquit\n");
-    if cfg!(feature = "info-diag") {
+    if cfg!(feature = "verbose1") {
         assert!(
             out.contains("info string bench: invalid ttSizeMB"),
             "expected a loud parse error:\n{out}"
@@ -91,7 +91,7 @@ fn garbage_argument_fails_loudly_without_panicking() {
     );
 }
 
-#[cfg(feature = "info-diag")]
+#[cfg(feature = "verbose1")]
 #[cfg_attr(miri, ignore)]
 #[test]
 fn unsupported_limit_type_fails_loudly() {

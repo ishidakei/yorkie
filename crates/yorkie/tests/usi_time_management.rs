@@ -8,15 +8,12 @@
 //!
 //! The whole file is skipped with a notice when `nn.bin` is absent.
 //!
-//! Gated on `usi-extras`: the session drives analysis-only `go` clauses, and the
-//! spawned `yorkie` binary carries the feature only when the test binary does.
+//! Gated on `verbose2`: the session drives analysis-only `go` clauses, every
+//! assertion reads the search `info depth …` line (its `nodes` and `score`
+//! fields), and the spawned `yorkie` binary reaches that level only when the
+//! test binary does.
 
-//!
-//! **`info-output` gate.** Every assertion reads the search `info depth …` line
-//! (its `nodes` and `score` fields), which only an `info-output` build emits, so
-//! the file is gated on that feature too. `--all-features` carries both.
-
-#![cfg(all(feature = "usi-extras", feature = "info-output"))]
+#![cfg(feature = "verbose2")]
 
 mod common;
 

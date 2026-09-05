@@ -13,12 +13,11 @@
 //! prints a notice and passes. The fixture is a single-PV capture, so the test
 //! also skips itself in a build whose compiled-in `MultiPV` is not 1.
 //!
-//! Gated on `usi-extras`: these sessions drive analysis-only `go` clauses, which
-//! a default build refuses rather than reinterprets.
-//!
-//! Gated on `info-output` too, since the assertions read a search `info` line.
+//! Gated on `verbose2`: these sessions drive analysis-only `go` clauses, which
+//! a build below that level refuses rather than reinterprets, and the
+//! assertions read a search `info` line.
 
-#![cfg(all(feature = "usi-extras", feature = "info-output"))]
+#![cfg(feature = "verbose2")]
 
 mod common;
 

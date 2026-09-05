@@ -16,37 +16,40 @@ yorkie-storage = { path = "../yorkie-storage" }
 serde = { version = "~1.0", features = ["derive"] }
 serde_json = "~1.0"
 
-# `usi-extras` is the umbrella feature for USI commands a tournament game never
-# issues: the `tt` family, `bench`, and the non-match `go` clauses (`depth` /
-# `nodes` / `mate` / `movetime` / `infinite` / `rtime`). Off by default, so the
-# tournament binary does not contain them at all.
+# One ordinal axis decides how much of the USI surface a build reads and prints.
+# Each level contains the one below it, and "no feature" is level 0, so there is
+# no `verbose0`:
 #
-# `tt` and `bench` disappear as command tokens with the feature off. The gated
-# `go` clauses cannot disappear the same way, since `go` itself is a match
-# command, so a `go` line carrying one is *rejected* with an `info string` and
-# starts no search — silently ignoring the clause would turn `go depth 4` into an
-# unbounded, clock-less search mid-game.
-#
-# `tt-entry16` is the Storage-layer entry-widening feature, re-exported so this
-# crate's session tests can `cfg` on it. Off by default, and independent of
-# `usi-extras`.
-#
-# The default build emits no `info` line at all except the initialisation-phase
-# `info string`s, which are how a failed startup is diagnosed and are
-# unconditional in every build. On top of that:
-#
-#   - `info-diag` restores the diagnostic `info string` lines emitted outside the
+#   - no feature — the tournament build: the commands a rated game issues, and
+#     `bestmove` plus the initialisation-phase `info string`s as its only output.
+#     Those initialisation lines are how a failed startup is diagnosed at all, so
+#     no level gates them.
+#   - `verbose1` — adds the diagnostic `info string` lines emitted outside the
 #     initialisation phase.
-#   - `info-output` restores the search `info` lines, and implies `info-diag`.
+#   - `verbose2` — adds the search `info` lines, and the non-match `go` clauses
+#     (`depth` / `nodes` / `mate` / `movetime` / `infinite` / `rtime`) an
+#     analysis mode needs.
+#   - `verbose3` — adds `tt store` / `tt probe` / `tt children` and `bench`.
+#
+# `tt` and `bench` disappear as command tokens below `verbose3`. The gated `go`
+# clauses cannot disappear the same way, since `go` itself is a match command, so
+# below `verbose2` a `go` line carrying one is *rejected* and starts no search —
+# silently ignoring the clause would turn `go depth 4` into an unbounded,
+# clock-less search mid-game. The refusal happens at every level; `verbose1` is
+# where it is also reported.
 #
 # The `tt` command family and the `bench` summary line are not diagnostics but
-# the response payload of a `usi-extras` command, so they ride on that feature
-# alone.
+# the response payload of a `verbose3` command, so they ride on that level alone
+# and no `info` line is involved in gating them.
+#
+# `tt-entry16` is the Storage-layer entry-widening feature, re-exported so this
+# crate's session tests can `cfg` on it. Off by default, and orthogonal to the
+# verbosity axis.
 [features]
-usi-extras = []
+verbose1 = []
+verbose2 = ["verbose1"]
+verbose3 = ["verbose2"]
 tt-entry16 = ["yorkie-search/tt-entry16", "yorkie-storage/tt-entry16"]
-info-diag = []
-info-output = ["info-diag"]
 
 [lints]
 workspace = true

@@ -17,16 +17,13 @@
 //! cargo test --release -p yorkie --test nps_scaling -- --ignored --nocapture
 //! ```
 //!
-//! Gated on `usi-extras`: the session drives analysis-only `go` clauses, and the
-//! spawned `yorkie` binary carries the feature only when the test binary does.
+//! Gated on `verbose2`: the session drives analysis-only `go` clauses, and this
+//! is an NPS measurement payload that reads `nodes` back out of the engine's
+//! transcript — the level at which the whole measurement surface (per-iteration
+//! `info` lines included) is the one a bench round reports on. The spawned
+//! `yorkie` binary reaches that level only when the test binary does.
 
-//!
-//! **`info-output` gate.** This is an NPS measurement payload: it reads `nodes`
-//! back out of the engine's transcript, so it is built with `info-output` — the
-//! feature under which the whole measurement surface (per-iteration `info` lines
-//! included) is the one a bench round reports on. `--all-features` carries both.
-
-#![cfg(all(feature = "usi-extras", feature = "info-output"))]
+#![cfg(feature = "verbose2")]
 
 mod common;
 

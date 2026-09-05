@@ -10,10 +10,10 @@
 //! process must never crash, and it must exit cleanly on `quit`. A
 //! `bestmove resign` or `bestmove win` ends the loop early.
 //!
-//! Gated on `usi-extras`: the session drives analysis-only `go` clauses, and the
-//! spawned `yorkie` binary carries the feature only when the test binary does.
+//! Gated on `verbose2`: the session drives analysis-only `go` clauses, and the
+//! spawned `yorkie` binary reaches that level only when the test binary does.
 
-#![cfg(feature = "usi-extras")]
+#![cfg(feature = "verbose2")]
 
 mod common;
 

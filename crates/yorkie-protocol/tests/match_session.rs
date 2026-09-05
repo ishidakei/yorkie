@@ -3,16 +3,17 @@
 //!
 //! A bridge in a rated game sends only `usi`, `isready`, `setoption`,
 //! `usinewgame`, `position`, a clock-clause or `ponder` `go`, `stop`,
-//! `ponderhit`, `gameover` and `quit`; everything else lives behind
-//! `usi-extras`.
+//! `ponderhit`, `gameover` and `quit`; everything else arrives at a higher
+//! verbosity level.
 //!
 //! [`match_shaped_session_is_byte_identical`] is deliberately *not*
-//! feature-gated: it runs in both configurations and pins the same bytes, which
-//! is the "turning the feature off changes nothing a game can see" claim. The
-//! gated module below compiles only with the feature off and pins the refusals.
+//! feature-gated: it runs at every level and pins the same bytes, which is the
+//! "raising the level changes nothing a game can see" claim. The two gated
+//! modules below compile only under the level whose absence they pin, and hold
+//! the refusals.
 //!
 //! The diagnostic lines are composed through `common::diag_line`, so the
-//! transcripts stay byte-exact with and without `info-diag`.
+//! transcripts stay byte-exact with and without `verbose1`.
 //!
 //! No network is loaded, so every `go` resolves through the no-eval path — the
 //! one search outcome that is deterministic to the byte.
@@ -22,13 +23,13 @@ mod common;
 use common::{diag_line, drive};
 
 /// The play part of a game-shaped session, byte-for-byte — the same expectation
-/// with `usi-extras` on and off.
+/// at every verbosity level.
 ///
 /// The handshake in front of it, where the builds legitimately differ, is pinned
 /// separately by [`whole_session_including_the_handshake`].
 ///
 /// The no-network notice is a diagnostic, so it is present exactly when
-/// `info-diag` is; the `bestmove` lines themselves are unconditional.
+/// `verbose1` is; the `bestmove` lines themselves are unconditional.
 fn play_output() -> String {
     let notice = diag_line("no eval network loaded; run isready");
     format!("{notice}bestmove resign\n{notice}bestmove resign\n")
@@ -94,13 +95,12 @@ fn go_ponder_and_ponderhit_are_match_commands() {
     );
 }
 
-/// The default build: the non-match commands are gone, and they go out loudly.
-#[cfg(not(feature = "usi-extras"))]
-mod without_usi_extras {
+/// Below `verbose3`: `bench` is not a command token at all — it lands in the
+/// ordinary unknown-command path, exactly as `tt` does.
+#[cfg(not(feature = "verbose3"))]
+mod below_verbose3 {
     use super::{diag_line, drive};
 
-    /// `bench` is not a command token at all — it lands in the ordinary
-    /// unknown-command path, exactly as `tt` does.
     #[cfg_attr(miri, ignore)]
     #[test]
     fn bench_is_an_unknown_command() {
@@ -110,6 +110,13 @@ mod without_usi_extras {
             diag_line("unknown command: bench 16 1 6 default depth")
         );
     }
+}
+
+/// Below `verbose2`: the non-match `go` clauses are gone, and they go out
+/// loudly.
+#[cfg(not(feature = "verbose2"))]
+mod below_verbose2 {
+    use super::{diag_line, drive};
 
     /// Every gated `go` clause is refused by name, and no search starts: no
     /// `bestmove`, no `info` beyond the one error line. Silently dropping the
@@ -129,13 +136,13 @@ mod without_usi_extras {
             assert_eq!(
                 drive(&format!("position startpos\ngo {clause}\nquit\n")),
                 diag_line(&format!(
-                    "go error: `{name}` requires a usi-extras build; no search started"
+                    "go error: `{name}` requires a verbose2 build; no search started"
                 )),
             );
         }
         assert_eq!(
             drive("position startpos\ngo infinite\nquit\n"),
-            diag_line("go error: `infinite` requires a usi-extras build; no search started")
+            diag_line("go error: `infinite` requires a verbose2 build; no search started")
         );
     }
 
@@ -146,7 +153,7 @@ mod without_usi_extras {
     fn a_gated_clause_poisons_the_whole_go_line() {
         assert_eq!(
             drive("go btime 60000 wtime 60000 depth 4\nquit\n"),
-            diag_line("go error: `depth` requires a usi-extras build; no search started")
+            diag_line("go error: `depth` requires a verbose2 build; no search started")
         );
     }
 
@@ -165,7 +172,7 @@ mod without_usi_extras {
             drive(session),
             format!(
                 "{}{}bestmove resign\n",
-                diag_line("go error: `depth` requires a usi-extras build; no search started"),
+                diag_line("go error: `depth` requires a verbose2 build; no search started"),
                 diag_line("no eval network loaded; run isready"),
             )
         );

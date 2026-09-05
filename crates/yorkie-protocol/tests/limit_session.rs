@@ -12,15 +12,12 @@
 //! `configs/test.toml` the three limits are off, and with
 //! `configs/test-limits.toml` they are on.
 //!
-//! Gated on `usi-extras`: these sessions drive analysis-only `go` clauses, which
-//! a default build refuses rather than reinterprets.
+//! Gated on `verbose2`: these sessions drive analysis-only `go` clauses, which
+//! a build below that level refuses rather than reinterprets, and every
+//! assertion here reads the per-iteration `info depth …` lines, which only a
+//! `verbose2` build emits.
 
-//!
-//! **`info-output` gate.** Every assertion here reads the per-iteration
-//! `info depth …` lines, which only an `info-output` build emits, so the file is
-//! gated on that feature too. `--all-features` carries both.
-
-#![cfg(all(feature = "usi-extras", feature = "info-output"))]
+#![cfg(feature = "verbose2")]
 
 mod common;
 

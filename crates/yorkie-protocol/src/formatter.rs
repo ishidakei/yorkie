@@ -36,7 +36,7 @@ impl<'w, W: Write + ?Sized> Formatter<'w, W> {
     ///
     /// The lazy form of [`Self::info_string`]: the caller passes `format_args!`
     /// instead of a `String`, so an interpolated message costs no allocation —
-    /// and a build whose sink drops the line (the `info-diag` gate in
+    /// and a build whose sink drops the line (the `verbose1` gate in
     /// [`crate::driver`]) never formats it at all.
     pub fn info_string_fmt(&mut self, body: std::fmt::Arguments<'_>) -> io::Result<()> {
         self.line(format_args!("info string {body}"))

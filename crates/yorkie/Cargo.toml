@@ -21,13 +21,13 @@ serde_json = "~1.0"
 # binary can reach them. All are off by default: the tournament binary's only
 # search output is `bestmove`, and the only `info string`s it can print are the
 # initialisation-phase ones, which no feature gates. A measurement build — the
-# one that reads `nodes` / `nps` back out of the transcript — wants
-# `usi-extras,info-output`.
+# one that reads `nodes` / `nps` back out of the transcript — wants `verbose3`,
+# which drives `bench` and prints the search `info` lines its guards read.
 [features]
-usi-extras = ["yorkie-protocol/usi-extras"]
+verbose1 = ["yorkie-protocol/verbose1"]
+verbose2 = ["yorkie-protocol/verbose2"]
+verbose3 = ["yorkie-protocol/verbose3"]
 tt-entry16 = ["yorkie-protocol/tt-entry16"]
-info-diag = ["yorkie-protocol/info-diag"]
-info-output = ["yorkie-protocol/info-output"]
 
 [lints]
 workspace = true

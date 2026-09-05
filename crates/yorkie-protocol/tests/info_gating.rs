@@ -1,20 +1,21 @@
-//! What the `info` features gate, from the outside: a real search in the
-//! default (tournament) build says `bestmove` and nothing else, while the
-//! `isready` / initialisation-phase `info string`s survive in every build.
+//! What the verbosity levels gate on the output side, from the outside: a real
+//! search in the default (tournament) build says `bestmove` and nothing else,
+//! while the `isready` / initialisation-phase `info string`s survive at every
+//! level.
 //!
 //! The three build shapes this file distinguishes:
 //!
 //! | build | search `info` | diagnostic `info string` | init-phase `info string` |
 //! |---|---|---|---|
-//! | default | — | — | yes |
-//! | `info-diag` | — | yes | yes |
-//! | `info-output` | yes | yes | yes |
+//! | no feature | — | — | yes |
+//! | `verbose1` | — | yes | yes |
+//! | `verbose2` | yes | yes | yes |
 //!
 //! The positive side is pinned by the session tests; this file pins the negative
 //! side, which no other test can make.
 //!
-//! Deliberately not `usi-extras`-gated: the search here is driven by a
-//! clock-bounded `go`, so the file runs in every build shape.
+//! Deliberately ungated: the search here is driven by a clock-bounded `go`, so
+//! the file runs in every build shape.
 //!
 //! **One test on purpose.** The first half needs the package-root working
 //! directory so the network load fails, and the second stages a synthetic
@@ -33,8 +34,8 @@ fn info_lines(out: &str) -> Vec<&str> {
 
 #[cfg_attr(miri, ignore)]
 #[test]
-fn search_output_is_bestmove_only_unless_info_output_is_built_in() {
-    // --- Part 1: the initialisation phase, which no feature gates. ---
+fn search_output_is_bestmove_only_below_verbose2() {
+    // --- Part 1: the initialisation phase, which no level gates. ---
     //
     // No network at the package-root working directory, so `isready` fails the
     // load. That notice (and the withheld `readyok`) is how a bad deployment is
@@ -50,7 +51,7 @@ fn search_output_is_bestmove_only_unless_info_output_is_built_in() {
     //
     // `stop` rides in the same input, so the search aborts at its first
     // checkpoint and the session stays fast; the reply is still a full one
-    // (final PV under `info-output`, then `bestmove`).
+    // (final PV under `verbose2`, then `bestmove`).
     stage_configured_eval_dir();
     let out = drive(
         "usi\n\
@@ -65,10 +66,10 @@ fn search_output_is_bestmove_only_unless_info_output_is_built_in() {
     assert_eq!(bestmoves.len(), 1, "expected one bestmove in:\n{out}");
 
     let infos = info_lines(&out);
-    if cfg!(feature = "info-output") {
+    if cfg!(feature = "verbose2") {
         assert!(
             infos.iter().any(|l| l.starts_with("info depth ")),
-            "an info-output build must report the search in:\n{out}"
+            "a verbose2 build must report the search in:\n{out}"
         );
     } else {
         // The whole claim of the default build, in one assertion: a search that
@@ -77,7 +78,7 @@ fn search_output_is_bestmove_only_unless_info_output_is_built_in() {
         // line either, so the expected count really is zero.
         assert!(
             infos.is_empty(),
-            "a build without `info-output` must emit no info line during a \
+            "a build without `verbose2` must emit no info line during a \
              search, got {infos:?} in:\n{out}"
         );
     }

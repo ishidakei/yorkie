@@ -224,12 +224,12 @@ fn fixture_root(tag: &str) -> PathBuf {
 }
 
 /// The transcript a diagnostic `info string <body>` contributes in *this* build:
-/// the line itself with `info-diag`, the empty string without it.
+/// the line itself with `verbose1`, the empty string without it.
 ///
 /// A session test that pins bytes composes its expectation through this helper
 /// so it stays byte-exact in both builds.
 pub fn diag_line(body: &str) -> String {
-    if cfg!(feature = "info-diag") {
+    if cfg!(feature = "verbose1") {
         format!("info string {body}\n")
     } else {
         String::new()

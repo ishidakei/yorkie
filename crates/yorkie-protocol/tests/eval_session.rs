@@ -12,15 +12,12 @@
 //! The comparison holds because the config compiles in a single worker; Lazy-SMP
 //! with more is deliberately not reproducible move-for-move.
 //!
-//! Gated on `usi-extras`: these sessions drive analysis-only `go` clauses, which
-//! a default build refuses rather than reinterprets.
+//! Gated on `verbose2`: these sessions drive analysis-only `go` clauses, which
+//! a build below that level refuses rather than reinterprets, and the
+//! search-report assertions read the `info depth …` lines, which only a
+//! `verbose2` build emits.
 
-//!
-//! **`info-output` gate.** The search-report assertions read the `info depth …`
-//! lines, which only an `info-output` build emits, so the file is gated on that
-//! feature too. `--all-features` carries both.
-
-#![cfg(all(feature = "usi-extras", feature = "info-output"))]
+#![cfg(feature = "verbose2")]
 
 mod common;
 

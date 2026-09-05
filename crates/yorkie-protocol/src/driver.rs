@@ -1,5 +1,5 @@
 // Only the score / PV renderers use it, and both are optional surfaces.
-#[cfg(any(feature = "usi-extras", feature = "info-output"))]
+#[cfg(feature = "verbose2")]
 use core::fmt::NumBuffer;
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
@@ -16,21 +16,21 @@ use yorkie_search::{
     TimeManagement, WorkerHistories, WorkerResult, WorkerVote, declaration_win,
     generate_root_moves, probe_book, select_best_worker,
 };
-// The PV-line surface: only an `info-output` build renders one, so only it needs
+// The PV-line surface: only a `verbose2` build renders one, so only it needs
 // the line's data type, its bound marker and the sink trait.
-#[cfg(feature = "info-output")]
+#[cfg(feature = "verbose2")]
 use yorkie_search::{PvBound, PvInfo, PvSink};
 use yorkie_state::{Move, Position, format_usi_move, parse_sfen, parse_usi_move};
 use yorkie_storage::{Book, TranspositionTable, Value};
-#[cfg(feature = "usi-extras")]
+#[cfg(feature = "verbose3")]
 use yorkie_storage::{TTData, VALUE_NONE};
 
-#[cfg(feature = "usi-extras")]
+#[cfg(feature = "verbose3")]
 use crate::bench;
 use crate::formatter::Formatter;
 use crate::parser::{Command, GoLimits, MATE_UNLIMITED_MS, PositionSfen, parse_line};
 use crate::settings::Settings;
-#[cfg(feature = "usi-extras")]
+#[cfg(feature = "verbose3")]
 use crate::tt_command::{
     TtCommand, TtPosition, TtStoreArgs, bound_name, parse_tt, value_from_tt, value_to_tt,
 };
@@ -47,7 +47,7 @@ pub const ENGINE_AUTHOR: &str = "Kei Ishida <ishida.kei@gmail.com>";
 // reference's `USI_Hash` option, `yaneuraou-search.cpp` — the depth-1 fixture
 // capture condition): the first successful `isready` sizes it if still
 // unsized, and nothing resizes it thereafter, because nothing can change the
-// constant. The `usi-extras` `bench` command is the one exception: it carries
+// constant. The `verbose3` `bench` command is the one exception: it carries
 // its own table size as a command argument. See
 // [`UsiDriver::resize_tt_to_hash_config`].
 
@@ -70,7 +70,7 @@ const KEEP_ALIVE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const KEEP_ALIVE_TICKS_PER_NEWLINE: u32 = 50;
 
 // Reference USI score conversion (`score.cpp`, `usi.cpp`). These are
-// `pub(crate)` so the `usi-extras` `tt` commands, which speak the same score
+// `pub(crate)` so the `verbose3` `tt` commands, which speak the same score
 // surface, do not grow a second copy of the scale.
 //
 // The mate scale is only needed to *render* a score, and both surfaces that
@@ -78,10 +78,10 @@ const KEEP_ALIVE_TICKS_PER_NEWLINE: u32 = 50;
 // constants nor `push_score` / `format_score`. `PAWN_VALUE` is unconditional:
 // `to_cp` and the draw-contempt scaling read it in every build.
 /// `VALUE_MATE` (`types.h`).
-#[cfg(any(feature = "usi-extras", feature = "info-output"))]
+#[cfg(feature = "verbose2")]
 pub(crate) const VALUE_MATE: Value = 32000;
 /// `VALUE_TB_WIN_IN_MAX_PLY` (`types.h`): the `is_decisive` threshold.
-#[cfg(any(feature = "usi-extras", feature = "info-output"))]
+#[cfg(feature = "verbose2")]
 pub(crate) const VALUE_TB_WIN_IN_MAX_PLY: Value = VALUE_MATE - 246;
 /// `Eval::PawnValue` / `NormalizeToPawnValue` (`usi.cpp`).
 pub(crate) const PAWN_VALUE: Value = 90;
@@ -104,7 +104,7 @@ fn to_cp(v: Value) -> Value {
 /// Appending in place keeps the `info` PV path free of the `String` temporary
 /// [`format_score`] hands back; [`format_score`] itself stays for the two book
 /// call sites that need an owned value.
-#[cfg(any(feature = "usi-extras", feature = "info-output"))]
+#[cfg(feature = "verbose2")]
 fn push_score(out: &mut String, v: Value) {
     let mut digits = NumBuffer::new();
     if v.abs() >= VALUE_TB_WIN_IN_MAX_PLY {
@@ -119,7 +119,7 @@ fn push_score(out: &mut String, v: Value) {
 }
 
 /// [`push_score`] into a fresh `String`.
-#[cfg(any(feature = "usi-extras", feature = "info-output"))]
+#[cfg(feature = "verbose2")]
 pub(crate) fn format_score(v: Value) -> String {
     let mut out = String::new();
     push_score(&mut out, v);
@@ -203,7 +203,7 @@ struct ActiveSearch {
     /// thread has not yet returned. A flag stamped under the output lock closes
     /// it — any reader that has seen the `bestmove` line took the same lock
     /// afterwards, so it cannot see this as unset.
-    #[cfg_attr(not(feature = "usi-extras"), allow(dead_code))]
+    #[cfg_attr(not(feature = "verbose3"), allow(dead_code))]
     bestmove_sent: Arc<AtomicBool>,
     /// The root game ply this search ran at (`rootPos.game_ply()`), carried so
     /// a completed real search updates the driver's `last_game_ply`
@@ -300,7 +300,7 @@ pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
     /// worker is the per-`go` coordinator thread [`Self::handle_go`] spawns.
     pool: ThreadPool,
     /// The pool size the next (re)build uses. Always the `threads` config
-    /// constant, except while a `usi-extras` `bench` runs its own thread count
+    /// constant, except while a `verbose3` `bench` runs its own thread count
     /// — the one command that carries a worker count as an argument. Nothing
     /// on the match path ever writes it.
     pool_threads: usize,
@@ -426,14 +426,14 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 Command::UsiNewGame => self.handle_usinewgame(),
                 Command::Position { sfen, moves } => self.handle_position(sfen, &moves)?,
                 Command::Go(limits) => self.handle_go(limits)?,
-                #[cfg(not(feature = "usi-extras"))]
+                #[cfg(not(feature = "verbose2"))]
                 Command::GoExtraClause(clause) => self.handle_go_extra_clause(&clause)?,
                 Command::Stop => self.handle_stop(),
                 Command::GameOver => self.handle_gameover(),
                 Command::PonderHit => self.handle_ponderhit()?,
-                #[cfg(feature = "usi-extras")]
+                #[cfg(feature = "verbose3")]
                 Command::Bench(tokens) => self.handle_bench(&tokens)?,
-                #[cfg(feature = "usi-extras")]
+                #[cfg(feature = "verbose3")]
                 Command::Tt(tokens) => self.handle_tt(&tokens)?,
                 Command::Quit => {
                     self.finish_search_join();
@@ -454,19 +454,19 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// Emit one `info string <msg>` line.
     ///
     /// This is the unconditional sink, reserved for the initialisation phase and
-    /// for a `usi-extras` command's response payload: those lines are how a
+    /// for a `verbose3` command's response payload: those lines are how a
     /// failed startup is diagnosed at all, so no feature may take them away.
     /// Everything else goes through [`Self::info_string_diag`].
     fn info_string(&self, msg: &str) -> io::Result<()> {
         Formatter::new(&mut *self.lock_writer()).info_string(msg)
     }
 
-    /// Emit one diagnostic `info string` line — the `info-diag` surface, which
+    /// Emit one diagnostic `info string` line — the `verbose1` surface, which
     /// carries every `info string` produced outside the initialisation phase.
     ///
     /// Callers pass `format_args!`, not a `String`, so the message is composed
     /// only if it is going to be written.
-    #[cfg(feature = "info-diag")]
+    #[cfg(feature = "verbose1")]
     fn info_string_diag(&self, body: std::fmt::Arguments<'_>) -> io::Result<()> {
         Formatter::new(&mut *self.lock_writer()).info_string_fmt(body)
     }
@@ -475,7 +475,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// never formatted, so a rejected command costs one call and no allocation.
     /// The `Ok(())` keeps every call site's `?` / `return` shape identical in
     /// both builds.
-    #[cfg(not(feature = "info-diag"))]
+    #[cfg(not(feature = "verbose1"))]
     fn info_string_diag(&self, _body: std::fmt::Arguments<'_>) -> io::Result<()> {
         Ok(())
     }
@@ -642,7 +642,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// single output sink, mirroring the reference `print_info_string`
     /// (`usi.cpp`): the text is split on `'\n'` and whitespace-only lines are
     /// skipped.
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose3")]
     fn emit_info_string_lines(&self, text: &str) -> io::Result<()> {
         for line in text.split('\n') {
             if !line.trim().is_empty() {
@@ -654,7 +654,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 
     /// Emit the `Using N thread[s][ with NUMA node thread binding: ...]` line
     /// (`engine.cpp`).
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose3")]
     fn emit_thread_allocation_information(&self) -> io::Result<()> {
         self.emit_info_string_lines(&thread_allocation_information_as_string(
             self.pool.size(),
@@ -1039,16 +1039,16 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         Ok(())
     }
 
-    /// A `go` line carrying a clause that lives behind `usi-extras`, seen by a
-    /// build without the feature: report it and start nothing.
+    /// A `go` line carrying a clause that arrives at `verbose2`, seen by a build
+    /// below that level: report it and start nothing.
     ///
     /// Failing loud is deliberate — ignoring the clause would silently change
     /// the search's terms, turning `go depth 4` into a clock-less `go` in the
     /// middle of a game. Any search already running is left alone.
-    #[cfg(not(feature = "usi-extras"))]
+    #[cfg(not(feature = "verbose2"))]
     fn handle_go_extra_clause(&mut self, clause: &str) -> io::Result<()> {
         self.info_string_diag(format_args!(
-            "go error: `{clause}` requires a usi-extras build; no search started"
+            "go error: `{clause}` requires a verbose2 build; no search started"
         ))
     }
 
@@ -1386,7 +1386,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// Only the driving is synchronous — bench needs each position's node total
     /// before moving on. A position with no network loaded resigns and
     /// contributes 0 nodes.
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose3")]
     fn bench_run_one(&mut self, limits: GoLimits) -> io::Result<u64> {
         let Some(job) = self.prepare_coordinator_job(limits, true) else {
             self.info_string_diag(format_args!("no eval network loaded; run isready"))?;
@@ -1411,7 +1411,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// The requested thread count and table size are the only ones in the engine
     /// that do not come from the config constants, and they last as long as the
     /// session.
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose3")]
     fn handle_bench(&mut self, tokens: &[String]) -> io::Result<()> {
         // Reclaim any running search before touching the pool / the TT.
         self.finish_search_join();
@@ -1460,10 +1460,10 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // `+1` mirrors the reference's divide-by-zero guard (`usi.cpp`).
         //
         // The summary is `bench`'s RESULT, not a diagnostic: it is the whole
-        // point of the command, so it rides on `usi-extras` alone and no
-        // `info` feature can silence it. (A measurement run wants
-        // `usi-extras,info-output` anyway — the per-position `info` lines are
-        // where a bad run shows itself.)
+        // point of the command, so it rides on `verbose3` alone and no
+        // verbosity level below it can silence it. (`verbose3` also brings the
+        // per-position `info` lines a measurement run reads, which is where a
+        // bad run shows itself.)
         let time_ms = start.elapsed().as_millis() as u64 + 1;
         let nps = 1000 * total_nodes / time_ms;
         self.info_string(&format!(
@@ -1542,10 +1542,10 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         Ok(())
     }
 
-    // The `tt` command family exists only under the `usi-extras` cargo feature.
+    // The `tt` command family exists only under the `verbose3` cargo feature.
     // Its `info string` lines are the commands' response — a `tt probe` that
     // printed nothing would be a command with no output — so they go through the
-    // unconditional [`Self::info_string`] rather than the `info-diag` sink.
+    // unconditional [`Self::info_string`] rather than the `verbose1` sink.
 
     /// Dispatch one `tt …` line.
     ///
@@ -1559,7 +1559,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// `JoinHandle::is_finished`: the coordinator writes `bestmove` and *then*
     /// unwinds. `is_finished` still stands beside it for the searches that end
     /// without a reply.
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose3")]
     fn handle_tt(&mut self, tokens: &[String]) -> io::Result<()> {
         if self.search.as_ref().is_some_and(|active| {
             active.bestmove_sent.load(Ordering::Relaxed) || active.handle.is_finished()
@@ -1591,7 +1591,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     }
 
     /// The single error channel for the `tt` commands.
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose3")]
     fn tt_error(&self, msg: &str) -> io::Result<()> {
         self.info_string(&format!("tt error: {msg}"))
     }
@@ -1601,7 +1601,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// The extra king check is this surface's own: `parse_sfen` accepts a
     /// kingless board, but the move generators these commands then run assume
     /// both kings are present.
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose3")]
     fn tt_position(&self, position: &TtPosition) -> Result<Position, String> {
         use yorkie_state::Color;
 
@@ -1621,7 +1621,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// current generation, exactly as a search storing that value at that depth
     /// would. That includes the replacement policy, which may decline the write,
     /// so the command re-probes afterwards and reports which happened.
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose3")]
     fn tt_store(&self, args: &TtStoreArgs) -> io::Result<()> {
         let pos = match self.tt_position(&args.position) {
             Ok(pos) => pos,
@@ -1682,7 +1682,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 
     /// `tt probe …` — read the entry for the named position (`ply == 0`, so the
     /// reported value is exactly the stored one).
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose3")]
     fn tt_probe(&self, position: &TtPosition) -> io::Result<()> {
         let pos = match self.tt_position(position) {
             Ok(pos) => pos,
@@ -1708,7 +1708,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// child" prints as `mate 6`, one ply further out than a `tt probe` of that
     /// child's own SFEN would. A child with no entry produces no line, and the
     /// closing `tt children end <n>` line marks the list complete.
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose3")]
     fn tt_children(&self, position: &TtPosition) -> io::Result<()> {
         let mut pos = match self.tt_position(position) {
             Ok(pos) => pos,
@@ -1761,7 +1761,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 ///
 /// `ply` is the entry's distance from the position the command named, so the
 /// value is reported in that position's frame.
-#[cfg(feature = "usi-extras")]
+#[cfg(feature = "verbose3")]
 fn tt_entry_fields(data: &TTData, legal: &[Move], ply: i32) -> String {
     let mv = legal
         .iter()
@@ -1782,7 +1782,7 @@ fn tt_entry_fields(data: &TTData, legal: &[Move], ply: i32) -> String {
 /// scale [`format_score`] gives an `info … score` line, or the literal `none`
 /// for the `VALUE_NONE` sentinel (which the search writes into `eval16`
 /// whenever a node has no static eval — `tt store` cannot produce it).
-#[cfg(feature = "usi-extras")]
+#[cfg(feature = "verbose3")]
 fn tt_score_field(v: Value) -> String {
     if v == VALUE_NONE {
         "none".to_string()
@@ -1798,8 +1798,8 @@ fn tt_score_field(v: Value) -> String {
 /// omitted so the `info` line stays deterministic for the session tests, and
 /// `seldepth` / `multipv` are always emitted.
 ///
-/// `info-output` only: the default build renders no PV line.
-#[cfg(feature = "info-output")]
+/// `verbose2` only: the default build renders no PV line.
+#[cfg(feature = "verbose2")]
 fn write_pv_info<W: Write + ?Sized>(w: &mut W, info: &PvInfo) -> io::Result<()> {
     let mut ply_digits = NumBuffer::new();
     let mut index_digits = NumBuffer::new();
@@ -1836,15 +1836,15 @@ fn write_pv_info<W: Write + ?Sized>(w: &mut W, info: &PvInfo) -> io::Result<()> 
 /// to the shared USI output. Installed on the main worker only; helpers and the
 /// fixed-depth path get no sink and emit nothing.
 ///
-/// `info-output` only. Without the feature the main worker is given no sink
-/// either, which is what keeps the default build's search free of PV work: the
+/// `verbose2` only. Below that level the main worker is given no sink either,
+/// which is what keeps the tournament build's search free of PV work: the
 /// search's emission sites are all behind `pv_sink.is_some()`.
-#[cfg(feature = "info-output")]
+#[cfg(feature = "verbose2")]
 struct WriterPvSink<W: Write + Send> {
     writer: Arc<Mutex<W>>,
 }
 
-#[cfg(feature = "info-output")]
+#[cfg(feature = "verbose2")]
 impl<W: Write + Send> PvSink for WriterPvSink<W> {
     fn emit(&mut self, info: &PvInfo) {
         let mut guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
@@ -2010,14 +2010,14 @@ fn emit_bestmove<W: Write>(writer: &Arc<Mutex<W>>, sent: &AtomicBool, mv: &str) 
 /// Emit one diagnostic `info string <msg>` from the coordinator (best-effort) —
 /// the book-probe notices, which are produced on the search thread and so cannot
 /// use the driver's own [`UsiDriver::info_string_diag`].
-#[cfg(feature = "info-diag")]
+#[cfg(feature = "verbose1")]
 fn emit_info_string_diag<W: Write>(writer: &Arc<Mutex<W>>, msg: &str) {
     let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
     let _ = Formatter::new(&mut *guard).info_string(msg);
 }
 
 /// The default build's coordinator diagnostic sink: nothing is written.
-#[cfg(not(feature = "info-diag"))]
+#[cfg(not(feature = "verbose1"))]
 fn emit_info_string_diag<W: Write>(_writer: &Arc<Mutex<W>>, _msg: &str) {}
 
 /// A running keep-alive: a helper thread that emits a bare newline every
@@ -2087,9 +2087,9 @@ impl Drop for KeepAlive {
     }
 }
 
-/// Join book PV moves into a USI ` `-separated string. `info-output` only — the
+/// Join book PV moves into a USI ` `-separated string. `verbose2` only — the
 /// book `info` lines are its only caller.
-#[cfg(feature = "info-output")]
+#[cfg(feature = "verbose2")]
 fn pv_string(pv: &[Move]) -> String {
     pv.iter()
         .map(|m| format_usi_move(*m))
@@ -2106,7 +2106,7 @@ fn pv_string(pv: &[Move]) -> String {
 /// until `stop` or `ponderhit`, reusing the async-stop machinery rather than
 /// busy-waiting.
 ///
-/// Both `info` blocks are `info-output`; the hold and the `bestmove` are not, so
+/// Both `info` blocks are `verbose2`; the hold and the `bestmove` are not, so
 /// a default build answers a book hit with the move and nothing else.
 fn emit_book_hit<W: Write>(
     writer: &Arc<Mutex<W>>,
@@ -2119,7 +2119,7 @@ fn emit_book_hit<W: Write>(
 ) {
     // Per-candidate multipv info lines (emitted immediately, like the reference's
     // in-probe isRoot block).
-    #[cfg(feature = "info-output")]
+    #[cfg(feature = "verbose2")]
     {
         let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
         let mut f = Formatter::new(&mut *guard);
@@ -2149,7 +2149,7 @@ fn emit_book_hit<W: Write>(
     }
 
     // Final depth-0 info line + bestmove.
-    #[cfg(feature = "info-output")]
+    #[cfg(feature = "verbose2")]
     let pv = {
         let mut pv = format_usi_move(hit.best);
         if let Some(p) = hit.ponder {
@@ -2165,7 +2165,7 @@ fn emit_book_hit<W: Write>(
     }
     let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
     let mut f = Formatter::new(&mut *guard);
-    #[cfg(feature = "info-output")]
+    #[cfg(feature = "verbose2")]
     let _ = f.info(&format!(
         "depth 0 seldepth 0 multipv 1 score {} nodes 0 pv {pv}",
         format_score(Value::from(hit.value)),
@@ -2709,7 +2709,7 @@ fn resolve_worker_networks<T>(
         .collect()
 }
 
-// The thread-allocation diagnostic is emitted by the `usi-extras` `bench`
+// The thread-allocation diagnostic is emitted by the `verbose3` `bench`
 // command and nowhere else, since that is the only command that can change the
 // worker count; everything else about the layout is a compile-time constant.
 /// The `(bound_count, cpus_in_node)` pairs per node (`thread.cpp` +
@@ -2719,7 +2719,7 @@ fn resolve_worker_networks<T>(
 /// `0..=highest_bound_node`, then — since at least one thread is bound —
 /// extend with `(0, cpus_in_node)` for the remaining nodes up to
 /// `num_numa_nodes`.
-#[cfg(feature = "usi-extras")]
+#[cfg(feature = "verbose3")]
 fn bound_thread_counts(cfg: &NumaConfig, bound: &[NumaIndex]) -> Vec<(usize, usize)> {
     if bound.is_empty() {
         return Vec::new();
@@ -2743,7 +2743,7 @@ fn bound_thread_counts(cfg: &NumaConfig, bound: &[NumaIndex]) -> Vec<(usize, usi
 
 /// The `a/x:b/y:...` per-node `bound/total` string (`engine.cpp`); empty when
 /// nothing is bound.
-#[cfg(feature = "usi-extras")]
+#[cfg(feature = "verbose3")]
 fn thread_binding_information_as_string(cfg: &NumaConfig, bound: &[NumaIndex]) -> String {
     bound_thread_counts(cfg, bound)
         .iter()
@@ -2754,7 +2754,7 @@ fn thread_binding_information_as_string(cfg: &NumaConfig, bound: &[NumaIndex]) -
 
 /// `"Using N thread[s]"`, plus `" with NUMA node thread binding: a/x:b/y..."`
 /// when any thread is bound (`engine.cpp`).
-#[cfg(feature = "usi-extras")]
+#[cfg(feature = "verbose3")]
 fn thread_allocation_information_as_string(
     threads_size: usize,
     cfg: &NumaConfig,
@@ -2866,10 +2866,10 @@ struct CoordinatorJob<W: Write + Send + 'static> {
 struct CoordinatedOutcome {
     histories: WorkerHistories,
     /// `bench` is the only reader (the async `go` path takes its node total off
-    /// the wire), and `bench` is `usi-extras`. The field is still *written* on
+    /// the wire), and `bench` is `verbose3`. The field is still *written* on
     /// every search in both configurations — keeping the coordinator itself
     /// feature-agnostic is worth one `allow` here.
-    #[cfg_attr(not(feature = "usi-extras"), allow(dead_code))]
+    #[cfg_attr(not(feature = "verbose3"), allow(dead_code))]
     nodes: u64,
     time_state: Option<(Value, Value, Option<f64>)>,
 }
@@ -3032,7 +3032,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         });
     }
 
-    // The main worker is the only one given a PV sink. Without `info-output` it
+    // The main worker is the only one given a PV sink. Without `verbose2` it
     // is given the `MultiPV` value alone and no sink: `MultiPV` shapes the
     // search, so it is installed in every build, while the rest of the PV-output
     // configuration only decides which lines get printed. With no sink the
@@ -3049,14 +3049,14 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     qs.set_draw_value(draw_contempt);
     qs.set_generate_all_legal_moves(generate_all_legal_moves);
     qs.set_mate_mode(mate_mode);
-    #[cfg(feature = "info-output")]
+    #[cfg(feature = "verbose2")]
     qs.set_pv_output(
         pv_config,
         Box::new(WriterPvSink {
             writer: Arc::clone(&writer),
         }),
     );
-    #[cfg(not(feature = "info-output"))]
+    #[cfg(not(feature = "verbose2"))]
     qs.set_multi_pv(multi_pv);
     let main_result = qs.run_worker(&pos, root_moves, depth);
 
@@ -3107,7 +3107,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     // The chosen worker's MultiPV lines and completed depth feed the final `info`
     // PV block and nothing else, so a default build neither clones nor keeps
     // them.
-    #[cfg(feature = "info-output")]
+    #[cfg(feature = "verbose2")]
     let (mut pv_lines, completed_depth) = (
         chosen_result.pv_lines.clone(),
         chosen_result.completed_depth.max(1),
@@ -3122,11 +3122,11 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     let out_previous_time_reduction = results[0].time_reduction;
 
     // Ponder-extend the CHOSEN worker's length-1 PV via the shared TT.
-    #[cfg(feature = "info-output")]
+    #[cfg(feature = "verbose2")]
     let ponder_before = best.pv.len();
     let mut work = pos.clone();
     qs.extract_ponder(&mut work, &mut best, ponder_candidate);
-    #[cfg(feature = "info-output")]
+    #[cfg(feature = "verbose2")]
     let ponder_extended = best.pv.len() != ponder_before;
 
     // `ResignValue` is decided *before* the final PV output, because a
@@ -3146,10 +3146,10 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     // Final PV output before `bestmove`. `pv_idx == lines.len()` makes every
     // line exact, matching the reference's `pv()` after the MultiPV loop.
     //
-    // `info-output` only; `resign_by_value` above is not gated, since it decides
+    // `verbose2` only; `resign_by_value` above is not gated, since it decides
     // the reply itself and a build that prints no PV still resigns on the same
     // score.
-    #[cfg(feature = "info-output")]
+    #[cfg(feature = "verbose2")]
     {
         // `uciPvSent` is the main worker's flag; it is cleared when the chosen
         // PV was ponder-extended, or when the chosen worker is not the main one
@@ -3225,11 +3225,11 @@ mod tests {
     }
 
     /// The transcript a diagnostic `info string <body>` contributes in THIS
-    /// build: the line with `info-diag`, nothing without it. Lets a pinned
+    /// build: the line with `verbose1`, nothing without it. Lets a pinned
     /// transcript stay byte-exact in both builds instead of being asserted in
     /// only one of them.
     fn diag(body: &str) -> String {
-        if cfg!(feature = "info-diag") {
+        if cfg!(feature = "verbose1") {
             format!("info string {body}\n")
         } else {
             String::new()
@@ -3237,14 +3237,14 @@ mod tests {
     }
 
     /// Render one PV line exactly as [`write_pv_info`] would put it on the wire.
-    #[cfg(feature = "info-output")]
+    #[cfg(feature = "verbose2")]
     fn pv_line(info: &PvInfo) -> String {
         let mut buf = Vec::<u8>::new();
         write_pv_info(&mut buf, info).expect("write to Vec cannot fail");
         String::from_utf8(buf).expect("utf-8")
     }
 
-    #[cfg(feature = "info-output")]
+    #[cfg(feature = "verbose2")]
     fn pv_info_fixture(score: Value, bound: PvBound, pv: &[&str]) -> PvInfo {
         let pos = Position::startpos();
         PvInfo {
@@ -3265,7 +3265,7 @@ mod tests {
     /// `NumBuffer`-backed digits rather than `format!` temporaries, so pin the
     /// full wire bytes for every branch of the line (cp / mate, both signs, the
     /// three bounds, and an empty PV) rather than just the fields' presence.
-    #[cfg(feature = "info-output")]
+    #[cfg(feature = "verbose2")]
     #[test]
     fn pv_info_line_is_byte_exact() {
         assert_eq!(
@@ -3298,7 +3298,7 @@ mod tests {
 
     /// A drop move and the `depth 0` / `nodes 0` extremes still round-trip
     /// byte-for-byte (the digit paths that `NumBuffer` now owns).
-    #[cfg(feature = "info-output")]
+    #[cfg(feature = "verbose2")]
     #[test]
     fn pv_info_line_covers_zero_and_drop_extremes() {
         let mut info = pv_info_fixture(0, PvBound::Exact, &[]);
@@ -3561,7 +3561,7 @@ mod tests {
     #[test]
     fn position_sfen_malformed_emits_info_string() {
         let out = run_with("position sfen not-a-board b - 1\nquit\n");
-        if cfg!(feature = "info-diag") {
+        if cfg!(feature = "verbose1") {
             assert!(
                 out.starts_with("info string position parse error:"),
                 "unexpected output: {out:?}",
@@ -3579,7 +3579,7 @@ mod tests {
     fn position_with_illegal_move_emits_info_string() {
         // 1a1b would move a non-existent piece (square 1a empty at startpos).
         let out = run_with("position startpos moves 1a1b\nquit\n");
-        if cfg!(feature = "info-diag") {
+        if cfg!(feature = "verbose1") {
             assert!(
                 out.starts_with("info string illegal move:"),
                 "unexpected output: {out:?}",
@@ -3595,7 +3595,7 @@ mod tests {
         // 1a1b' shape — pick a syntactically valid move that is not a legal
         // generated move from startpos. Pawn on 7g cannot jump to 5g.
         let out = run_with("position startpos moves 7g5g\nquit\n");
-        if cfg!(feature = "info-diag") {
+        if cfg!(feature = "verbose1") {
             assert!(
                 out.starts_with("info string illegal move:"),
                 "unexpected output: {out:?}",
@@ -3618,7 +3618,7 @@ mod tests {
                        go\n\
                        quit\n";
         let out = run_with(session);
-        if cfg!(feature = "info-diag") {
+        if cfg!(feature = "verbose1") {
             assert!(
                 out.contains("info string position parse error:"),
                 "missing parse-error info string in: {out}"
@@ -3640,7 +3640,7 @@ mod tests {
         // legal, search-chosen move — is covered in tests/eval_session.rs with a
         // synthetic network, and in tests/real_network_selfplay against nn.bin.)
         let out = run_with("go\nquit\n");
-        if cfg!(feature = "info-diag") {
+        if cfg!(feature = "verbose1") {
             assert!(
                 out.contains("info string no eval network loaded; run isready"),
                 "expected the no-network notice, got: {out:?}"
@@ -3650,7 +3650,7 @@ mod tests {
         assert_eq!(bestmoves, vec!["bestmove resign"]);
     }
 
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose2")]
     #[cfg_attr(miri, ignore)]
     #[test]
     fn go_with_limit_subtokens_still_emits_one_bestmove() {
@@ -3663,26 +3663,27 @@ mod tests {
         assert_eq!(bestmoves.len(), 1);
     }
 
-    /// Feature off — the default (tournament) build: the same line is refused by
-    /// name and starts nothing, so there is no `bestmove` at all. The clock
-    /// clauses riding along on it do not rescue it: a `go` whose terms the build
-    /// cannot honour is not silently downgraded to one it can.
-    #[cfg(not(feature = "usi-extras"))]
+    /// Below `verbose2` — the default (tournament) build: the same line is
+    /// refused by name and starts nothing, so there is no `bestmove` at all. The
+    /// clock clauses riding along on it do not rescue it: a `go` whose terms the
+    /// build cannot honour is not silently downgraded to one it can.
+    #[cfg(not(feature = "verbose2"))]
     #[cfg_attr(miri, ignore)]
     #[test]
     fn go_with_gated_limit_subtokens_is_refused_and_starts_no_search() {
         let session = "go depth 8 wtime 60000 btime 60000 byoyomi 5000\nquit\n";
         // The refusal is what matters — no `bestmove`, so no search started. The
-        // line that names it is `info-diag`.
+        // line that names it is `verbose1`.
         assert_eq!(
             run_with(session),
-            diag("go error: `depth` requires a usi-extras build; no search started")
+            diag("go error: `depth` requires a verbose2 build; no search started")
         );
     }
 
-    /// Feature off: the match clauses are untouched — a clock-bounded `go` still
-    /// runs and emits one `bestmove` (resign here, as no network is loaded).
-    #[cfg(not(feature = "usi-extras"))]
+    /// Below `verbose2`: the match clauses are untouched — a clock-bounded `go`
+    /// still runs and emits one `bestmove` (resign here, as no network is
+    /// loaded).
+    #[cfg(not(feature = "verbose2"))]
     #[cfg_attr(miri, ignore)]
     #[test]
     fn go_with_match_subtokens_still_emits_one_bestmove() {
@@ -3692,12 +3693,12 @@ mod tests {
         assert_eq!(bestmoves, vec!["bestmove resign"]);
     }
 
-    /// Feature off: `bench` is not a command, so it lands in the ordinary
+    /// Below `verbose3`: `bench` is not a command, so it lands in the ordinary
     /// unknown-command path — the same line any stray input produces.
-    #[cfg(not(feature = "usi-extras"))]
+    #[cfg(not(feature = "verbose3"))]
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn bench_is_an_unknown_command_without_usi_extras() {
+    fn bench_is_an_unknown_command_below_verbose3() {
         assert_eq!(
             run_with("bench 16 1 6 default depth\nquit\n"),
             diag("unknown command: bench 16 1 6 default depth")
@@ -3718,7 +3719,7 @@ mod tests {
     /// helpers first, so repeated rebuilds never wedge the main loop or leak
     /// threads. No network is loaded, so every bench position resigns
     /// immediately and the run is fast.
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose3")]
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_bench_thread_count_emits_the_allocation_line() {
@@ -3791,7 +3792,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[cfg(feature = "usi-extras")]
+    #[cfg(feature = "verbose3")]
     #[test]
     fn info_strings_exact_formats() {
         let cfg = NumaConfig::from_string("0-3,8:16-31").unwrap();

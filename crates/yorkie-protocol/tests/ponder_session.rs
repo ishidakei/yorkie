@@ -13,10 +13,10 @@
 //! `Stochastic_Ponder` is a compile-time constant, so the test for it asserts
 //! what the value this build carries implies and skips itself otherwise.
 //!
-//! Gated on `usi-extras` only because these sessions drive analysis-only `go`
+//! Gated on `verbose2` only because these sessions drive analysis-only `go`
 //! clauses. The ponder machinery itself is match behaviour and is exercised in
 //! both builds by `tests/match_session.rs`.
-#![cfg(feature = "usi-extras")]
+#![cfg(feature = "verbose2")]
 
 mod common;
 

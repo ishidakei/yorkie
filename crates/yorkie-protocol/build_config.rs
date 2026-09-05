@@ -111,8 +111,8 @@ const fn choice(key: &'static str, usi: &'static str, choices: &'static [&'stati
 /// The exact key set a config file must carry — no more, no less.
 ///
 /// Ranges are the runtime declarations' own `min` / `max`, so a value this
-/// schema accepts is a value the `usi-extras` build would have accepted from a
-/// `setoption`, and the two builds cannot drift apart through the config file.
+/// schema accepts is a value a `setoption`-driven engine would have accepted,
+/// and the compiled-in setting cannot drift outside what the option allows.
 const SCHEMA: &[Spec] = &[
     // --- Engine core.
     int("usi_hash", "USI_Hash", 1, 33_554_432),

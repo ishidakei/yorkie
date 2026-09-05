@@ -1,7 +1,7 @@
 //! The `bench` command's argument parsing and default position set — a port of
 //! the reference `setup_bench` and its `Defaults` list (`benchmark.cpp`).
 //!
-//! The whole module exists only under the `usi-extras` cargo feature, so the
+//! The whole module exists only under the `verbose3` cargo feature, so the
 //! default build has neither this parse nor the `bench` command token.
 //!
 //! This module owns only the semantic parse of the argument tokens into a
