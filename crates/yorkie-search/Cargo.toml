@@ -20,10 +20,10 @@ serde_json = "~1.0"
 # it: the wide TT changes which probes hit, so the reference-captured parity
 # gates cannot hold and are compiled out under it. Off by default.
 #
-# `verbose1` and `verbose2` are the Protocol layer's verbosity levels, propagated
-# down (and on to the Storage layer) so everything this crate computes only to be
-# printed at one of them is absent from the compiled crate below that level
-# rather than merely unused:
+# `verbose1`, `verbose2` and `verbose3` are the Protocol layer's verbosity
+# levels, propagated down (and on to the Storage layer) so everything this crate
+# computes only to be printed at one of them is absent from the compiled crate
+# below that level rather than merely unused:
 #
 #   - `verbose1` — the book probe's diagnostic message bodies, which the Protocol
 #     layer turns into `info string` lines.
@@ -31,13 +31,17 @@ serde_json = "~1.0"
 #     configuration and line assembly, the root moves' fail-bound flags, the book
 #     hit's per-candidate lines, and the transposition table's `hashfull`
 #     occupancy the Storage layer supplies.
+#   - `verbose3` — the per-entry path-dependence mark a `tt probe` reports: the
+#     bit the search carries on its return path, and the propagation that
+#     maintains it.
 #
-# Each level implies the one below it, as on the Protocol layer. Both are off by
+# Each level implies the one below it, as on the Protocol layer. All are off by
 # default.
 [features]
 tt-entry16 = ["yorkie-storage/tt-entry16"]
 verbose1 = []
 verbose2 = ["verbose1", "yorkie-storage/verbose2"]
+verbose3 = ["verbose2", "yorkie-storage/verbose3"]
 
 [lints]
 workspace = true

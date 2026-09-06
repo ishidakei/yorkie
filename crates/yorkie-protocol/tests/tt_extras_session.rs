@@ -78,7 +78,8 @@ fn store_then_probe_returns_the_same_entry() {
             "store ok".to_string(),
             // 100 cp → 90 internal → 100 cp; 50 cp → 45 internal → 50 cp. Both
             // survive the USI PawnValue scale exactly.
-            "probe hit move 7g7f value cp 100 depth 12 bound exact eval cp 50 pv true".to_string(),
+            "probe hit move 7g7f value cp 100 depth 12 bound exact eval cp 50 pv true pathdep 0"
+                .to_string(),
         ]
     );
 }
@@ -94,7 +95,8 @@ fn omitting_pv_stores_a_non_pv_entry() {
         got,
         vec![
             "store ok".to_string(),
-            "probe hit move 2g2f value cp 0 depth 3 bound lower eval cp 0 pv false".to_string(),
+            "probe hit move 2g2f value cp 0 depth 3 bound lower eval cp 0 pv false pathdep 0"
+                .to_string(),
         ]
     );
 }
@@ -124,12 +126,89 @@ fn centipawn_round_trip_quantises_to_the_usi_pawn_scale() {
             vec![
                 "store ok".to_string(),
                 format!(
-                    "probe hit move none value cp {expected} depth 1 bound exact eval cp {expected} pv false"
+                    "probe hit move none value cp {expected} depth 1 bound exact eval cp {expected} pv false pathdep 0"
                 ),
             ],
             "cp {given} must quantise to cp {expected}"
         );
     }
+}
+
+// 1b. The path-dependence mark, written and read from outside.
+
+/// The mark is a stored field like any other: `tt store … pathdep 1` writes it,
+/// `tt probe` reads it back, and `tt children` carries it per child.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn the_path_dependence_mark_round_trips_through_store_and_probe() {
+    let child = sfen_after(&["7g7f"]);
+    let got = tt_session(&[
+        "tt store startpos move 2g2f value 0 depth 3 bound lower eval 0 pathdep 1",
+        "tt probe startpos",
+        &store_at(
+            &child,
+            "move 3c3d value 0 depth 3 bound lower eval 0 pathdep 1",
+        ),
+        "tt children startpos",
+    ]);
+    assert_eq!(
+        got,
+        vec![
+            "store ok".to_string(),
+            "probe hit move 2g2f value cp 0 depth 3 bound lower eval cp 0 pv false pathdep 1"
+                .to_string(),
+            "store ok".to_string(),
+            "child 7g7f move 3c3d value cp 0 depth 3 bound lower eval cp 0 pv false pathdep 1"
+                .to_string(),
+            "children end 1".to_string(),
+        ]
+    );
+}
+
+/// The clause defaults to `0`, and an entry re-stored without it comes back
+/// unmarked: the mark follows the payload rather than accumulating.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_store_without_the_clause_leaves_the_entry_unmarked() {
+    let got = tt_session(&[
+        "tt store startpos move 2g2f value 0 depth 3 bound exact eval 0 pathdep 1",
+        "tt probe startpos",
+        "tt store startpos move 2g2f value 0 depth 3 bound exact eval 0",
+        "tt probe startpos",
+    ]);
+    let marks: Vec<&str> = got
+        .iter()
+        .filter_map(|l| l.rsplit_once("pathdep ").map(|(_, m)| m))
+        .collect();
+    assert_eq!(marks, vec!["1", "0"], "got: {got:?}");
+}
+
+/// Entries in one cluster carry their marks independently, which in the default
+/// layout means the shared mark word is updated bit by bit. Three positions
+/// differing only in the low key bits land in one cluster there; under
+/// `tt-entry16` they are simply three entries, and the assertion is the same.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn one_positions_mark_does_not_disturb_anothers() {
+    let marked = sfen_after(&["7g7f"]);
+    let unmarked = sfen_after(&["2g2f"]);
+    let got = tt_session(&[
+        &store_at(
+            &marked,
+            "move none value 0 depth 5 bound lower eval 0 pathdep 1",
+        ),
+        &store_at(
+            &unmarked,
+            "move none value 0 depth 5 bound lower eval 0 pathdep 0",
+        ),
+        &format!("tt probe sfen {marked}"),
+        &format!("tt probe sfen {unmarked}"),
+    ]);
+    let marks: Vec<&str> = got
+        .iter()
+        .filter_map(|l| l.rsplit_once("pathdep ").map(|(_, m)| m))
+        .collect();
+    assert_eq!(marks, vec!["1", "0"], "got: {got:?}");
 }
 
 // 2. The mate / root-relative ply convention.
@@ -145,7 +224,8 @@ fn mate_scores_round_trip_through_store_and_probe() {
         got,
         vec![
             "store ok".to_string(),
-            "probe hit move 7g7f value mate 5 depth 30 bound exact eval cp 0 pv true".to_string(),
+            "probe hit move 7g7f value mate 5 depth 30 bound exact eval cp 0 pv true pathdep 0"
+                .to_string(),
         ]
     );
 
@@ -157,7 +237,8 @@ fn mate_scores_round_trip_through_store_and_probe() {
         got,
         vec![
             "store ok".to_string(),
-            "probe hit move 7g7f value mate -5 depth 30 bound exact eval cp 0 pv false".to_string(),
+            "probe hit move 7g7f value mate -5 depth 30 bound exact eval cp 0 pv false pathdep 0"
+                .to_string(),
         ]
     );
 }
@@ -183,9 +264,11 @@ fn children_report_values_relative_to_the_named_position() {
         vec![
             "store ok".to_string(),
             // Named as the root: exactly what was stored.
-            "probe hit move 3c3d value mate 5 depth 30 bound exact eval cp 0 pv true".to_string(),
+            "probe hit move 3c3d value mate 5 depth 30 bound exact eval cp 0 pv true pathdep 0"
+                .to_string(),
             // Named as a child of startpos: one ply further from the root.
-            "child 7g7f move 3c3d value mate 6 depth 30 bound exact eval cp 0 pv true".to_string(),
+            "child 7g7f move 3c3d value mate 6 depth 30 bound exact eval cp 0 pv true pathdep 0"
+                .to_string(),
             "children end 1".to_string(),
         ]
     );
@@ -206,8 +289,10 @@ fn children_do_not_shift_non_mate_values() {
         got,
         vec![
             "store ok".to_string(),
-            "probe hit move 8c8d value cp 90 depth 7 bound upper eval cp -90 pv false".to_string(),
-            "child 2g2f move 8c8d value cp 90 depth 7 bound upper eval cp -90 pv false".to_string(),
+            "probe hit move 8c8d value cp 90 depth 7 bound upper eval cp -90 pv false pathdep 0"
+                .to_string(),
+            "child 2g2f move 8c8d value cp 90 depth 7 bound upper eval cp -90 pv false pathdep 0"
+                .to_string(),
             "children end 1".to_string(),
         ]
     );
@@ -249,9 +334,9 @@ fn children_lists_only_seeded_children() {
         .collect();
     children.sort_unstable();
     let mut expected = vec![
-        "child 7g7f move none value cp 100 depth 4 bound lower eval cp 0 pv false",
-        "child 2g2f move none value cp 200 depth 5 bound lower eval cp 0 pv false",
-        "child 6i7h move none value cp 300 depth 6 bound lower eval cp 0 pv false",
+        "child 7g7f move none value cp 100 depth 4 bound lower eval cp 0 pv false pathdep 0",
+        "child 2g2f move none value cp 200 depth 5 bound lower eval cp 0 pv false pathdep 0",
+        "child 6i7h move none value cp 300 depth 6 bound lower eval cp 0 pv false pathdep 0",
     ];
     expected.sort_unstable();
     assert_eq!(children, expected, "got: {got:?}");
@@ -301,6 +386,8 @@ fn malformed_input_yields_one_error_line_each() {
         "tt store startpos move 7g7f value 999999 depth 1 bound exact eval 0",
         "tt store startpos move 7g7f value 0 depth 9999 bound exact eval 0",
         "tt store startpos move 7g7f value 0 depth -3 bound exact eval 0",
+        "tt store startpos move 7g7f value 0 depth 1 bound exact eval 0 pathdep 2",
+        "tt store startpos move 7g7f value 0 depth 1 bound exact eval 0 pathdep",
         // Move token: syntactically broken, and legal-but-not-here.
         "tt store startpos move zzzz value 0 depth 1 bound exact eval 0",
         "tt store startpos move 1a1b value 0 depth 1 bound exact eval 0",
@@ -359,7 +446,7 @@ fn a_rejected_store_leaves_the_existing_entry_intact() {
     assert!(got[1].starts_with("error: "), "got {got:?}");
     assert_eq!(
         got[2],
-        "probe hit move 7g7f value cp 100 depth 12 bound exact eval cp 50 pv true"
+        "probe hit move 7g7f value cp 100 depth 12 bound exact eval cp 50 pv true pathdep 0"
     );
 }
 
@@ -384,7 +471,8 @@ fn a_declined_write_is_reported_not_silently_dropped() {
             "store skipped (replacement policy kept the existing entry)".to_string(),
             // The deeper exact entry survives — except for its move, which
             // `TTEntry::save` always refreshes when a new one is supplied.
-            "probe hit move 2g2f value cp 100 depth 40 bound exact eval cp 0 pv true".to_string(),
+            "probe hit move 2g2f value cp 100 depth 40 bound exact eval cp 0 pv true pathdep 0"
+                .to_string(),
         ]
     );
 }
@@ -536,7 +624,7 @@ fn the_tt_commands_round_trip_through_the_wide_table() {
     let expected_probes: Vec<String> = (0..CHILDREN.len())
         .map(|i| {
             format!(
-                "probe hit move none value cp {} depth {} bound lower eval cp 0 pv false",
+                "probe hit move none value cp {} depth {} bound lower eval cp 0 pv false pathdep 0",
                 (i + 1) * 100,
                 i + 4
             )
@@ -557,7 +645,7 @@ fn the_tt_commands_round_trip_through_the_wide_table() {
         .enumerate()
         .map(|(i, mv)| {
             format!(
-                "child {mv} move none value cp {} depth {} bound lower eval cp 0 pv false",
+                "child {mv} move none value cp {} depth {} bound lower eval cp 0 pv false pathdep 0",
                 (i + 1) * 100,
                 i + 4
             )

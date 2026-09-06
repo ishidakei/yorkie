@@ -57,6 +57,30 @@
 //! `&mut self`, which the driver reaches through [`Arc::get_mut`] — `Some` only
 //! once every worker has been joined and dropped its clone. The type system
 //! therefore enforces that a resize or clear never races a probe.
+//!
+//! # The path-dependence mark (`verbose3`)
+//!
+//! A stored value can depend on the move history by which its position was
+//! reached, because a repetition judgement reads that history. At `verbose3`
+//! each entry carries one bit recording that its value and best move were
+//! derived through such a judgement, so an outside inspector can tell those
+//! entries apart. Nothing in the table reads the bit: it is not part of an
+//! entry's identity, it does not enter the replacement priority, and a probe
+//! hits or misses regardless of it.
+//!
+//! The two layouts keep it in different places, because only one of them has a
+//! spare byte:
+//!
+//! | | default | `tt-entry16` |
+//! |---|---|---|
+//! | where the bit lives | the cluster's two padding bytes, as an `AtomicU16` whose bit `i` belongs to `entry[i]` | bit 0 of the stored key |
+//! | what it costs | nothing — the bytes were padding | the key drops to 63 bits, so the false-hit rate is 2⁻⁶³ |
+//!
+//! In the default layout the bit and the entry are separate words, so a reader
+//! can briefly see a new entry beside the old bit under contention — the same
+//! tearing the six entry fields already permit, and acceptable for a
+//! diagnostic. Under `tt-entry16` the bit is written with the key, in one
+//! store.
 
 use std::alloc::Layout;
 use std::mem::{offset_of, size_of};
@@ -139,11 +163,20 @@ type TteKey = u64;
 /// The atomic wrapper for [`TteKey`]; same size and alignment as the plain type.
 #[cfg(feature = "tt-entry16")]
 type AtomicTteKey = AtomicU64;
-/// The whole key is stored, so this is the identity.
+/// Narrow `key` to what an entry stores. That is the whole key, except at
+/// `verbose3`, where bit 0 of the stored key is the path-dependence mark and
+/// the identity is the remaining 63 bits.
 #[cfg(feature = "tt-entry16")]
 #[inline]
 fn tte_key(key: u64) -> TteKey {
-    key
+    #[cfg(feature = "verbose3")]
+    {
+        key & !1
+    }
+    #[cfg(not(feature = "verbose3"))]
+    {
+        key
+    }
 }
 /// A stored key widened back to 64 bits — already that wide here. Compiled only
 /// where [`TranspositionTable::checksum`] is.
@@ -158,6 +191,23 @@ const CLUSTER_SIZE: usize = 2;
 /// None needed — `2 × 16` is exactly 32.
 #[cfg(feature = "tt-entry16")]
 const CLUSTER_PADDING: usize = 0;
+
+/// Whether a stored key identifies the same position as `k`.
+///
+/// Plain equality, except where the stored key's bit 0 is the path-dependence
+/// mark rather than part of the hash, in which case both sides are compared
+/// with it cleared.
+#[inline]
+fn key_matches(stored: TteKey, k: TteKey) -> bool {
+    #[cfg(all(feature = "tt-entry16", feature = "verbose3"))]
+    {
+        stored & !1 == k & !1
+    }
+    #[cfg(not(all(feature = "tt-entry16", feature = "verbose3")))]
+    {
+        stored == k
+    }
+}
 
 /// Bound type of a stored value (`types.h`). The discriminants are
 /// load-bearing: `Exact == Upper | Lower`, and the value packs into
@@ -204,6 +254,13 @@ pub struct TTData {
     pub bound: Bound,
     /// Whether this was a PV node.
     pub is_pv: bool,
+    /// Whether [`Self::value`] and [`Self::move16`] were derived through at
+    /// least one repetition judgement on the path the search took to this
+    /// position. A sufficient sign of path dependence, not an exact one: an
+    /// unmarked value may still differ on another path, and a marked one may
+    /// not.
+    #[cfg(feature = "verbose3")]
+    pub path_dep: bool,
 }
 
 impl TTData {
@@ -217,6 +274,8 @@ impl TTData {
             depth: DEPTH_NONE,
             bound: Bound::None,
             is_pv: false,
+            #[cfg(feature = "verbose3")]
+            path_dep: false,
         }
     }
 }
@@ -269,6 +328,10 @@ impl TTEntry {
             depth: DEPTH_NONE + self.depth8.load(REL) as Depth,
             bound: Bound::from_u8((gen_bound8 & BOUND_MASK) >> BOUND_SHIFT),
             is_pv: (gen_bound8 & PV_MASK) != 0,
+            // The mark is not an entry field; [`Cluster::read`] fills it in
+            // from wherever the layout keeps it.
+            #[cfg(feature = "verbose3")]
+            path_dep: false,
         }
     }
 
@@ -299,56 +362,6 @@ impl TTEntry {
         *self.value16.get_mut() = 0;
         *self.eval16.get_mut() = 0;
     }
-
-    /// Store a new node's data, possibly overwriting an older position
-    /// (`TTEntry::save`). `curr_generation` is an argument rather than read from
-    /// the table, because the reference lets learners pass a per-thread one.
-    ///
-    /// The old fields are each read once before any store, so the replacement
-    /// decision sees the pre-save entry state.
-    #[inline]
-    #[allow(clippy::too_many_arguments)]
-    fn save(
-        &self,
-        k: TteKey,
-        v: Value,
-        pv: bool,
-        b: Bound,
-        d: Depth,
-        m: u16,
-        ev: Value,
-        curr_generation: u8,
-    ) {
-        let old_key = self.key.load(REL);
-        let old_depth8 = self.depth8.load(REL);
-        let old_gen_bound8 = self.gen_bound8.load(REL);
-
-        // Preserve the old move if we don't have a new one for this position.
-        if m != 0 || k != old_key {
-            self.move16.store(m, REL);
-        }
-
-        // The depth comparison is in `i32` to match the reference's `int`
-        // promotion: `depth8 - 4` may be negative.
-        if b == Bound::Exact
-            || k != old_key
-            || d - DEPTH_NONE + 2 * pv as Depth > old_depth8 as Depth - 4
-            || relative_age(old_gen_bound8, curr_generation) != 0
-        {
-            debug_assert!(d > DEPTH_NONE);
-            debug_assert!(d - DEPTH_NONE < 256);
-            debug_assert!(curr_generation <= GENERATION_MASK);
-
-            self.key.store(k, REL);
-            self.depth8.store((d - DEPTH_NONE) as u8, REL);
-            self.gen_bound8.store(
-                curr_generation | (b as u8) << BOUND_SHIFT | (pv as u8) << PV_SHIFT,
-                REL,
-            );
-            self.value16.store(v as i16, REL);
-            self.eval16.store(ev as i16, REL);
-        }
-    }
 }
 
 /// A cluster of [`CLUSTER_SIZE`] entries, padded to a round 32 bytes. Entries
@@ -358,7 +371,137 @@ impl TTEntry {
 #[derive(Default)]
 struct Cluster {
     entry: [TTEntry; CLUSTER_SIZE],
+    /// Trailing bytes with nothing in them. An all-zero `Cluster` is a valid
+    /// empty one, so they stay zero for the life of the table.
+    #[cfg(any(not(feature = "verbose3"), feature = "tt-entry16"))]
     _padding: [u8; CLUSTER_PADDING],
+    /// The entries' path-dependence marks, bit `i` belonging to `entry[i]`.
+    /// It occupies the two bytes the cluster has to spare, and is 2-aligned
+    /// there, so the cluster is still 32 bytes and no entry moves.
+    #[cfg(all(feature = "verbose3", not(feature = "tt-entry16")))]
+    marks: AtomicU16,
+}
+
+impl Cluster {
+    /// Decode `slot`'s payload (`TTEntry::read`), including the mark, which is
+    /// not an entry field.
+    #[inline]
+    fn read(&self, slot: usize) -> TTData {
+        #[cfg(not(feature = "verbose3"))]
+        {
+            self.entry[slot].read()
+        }
+        #[cfg(feature = "verbose3")]
+        {
+            let mut data = self.entry[slot].read();
+            data.path_dep = self.path_dep(slot);
+            data
+        }
+    }
+
+    /// Zero every entry, and with it every mark.
+    #[inline]
+    fn reset(&mut self) {
+        for entry in self.entry.iter_mut() {
+            entry.reset();
+        }
+        #[cfg(all(feature = "verbose3", not(feature = "tt-entry16")))]
+        {
+            *self.marks.get_mut() = 0;
+        }
+    }
+
+    /// Store a new node's data into `slot`, possibly overwriting an older
+    /// position (`TTEntry::save`). `curr_generation` is an argument rather than
+    /// read from the table, because the reference lets learners pass a
+    /// per-thread one.
+    ///
+    /// The old fields are each read once before any store, so the replacement
+    /// decision sees the pre-save entry state. `path_dep` follows the payload:
+    /// it is written exactly when the payload is, and left alone when the
+    /// replacement condition declines the store.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn save(
+        &self,
+        slot: usize,
+        k: TteKey,
+        v: Value,
+        pv: bool,
+        b: Bound,
+        d: Depth,
+        m: u16,
+        ev: Value,
+        curr_generation: u8,
+        #[cfg(feature = "verbose3")] path_dep: bool,
+    ) {
+        // The stored key's bit 0 is the mark here, and `tte_key` has already
+        // cleared it out of `k`.
+        #[cfg(all(feature = "verbose3", feature = "tt-entry16"))]
+        let k = k | path_dep as TteKey;
+
+        let entry = &self.entry[slot];
+        let old_key = entry.key.load(REL);
+        let old_depth8 = entry.depth8.load(REL);
+        let old_gen_bound8 = entry.gen_bound8.load(REL);
+
+        // Preserve the old move if we don't have a new one for this position.
+        if m != 0 || !key_matches(old_key, k) {
+            entry.move16.store(m, REL);
+        }
+
+        // The depth comparison is in `i32` to match the reference's `int`
+        // promotion: `depth8 - 4` may be negative.
+        if b == Bound::Exact
+            || !key_matches(old_key, k)
+            || d - DEPTH_NONE + 2 * pv as Depth > old_depth8 as Depth - 4
+            || relative_age(old_gen_bound8, curr_generation) != 0
+        {
+            debug_assert!(d > DEPTH_NONE);
+            debug_assert!(d - DEPTH_NONE < 256);
+            debug_assert!(curr_generation <= GENERATION_MASK);
+
+            entry.key.store(k, REL);
+            entry.depth8.store((d - DEPTH_NONE) as u8, REL);
+            entry.gen_bound8.store(
+                curr_generation | (b as u8) << BOUND_SHIFT | (pv as u8) << PV_SHIFT,
+                REL,
+            );
+            entry.value16.store(v as i16, REL);
+            entry.eval16.store(ev as i16, REL);
+            #[cfg(all(feature = "verbose3", not(feature = "tt-entry16")))]
+            self.set_path_dep(slot, path_dep);
+        }
+    }
+}
+
+#[cfg(feature = "verbose3")]
+impl Cluster {
+    /// `slot`'s path-dependence mark.
+    #[inline]
+    fn path_dep(&self, slot: usize) -> bool {
+        #[cfg(not(feature = "tt-entry16"))]
+        {
+            self.marks.load(REL) & (1 << slot) != 0
+        }
+        #[cfg(feature = "tt-entry16")]
+        {
+            self.entry[slot].key.load(REL) & 1 != 0
+        }
+    }
+
+    /// Write `slot`'s mark, leaving its neighbours' bits alone: every entry in
+    /// the cluster shares this word, and their writers race.
+    #[cfg(not(feature = "tt-entry16"))]
+    #[inline]
+    fn set_path_dep(&self, slot: usize, path_dep: bool) {
+        let bit = 1u16 << slot;
+        if path_dep {
+            self.marks.fetch_or(bit, REL);
+        } else {
+            self.marks.fetch_and(!bit, REL);
+        }
+    }
 }
 
 // The `clusterCount` arithmetic assumes a 32-byte cluster, and `tt-entry16`'s
@@ -385,6 +528,11 @@ const _: () = assert!(offset_of!(TTEntry, gen_bound8) == KEY_SIZE + 1);
 const _: () = assert!(offset_of!(TTEntry, move16) == KEY_SIZE + 2);
 const _: () = assert!(offset_of!(TTEntry, value16) == KEY_SIZE + 4);
 const _: () = assert!(offset_of!(TTEntry, eval16) == KEY_SIZE + 6);
+
+// The mark word sits in the cluster's spare bytes, where its 2-byte alignment
+// is satisfied, so the cluster neither grows nor shifts an entry.
+#[cfg(all(feature = "verbose3", not(feature = "tt-entry16")))]
+const _: () = assert!(offset_of!(Cluster, marks) == size_of::<TTEntry>() * CLUSTER_SIZE);
 
 /// Base alignment of the cluster allocation: a 2 MiB huge-page boundary on
 /// Linux so a `MADV_HUGEPAGE` hint can back the region with transparent huge
@@ -560,9 +708,7 @@ impl TranspositionTable {
     pub fn clear(&mut self) {
         *self.generation8.get_mut() = 0;
         for cluster in self.table.iter_mut() {
-            for entry in cluster.entry.iter_mut() {
-                entry.reset();
-            }
+            cluster.reset();
         }
     }
 
@@ -663,10 +809,11 @@ impl TranspositionTable {
         let generation = self.generation8.load(REL);
         let cluster = &self.table[ci];
 
-        if let Some(i) = (0..CLUSTER_SIZE).find(|&i| cluster.entry[i].key.load(REL) == k) {
+        if let Some(i) = (0..CLUSTER_SIZE).find(|&i| key_matches(cluster.entry[i].key.load(REL), k))
+        {
             let found = cluster.entry[i].is_occupied();
-            let data = cluster.entry[i].read();
-            return (found, data, TTWriter::new(&cluster.entry[i]));
+            let data = cluster.read(i);
+            return (found, data, TTWriter::new(cluster, i));
         }
 
         // Miss: pick the least-valuable entry to replace.
@@ -679,11 +826,7 @@ impl TranspositionTable {
             }
         }
 
-        (
-            false,
-            TTData::none(),
-            TTWriter::new(&cluster.entry[replace]),
-        )
+        (false, TTData::none(), TTWriter::new(cluster, replace))
     }
 
     /// Like [`Self::probe`] but returns the chosen entry's location rather than
@@ -705,9 +848,10 @@ impl TranspositionTable {
         let generation = self.generation8.load(REL);
         let cluster = &self.table[ci];
 
-        if let Some(i) = (0..CLUSTER_SIZE).find(|&i| cluster.entry[i].key.load(REL) == k) {
+        if let Some(i) = (0..CLUSTER_SIZE).find(|&i| key_matches(cluster.entry[i].key.load(REL), k))
+        {
             let found = cluster.entry[i].is_occupied();
-            let data = cluster.entry[i].read();
+            let data = cluster.read(i);
             return (
                 found,
                 data,
@@ -754,8 +898,10 @@ impl TranspositionTable {
         mv: u16,
         eval: Value,
         generation: u8,
+        #[cfg(feature = "verbose3")] path_dep: bool,
     ) {
-        self.table[slot.cluster].entry[slot.entry].save(
+        self.table[slot.cluster].save(
+            slot.entry,
             tte_key(key),
             value,
             pv,
@@ -764,6 +910,8 @@ impl TranspositionTable {
             mv,
             eval,
             generation,
+            #[cfg(feature = "verbose3")]
+            path_dep,
         );
     }
 
@@ -772,6 +920,10 @@ impl TranspositionTable {
     /// Nothing a game plays reads it: it exists to pin the table's contents
     /// while the table is being inspected from the outside, which is what the
     /// `verbose3` level is for, so it is compiled only there.
+    ///
+    /// The path-dependence marks are part of what the table stores and so are
+    /// mixed in: in the default layout as the cluster's mark word, and under
+    /// `tt-entry16` inside the key each entry already contributes.
     #[cfg(feature = "verbose3")]
     pub fn checksum(&self) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -788,6 +940,8 @@ impl TranspositionTable {
                 mix(e.value16.load(REL) as u16 as u64);
                 mix(e.eval16.load(REL) as u16 as u64);
             }
+            #[cfg(not(feature = "tt-entry16"))]
+            mix(cluster.marks.load(REL) as u64);
         }
         mix(self.generation8.load(REL) as u64);
         h
@@ -802,15 +956,18 @@ pub struct TtSlot {
     entry: usize,
 }
 
-/// A single-use handle for writing one entry (`TTWriter`).
+/// A single-use handle for writing one entry (`TTWriter`). It addresses the
+/// cluster and a slot in it rather than the entry alone, because an entry's
+/// path-dependence mark can live outside the entry.
 pub struct TTWriter<'a> {
-    entry: &'a TTEntry,
+    cluster: &'a Cluster,
+    slot: usize,
 }
 
 impl<'a> TTWriter<'a> {
     #[inline]
-    fn new(entry: &'a TTEntry) -> Self {
-        TTWriter { entry }
+    fn new(cluster: &'a Cluster, slot: usize) -> Self {
+        TTWriter { cluster, slot }
     }
 
     /// Store data into the targeted entry, subject to the replacement policy
@@ -828,9 +985,21 @@ impl<'a> TTWriter<'a> {
         mv: u16,
         eval: Value,
         generation: u8,
+        #[cfg(feature = "verbose3")] path_dep: bool,
     ) {
-        self.entry
-            .save(tte_key(key), value, pv, bound, depth, mv, eval, generation);
+        self.cluster.save(
+            self.slot,
+            tte_key(key),
+            value,
+            pv,
+            bound,
+            depth,
+            mv,
+            eval,
+            generation,
+            #[cfg(feature = "verbose3")]
+            path_dep,
+        );
     }
 }
 
@@ -897,7 +1066,10 @@ mod alloc_tests {
                 assert_eq!(e.value16.load(REL), 0);
                 assert_eq!(e.eval16.load(REL), 0);
             }
+            #[cfg(any(not(feature = "verbose3"), feature = "tt-entry16"))]
             assert_eq!(cluster._padding, [0u8; CLUSTER_PADDING]);
+            #[cfg(all(feature = "verbose3", not(feature = "tt-entry16")))]
+            assert_eq!(cluster.marks.load(REL), 0);
         }
     }
 

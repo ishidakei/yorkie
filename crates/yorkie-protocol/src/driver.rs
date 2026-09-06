@@ -1711,6 +1711,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             move16,
             args.eval,
             generation,
+            args.path_dep,
         );
 
         // Verify rather than assume. `move16 == 0` is excluded from the
@@ -1724,6 +1725,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             && data.depth == args.depth
             && data.bound == args.bound
             && data.is_pv == args.pv
+            && data.path_dep == args.path_dep
             && (move16 == 0 || data.move16 == move16);
         if stored {
             self.info_string("tt store ok")
@@ -1803,7 +1805,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 }
 
 /// The labelled body shared by `tt probe hit` and `tt child` lines:
-/// `move <usi|none> value <score> depth <d> bound <b> eval <score> pv <bool>`.
+/// `move <usi|none> value <score> depth <d> bound <b> eval <score> pv <bool>
+/// pathdep <0|1>`.
 ///
 /// `legal` is the legal-move list of the position the entry belongs to, used to
 /// widen the stored 16-bit fragment exactly as the search does: a fragment with
@@ -1822,12 +1825,13 @@ fn tt_entry_fields(data: &TTData, legal: &[Move], ply: i32) -> String {
         .find(|m| m.move16() == data.move16)
         .map_or_else(|| "none".to_string(), format_usi_move);
     format!(
-        "move {mv} value {} depth {} bound {} eval {} pv {}",
+        "move {mv} value {} depth {} bound {} eval {} pv {} pathdep {}",
         tt_score_field(value_from_tt(data.value, ply)),
         data.depth,
         bound_name(data.bound),
         tt_score_field(data.eval),
         data.is_pv,
+        data.path_dep as u8,
     )
 }
 

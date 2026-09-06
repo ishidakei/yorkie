@@ -24,6 +24,11 @@
 //! Centipawn arguments and output use the reference USI scale, so `tt` speaks
 //! the same numbers as an `info … score cp N` line. That mapping is lossy in
 //! both directions, so a `cp` round trip quantises; `mate` arguments are exact.
+//!
+//! The entry's path-dependence mark is on the surface too: `tt store` takes an
+//! optional `pathdep <0|1>` (`0` when omitted) and `tt probe` / `tt children`
+//! report it, so an entry's mark can be written and read from outside without
+//! a search having to produce it.
 
 use yorkie_storage::{Bound, DEPTH_NONE, Depth, Value};
 
@@ -90,6 +95,8 @@ pub struct TtStoreArgs {
     /// Static eval in internal units (the entry's `eval16` field).
     pub eval: Value,
     pub pv: bool,
+    /// The entry's path-dependence mark (`false` when the clause is omitted).
+    pub path_dep: bool,
 }
 
 /// One parsed `tt` invocation.
@@ -165,6 +172,7 @@ fn parse_store(tokens: &[&str]) -> Result<TtStoreArgs, TtParseError> {
     let mut bound: Option<Bound> = None;
     let mut eval: Option<Value> = None;
     let mut pv = false;
+    let mut path_dep: Option<bool> = None;
 
     let mut i = 0;
     while i < tokens.len() {
@@ -225,6 +233,11 @@ fn parse_store(tokens: &[&str]) -> Result<TtStoreArgs, TtParseError> {
                 pv = true;
                 i += 1;
             }
+            "pathdep" => {
+                reject_duplicate(&path_dep, "pathdep")?;
+                path_dep = Some(parse_path_dep(operand(tokens, i, "pathdep")?)?);
+                i += 2;
+            }
             other => {
                 return Err(err(format!("unexpected token `{other}` in `tt store`")));
             }
@@ -239,7 +252,17 @@ fn parse_store(tokens: &[&str]) -> Result<TtStoreArgs, TtParseError> {
         bound: bound.ok_or_else(|| missing("bound <exact|lower|upper>"))?,
         eval: eval.ok_or_else(|| missing("eval <cp>"))?,
         pv,
+        path_dep: path_dep.unwrap_or(false),
     })
+}
+
+/// The `pathdep` operand: the same `0` / `1` spelling the field is reported in.
+fn parse_path_dep(tok: &str) -> Result<bool, TtParseError> {
+    match tok {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        other => Err(err(format!("`pathdep` takes `0` or `1`, found `{other}`"))),
+    }
 }
 
 fn missing(clause: &str) -> TtParseError {
@@ -405,12 +428,13 @@ mod tests {
                 bound: Bound::Exact,
                 eval: 45,
                 pv: true,
+                path_dep: false,
             })
         );
     }
 
     #[test]
-    fn pv_flag_defaults_to_false_and_cp_synonym_is_accepted() {
+    fn pv_and_pathdep_default_to_false_and_cp_synonym_is_accepted() {
         let cmd = parse("store startpos move none value cp 0 depth 0 bound lower eval cp 0")
             .expect("parses");
         assert_eq!(
@@ -423,8 +447,42 @@ mod tests {
                 bound: Bound::Lower,
                 eval: 0,
                 pv: false,
+                path_dep: false,
             })
         );
+    }
+
+    #[test]
+    fn pathdep_takes_zero_or_one_and_nothing_else() {
+        let stored = |arg: &str| {
+            parse(&format!(
+                "store startpos move none value 0 depth 1 bound exact eval 0 pathdep {arg}"
+            ))
+        };
+        let TtCommand::Store(one) = stored("1").expect("`pathdep 1` parses") else {
+            panic!("`store` parses as a store");
+        };
+        assert!(one.path_dep);
+        let TtCommand::Store(zero) = stored("0").expect("`pathdep 0` parses") else {
+            panic!("`store` parses as a store");
+        };
+        assert!(!zero.path_dep);
+
+        for arg in ["true", "2", "-1", "yes"] {
+            assert!(stored(arg).is_err(), "`pathdep {arg}` must be rejected");
+        }
+        // Operand-less and duplicated, as every other clause is checked.
+        assert!(
+            parse("store startpos move none value 0 depth 1 bound exact eval 0 pathdep").is_err()
+        );
+        assert!(
+            parse(
+                "store startpos move none value 0 depth 1 bound exact eval 0 pathdep 1 pathdep 0"
+            )
+            .is_err()
+        );
+        // `probe` / `children` take a position clause and nothing else.
+        assert!(parse("probe startpos pathdep 1").is_err());
     }
 
     #[test]

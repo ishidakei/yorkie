@@ -48,7 +48,7 @@ fn key_mid(hi: u64, mid: u64, frag: u16) -> u64 {
 }
 
 /// Probe `k` and store through the returned writer, at the table's current
-/// generation.
+/// generation, leaving the entry unmarked.
 #[allow(clippy::too_many_arguments)]
 fn store(
     tt: &mut TranspositionTable,
@@ -63,7 +63,18 @@ fn store(
 ) {
     let generation = tt.generation();
     let (_, _, w) = tt.probe(k, side);
-    w.write(k, value, pv, bound, depth, mv, eval, generation);
+    w.write(
+        k,
+        value,
+        pv,
+        bound,
+        depth,
+        mv,
+        eval,
+        generation,
+        #[cfg(feature = "verbose3")]
+        false,
+    );
 }
 
 #[cfg_attr(miri, ignore)]
@@ -88,6 +99,8 @@ fn store_probe_round_trip_every_field() {
         0x0abc,
         -654,
         tt_generation_zero(),
+        #[cfg(feature = "verbose3")]
+        false,
     );
 
     // Hit: every field survives the round trip.
@@ -208,31 +221,35 @@ fn replacement_evicts_lowest_priority_entry() {
     // Both written at generation 0, so every relative_age is 0 and
     // replace_priority == depth8 == depth − DEPTH_NONE.
     //
-    //   slot 0: frag 1, depth 10 → depth8 13, priority 13
-    //   slot 1: frag 2, depth  5 → depth8  8, priority  8   ← lowest
+    //   slot 0: frag 2, depth 10 → depth8 13, priority 13
+    //   slot 1: frag 4, depth  5 → depth8  8, priority  8   ← lowest
     //
-    // The cluster is now full, so a miss replaces slot 1 (frag 2).
+    // The cluster is now full, so a miss replaces slot 1 (frag 4).
+    //
+    // The fragments are spaced by two because key bit 0 is the
+    // path-dependence mark at `verbose3`, so consecutive ones would name the
+    // same entry there.
     let mut tt = TranspositionTable::new();
     tt.resize(1);
     let side = 0;
     let hi = 100;
 
-    store(&mut tt, key(hi, 1), side, 0, false, Bound::Lower, 10, 1, 0);
-    store(&mut tt, key(hi, 2), side, 0, false, Bound::Lower, 5, 2, 0);
+    store(&mut tt, key(hi, 2), side, 0, false, Bound::Lower, 10, 1, 0);
+    store(&mut tt, key(hi, 4), side, 0, false, Bound::Lower, 5, 2, 0);
 
     // Both present before the eviction.
-    assert!(tt.probe(key(hi, 1), side).0);
     assert!(tt.probe(key(hi, 2), side).0);
+    assert!(tt.probe(key(hi, 4), side).0);
 
-    // Miss on frag 3 → writer targets the evicted slot; write frag 3 there.
-    store(&mut tt, key(hi, 3), side, 0, false, Bound::Lower, 1, 3, 0);
+    // Miss on frag 6 → writer targets the evicted slot; write frag 6 there.
+    store(&mut tt, key(hi, 6), side, 0, false, Bound::Lower, 1, 3, 0);
 
     assert!(
-        !tt.probe(key(hi, 2), side).0,
-        "frag 2 (depth 5) should have been evicted"
+        !tt.probe(key(hi, 4), side).0,
+        "frag 4 (depth 5) should have been evicted"
     );
-    assert!(tt.probe(key(hi, 1), side).0, "frag 1 should survive");
-    assert!(tt.probe(key(hi, 3), side).0, "frag 3 should now be present");
+    assert!(tt.probe(key(hi, 2), side).0, "frag 2 should survive");
+    assert!(tt.probe(key(hi, 6), side).0, "frag 6 should now be present");
 }
 
 #[cfg_attr(miri, ignore)]
@@ -292,11 +309,15 @@ fn generation_aging_lowers_replacement_priority() {
 #[cfg(feature = "tt-entry16")]
 fn generation_aging_lowers_replacement_priority() {
     // After three new_search() bumps the table is at generation 3:
-    //   P: frag 1, depth 20, gen 0 → depth8 23, age 3, priority 23 − 24 = −1  ← lowest
-    //   Q: frag 2, depth  3, gen 3 → depth8  6, age 0, priority  6
+    //   P: frag 2, depth 20, gen 0 → depth8 23, age 3, priority 23 − 24 = −1  ← lowest
+    //   Q: frag 4, depth  3, gen 3 → depth8  6, age 0, priority  6
     //
     // Without aging P's priority would be 23 — higher than Q's 6, so Q would be
     // the victim. Aging flips the order and the miss evicts P instead.
+    //
+    // The fragments are spaced by two because key bit 0 is the
+    // path-dependence mark at `verbose3`, so consecutive ones would name the
+    // same entry there.
     let mut tt = TranspositionTable::new();
     tt.resize(1);
     let side = 0;
@@ -304,30 +325,30 @@ fn generation_aging_lowers_replacement_priority() {
 
     // P written at generation 0.
     assert_eq!(tt.generation(), 0);
-    store(&mut tt, key(hi, 1), side, 0, false, Bound::Lower, 20, 1, 0);
+    store(&mut tt, key(hi, 2), side, 0, false, Bound::Lower, 20, 1, 0);
 
     // Advance to generation 3, then write Q.
     tt.new_search();
     tt.new_search();
     tt.new_search();
     assert_eq!(tt.generation(), 3);
-    store(&mut tt, key(hi, 2), side, 0, false, Bound::Lower, 3, 2, 0);
+    store(&mut tt, key(hi, 4), side, 0, false, Bound::Lower, 3, 2, 0);
 
     // Sanity: both occupy the cluster.
-    assert!(tt.probe(key(hi, 1), side).0);
     assert!(tt.probe(key(hi, 2), side).0);
+    assert!(tt.probe(key(hi, 4), side).0);
 
-    // Miss → evicts the aged, deep entry P (frag 1), not the shallow fresh Q.
-    store(&mut tt, key(hi, 3), side, 0, false, Bound::Lower, 1, 3, 3);
+    // Miss → evicts the aged, deep entry P (frag 2), not the shallow fresh Q.
+    store(&mut tt, key(hi, 6), side, 0, false, Bound::Lower, 1, 3, 3);
     assert!(
-        !tt.probe(key(hi, 1), side).0,
+        !tt.probe(key(hi, 2), side).0,
         "aged deep entry P should be evicted"
     );
     assert!(
-        tt.probe(key(hi, 2), side).0,
+        tt.probe(key(hi, 4), side).0,
         "fresh shallow entry Q should survive"
     );
-    assert!(tt.probe(key(hi, 3), side).0, "frag 3 should now be present");
+    assert!(tt.probe(key(hi, 6), side).0, "frag 6 should now be present");
 }
 
 /// The entry-count half of the `tt-entry16` trade, as behaviour rather than a
@@ -340,12 +361,19 @@ fn a_cluster_holds_exactly_cluster_size_positions() {
     let side = 0;
     let hi = 555;
 
+    // Fragments are spaced by two: under `verbose3` the wide layout spends key
+    // bit 0 on the path-dependence mark, so a family of consecutive fragments
+    // would hold two positions that are one and the same entry there.
+    let frag = |i: u16| i * 2;
+
     // Equal depth throughout, so nothing is preferentially retained and the
     // test turns purely on capacity.
-    for f in 1..=CLUSTER_ENTRIES as u16 {
+    for i in 1..=CLUSTER_ENTRIES as u16 {
+        let f = frag(i);
         store(&mut tt, key(hi, f), side, 0, false, Bound::Lower, 7, f, 0);
     }
-    for f in 1..=CLUSTER_ENTRIES as u16 {
+    for i in 1..=CLUSTER_ENTRIES as u16 {
+        let f = frag(i);
         assert!(
             tt.probe(key(hi, f), side).0,
             "a full cluster must retain all {CLUSTER_ENTRIES} of its entries (frag {f} missing)"
@@ -354,7 +382,7 @@ fn a_cluster_holds_exactly_cluster_size_positions() {
 
     // One more distinct position than the cluster can hold: it is stored, and
     // exactly one of the previous occupants is gone.
-    let extra = CLUSTER_ENTRIES as u16 + 1;
+    let extra = frag(CLUSTER_ENTRIES as u16 + 1);
     store(
         &mut tt,
         key(hi, extra),
@@ -368,7 +396,7 @@ fn a_cluster_holds_exactly_cluster_size_positions() {
     );
     assert!(tt.probe(key(hi, extra), side).0, "the new entry is present");
     let survivors = (1..=CLUSTER_ENTRIES as u16)
-        .filter(|&f| tt.probe(key(hi, f), side).0)
+        .filter(|&i| tt.probe(key(hi, frag(i)), side).0)
         .count();
     assert_eq!(
         survivors,
@@ -548,9 +576,11 @@ fn fresh_resize_reads_back_all_misses() {
     tt.resize(2);
     for hi in 0..2048u64 {
         for side in 0..2u8 {
-            // A nonzero fragment cannot match a zeroed entry's `key == 0`, so
-            // the probe takes the true miss path.
-            let k = key(hi & 0x7fff, (hi as u16).wrapping_mul(7) | 1);
+            // A fragment that is nonzero *above bit 0* cannot match a zeroed
+            // entry's `key == 0`, so the probe takes the true miss path. Bit 0
+            // is excluded because the `verbose3` wide layout stores the
+            // path-dependence mark there rather than the hash.
+            let k = key(hi & 0x7fff, (hi as u16).wrapping_mul(7) | 2);
             let (found, data, _) = tt.probe(k, side);
             assert!(!found, "fresh table entry occupied at hi={hi}");
             assert_eq!(data, miss_sentinel());
@@ -671,6 +701,8 @@ fn miss_sentinel() -> TTData {
         depth: DEPTH_NONE,
         bound: Bound::None,
         is_pv: false,
+        #[cfg(feature = "verbose3")]
+        path_dep: false,
     }
 }
 
@@ -828,5 +860,225 @@ mod narrow_key_identity {
         assert!(found_a);
         assert_eq!(data_a.value, 222, "the two share one entry");
         assert_eq!(data_a.move16, 0x22);
+    }
+}
+
+/// The per-entry path-dependence mark, which exists only at `verbose3`. The
+/// search's rule for *when* an entry is marked is the Search layer's; what is
+/// pinned here is that a mark written for one entry comes back for that entry
+/// and no other, follows the payload through the replacement policy, and is
+/// part of what [`TranspositionTable::checksum`] summarises.
+#[cfg(feature = "verbose3")]
+mod path_dependence_mark {
+    use super::*;
+
+    /// [`store`], with the mark it leaves unmarked spelled out.
+    #[allow(clippy::too_many_arguments)]
+    fn store_marked(
+        tt: &mut TranspositionTable,
+        k: u64,
+        side: u8,
+        value: i32,
+        pv: bool,
+        bound: Bound,
+        depth: i32,
+        mv: u16,
+        eval: i32,
+        path_dep: bool,
+    ) {
+        let generation = tt.generation();
+        let (_, _, w) = tt.probe(k, side);
+        w.write(k, value, pv, bound, depth, mv, eval, generation, path_dep);
+    }
+
+    /// `CLUSTER_ENTRIES` keys that share one cluster, spaced so no two of them
+    /// differ only in the key bit the wide layout spends on the mark.
+    fn cluster_family(hi: u64) -> Vec<u64> {
+        (0..CLUSTER_ENTRIES)
+            .map(|i| key(hi, 0x10 + (i as u16) * 0x10))
+            .collect()
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_stored_mark_reads_back_and_a_rewrite_replaces_it() {
+        let mut tt = TranspositionTable::new();
+        tt.resize(1);
+        let side = 0;
+        let k = key(64, 0x0102);
+
+        store_marked(&mut tt, k, side, 10, false, Bound::Exact, 8, 0x11, 0, true);
+        assert!(tt.probe(k, side).1.path_dep);
+
+        // The same slot, rewritten unmarked: the mark follows the payload
+        // rather than accumulating.
+        store_marked(&mut tt, k, side, 20, false, Bound::Exact, 8, 0x11, 0, false);
+        let (found, data, _) = tt.probe(k, side);
+        assert!(found);
+        assert_eq!(data.value, 20);
+        assert!(!data.path_dep);
+    }
+
+    /// A miss carries no mark, whatever the entry it would replace holds.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn the_miss_sentinel_is_unmarked() {
+        let mut tt = TranspositionTable::new();
+        tt.resize(1);
+        let side = 0;
+
+        store_marked(
+            &mut tt,
+            key(70, 0x0001),
+            side,
+            10,
+            false,
+            Bound::Exact,
+            8,
+            0x11,
+            0,
+            true,
+        );
+        let (found, data, _) = tt.probe(key(70, 0x0002), side);
+        assert!(!found);
+        assert_eq!(data, miss_sentinel());
+    }
+
+    /// Every entry of one cluster carries its own mark. In the default layout
+    /// they share a single word, so this is what says the per-slot writes do
+    /// not clobber each other.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn entries_sharing_a_cluster_keep_their_own_marks() {
+        let mut tt = TranspositionTable::new();
+        tt.resize(1);
+        let side = 1;
+        let family = cluster_family(88);
+
+        // Alternate the marks, so neither an all-set nor an all-clear word
+        // would pass.
+        for (i, &k) in family.iter().enumerate() {
+            store_marked(
+                &mut tt,
+                k,
+                side,
+                i as i32,
+                false,
+                Bound::Exact,
+                8,
+                0x20 + i as u16,
+                0,
+                i % 2 == 0,
+            );
+        }
+        for (i, &k) in family.iter().enumerate() {
+            let (found, data, _) = tt.probe(k, side);
+            assert!(found, "entry {i} must still be there");
+            assert_eq!(data.value, i as i32);
+            assert_eq!(data.path_dep, i % 2 == 0, "entry {i} carries its own mark");
+        }
+
+        // Rewriting one entry's mark leaves its neighbours' alone.
+        store_marked(
+            &mut tt,
+            family[0],
+            side,
+            0,
+            false,
+            Bound::Exact,
+            8,
+            0x20,
+            0,
+            false,
+        );
+        for (i, &k) in family.iter().enumerate() {
+            let expected = i != 0 && i % 2 == 0;
+            assert_eq!(tt.probe(k, side).1.path_dep, expected, "entry {i}");
+        }
+    }
+
+    /// A write the replacement policy declines leaves the mark as it is, like
+    /// every other field of the entry it kept.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_declined_write_leaves_the_mark_alone() {
+        let mut tt = TranspositionTable::new();
+        tt.resize(1);
+        let side = 0;
+        let k = key(96, 0x0303);
+
+        store_marked(&mut tt, k, side, 10, true, Bound::Exact, 40, 0x11, 0, true);
+        // Shallow, non-exact, same position and generation: declined.
+        store_marked(&mut tt, k, side, 99, false, Bound::Lower, 1, 0x22, 0, false);
+
+        let (found, data, _) = tt.probe(k, side);
+        assert!(found);
+        assert_eq!(data.value, 10, "the declined write kept the deep entry");
+        assert!(data.path_dep, "and with it the mark");
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn clear_drops_the_marks_with_the_entries() {
+        let mut tt = TranspositionTable::new();
+        tt.resize(1);
+        let side = 0;
+        let empty = tt.checksum();
+
+        for &k in &cluster_family(112) {
+            store_marked(&mut tt, k, side, 1, false, Bound::Exact, 8, 0x11, 0, true);
+        }
+        tt.clear();
+        assert_eq!(
+            tt.checksum(),
+            empty,
+            "a cleared table must be indistinguishable from a fresh one"
+        );
+    }
+
+    /// The checksum summarises everything the table stores, the mark included,
+    /// so two runs that differ in nothing else still differ in it.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn the_checksum_covers_the_mark() {
+        let checksum_with = |path_dep: bool| {
+            let mut tt = TranspositionTable::new();
+            tt.resize(1);
+            store_marked(
+                &mut tt,
+                key(128, 0x0404),
+                0,
+                7,
+                false,
+                Bound::Exact,
+                8,
+                0x11,
+                0,
+                path_dep,
+            );
+            tt.checksum()
+        };
+        assert_eq!(checksum_with(false), checksum_with(false));
+        assert_ne!(checksum_with(false), checksum_with(true));
+    }
+
+    /// Under `tt-entry16` the mark is bit 0 of the stored key, so identity is
+    /// the remaining 63 bits: two keys differing only there share an entry.
+    /// That is the whole price of putting it in the key.
+    #[cfg(feature = "tt-entry16")]
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn the_wide_layout_spends_key_bit_zero_on_the_mark() {
+        let mut tt = TranspositionTable::new();
+        tt.resize(1);
+        let side = 0;
+        let a = key(144, 0x0500);
+        let b = a | 1;
+
+        store_marked(&mut tt, a, side, 11, false, Bound::Exact, 8, 0x11, 0, true);
+        let (found, data, _) = tt.probe(b, side);
+        assert!(found, "bit 0 is the mark, not part of the identity");
+        assert_eq!(data.value, 11);
+        assert!(data.path_dep);
     }
 }
