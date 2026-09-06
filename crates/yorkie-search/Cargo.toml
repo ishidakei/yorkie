@@ -19,8 +19,15 @@ serde_json = "~1.0"
 # Re-exported from the Storage layer so this crate's code and tests can `cfg` on
 # it: the wide TT changes which probes hit, so the reference-captured parity
 # gates cannot hold and are compiled out under it. Off by default.
+#
+# `verbose2` is the Protocol layer's verbosity level, propagated down (and on to
+# the Storage layer) so the fields a search `info` line needs but a quieter build
+# never prints — currently the transposition table's `hashfull` occupancy — are
+# absent from the compiled crate below that level rather than merely unused. Off
+# by default.
 [features]
 tt-entry16 = ["yorkie-storage/tt-entry16"]
+verbose2 = ["yorkie-storage/verbose2"]
 
 [lints]
 workspace = true

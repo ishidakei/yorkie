@@ -42,12 +42,17 @@ serde_json = "~1.0"
 # the response payload of a `verbose3` command, so they ride on that level alone
 # and no `info` line is involved in gating them.
 #
+# `verbose2` also turns on the Search layer's feature of the same name (and,
+# through it, the Storage layer's), because a search `info` line carries a field
+# those layers must produce: the transposition table's `hashfull` occupancy.
+# Below that level neither the field nor the method behind it is compiled at all.
+#
 # `tt-entry16` is the Storage-layer entry-widening feature, re-exported so this
 # crate's session tests can `cfg` on it. Off by default, and orthogonal to the
 # verbosity axis.
 [features]
 verbose1 = []
-verbose2 = ["verbose1"]
+verbose2 = ["verbose1", "yorkie-search/verbose2"]
 verbose3 = ["verbose2"]
 tt-entry16 = ["yorkie-search/tt-entry16", "yorkie-storage/tt-entry16"]
 

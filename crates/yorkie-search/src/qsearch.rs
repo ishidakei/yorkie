@@ -573,6 +573,10 @@ pub struct PvInfo {
     pub bound: PvBound,
     /// `info.nodes`.
     pub nodes: u64,
+    /// The transposition table's occupancy in permille at the moment the line
+    /// was assembled (`TranspositionTable::hashfull`, `maxAge = 0`).
+    #[cfg(feature = "verbose2")]
+    pub hashfull: u32,
     /// `info.pv` as moves (the Protocol layer joins them into USI text).
     pub pv: Vec<Move>,
 }
@@ -2029,6 +2033,11 @@ impl QSearch<'_> {
             .pv_config
             .as_ref()
             .is_some_and(|c| c.consideration_mode);
+        // The reference reads the occupancy again for each line it prints, but
+        // no search runs between the lines of one call, so one read serves them
+        // all.
+        #[cfg(feature = "verbose2")]
+        let hashfull = self.tt.hashfull(0);
         let mut out = Vec::with_capacity(multi_pv);
         for (i, rm) in root_moves.iter().enumerate().take(multi_pv) {
             let updated = rm.score != -VALUE_INFINITE;
@@ -2067,6 +2076,8 @@ impl QSearch<'_> {
                 score: v,
                 bound,
                 nodes,
+                #[cfg(feature = "verbose2")]
+                hashfull,
                 pv,
             });
         }

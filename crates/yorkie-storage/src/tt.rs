@@ -581,6 +581,10 @@ impl TranspositionTable {
     /// Approximate table occupancy in permille, counting only entries younger
     /// than `max_age` (`TranspositionTable::hashfull`). Samples the first 1000
     /// clusters; the table must hold at least that many.
+    ///
+    /// Its only consumer is the search `info` line's `hashfull` field, so it is
+    /// compiled only into a build that prints one.
+    #[cfg(feature = "verbose2")]
     pub fn hashfull(&self, max_age: u8) -> u32 {
         let generation = self.generation8.load(REL);
         let mut cnt = 0u32;

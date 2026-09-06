@@ -33,8 +33,15 @@ libc = "0.2"
 #
 # Off by default. With it on the probe-hit pattern changes, so search output
 # matches neither the default build's nor the reference's.
+#
+# `verbose2` is the Protocol layer's verbosity level, propagated down so the
+# occupancy statistic the search `info` lines carry (`hashfull`) can be gated
+# here rather than left to the optimizer: below that level the crate compiles
+# without `TranspositionTable::hashfull` at all. It changes nothing else about
+# the table, and is off by default like every level of that axis.
 [features]
 tt-entry16 = []
+verbose2 = []
 
 [lints]
 workspace = true
