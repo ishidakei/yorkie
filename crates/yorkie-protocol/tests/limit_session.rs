@@ -45,10 +45,34 @@ fn start_ready() -> StreamHarness {
     h
 }
 
+/// Drop the clock-derived `nps` / `time` fields from an `info` line. Two
+/// searches over an identical node sequence report identical everything else,
+/// but each measures its own wall clock, so a comparison has to leave those two
+/// out. Scanning stops at `pv`, whose tail is moves.
+fn without_clock_fields(line: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut toks = line.split_whitespace();
+    while let Some(tok) = toks.next() {
+        match tok {
+            "nps" | "time" => {
+                toks.next();
+            }
+            "pv" => {
+                kept.push(tok);
+                kept.extend(toks);
+                break;
+            }
+            _ => kept.push(tok),
+        }
+    }
+    kept.join(" ")
+}
+
 /// One summary per completed search in `out`: each search's last `info depth …`
-/// line joined with its `bestmove …` line, in order. Loading the synthetic
-/// network dominates a session's cost, so tests that compare two searches run
-/// both in *one* session and split the transcript here.
+/// line — minus its wall-clock fields — joined with its `bestmove …` line, in
+/// order. Loading the synthetic network dominates a session's cost, so tests
+/// that compare two searches run both in *one* session and split the transcript
+/// here.
 ///
 /// Which `info` line ends up last is only meaningful when the PV is not
 /// throttled: under a non-zero `PvInterval` the per-iteration PV is gated on the
@@ -61,7 +85,7 @@ fn go_summaries(out: &str) -> Vec<String> {
         if line.starts_with("info depth") {
             cur_info = line;
         } else if line.starts_with("bestmove") {
-            res.push(format!("{cur_info}\n{line}"));
+            res.push(format!("{}\n{line}", without_clock_fields(cur_info)));
             cur_info = "";
         }
     }

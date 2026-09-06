@@ -1845,12 +1845,9 @@ fn tt_score_field(v: Value) -> String {
 }
 
 /// Write one PV `info` line from a [`PvInfo`] — the reference's
-/// `on_update_full` (`usi.cpp`) as this port surfaces it.
-///
-/// The reference's clock-derived `nps` / `time` decorations are omitted so the
-/// `info` line does not vary with how fast the machine ran it; `hashfull` is a
-/// function of what the search stored, so it stays. `seldepth` / `multipv` are
-/// always emitted.
+/// `on_update_full` (`usi.cpp`) as this port surfaces it, carrying every field
+/// the reference prints and in its order: `nodes nps hashfull time pv`.
+/// `seldepth` / `multipv` are always emitted.
 ///
 /// `verbose2` only: the default build renders no PV line.
 #[cfg(feature = "verbose2")]
@@ -1859,6 +1856,7 @@ fn write_pv_info<W: Write + ?Sized>(w: &mut W, info: &PvInfo) -> io::Result<()> 
     let mut index_digits = NumBuffer::new();
     let mut node_digits = NumBuffer::new();
     let mut permille_digits = NumBuffer::new();
+    let mut clock_digits = NumBuffer::new();
 
     // Comfortably past the fixed part of the line, so only a long PV regrows.
     let mut body = String::with_capacity(64);
@@ -1877,8 +1875,12 @@ fn write_pv_info<W: Write + ?Sized>(w: &mut W, info: &PvInfo) -> io::Result<()> 
     }
     body.push_str(" nodes ");
     body.push_str(info.nodes.format_into(&mut node_digits));
+    body.push_str(" nps ");
+    body.push_str(info.nps.format_into(&mut clock_digits));
     body.push_str(" hashfull ");
     body.push_str(info.hashfull.format_into(&mut permille_digits));
+    body.push_str(" time ");
+    body.push_str(info.time_ms.format_into(&mut clock_digits));
     if !info.pv.is_empty() {
         body.push_str(" pv");
         for m in &info.pv {
@@ -2164,7 +2166,9 @@ fn pv_string(pv: &[Move]) -> String {
 ///
 /// Under `go ponder` / `go infinite` the final line and `bestmove` are held
 /// until `stop` or `ponderhit`, reusing the async-stop machinery rather than
-/// busy-waiting.
+/// busy-waiting. `time_ms` is stamped once, when the book answered, so the hold
+/// does not inflate the elapsed time attributed to the reply; no search ran, so
+/// both `nodes` and `nps` are 0 on every line.
 ///
 /// Both `info` blocks are `verbose2`; the hold and the `bestmove` are not, so
 /// a default build answers a book hit with the move and nothing else.
@@ -2173,6 +2177,7 @@ fn emit_book_hit<W: Write>(
     writer: &Arc<Mutex<W>>,
     hit: &BookHit,
     #[cfg(feature = "verbose2")] hashfull: u32,
+    #[cfg(feature = "verbose2")] time_ms: u64,
     ponder: Option<&Arc<PonderSignal>>,
     infinite: bool,
     stop: &AtomicBool,
@@ -2187,7 +2192,8 @@ fn emit_book_hit<W: Write>(
         let mut f = Formatter::new(&mut *guard);
         for line in &hit.info_lines {
             let body = format!(
-                "depth {} seldepth 0 multipv {} score {} nodes 0 hashfull {hashfull} pv {}",
+                "depth {} seldepth 0 multipv {} score {} nodes 0 nps 0 \
+                 hashfull {hashfull} time {time_ms} pv {}",
                 line.depth,
                 line.multipv,
                 format_score(Value::from(line.score)),
@@ -2229,7 +2235,8 @@ fn emit_book_hit<W: Write>(
     let mut f = Formatter::new(&mut *guard);
     #[cfg(feature = "verbose2")]
     let _ = f.info(&format!(
-        "depth 0 seldepth 0 multipv 1 score {} nodes 0 hashfull {hashfull} pv {pv}",
+        "depth 0 seldepth 0 multipv 1 score {} nodes 0 nps 0 \
+         hashfull {hashfull} time {time_ms} pv {pv}",
         format_score(Value::from(hit.value)),
     ));
     let _ = f.bestmove(&bm);
@@ -3071,11 +3078,20 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
             emit_info_string_diag(&writer, diag);
         }
         if let Some(hit) = probed.hit {
+            // `tm.elapsed_time()` at the moment the book answered, floored at 1
+            // — the `time` the reply's `info` lines carry.
+            #[cfg(feature = "verbose2")]
+            let book_time_ms = (Instant::now()
+                .saturating_duration_since(pv_config.start_time)
+                .as_millis() as u64)
+                .max(1);
             emit_book_hit(
                 &writer,
                 &hit,
                 #[cfg(feature = "verbose2")]
                 tt.hashfull(0),
+                #[cfg(feature = "verbose2")]
+                book_time_ms,
                 ponder.as_ref(),
                 infinite,
                 &stop,
@@ -3353,7 +3369,9 @@ mod tests {
             score,
             bound,
             nodes: 1_234_567_890,
+            nps: 2_469_135_780,
             hashfull: 314,
+            time_ms: 500,
             pv: pv
                 .iter()
                 .map(|s| parse_usi_move(s, &pos).expect("fixture move parses"))
@@ -3370,21 +3388,21 @@ mod tests {
     fn pv_info_line_is_byte_exact() {
         assert_eq!(
             pv_line(&pv_info_fixture(90, PvBound::Exact, &["7g7f", "3c3d"])),
-            "info depth 12 seldepth 19 multipv 2 score cp 100 nodes 1234567890 hashfull 314 pv 7g7f 3c3d\n"
+            "info depth 12 seldepth 19 multipv 2 score cp 100 nodes 1234567890 nps 2469135780 hashfull 314 time 500 pv 7g7f 3c3d\n"
         );
         // Truncating division toward zero, negative side.
         assert_eq!(
             pv_line(&pv_info_fixture(-95, PvBound::Lower, &["7g7f"])),
-            "info depth 12 seldepth 19 multipv 2 score cp -105 lowerbound nodes 1234567890 hashfull 314 pv 7g7f\n"
+            "info depth 12 seldepth 19 multipv 2 score cp -105 lowerbound nodes 1234567890 nps 2469135780 hashfull 314 time 500 pv 7g7f\n"
         );
         assert_eq!(
             pv_line(&pv_info_fixture(0, PvBound::Upper, &[])),
-            "info depth 12 seldepth 19 multipv 2 score cp 0 upperbound nodes 1234567890 hashfull 314\n"
+            "info depth 12 seldepth 19 multipv 2 score cp 0 upperbound nodes 1234567890 nps 2469135780 hashfull 314 time 500\n"
         );
         // Decisive scores switch to `mate <distance>`, signed by the side.
         assert_eq!(
             pv_line(&pv_info_fixture(VALUE_MATE - 5, PvBound::Exact, &["7g7f"])),
-            "info depth 12 seldepth 19 multipv 2 score mate 5 nodes 1234567890 hashfull 314 pv 7g7f\n"
+            "info depth 12 seldepth 19 multipv 2 score mate 5 nodes 1234567890 nps 2469135780 hashfull 314 time 500 pv 7g7f\n"
         );
         assert_eq!(
             pv_line(&pv_info_fixture(
@@ -3392,13 +3410,13 @@ mod tests {
                 PvBound::Exact,
                 &["7g7f"]
             )),
-            "info depth 12 seldepth 19 multipv 2 score mate -5 nodes 1234567890 hashfull 314 pv 7g7f\n"
+            "info depth 12 seldepth 19 multipv 2 score mate -5 nodes 1234567890 nps 2469135780 hashfull 314 time 500 pv 7g7f\n"
         );
     }
 
-    /// A drop move, the `depth 0` / `nodes 0` extremes and both ends of the
-    /// `hashfull` permille range still round-trip byte-for-byte (the digit paths
-    /// that `NumBuffer` now owns).
+    /// A drop move, the `depth 0` / `nodes 0` / `nps 0` extremes, the floored
+    /// `time 1`, and both ends of the `hashfull` permille range still round-trip
+    /// byte-for-byte (the digit paths that `NumBuffer` now owns).
     #[cfg(feature = "verbose2")]
     #[test]
     fn pv_info_line_covers_zero_and_drop_extremes() {
@@ -3407,10 +3425,12 @@ mod tests {
         info.sel_depth = 0;
         info.multipv = 1;
         info.nodes = 0;
+        info.nps = 0;
         info.hashfull = 0;
+        info.time_ms = 1;
         assert_eq!(
             pv_line(&info),
-            "info depth 0 seldepth 0 multipv 1 score cp 0 nodes 0 hashfull 0\n"
+            "info depth 0 seldepth 0 multipv 1 score cp 0 nodes 0 nps 0 hashfull 0 time 1\n"
         );
 
         let pos = parse_sfen("4k4/9/9/9/9/9/9/9/4K4 b P 1").expect("sfen parses");
@@ -3418,7 +3438,7 @@ mod tests {
         info.hashfull = 1000;
         assert_eq!(
             pv_line(&info),
-            "info depth 0 seldepth 0 multipv 1 score cp 0 nodes 0 hashfull 1000 pv P*5e\n"
+            "info depth 0 seldepth 0 multipv 1 score cp 0 nodes 0 nps 0 hashfull 1000 time 1 pv P*5e\n"
         );
     }
 

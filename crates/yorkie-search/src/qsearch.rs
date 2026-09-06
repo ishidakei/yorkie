@@ -595,9 +595,14 @@ pub struct PvInfo {
     pub bound: PvBound,
     /// `info.nodes`.
     pub nodes: u64,
+    /// `info.nps` — `nodes * 1000 / time_ms`.
+    pub nps: u64,
     /// The transposition table's occupancy in permille at the moment the line
     /// was assembled (`TranspositionTable::hashfull`, `maxAge = 0`).
     pub hashfull: u32,
+    /// `info.timeMs` — milliseconds since the `go` that started this search
+    /// (`tm.elapsed_time()`), floored at 1 so [`Self::nps`] has a divisor.
+    pub time_ms: u64,
     /// `info.pv` as moves (the Protocol layer joins them into USI text).
     pub pv: Vec<Move>,
 }
@@ -2085,8 +2090,22 @@ impl QSearch<'_> {
             .is_some_and(|c| c.consideration_mode);
         // The reference reads the occupancy again for each line it prints, but
         // no search runs between the lines of one call, so one read serves them
-        // all.
+        // all. The clock is read once for the same reason.
         let hashfull = self.tt.hashfull(0);
+        // `tm.elapsed_time()`, floored at 1 ms so a search that answered inside
+        // one tick still has a divisor for `nps`. The origin is the PV
+        // configuration's `limits.startTime`, the instant the `go` arrived and
+        // the one time management measures from.
+        let time_ms = self
+            .pv_config
+            .as_ref()
+            .map_or(0, |c| {
+                Instant::now()
+                    .saturating_duration_since(c.start_time)
+                    .as_millis() as u64
+            })
+            .max(1);
+        let nps = nodes * 1000 / time_ms;
         let mut out = Vec::with_capacity(multi_pv);
         for (i, rm) in root_moves.iter().enumerate().take(multi_pv) {
             let updated = rm.score != -VALUE_INFINITE;
@@ -2125,7 +2144,9 @@ impl QSearch<'_> {
                 score: v,
                 bound,
                 nodes,
+                nps,
                 hashfull,
+                time_ms,
                 pv,
             });
         }
