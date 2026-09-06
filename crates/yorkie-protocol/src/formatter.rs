@@ -38,6 +38,9 @@ impl<'w, W: Write + ?Sized> Formatter<'w, W> {
     /// instead of a `String`, so an interpolated message costs no allocation —
     /// and a build whose sink drops the line (the `verbose1` gate in
     /// [`crate::driver`]) never formats it at all.
+    ///
+    /// The diagnostics are its only caller, so it exists only at their level.
+    #[cfg(feature = "verbose1")]
     pub fn info_string_fmt(&mut self, body: std::fmt::Arguments<'_>) -> io::Result<()> {
         self.line(format_args!("info string {body}"))
     }
@@ -45,6 +48,10 @@ impl<'w, W: Write + ?Sized> Formatter<'w, W> {
     /// Emit a generic `info <body>` line. The caller composes everything after
     /// the `info ` keyword (e.g. `depth 1 score cp 12 nodes 30 pv 7g7f`); the
     /// search-progress reports the driver relays go through here.
+    ///
+    /// Those reports are the `verbose2` surface, and nothing else emits a bare
+    /// `info` line, so this exists only at that level.
+    #[cfg(feature = "verbose2")]
     pub fn info(&mut self, body: &str) -> io::Result<()> {
         self.line(format_args!("info {body}"))
     }
@@ -107,6 +114,7 @@ mod tests {
         assert_eq!(s, "info string unknown command: foo\n");
     }
 
+    #[cfg(feature = "verbose2")]
     #[test]
     fn info_body_format() {
         let s = captured(|f| f.info("depth 1 score cp 12 nodes 30 pv 7g7f").unwrap());

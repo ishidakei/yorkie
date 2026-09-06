@@ -24,7 +24,10 @@ pub mod root;
 pub mod timeman;
 pub mod update;
 
-pub use book::{BookConfig, BookHit, BookInfoLine, BookProbeResult, Prng, probe_book};
+pub use book::{BookConfig, BookHit, BookProbeResult, Prng, probe_book};
+// The book hit's per-candidate `info` lines: only a build that prints them.
+#[cfg(feature = "verbose2")]
+pub use book::BookInfoLine;
 pub use timeman::{TimeInput, TimeManagement};
 
 pub use history::{
@@ -34,9 +37,11 @@ pub use history::{
 };
 pub use movepick::MovePicker;
 pub use qsearch::{
-    PonderSignal, PvBound, PvInfo, PvOutputConfig, PvSink, QSearch, QSearchOutcome, SearchControl,
-    TimeControl, WorkerResult, fail_lh_pv_gate,
+    PonderSignal, QSearch, QSearchOutcome, SearchControl, TimeControl, WorkerResult,
 };
+// The PV-output surface: only a build that prints a search `info` line has it.
+#[cfg(feature = "verbose2")]
+pub use qsearch::{PvBound, PvInfo, PvOutputConfig, PvSink, fail_lh_pv_gate};
 pub use root::{
     EnteringKingConfig, EnteringKingRule, RootKind, RootMove, RootOutcome, WorkerVote,
     declaration_win, generate_root_moves, select_best_worker,

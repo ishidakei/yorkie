@@ -118,8 +118,9 @@ type AtomicTteKey = AtomicU16;
 fn tte_key(key: u64) -> TteKey {
     key as TteKey
 }
-/// A stored key widened back to 64 bits, for [`TranspositionTable::checksum`].
-#[cfg(not(feature = "tt-entry16"))]
+/// A stored key widened back to 64 bits, for [`TranspositionTable::checksum`],
+/// and compiled only where that is.
+#[cfg(all(not(feature = "tt-entry16"), feature = "verbose3"))]
 #[inline]
 fn key_bits(k: TteKey) -> u64 {
     k as u64
@@ -144,8 +145,9 @@ type AtomicTteKey = AtomicU64;
 fn tte_key(key: u64) -> TteKey {
     key
 }
-/// A stored key widened back to 64 bits — already that wide here.
-#[cfg(feature = "tt-entry16")]
+/// A stored key widened back to 64 bits — already that wide here. Compiled only
+/// where [`TranspositionTable::checksum`] is.
+#[cfg(all(feature = "tt-entry16", feature = "verbose3"))]
 #[inline]
 fn key_bits(k: TteKey) -> u64 {
     k
@@ -766,6 +768,11 @@ impl TranspositionTable {
     }
 
     /// A stable checksum over the whole table's raw bytes.
+    ///
+    /// Nothing a game plays reads it: it exists to pin the table's contents
+    /// while the table is being inspected from the outside, which is what the
+    /// `verbose3` level is for, so it is compiled only there.
+    #[cfg(feature = "verbose3")]
     pub fn checksum(&self) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         let mut mix = |x: u64| {

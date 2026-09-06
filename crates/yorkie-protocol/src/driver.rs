@@ -11,15 +11,15 @@ use std::time::{Duration, Instant};
 
 use yorkie_numa::{DEFAULT_POLICY, NumaConfig, NumaIndex, SysfsOptions, mempolicy};
 use yorkie_search::{
-    BookConfig, BookHit, EnteringKingConfig, EnteringKingRule, PonderSignal, Prng, PvOutputConfig,
-    QSearch, RootMove, Search, SearchControl, SharedHistories, TimeControl, TimeInput,
-    TimeManagement, WorkerHistories, WorkerResult, WorkerVote, declaration_win,
-    generate_root_moves, probe_book, select_best_worker,
+    BookConfig, BookHit, EnteringKingConfig, EnteringKingRule, PonderSignal, Prng, QSearch,
+    RootMove, Search, SearchControl, SharedHistories, TimeControl, TimeInput, TimeManagement,
+    WorkerHistories, WorkerResult, WorkerVote, declaration_win, generate_root_moves, probe_book,
+    select_best_worker,
 };
 // The PV-line surface: only a `verbose2` build renders one, so only it needs
-// the line's data type, its bound marker and the sink trait.
+// the line's data type, its bound marker, the sink trait and the output config.
 #[cfg(feature = "verbose2")]
-use yorkie_search::{PvBound, PvInfo, PvSink};
+use yorkie_search::{PvBound, PvInfo, PvOutputConfig, PvSink};
 use yorkie_state::{Move, Position, format_usi_move, parse_sfen, parse_usi_move};
 use yorkie_storage::{Book, TranspositionTable, Value};
 #[cfg(feature = "verbose3")]
@@ -34,6 +34,36 @@ use crate::settings::Settings;
 use crate::tt_command::{
     TtCommand, TtPosition, TtStoreArgs, bound_name, parse_tt, value_from_tt, value_to_tt,
 };
+
+/// Emit one diagnostic `info string` line through a [`UsiDriver`] — the
+/// `verbose1` surface — and compile the message only into a build that has that
+/// surface.
+///
+/// A macro rather than a plain method call because the message text is part of
+/// the surface: below `verbose1` the expansion drops the format string and the
+/// formatting with it, keeping the text out of the binary, and yields the same
+/// `Ok(())` so every call site's `?` / `return` shape is identical in both
+/// builds. Arguments are still named once each, so a value computed only for the
+/// message cannot be left behind as an unused binding.
+///
+/// Pass interpolated values as trailing arguments (`"illegal move: {}", s`)
+/// rather than as inline captures at any call site a build below `verbose1`
+/// still compiles: an inline capture is invisible to the expansion that drops
+/// the message, so the binding it names would go unused there.
+macro_rules! diag {
+    ($driver:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
+        #[cfg(feature = "verbose1")]
+        {
+            $driver.info_string_diag(format_args!($fmt $(, $arg)*))
+        }
+        #[cfg(not(feature = "verbose1"))]
+        {
+            let _ = &$driver;
+            $(let _ = &$arg;)*
+            Ok::<(), io::Error>(())
+        }
+    }};
+}
 
 /// The public values used in the `id name` / `id author` lines.
 ///
@@ -203,7 +233,10 @@ struct ActiveSearch {
     /// thread has not yet returned. A flag stamped under the output lock closes
     /// it — any reader that has seen the `bestmove` line took the same lock
     /// afterwards, so it cannot see this as unset.
-    #[cfg_attr(not(feature = "verbose3"), allow(dead_code))]
+    ///
+    /// The `tt` commands' idle check is its only reader, and they are
+    /// `verbose3`, so a build below that level neither carries nor raises it.
+    #[cfg(feature = "verbose3")]
     bestmove_sent: Arc<AtomicBool>,
     /// The root game ply this search ran at (`rootPos.game_ply()`), carried so
     /// a completed real search updates the driver's `last_game_ply`
@@ -439,7 +472,12 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                     self.finish_search_join();
                     return Ok(());
                 }
+                #[cfg(feature = "verbose1")]
                 Command::Unknown(line) => self.handle_unknown(&line)?,
+                // The line is consumed and dropped either way; only the report
+                // of it is a level.
+                #[cfg(not(feature = "verbose1"))]
+                Command::Unknown => {}
                 Command::TooLong => self.handle_too_long()?,
             }
         }
@@ -456,7 +494,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// This is the unconditional sink, reserved for the initialisation phase and
     /// for a `verbose3` command's response payload: those lines are how a
     /// failed startup is diagnosed at all, so no feature may take them away.
-    /// Everything else goes through [`Self::info_string_diag`].
+    /// Everything else goes through [`diag!`].
     fn info_string(&self, msg: &str) -> io::Result<()> {
         Formatter::new(&mut *self.lock_writer()).info_string(msg)
     }
@@ -465,19 +503,12 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// carries every `info string` produced outside the initialisation phase.
     ///
     /// Callers pass `format_args!`, not a `String`, so the message is composed
-    /// only if it is going to be written.
+    /// only if it is going to be written. They reach this through [`diag!`],
+    /// which is what keeps the message text itself out of a build that cannot
+    /// print it.
     #[cfg(feature = "verbose1")]
     fn info_string_diag(&self, body: std::fmt::Arguments<'_>) -> io::Result<()> {
         Formatter::new(&mut *self.lock_writer()).info_string_fmt(body)
-    }
-
-    /// The default build's diagnostic sink: nothing is written and `body` is
-    /// never formatted, so a rejected command costs one call and no allocation.
-    /// The `Ok(())` keeps every call site's `?` / `return` shape identical in
-    /// both builds.
-    #[cfg(not(feature = "verbose1"))]
-    fn info_string_diag(&self, _body: std::fmt::Arguments<'_>) -> io::Result<()> {
-        Ok(())
     }
 
     /// Emit one `bestmove <mv>` line.
@@ -895,7 +926,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             PositionSfen::Sfen(s) => match parse_sfen(s) {
                 Ok(p) => p,
                 Err(e) => {
-                    return self.info_string_diag(format_args!("position parse error: {e}"));
+                    return diag!(self, "position parse error: {}", e);
                 }
             },
         };
@@ -904,13 +935,13 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             let parsed = match parse_usi_move(s, &scratch) {
                 Ok(m) => m,
                 Err(_) => {
-                    return self.info_string_diag(format_args!("illegal move: {s}"));
+                    return diag!(self, "illegal move: {}", s);
                 }
             };
             legal_buf.clear();
             scratch.generate_legal_all(&mut legal_buf);
             if !legal_buf.contains(&parsed) {
-                return self.info_string_diag(format_args!("illegal move: {s}"));
+                return diag!(self, "illegal move: {}", s);
             }
             scratch.do_move(parsed);
         }
@@ -983,6 +1014,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             depth_black_limit: self.settings.book_depth_black_limit(),
             depth_white_limit: self.settings.book_depth_white_limit(),
             consider_move_count: self.settings.consider_book_move_count(),
+            // Shapes the book `info` lines and nothing else, so it is read only
+            // in a build that prints them.
+            #[cfg(feature = "verbose2")]
             pv_moves: self.settings.book_pv_moves(),
             flipped_book: self.settings.flipped_book(),
         }
@@ -1008,8 +1042,12 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 
         // Build the coordinator job (option-seeded limits, all per-`go`
         // snapshots). `None` means no network is loaded — notify and resign.
-        let Some(job) = self.prepare_coordinator_job(limits, false) else {
-            self.info_string_diag(format_args!("no eval network loaded; run isready"))?;
+        let Some(job) = self.prepare_coordinator_job(
+            limits,
+            #[cfg(feature = "verbose2")]
+            false,
+        ) else {
+            diag!(self, "no eval network loaded; run isready")?;
             return self.bestmove("resign");
         };
 
@@ -1019,6 +1057,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         let stop_for_active = Arc::clone(&job.stop);
         let ponder_for_active = job.ponder.as_ref().map(Arc::clone);
         let suppress_for_active = Arc::clone(&job.suppress_bestmove);
+        #[cfg(feature = "verbose3")]
         let sent_for_active = Arc::clone(&job.bestmove_sent);
         let handle = std::thread::spawn(move || {
             let outcome = run_coordinated(job);
@@ -1033,6 +1072,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             stop: stop_for_active,
             ponder: ponder_for_active,
             suppress: suppress_for_active,
+            #[cfg(feature = "verbose3")]
             bestmove_sent: sent_for_active,
             game_ply,
         });
@@ -1047,9 +1087,11 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// middle of a game. Any search already running is left alone.
     #[cfg(not(feature = "verbose2"))]
     fn handle_go_extra_clause(&mut self, clause: &str) -> io::Result<()> {
-        self.info_string_diag(format_args!(
-            "go error: `{clause}` requires a verbose2 build; no search started"
-        ))
+        diag!(
+            self,
+            "go error: `{}` requires a verbose2 build; no search started",
+            clause
+        )
     }
 
     /// Stochastic_Ponder `go ponder` rewind (`usi.cpp`): reconstruct the
@@ -1073,11 +1115,11 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// Returns `None` when no network is loaded; the caller emits the resign or
     /// notice appropriate to its context. `disable_pv_interval` forces the
     /// per-iteration PV interval to zero so every iteration prints, and is set
-    /// only by `bench`.
+    /// only by `bench`; there is no such interval to force below `verbose2`.
     fn prepare_coordinator_job(
         &mut self,
         mut limits: GoLimits,
-        disable_pv_interval: bool,
+        #[cfg(feature = "verbose2")] disable_pv_interval: bool,
     ) -> Option<CoordinatorJob<W>> {
         // Nothing propagates the NNUE fixed-point scale here: the reference's
         // mutable global `NNUE::FV_SCALE` is a compile-time constant in the
@@ -1182,8 +1224,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 &mut prng,
             );
             if tm.mtg_error {
-                let _ =
-                    self.info_string_diag(format_args!("Error! : MaxMovesToDraw is too small."));
+                let _ = diag!(self, "Error! : MaxMovesToDraw is too small.");
             }
             Some(TimeControl {
                 tm,
@@ -1232,18 +1273,26 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // `computed_pv_interval` is `0` (never suppress — every iteration
         // prints) under `go infinite`, `ConsiderationMode`, or the bench-only
         // `disablePvInterval` (`usi.cpp`); else the `PvInterval` option [ms].
-        let consideration_mode = self.settings.consideration_mode();
-        let computed_pv_interval = if disable_pv_interval || limits.infinite || consideration_mode {
-            Duration::ZERO
-        } else {
-            Duration::from_millis(self.settings.pv_interval().max(0) as u64)
-        };
-        let pv_config = PvOutputConfig {
-            multi_pv,
-            pv_interval: computed_pv_interval,
-            consideration_mode,
-            output_fail_lh_pv: self.settings.output_fail_lh_pv(),
-            start_time: now,
+        //
+        // Everything here decides which PV lines get printed and nothing else —
+        // `MultiPV`, which shapes the search, is passed separately above — so a
+        // build that prints none neither reads the settings nor carries the
+        // snapshot.
+        #[cfg(feature = "verbose2")]
+        let pv_config = {
+            let consideration_mode = self.settings.consideration_mode();
+            let computed_pv_interval =
+                if disable_pv_interval || limits.infinite || consideration_mode {
+                    Duration::ZERO
+                } else {
+                    Duration::from_millis(self.settings.pv_interval().max(0) as u64)
+                };
+            PvOutputConfig {
+                pv_interval: computed_pv_interval,
+                consideration_mode,
+                output_fail_lh_pv: self.settings.output_fail_lh_pv(),
+                start_time: now,
+            }
         };
 
         // The worker count and the persistent helper slots to dispatch to. The
@@ -1300,8 +1349,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // The Stochastic_Ponder teardown flag: when set, the coordinator emits
         // no `bestmove` (nor final PV) for this search (`usi.cpp`).
         let suppress_bestmove = Arc::new(AtomicBool::new(false));
-        // Raised when this `go`'s reply reaches the output sink; the driver reads
-        // it to decide whether a search is still in flight.
+        // Raised when this `go`'s reply reaches the output sink; the `tt`
+        // commands' idle check is the only reader, so only their level has it.
+        #[cfg(feature = "verbose3")]
         let bestmove_sent = Arc::new(AtomicBool::new(false));
 
         // Snapshot the entering-king rule for this `go` and precompute its
@@ -1368,6 +1418,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             ponder,
             infinite,
             suppress_bestmove,
+            #[cfg(feature = "verbose3")]
             bestmove_sent,
             entering_king,
             max_moves_to_draw,
@@ -1375,6 +1426,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             resign_value,
             generate_all_legal_moves,
             mate_mode,
+            multi_pv,
+            #[cfg(feature = "verbose2")]
             pv_config,
             writer,
         })
@@ -1388,8 +1441,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// contributes 0 nodes.
     #[cfg(feature = "verbose3")]
     fn bench_run_one(&mut self, limits: GoLimits) -> io::Result<u64> {
+        // `bench` is `verbose3`, so the PV interval it disables always exists.
         let Some(job) = self.prepare_coordinator_job(limits, true) else {
-            self.info_string_diag(format_args!("no eval network loaded; run isready"))?;
+            diag!(self, "no eval network loaded; run isready")?;
             self.bestmove("resign")?;
             return Ok(0);
         };
@@ -1419,7 +1473,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         let current = bench::current_sfen(&self.pos);
         let config = match bench::parse_bench(tokens, &current) {
             Ok(c) => c,
-            Err(e) => return self.info_string_diag(format_args!("bench: {e}")),
+            Err(e) => return diag!(self, "bench: {}", e),
         };
 
         // The two values the reference replays as `setoption` lines
@@ -1447,9 +1501,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 Err(e) => {
                     // A malformed position in a `<fenFile>` is skipped loudly, not
                     // fatal — the rest of the bench still runs.
-                    self.info_string_diag(format_args!(
-                        "bench: skipping bad position `{fen}`: {e}"
-                    ))?;
+                    diag!(self, "bench: skipping bad position `{}`: {}", fen, e)?;
                     continue;
                 }
             }
@@ -1740,12 +1792,13 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         self.info_string(&format!("tt children end {hits}"))
     }
 
+    #[cfg(feature = "verbose1")]
     fn handle_unknown(&mut self, line: &str) -> io::Result<()> {
-        self.info_string_diag(format_args!("unknown command: {line}"))
+        diag!(self, "unknown command: {}", line)
     }
 
     fn handle_too_long(&mut self) -> io::Result<()> {
-        self.info_string_diag(format_args!("command too long"))
+        diag!(self, "command too long")
     }
 }
 
@@ -2005,9 +2058,16 @@ fn build_position_from(sfen: &PositionSfen, moves: &[String]) -> Option<Position
 ///
 /// `sent` is raised before the lock is released, so the reply becoming visible
 /// and this search counting as finished are one indivisible step downstream.
-fn emit_bestmove<W: Write>(writer: &Arc<Mutex<W>>, sent: &AtomicBool, mv: &str) {
+/// Only the `verbose3` `tt` commands ask that question, so only they carry the
+/// flag; the `bestmove` itself is written identically at every level.
+fn emit_bestmove<W: Write>(
+    writer: &Arc<Mutex<W>>,
+    #[cfg(feature = "verbose3")] sent: &AtomicBool,
+    mv: &str,
+) {
     let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
     let _ = Formatter::new(&mut *guard).bestmove(mv);
+    #[cfg(feature = "verbose3")]
     sent.store(true, Ordering::Relaxed);
 }
 
@@ -2019,10 +2079,6 @@ fn emit_info_string_diag<W: Write>(writer: &Arc<Mutex<W>>, msg: &str) {
     let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
     let _ = Formatter::new(&mut *guard).info_string(msg);
 }
-
-/// The default build's coordinator diagnostic sink: nothing is written.
-#[cfg(not(feature = "verbose1"))]
-fn emit_info_string_diag<W: Write>(_writer: &Arc<Mutex<W>>, _msg: &str) {}
 
 /// A running keep-alive: a helper thread that emits a bare newline every
 /// [`KEEP_ALIVE_TICKS_PER_NEWLINE`] polls so a GUI does not time out while the
@@ -2121,7 +2177,7 @@ fn emit_book_hit<W: Write>(
     infinite: bool,
     stop: &AtomicBool,
     suppress_bestmove: &AtomicBool,
-    sent: &AtomicBool,
+    #[cfg(feature = "verbose3")] sent: &AtomicBool,
 ) {
     // Per-candidate multipv info lines (emitted immediately, like the reference's
     // in-probe isRoot block).
@@ -2177,6 +2233,7 @@ fn emit_book_hit<W: Write>(
         format_score(Value::from(hit.value)),
     ));
     let _ = f.bestmove(&bm);
+    #[cfg(feature = "verbose3")]
     sent.store(true, Ordering::Relaxed);
 }
 
@@ -2838,7 +2895,8 @@ struct CoordinatorJob<W: Write + Send + 'static> {
     /// Stamped `true` in the same output-lock critical section that writes this
     /// search's `bestmove`, so the driver can tell "reply is out" from "thread
     /// has exited" (see [`ActiveSearch::bestmove_sent`]). A suppressed reply
-    /// never sets it — nothing went out.
+    /// never sets it — nothing went out. `verbose3`, like the reader.
+    #[cfg(feature = "verbose3")]
     bestmove_sent: Arc<AtomicBool>,
     /// The entering-king declaration config snapshot for this `go`.
     entering_king: EnteringKingConfig,
@@ -2856,7 +2914,12 @@ struct CoordinatorJob<W: Write + Send + 'static> {
     /// `go mate` mode — disables the early mate break and enables the mate-found
     /// stop rule.
     mate_mode: bool,
-    /// The MultiPV / PV-output config for this `go`.
+    /// The raw `MultiPV` option value for this `go`. It shapes the search, so
+    /// every build carries it.
+    multi_pv: usize,
+    /// The PV-output config for this `go` — what gets printed, in a build that
+    /// prints anything.
+    #[cfg(feature = "verbose2")]
     pv_config: PvOutputConfig,
     /// The shared output sink for the per-iteration / final `info` / `bestmove`.
     writer: Arc<Mutex<W>>,
@@ -2872,10 +2935,9 @@ struct CoordinatorJob<W: Write + Send + 'static> {
 struct CoordinatedOutcome {
     histories: WorkerHistories,
     /// `bench` is the only reader (the async `go` path takes its node total off
-    /// the wire), and `bench` is `verbose3`. The field is still *written* on
-    /// every search in both configurations — keeping the coordinator itself
-    /// feature-agnostic is worth one `allow` here.
-    #[cfg_attr(not(feature = "verbose3"), allow(dead_code))]
+    /// the wire), and `bench` is `verbose3`, so a build below it neither carries
+    /// nor sums the total.
+    #[cfg(feature = "verbose3")]
     nodes: u64,
     time_state: Option<(Value, Value, Option<f64>)>,
 }
@@ -2913,6 +2975,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         ponder,
         infinite,
         suppress_bestmove,
+        #[cfg(feature = "verbose3")]
         bestmove_sent,
         entering_king,
         max_moves_to_draw,
@@ -2920,10 +2983,12 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         resign_value,
         generate_all_legal_moves,
         mate_mode,
+        multi_pv,
+        #[cfg(feature = "verbose2")]
         pv_config,
         writer,
     } = job;
-    let multi_pv = pv_config.multi_pv.max(1);
+    let multi_pv = multi_pv.max(1);
 
     // Bind this coordinator to its assigned NUMA node before any search work,
     // and make that node's memory its allocation preference, so everything this
@@ -2946,9 +3011,15 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     // dispatched, exactly as `start_searching` exits before `threads.start_searching()`.
     let root_moves = generate_root_moves(&pos, generate_all_legal_moves);
     if root_moves.is_empty() {
-        emit_bestmove(&writer, &bestmove_sent, "resign");
+        emit_bestmove(
+            &writer,
+            #[cfg(feature = "verbose3")]
+            &bestmove_sent,
+            "resign",
+        );
         return CoordinatedOutcome {
             histories,
+            #[cfg(feature = "verbose3")]
             nodes: 0,
             time_state: skip_search_carry(),
         };
@@ -2959,12 +3030,23 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     // verbatim so the host plays it.
     if let Some(mv) = declaration_win(&pos, &entering_king) {
         if mv == Move::win() {
-            emit_bestmove(&writer, &bestmove_sent, "win");
+            emit_bestmove(
+                &writer,
+                #[cfg(feature = "verbose3")]
+                &bestmove_sent,
+                "win",
+            );
         } else {
-            emit_bestmove(&writer, &bestmove_sent, &format_usi_move(mv));
+            emit_bestmove(
+                &writer,
+                #[cfg(feature = "verbose3")]
+                &bestmove_sent,
+                &format_usi_move(mv),
+            );
         }
         return CoordinatedOutcome {
             histories,
+            #[cfg(feature = "verbose3")]
             nodes: 0,
             time_state: skip_search_carry(),
         };
@@ -2984,6 +3066,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
             &book_config,
             &mut prng,
         );
+        #[cfg(feature = "verbose1")]
         for diag in &probed.diagnostics {
             emit_info_string_diag(&writer, diag);
         }
@@ -2997,10 +3080,12 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
                 infinite,
                 &stop,
                 &suppress_bestmove,
+                #[cfg(feature = "verbose3")]
                 &bestmove_sent,
             );
             return CoordinatedOutcome {
                 histories,
+                #[cfg(feature = "verbose3")]
                 nodes: 0,
                 time_state: skip_search_carry(),
             };
@@ -3040,13 +3125,12 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         });
     }
 
-    // The main worker is the only one given a PV sink. Without `verbose2` it
-    // is given the `MultiPV` value alone and no sink: `MultiPV` shapes the
-    // search, so it is installed in every build, while the rest of the PV-output
-    // configuration only decides which lines get printed. With no sink the
-    // search's emission sites short-circuit before they collect a PV or fold the
-    // cross-worker node total, so the search itself is identical in all three
-    // build shapes.
+    // The main worker is the only one given a PV sink, and only a `verbose2`
+    // build has one to give: `MultiPV` shapes the search, so it is installed in
+    // every build, while the rest of the PV-output configuration only decides
+    // which lines get printed. Below that level the emission sites are not
+    // compiled at all, so the search itself is identical in all three build
+    // shapes.
     let net = search.network();
     let mut qs = QSearch::with_histories(net, &tt, histories);
     qs.set_control(control);
@@ -3057,6 +3141,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     qs.set_draw_value(draw_contempt);
     qs.set_generate_all_legal_moves(generate_all_legal_moves);
     qs.set_mate_mode(mate_mode);
+    qs.set_multi_pv(multi_pv);
     #[cfg(feature = "verbose2")]
     qs.set_pv_output(
         pv_config,
@@ -3064,8 +3149,6 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
             writer: Arc::clone(&writer),
         }),
     );
-    #[cfg(not(feature = "verbose2"))]
-    qs.set_multi_pv(multi_pv);
     let main_result = qs.run_worker(&pos, root_moves, depth);
 
     // Ponder / infinite hold (the SKIP_SEARCH wait loop,
@@ -3089,8 +3172,10 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         results.push(slot.collect());
     }
 
-    // Aggregated node count for the `info` line — every worker's exact final
-    // count (the reference `threads.nodes_searched()`).
+    // Aggregated node count for the `info` line and for `bench` — every worker's
+    // exact final count (the reference `threads.nodes_searched()`). Both readers
+    // are levels, so a build with neither does not sum.
+    #[cfg(feature = "verbose2")]
     let total_nodes: u64 = results.iter().map(|r| r.nodes).sum();
 
     // Choose the reported worker: the main worker for a `go depth N`, else the
@@ -3196,7 +3281,12 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     // reply the GUI sees. The `time_state` below is still returned so the
     // rewound search's score / ply seed the re-issue's side-flip continuity.
     if !suppress_bestmove.load(Ordering::Relaxed) {
-        emit_bestmove(&writer, &bestmove_sent, &bm);
+        emit_bestmove(
+            &writer,
+            #[cfg(feature = "verbose3")]
+            &bestmove_sent,
+            &bm,
+        );
     }
 
     // Consume the driver (ending the `&tt` / `&net` borrows) and reclaim the main
@@ -3204,6 +3294,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     // the `bench` accumulation and the time-management carry-forward.
     CoordinatedOutcome {
         histories: qs.into_histories(),
+        #[cfg(feature = "verbose3")]
         nodes: total_nodes,
         time_state: Some((
             out_best_previous_score,
@@ -4068,6 +4159,7 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             ponder: None,
             suppress: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "verbose3")]
             bestmove_sent: Arc::new(AtomicBool::new(true)),
             game_ply: 20,
         });
@@ -4103,6 +4195,7 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             ponder: None,
             suppress: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "verbose3")]
             bestmove_sent: Arc::new(AtomicBool::new(true)),
             game_ply: 3,
         });

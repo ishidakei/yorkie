@@ -3,6 +3,11 @@
 //! site (`yaneuraou-search.cpp`). Ported per the reference, which gates on
 //! `mainThread && multiPV == 1 && fail-bound && nodes > 10M && (rootDepth < 3
 //! || interval elapsed) && OutputFailLHPV`.
+//!
+//! Gated on `verbose2`: the predicate decides whether a search `info` line is
+//! printed, and only a build at that level has one to print.
+
+#![cfg(feature = "verbose2")]
 
 use yorkie_search::fail_lh_pv_gate;
 

@@ -42,18 +42,28 @@ serde_json = "~1.0"
 # the response payload of a `verbose3` command, so they ride on that level alone
 # and no `info` line is involved in gating them.
 #
-# `verbose2` also turns on the Search layer's feature of the same name (and,
-# through it, the Storage layer's), because a search `info` line carries a field
-# those layers must produce: the transposition table's `hashfull` occupancy.
-# Below that level neither the field nor the method behind it is compiled at all.
+# Each level also turns on the feature of the same name in every lower layer that
+# has one, because a level's output is not all produced here: what a build prints
+# at a level, and everything that exists only to compute it, is gated at that
+# level in whichever crate it lives, rather than left for the optimizer to
+# discard.
+#
+#   - `verbose1` → `yorkie-search/verbose1` — the book probe's diagnostic
+#     message bodies.
+#   - `verbose2` → `yorkie-search/verbose2` (and through it
+#     `yorkie-storage/verbose2`) — the PV-output surface, the root moves' fail
+#     bounds, the book hit's per-candidate lines, and the transposition table's
+#     `hashfull` occupancy.
+#   - `verbose3` → `yorkie-storage/verbose3` — `TranspositionTable::checksum`,
+#     which serves the table-inspection level and has no in-game reader.
 #
 # `tt-entry16` is the Storage-layer entry-widening feature, re-exported so this
 # crate's session tests can `cfg` on it. Off by default, and orthogonal to the
 # verbosity axis.
 [features]
-verbose1 = []
+verbose1 = ["yorkie-search/verbose1"]
 verbose2 = ["verbose1", "yorkie-search/verbose2"]
-verbose3 = ["verbose2"]
+verbose3 = ["verbose2", "yorkie-storage/verbose3"]
 tt-entry16 = ["yorkie-search/tt-entry16", "yorkie-storage/tt-entry16"]
 
 [lints]

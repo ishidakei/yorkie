@@ -20,7 +20,11 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+// `Duration` types the PV-output interval, which only a build that prints a PV
+// has.
+#[cfg(feature = "verbose2")]
+use std::time::Duration;
+use std::time::Instant;
 
 use yorkie_eval::{Accumulator, FinnyCache, MoveDelta, NnueNetwork, evaluate_with};
 use yorkie_state::{Color, Move, Piece, PieceKind, Position, RepetitionState, piece_value};
@@ -147,6 +151,10 @@ fn root_move_order(a: &RootMove, b: &RootMove) -> std::cmp::Ordering {
 /// pure predicate so it can be unit-tested. The `nodes > 10_000_000` conjunct
 /// and the `root_depth < 3` disjunct are easy to drop when reading the
 /// condition informally; both are the reference's.
+///
+/// It decides whether a PV line is printed and nothing else, so it exists only
+/// in a build that prints one.
+#[cfg(feature = "verbose2")]
 #[allow(clippy::too_many_arguments)]
 pub fn fail_lh_pv_gate(
     main_thread: bool,
@@ -499,12 +507,15 @@ pub struct QSearch<'a> {
     /// The per-iteration / final PV output sink (`main_manager()->pv()`). `None`
     /// on every worker but the main one, so helpers and the parity path emit
     /// nothing.
+    #[cfg(feature = "verbose2")]
     pv_sink: Option<Box<dyn PvSink>>,
     /// The main worker's PV-output configuration for this `go` (`None` elsewhere).
+    #[cfg(feature = "verbose2")]
     pv_config: Option<PvOutputConfig>,
     /// `lastPvInfoTime` — the last time a PV was emitted (`989`, refreshed at each
     /// `pv()` call). Seeded to `pv_config.start_time` per `go`; unused when
     /// `pv_config` is `None`.
+    #[cfg(feature = "verbose2")]
     last_pv_info_time: Instant,
 }
 
@@ -531,10 +542,12 @@ pub struct WorkerResult {
     /// (`yaneuraou-search.cpp`). The coordinator's final-PV fallback (`1289`)
     /// keys off this so a fully throttled search still emits one PV before
     /// `bestmove`. Always `false` for a helper (helpers never emit).
+    #[cfg(feature = "verbose2")]
     pub uci_pv_sent: bool,
     /// The last completed iteration's top-`multiPV` root moves, in score order —
     /// the lines the coordinator re-emits when the final PV was throttled
     /// (`uci_pv_sent == false`). `[best]` for the fixed-depth / helper paths.
+    #[cfg(feature = "verbose2")]
     pub pv_lines: Vec<RootMove>,
     /// `timeReduction` after iterative deepening (`yaneuraou-search.cpp`) —
     /// the value the driver stores as `previousTimeReduction` for the next
@@ -545,6 +558,9 @@ pub struct WorkerResult {
 
 /// USI `info` bound marker for one PV line — the reference `pv()` `isExact` /
 /// `scoreLowerbound` / `scoreUpperbound` logic (`yaneuraou-search.cpp`).
+///
+/// One field of a PV line, so it exists only in a build that prints one.
+#[cfg(feature = "verbose2")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PvBound {
     /// An exact score (no `lowerbound` / `upperbound` marker).
@@ -559,6 +575,12 @@ pub enum PvBound {
 /// (`search.h`) as this port surfaces it. The Protocol layer formats it into
 /// the wire line; the `Value`→`cp`/`mate` and `Move`→USI conversions live
 /// there.
+///
+/// The whole PV-output surface below — this type, its bound marker, the sink
+/// trait, the configuration and every method that assembles or emits a line —
+/// exists only to produce those `info` lines, so a build that prints none
+/// compiles none of it.
+#[cfg(feature = "verbose2")]
 #[derive(Clone, Debug)]
 pub struct PvInfo {
     /// `info.depth`.
@@ -575,7 +597,6 @@ pub struct PvInfo {
     pub nodes: u64,
     /// The transposition table's occupancy in permille at the moment the line
     /// was assembled (`TranspositionTable::hashfull`, `maxAge = 0`).
-    #[cfg(feature = "verbose2")]
     pub hashfull: u32,
     /// `info.pv` as moves (the Protocol layer joins them into USI text).
     pub pv: Vec<Move>,
@@ -585,6 +606,7 @@ pub struct PvInfo {
 /// `main_manager()->pv()` call sites). Only the **main** worker is given one;
 /// helper workers and the direct fixed-depth [`QSearch::run_root`] path leave it
 /// unset, so they never emit and the parity path is untouched.
+#[cfg(feature = "verbose2")]
 pub trait PvSink: Send {
     /// Emit one PV line.
     fn emit(&mut self, info: &PvInfo);
@@ -594,11 +616,12 @@ pub trait PvSink: Send {
 /// registration at `yaneuraou-search.cpp` and the per-search derivation at
 /// `989-997`). Installed on the main worker only, via
 /// [`QSearch::set_pv_output`].
+///
+/// `MultiPV` is not here: it shapes the search itself, so the driver passes it
+/// separately and every build applies it.
+#[cfg(feature = "verbose2")]
 #[derive(Clone)]
 pub struct PvOutputConfig {
-    /// `min(options["MultiPV"], rootMoves.size())` is applied inside the worker;
-    /// this is the raw `MultiPV` option value.
-    pub multi_pv: usize,
     /// `computed_pv_interval` (`993-997`): `0` (never suppress) when `go infinite`
     /// or `ConsiderationMode` is on, else the `PvInterval` option as a duration.
     pub pv_interval: Duration,
@@ -711,8 +734,11 @@ impl<'a> QSearch<'a> {
             best_move_tally: None,
             pv_idx: 0,
             multi_pv: 1,
+            #[cfg(feature = "verbose2")]
             pv_sink: None,
+            #[cfg(feature = "verbose2")]
             pv_config: None,
+            #[cfg(feature = "verbose2")]
             last_pv_info_time: Instant::now(),
         }
     }
@@ -789,20 +815,21 @@ impl<'a> QSearch<'a> {
         self.best_move_tally = Some((slots, index));
     }
 
-    /// Install the raw `MultiPV` option value for this `go` (helpers). The main
-    /// worker uses [`Self::set_pv_output`] instead, which also sets the sink. Both
-    /// clamp to `rootMoves.size()` inside [`Self::run_worker`]. Leave unset (`1`)
-    /// for the fixed-depth parity path.
+    /// Install the raw `MultiPV` option value for this `go`. `MultiPV` shapes the
+    /// search, so every worker in every build gets it; the main worker's PV
+    /// *output* is configured separately by [`Self::set_pv_output`]. Both clamp
+    /// to `rootMoves.size()` inside [`Self::run_worker`]. Leave unset (`1`) for
+    /// the fixed-depth parity path.
     pub fn set_multi_pv(&mut self, multi_pv: usize) {
         self.multi_pv = multi_pv.max(1);
     }
 
     /// Install the PV-output configuration and sink on the **main** worker (the
-    /// reference `main_manager()->pv()` owner). This sets `MultiPV`, the computed
-    /// PV interval, the consideration / fail-LH flags, and seeds `lastPvInfoTime`
+    /// reference `main_manager()->pv()` owner). This sets the computed PV
+    /// interval and the consideration / fail-LH flags, and seeds `lastPvInfoTime`
     /// to the search start; the sink receives each emitted line.
+    #[cfg(feature = "verbose2")]
     pub fn set_pv_output(&mut self, config: PvOutputConfig, sink: Box<dyn PvSink>) {
-        self.multi_pv = config.multi_pv.max(1);
         self.last_pv_info_time = config.start_time;
         self.pv_config = Some(config);
         self.pv_sink = Some(sink);
@@ -1656,9 +1683,13 @@ impl QSearch<'_> {
         // The last *completed* iteration's root move — the stable result an
         // aborted search rolls back to.
         let mut completed_best: Option<RootMove> = None;
+        // The coordinator's final-PV fallback is their only reader, so a build
+        // that prints no PV neither keeps nor copies them.
+        #[cfg(feature = "verbose2")]
         let mut completed_lines: Vec<RootMove> = Vec::new();
         let mut completed_depth = 0;
         // Whether the current iteration's final PV was emitted to the GUI.
+        #[cfg(feature = "verbose2")]
         let mut uci_pv_sent = false;
 
         let mut root_depth = 0;
@@ -1681,7 +1712,10 @@ impl QSearch<'_> {
                 rm.previous_score = rm.score;
             }
 
-            uci_pv_sent = false;
+            #[cfg(feature = "verbose2")]
+            {
+                uci_pv_sent = false;
+            }
 
             // The iteration's last search value, read by the MultiPV == 1
             // early-mate break below.
@@ -1736,6 +1770,7 @@ impl QSearch<'_> {
                         break;
                     }
 
+                    #[cfg(feature = "verbose2")]
                     if self.should_output_fail_lh(multi_pv, best_value, alpha, beta, root_depth) {
                         self.emit_pv(root_pos, &root_moves, pv_idx, root_depth, multi_pv);
                         self.last_pv_info_time = Instant::now();
@@ -1764,6 +1799,7 @@ impl QSearch<'_> {
                 // A later line may have out-scored an earlier one.
                 root_moves[..pv_idx + 1].sort_by(root_move_order);
 
+                #[cfg(feature = "verbose2")]
                 if self.pv_sink.is_some()
                     && (self.stopped
                         || pv_idx + 1 == multi_pv
@@ -1797,7 +1833,10 @@ impl QSearch<'_> {
             }
             self.last_iteration_pv = root_moves[0].pv.clone();
             completed_best = Some(root_moves[0].clone());
-            completed_lines = root_moves[..multi_pv].to_vec();
+            #[cfg(feature = "verbose2")]
+            {
+                completed_lines = root_moves[..multi_pv].to_vec();
+            }
             completed_depth = root_depth;
             self.completed_depth = root_depth;
 
@@ -1923,6 +1962,7 @@ impl QSearch<'_> {
         // then `root_moves[0]` — the best-so-far after the partial iteration's
         // sort — is still a legal move.
         let best = completed_best.unwrap_or_else(|| root_moves[0].clone());
+        #[cfg(feature = "verbose2")]
         if completed_lines.is_empty() {
             completed_lines = vec![best.clone()];
         }
@@ -1932,7 +1972,9 @@ impl QSearch<'_> {
             completed_depth,
             ponder_candidate,
             nodes: self.nodes,
+            #[cfg(feature = "verbose2")]
             uci_pv_sent,
+            #[cfg(feature = "verbose2")]
             pv_lines: completed_lines,
             time_reduction,
         }
@@ -1941,6 +1983,10 @@ impl QSearch<'_> {
     /// The aggregate node count across every worker: with a Lazy-SMP tally
     /// installed, the helpers' last-published slots plus this worker's live
     /// `self.nodes`.
+    ///
+    /// Only the PV-output path reads it — the `go nodes N` ceiling has its own
+    /// [`Self::counted_nodes`] — so it is compiled only where a PV is printed.
+    #[cfg(feature = "verbose2")]
     fn aggregate_nodes(&self) -> u64 {
         match &self.node_tally {
             Some((slots, idx)) => {
@@ -1958,6 +2004,7 @@ impl QSearch<'_> {
 
     /// Whether the PV-output interval has elapsed since the last emit.
     /// Without a PV config — helpers and the parity path — vacuously true.
+    #[cfg(feature = "verbose2")]
     fn pv_interval_elapsed(&self) -> bool {
         match &self.pv_config {
             Some(cfg) => self.last_pv_info_time + cfg.pv_interval <= Instant::now(),
@@ -1968,6 +2015,7 @@ impl QSearch<'_> {
     /// The reference's fail-high/low PV-output gate, bound to this worker's
     /// live state. Only the main worker owns a sink and PV config, so only it
     /// can pass.
+    #[cfg(feature = "verbose2")]
     fn should_output_fail_lh(
         &self,
         multi_pv: usize,
@@ -1994,6 +2042,7 @@ impl QSearch<'_> {
 
     /// Build and emit the per-line PV `info` output — the reference's
     /// `main_manager()->pv()`. A no-op when no sink is installed.
+    #[cfg(feature = "verbose2")]
     fn emit_pv(
         &mut self,
         root_pos: &Position,
@@ -2020,6 +2069,7 @@ impl QSearch<'_> {
     /// Public so the coordinator can build the final-PV fallback lines from the
     /// chosen worker's result, passing `pv_idx == lines.len()` to make every
     /// line exact.
+    #[cfg(feature = "verbose2")]
     pub fn build_pv_infos(
         &self,
         root_pos: &Position,
@@ -2036,7 +2086,6 @@ impl QSearch<'_> {
         // The reference reads the occupancy again for each line it prints, but
         // no search runs between the lines of one call, so one read serves them
         // all.
-        #[cfg(feature = "verbose2")]
         let hashfull = self.tt.hashfull(0);
         let mut out = Vec::with_capacity(multi_pv);
         for (i, rm) in root_moves.iter().enumerate().take(multi_pv) {
@@ -2076,7 +2125,6 @@ impl QSearch<'_> {
                 score: v,
                 bound,
                 nodes,
-                #[cfg(feature = "verbose2")]
                 hashfull,
                 pv,
             });
@@ -2090,6 +2138,7 @@ impl QSearch<'_> {
     ///
     /// The reference appends a repetition or terminal text marker to the PV
     /// string; this surfaces the PV as moves only and stops at the same points.
+    #[cfg(feature = "verbose2")]
     fn consideration_pv(&self, root_pos: &Position, root_pv: &[Move]) -> Vec<Move> {
         let mut pos = root_pos.clone();
         let mut moves: Vec<Move> = Vec::new();
@@ -3175,13 +3224,25 @@ impl QSearch<'_> {
                     rm.score = value;
                     rm.uci_score = value;
                     rm.sel_depth = self.sel_depth;
-                    rm.score_lowerbound = false;
-                    rm.score_upperbound = false;
+                    // The two flags decide only which bound marker a PV line
+                    // carries; the `uci_score` clamps beside them feed the
+                    // resign decision, so they happen at every level.
+                    #[cfg(feature = "verbose2")]
+                    {
+                        rm.score_lowerbound = false;
+                        rm.score_upperbound = false;
+                    }
                     if value >= beta {
-                        rm.score_lowerbound = true;
+                        #[cfg(feature = "verbose2")]
+                        {
+                            rm.score_lowerbound = true;
+                        }
                         rm.uci_score = beta;
                     } else if value <= alpha {
-                        rm.score_upperbound = true;
+                        #[cfg(feature = "verbose2")]
+                        {
+                            rm.score_upperbound = true;
+                        }
                         rm.uci_score = alpha;
                     }
                     rm.pv.clear();

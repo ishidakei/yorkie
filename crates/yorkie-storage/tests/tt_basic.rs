@@ -435,12 +435,16 @@ fn resize_to_same_size_is_a_no_op() {
     tt.resize(1);
     let k = key(5, 0x9);
     store(&mut tt, k, 0, 5, false, Bound::Exact, 9, 0x9, 5);
+    // The byte-level half of the claim rides on `checksum`, which only a
+    // `verbose3` build compiles; the probe below holds at every level.
+    #[cfg(feature = "verbose3")]
     let before = tt.checksum();
 
     // The same MiB yields the same cluster count, so the reference's early
     // return leaves the table untouched.
     tt.resize(1);
     assert_eq!(tt.cluster_count(), 32_768);
+    #[cfg(feature = "verbose3")]
     assert_eq!(
         tt.checksum(),
         before,
@@ -478,6 +482,9 @@ fn new_search_wraps_within_five_bits() {
     assert_eq!(tt.generation(), 0, "generation wraps at 2^5");
 }
 
+/// Compares whole tables byte for byte through `checksum`, so it exists only in
+/// a build that has one.
+#[cfg(feature = "verbose3")]
 #[cfg_attr(miri, ignore)]
 #[test]
 fn determinism_identical_sequences_yield_identical_tables() {
@@ -560,12 +567,14 @@ fn resize_grow_shrink_same_cycles_preserve_semantics() {
 
     for &mb in &[1usize, 4, 2, 8, 8, 1, 1, 16] {
         let prev_count = tt.cluster_count();
+        #[cfg(feature = "verbose3")]
         let prev_sum = tt.checksum();
         tt.resize(mb);
         assert_eq!(tt.cluster_count(), mb * 32_768);
 
         if tt.cluster_count() == prev_count {
             // Same size → untouched (no realloc, no clear).
+            #[cfg(feature = "verbose3")]
             assert_eq!(tt.checksum(), prev_sum, "same-size resize must be a no-op");
         } else {
             // Changed size → aligned, cleared allocation.

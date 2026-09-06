@@ -19,6 +19,28 @@ use yorkie_state::{
 };
 use yorkie_storage::{Book, BookMove};
 
+/// The name of the option a filter consulted, carried alongside its value so a
+/// diagnostic can quote it. The name has no other reader, so below `verbose1` —
+/// where there is no diagnostic — it is the unit type and none of the option-name
+/// literals is compiled.
+#[cfg(feature = "verbose1")]
+type OptionName = &'static str;
+#[cfg(not(feature = "verbose1"))]
+type OptionName = ();
+
+/// One option name, as [`OptionName`]: the literal itself where a diagnostic can
+/// print it, nothing below that level.
+macro_rules! option_name {
+    ($name:literal) => {{
+        #[cfg(feature = "verbose1")]
+        {
+            $name
+        }
+        #[cfg(not(feature = "verbose1"))]
+        {}
+    }};
+}
+
 /// Piece kinds in Apery hand order (Pawn..=Rook), used when swapping hands to
 /// build the color-flipped position.
 const HAND_KINDS: [PieceKind; 7] = [
@@ -137,6 +159,9 @@ pub struct BookConfig {
     /// forced false under V2.
     pub consider_move_count: bool,
     /// `BookPvMoves` — how many plies of book PV to build for the info lines.
+    /// Those lines are the only thing it shapes, so it exists only in a build
+    /// that prints them.
+    #[cfg(feature = "verbose2")]
     pub pv_moves: i64,
     /// `FlippedBook` — also probe the 180°-rotated position on a miss.
     pub flipped_book: bool,
@@ -156,31 +181,31 @@ impl BookConfig {
     /// The depth-floor option actually consulted at the root, as a `(name,
     /// value)` pair. Under V2 the NAME is side-to-move dependent (`book.cpp`)
     /// and the name is what the info string reports.
-    fn depth_limit_for(&self, stm: Color) -> (&'static str, i64) {
+    fn depth_limit_for(&self, stm: Color) -> (OptionName, i64) {
         match (self.book_options_v2, stm) {
-            (false, _) => ("BookDepthLimit", self.depth_limit),
-            (true, Color::Black) => ("BookDepthBlackLimit", self.depth_black_limit),
-            (true, Color::White) => ("BookDepthWhiteLimit", self.depth_white_limit),
+            (false, _) => (option_name!("BookDepthLimit"), self.depth_limit),
+            (true, Color::Black) => (option_name!("BookDepthBlackLimit"), self.depth_black_limit),
+            (true, Color::White) => (option_name!("BookDepthWhiteLimit"), self.depth_white_limit),
         }
     }
 
     /// The eval-gap option actually consulted at the root, likewise
     /// (`book.cpp`).
-    fn eval_diff_for(&self, stm: Color) -> (&'static str, i64) {
+    fn eval_diff_for(&self, stm: Color) -> (OptionName, i64) {
         match (self.book_options_v2, stm) {
-            (false, _) => ("BookEvalDiff", self.eval_diff),
-            (true, Color::Black) => ("BookEvalBlackDiff", self.eval_black_diff),
-            (true, Color::White) => ("BookEvalWhiteDiff", self.eval_white_diff),
+            (false, _) => (option_name!("BookEvalDiff"), self.eval_diff),
+            (true, Color::Black) => (option_name!("BookEvalBlackDiff"), self.eval_black_diff),
+            (true, Color::White) => (option_name!("BookEvalWhiteDiff"), self.eval_white_diff),
         }
     }
 
     /// The per-side eval floor and its option name — unchanged between
     /// profiles (already side-to-move dependent under V1, `book.cpp`).
-    fn eval_limit_for(&self, stm: Color) -> (&'static str, i64) {
+    fn eval_limit_for(&self, stm: Color) -> (OptionName, i64) {
         if stm == Color::Black {
-            ("BookEvalBlackLimit", self.eval_black_limit)
+            (option_name!("BookEvalBlackLimit"), self.eval_black_limit)
         } else {
-            ("BookEvalWhiteLimit", self.eval_white_limit)
+            (option_name!("BookEvalWhiteLimit"), self.eval_white_limit)
         }
     }
 }
@@ -188,6 +213,10 @@ impl BookConfig {
 /// One `info` line's worth of book-PV data for a surviving candidate (the
 /// reference `isRoot` multipv block). Exact string equality with the reference
 /// is not required; the field shape must match USI.
+///
+/// Nothing but the `info` lines reads it, so a build that prints none compiles
+/// neither this type nor the walk that fills it.
+#[cfg(feature = "verbose2")]
 #[derive(Clone, Debug)]
 pub struct BookInfoLine {
     /// 1-based candidate index (`multipv`).
@@ -211,6 +240,7 @@ pub struct BookHit {
     /// Stored eval of the selected move.
     pub value: i16,
     /// One info line per surviving candidate, best-first.
+    #[cfg(feature = "verbose2")]
     pub info_lines: Vec<BookInfoLine>,
 }
 
@@ -221,7 +251,10 @@ pub struct BookHit {
 pub struct BookProbeResult {
     /// The chosen move, or `None` on a miss.
     pub hit: Option<BookHit>,
-    /// Diagnostic message bodies to surface as `info string` lines.
+    /// Diagnostic message bodies to surface as `info string` lines. They are the
+    /// diagnostic surface itself, so a build that prints no diagnostic neither
+    /// collects nor composes them.
+    #[cfg(feature = "verbose1")]
     pub diagnostics: Vec<String>,
 }
 
@@ -285,10 +318,14 @@ pub fn probe_book(
                 depth: bm.depth,
                 count: bm.count,
             }),
+            #[cfg(feature = "verbose1")]
             None => result.diagnostics.push(format!(
                 "Error! : Illegal Move In Book DB : move16 = 0x{:04x}",
                 bm.move16
             )),
+            // The entry is dropped either way; only the report is a level.
+            #[cfg(not(feature = "verbose1"))]
+            None => {}
         }
     }
     if candidates.is_empty() {
@@ -297,6 +334,7 @@ pub fn probe_book(
 
     // Info lines are built from the post-legality candidate set, before any
     // narrow/eval/depth filtering removes moves.
+    #[cfg(feature = "verbose2")]
     let info_lines = build_info_lines(books, ignore_book_ply, pos, config, &candidates);
 
     let move_count_total: u64 = candidates.iter().map(|c| u64::from(c.count)).sum();
@@ -304,8 +342,10 @@ pub fn probe_book(
 
     // NarrowBook: drop moves under 10% adoption (only with real counts).
     if config.narrow_book_active() && has_move_count {
+        #[cfg(feature = "verbose1")]
         let before = candidates.len();
         candidates.retain(|c| f64::from(c.count) / move_count_total as f64 >= 0.1);
+        #[cfg(feature = "verbose1")]
         if candidates.len() != before {
             result.diagnostics.push(format!(
                 "NarrowBook : {before} moves to {} moves.",
@@ -322,20 +362,34 @@ pub fn probe_book(
     // eval cutoffs. Under V2 both the depth floor and the eval gap come from the
     // side-to-move-specific option, and the info strings name the option used.
     let stm = pos.side_to_move();
+    // The option names are carried only for the reports below, so a build with
+    // no reports binds the values alone.
+    #[cfg(feature = "verbose1")]
     let (depth_limit_name, depth_limit) = config.depth_limit_for(stm);
+    #[cfg(not(feature = "verbose1"))]
+    let (_, depth_limit) = config.depth_limit_for(stm);
     if depth_limit != 0 && i64::from(candidates[0].depth) < depth_limit {
+        #[cfg(feature = "verbose1")]
         result.diagnostics.push(format!(
             "{depth_limit_name} is lower than the depth of this node."
         ));
         candidates.clear();
     } else {
         let best_value = i64::from(candidates[0].value);
+        #[cfg(feature = "verbose1")]
         let (eval_diff_name, eval_diff) = config.eval_diff_for(stm);
+        #[cfg(not(feature = "verbose1"))]
+        let (_, eval_diff) = config.eval_diff_for(stm);
         let value_limit1 = best_value - eval_diff;
+        #[cfg(feature = "verbose1")]
         let (limit_name, value_limit2) = config.eval_limit_for(stm);
+        #[cfg(not(feature = "verbose1"))]
+        let (_, value_limit2) = config.eval_limit_for(stm);
         let value_limit = value_limit1.max(value_limit2);
+        #[cfg(feature = "verbose1")]
         let before = candidates.len();
         candidates.retain(|c| i64::from(c.value) >= value_limit);
+        #[cfg(feature = "verbose1")]
         if candidates.len() != before {
             result.diagnostics.push(format!(
                 "{eval_diff_name} = {eval_diff} , {limit_name} = {value_limit2} , {before} moves to {} moves.",
@@ -372,6 +426,7 @@ pub fn probe_book(
         best: best.mv,
         ponder,
         value: best.value,
+        #[cfg(feature = "verbose2")]
         info_lines,
     });
     result
@@ -396,6 +451,7 @@ fn ponder_move(
 }
 
 /// Build the per-candidate book-PV info lines (the `isRoot` multipv block).
+#[cfg(feature = "verbose2")]
 fn build_info_lines(
     books: &[Book],
     ignore_book_ply: bool,
@@ -427,6 +483,9 @@ fn build_info_lines(
 /// forward for up to `pv_moves` plies. A deterministic simplification of the
 /// reference `pv_builder` (which force-hits and may randomize); exact PV content
 /// is not gated, only its USI shape.
+///
+/// The info lines are its only caller, so it follows them.
+#[cfg(feature = "verbose2")]
 fn build_pv(
     books: &[Book],
     ignore_book_ply: bool,
@@ -651,6 +710,7 @@ mod tests {
             depth_black_limit: 0,
             depth_white_limit: 0,
             consider_move_count: false,
+            #[cfg(feature = "verbose2")]
             pv_moves: 8,
             flipped_book: false,
         }
@@ -732,16 +792,20 @@ mod tests {
                 .expect("hit");
             assert!(allowed.contains(&usi(hit.best).as_str()), "seed {seed}");
         }
-        // The info block reports every surviving candidate, best-first.
-        let mut prng = Prng::new(1);
-        let hit = probe_book(one(&book), false, &pos(STARTPOS_B), &c, &mut prng)
-            .hit
-            .expect("hit");
-        assert_eq!(hit.info_lines.len(), 3);
-        assert_eq!(hit.info_lines[0].multipv, 1);
-        assert_eq!(usi(hit.info_lines[0].pv[0]), "7g7f");
-        assert_eq!(hit.info_lines[0].score, 100);
-        assert_eq!(hit.info_lines[0].depth, 20);
+        // The info block reports every surviving candidate, best-first — in a
+        // build that has one.
+        #[cfg(feature = "verbose2")]
+        {
+            let mut prng = Prng::new(1);
+            let hit = probe_book(one(&book), false, &pos(STARTPOS_B), &c, &mut prng)
+                .hit
+                .expect("hit");
+            assert_eq!(hit.info_lines.len(), 3);
+            assert_eq!(hit.info_lines[0].multipv, 1);
+            assert_eq!(usi(hit.info_lines[0].pv[0]), "7g7f");
+            assert_eq!(hit.info_lines[0].score, 100);
+            assert_eq!(hit.info_lines[0].depth, 20);
+        }
     }
 
     #[test]
@@ -779,6 +843,9 @@ mod tests {
 
     // --- BookOptions V2. ---
 
+    /// The names exist only to be quoted in a diagnostic, so this holds only
+    /// where the diagnostics do.
+    #[cfg(feature = "verbose1")]
     #[test]
     fn v2_resolves_option_names_by_side_to_move() {
         let v1 = cfg();
@@ -834,6 +901,7 @@ mod tests {
         let r = probe_book(one(&book), false, &pos(STARTPOS_B), &c, &mut prng);
         let hit = r.hit.expect("hit");
         assert_eq!(usi(hit.best), "7g7f");
+        #[cfg(feature = "verbose1")]
         assert!(
             r.diagnostics
                 .iter()
@@ -866,6 +934,7 @@ mod tests {
         let r = probe_book(one(&book), false, &pos(STARTPOS_W), &c, &mut prng);
         let hit = r.hit.expect("hit");
         assert_eq!(usi(hit.best), "3c3d");
+        #[cfg(feature = "verbose1")]
         assert!(
             r.diagnostics
                 .iter()
@@ -901,6 +970,7 @@ mod tests {
         let mut prng = Prng::new(1);
         let r = probe_book(one(&black_book), false, &pos(STARTPOS_B), &c, &mut prng);
         assert!(r.hit.is_none(), "Black depth floor above 20 → miss");
+        #[cfg(feature = "verbose1")]
         assert!(
             r.diagnostics
                 .iter()
@@ -923,6 +993,7 @@ mod tests {
         let mut prng = Prng::new(1);
         let r = probe_book(one(&white_book), false, &pos(STARTPOS_W), &c, &mut prng);
         assert!(r.hit.is_none(), "White depth floor above 20 → miss");
+        #[cfg(feature = "verbose1")]
         assert!(
             r.diagnostics
                 .iter()
@@ -1005,6 +1076,7 @@ mod tests {
                 .hit
                 .expect("hit");
             assert_eq!(usi(hit.best), "7g7f", "seed {seed}");
+            #[cfg(feature = "verbose2")]
             assert_eq!(
                 hit.info_lines.len(),
                 1,
@@ -1086,6 +1158,7 @@ mod tests {
             .expect("hit");
         assert_eq!(usi(hit.best), "7g7f");
         assert_eq!(hit.ponder.map(usi), Some("3c3d".to_string()));
+        #[cfg(feature = "verbose2")]
         assert_eq!(
             hit.info_lines[0]
                 .pv
@@ -1118,6 +1191,7 @@ mod tests {
         let r = probe_book(one(&book), false, &pos(STARTPOS_B), &c, &mut prng);
         let hit = r.hit.expect("legal move still selectable");
         assert_eq!(usi(hit.best), "7g7f");
+        #[cfg(feature = "verbose1")]
         assert!(
             r.diagnostics.iter().any(|d| d.contains("Illegal Move")),
             "expected an illegal-move diagnostic, got {:?}",

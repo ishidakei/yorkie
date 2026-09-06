@@ -66,9 +66,13 @@ pub struct RootMove {
     pub mean_squared_score: i64,
     /// `selDepth` recorded when this move became the PV.
     pub sel_depth: i32,
-    /// `uciScore` is a lower bound (fail high).
+    /// `uciScore` is a lower bound (fail high). Read only to mark a PV line
+    /// `lowerbound`, so it exists only in a build that prints one.
+    #[cfg(feature = "verbose2")]
     pub score_lowerbound: bool,
-    /// `uciScore` is an upper bound (fail low).
+    /// `uciScore` is an upper bound (fail low). Read only to mark a PV line
+    /// `upperbound`, so it exists only in a build that prints one.
+    #[cfg(feature = "verbose2")]
     pub score_upperbound: bool,
     /// Nodes spent searching this root move's subtree.
     pub effort: u64,
@@ -87,7 +91,9 @@ impl RootMove {
             average_score: -VALUE_INFINITE,
             mean_squared_score: MEAN_SQUARED_INIT,
             sel_depth: 0,
+            #[cfg(feature = "verbose2")]
             score_lowerbound: false,
+            #[cfg(feature = "verbose2")]
             score_upperbound: false,
             effort: 0,
         }

@@ -96,7 +96,9 @@ spin_accessors! {
     book_eval_black_limit => BOOK_EVAL_BLACK_LIMIT;
     /// Absolute book-value floor with White to move (`BookEvalWhiteLimit`).
     book_eval_white_limit => BOOK_EVAL_WHITE_LIMIT;
-    /// How many book moves to emit as a PV (`BookPvMoves`).
+    /// How many book moves to emit as a PV (`BookPvMoves`). Read only where the
+    /// book `info` lines are built.
+    #[cfg(feature = "verbose2")]
     book_pv_moves => BOOK_PV_MOVES;
     /// Per-`go` search-depth ceiling, `0` unlimited (`DepthLimit`).
     depth_limit => DEPTH_LIMIT;
@@ -104,7 +106,9 @@ spin_accessors! {
     nodes_limit => NODES_LIMIT;
     /// Ply past which the search adjudicates a draw (`MaxMovesToDraw`).
     max_moves_to_draw => MAX_MOVES_TO_DRAW;
-    /// PV-output throttle in milliseconds (`PvInterval`).
+    /// PV-output throttle in milliseconds (`PvInterval`). Read only where a PV
+    /// is printed.
+    #[cfg(feature = "verbose2")]
     pv_interval => PV_INTERVAL;
     /// Draw score with Black to move, in centipawns (`DrawValueBlack`).
     draw_value_black => DRAW_VALUE_BLACK;
@@ -131,9 +135,13 @@ check_accessors! {
     ignore_book_ply => IGNORE_BOOK_PLY;
     /// Also probe the mirrored position (`FlippedBook`).
     flipped_book => FLIPPED_BOOK;
-    /// Collect each PV from the transposition table (`ConsiderationMode`).
+    /// Collect each PV from the transposition table (`ConsiderationMode`). Both
+    /// this and the fail-high/low toggle below shape a printed PV only, so they
+    /// are read only where one is printed.
+    #[cfg(feature = "verbose2")]
     consideration_mode => CONSIDERATION_MODE;
     /// Emit a PV on a fail-high / fail-low (`OutputFailLHPV`).
+    #[cfg(feature = "verbose2")]
     output_fail_lh_pv => OUTPUT_FAIL_LH_PV;
     /// Also consider the suppressed non-promoting moves
     /// (`GenerateAllLegalMoves`).

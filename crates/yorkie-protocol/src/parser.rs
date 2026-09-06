@@ -100,8 +100,41 @@ pub enum Command {
     #[cfg(feature = "verbose3")]
     Tt(Vec<String>),
     Quit,
+    /// A line no arm recognised. The line text is retained only so the
+    /// `verbose1` diagnostic can echo it back; below that level nothing can
+    /// print it, so the variant carries nothing and the text is never copied.
+    /// Every construction goes through [`unknown`], which is where the two
+    /// shapes live.
+    #[cfg(feature = "verbose1")]
     Unknown(String),
+    #[cfg(not(feature = "verbose1"))]
+    Unknown,
     TooLong,
+}
+
+/// [`Command::Unknown`] for `line`, carrying the text only where a build can
+/// print it.
+#[cfg(feature = "verbose1")]
+fn unknown(line: &str) -> Command {
+    Command::Unknown(line.to_string())
+}
+
+#[cfg(not(feature = "verbose1"))]
+fn unknown(_line: &str) -> Command {
+    Command::Unknown
+}
+
+/// [`Command::Unknown`] for a malformed `setoption`, whose reported text is the
+/// re-joined line. The join exists only for the report, so a build that cannot
+/// print one does not perform it.
+#[cfg(feature = "verbose1")]
+fn unknown_setoption(tokens: &[&str]) -> Command {
+    Command::Unknown(format!("setoption {}", tokens.join(" ")))
+}
+
+#[cfg(not(feature = "verbose1"))]
+fn unknown_setoption(_tokens: &[&str]) -> Command {
+    Command::Unknown
 }
 
 pub fn parse_line(input: &str) -> Command {
@@ -110,7 +143,7 @@ pub fn parse_line(input: &str) -> Command {
     }
     let trimmed = input.trim_matches(|c: char| c == '\r' || c == '\n' || c.is_whitespace());
     if trimmed.is_empty() {
-        return Command::Unknown(String::new());
+        return unknown("");
     }
     let mut parts = trimmed.split_whitespace();
     let head = parts.next().unwrap_or("");
@@ -139,14 +172,14 @@ pub fn parse_line(input: &str) -> Command {
         // command existed.
         #[cfg(feature = "verbose3")]
         "tt" => Command::Tt(parts.map(str::to_string).collect()),
-        _ => Command::Unknown(trimmed.to_string()),
+        _ => unknown(trimmed),
     }
 }
 
 fn parse_position<'a>(line: &str, parts: impl Iterator<Item = &'a str>) -> Command {
     let tokens: Vec<&str> = parts.collect();
     let Some((&kind, rest)) = tokens.split_first() else {
-        return Command::Unknown(line.to_string());
+        return unknown(line);
     };
     let (sfen, after_sfen) = match kind {
         "startpos" => (PositionSfen::StartPos, rest),
@@ -155,17 +188,17 @@ fn parse_position<'a>(line: &str, parts: impl Iterator<Item = &'a str>) -> Comma
             // the joined string to `yorkie_state::parse_sfen` in the driver and
             // surface any per-field error from there.
             if rest.len() < 4 {
-                return Command::Unknown(line.to_string());
+                return unknown(line);
             }
             let sfen_str = rest[..4].join(" ");
             (PositionSfen::Sfen(sfen_str), &rest[4..])
         }
-        _ => return Command::Unknown(line.to_string()),
+        _ => return unknown(line),
     };
     let moves = match after_sfen {
         [] => Vec::new(),
         ["moves", rest @ ..] => rest.iter().map(|s| (*s).to_string()).collect(),
-        _ => return Command::Unknown(line.to_string()),
+        _ => return unknown(line),
     };
     Command::Position { sfen, moves }
 }
@@ -210,7 +243,7 @@ fn parse_go<'a>(line: &str, parts: impl Iterator<Item = &'a str>) -> Command {
                 }
                 Some(value) => {
                     let Ok(v) = value.parse::<u64>() else {
-                        return Command::Unknown(line.to_string());
+                        return unknown(line);
                     };
                     limits.mate = Some(v);
                     i += 2;
@@ -219,16 +252,16 @@ fn parse_go<'a>(line: &str, parts: impl Iterator<Item = &'a str>) -> Command {
             "depth" | "nodes" | "movetime" | "wtime" | "btime" | "winc" | "binc" | "byoyomi"
             | "rtime" => {
                 let Some(value) = tokens.get(i + 1) else {
-                    return Command::Unknown(line.to_string());
+                    return unknown(line);
                 };
                 if key == "depth" {
                     match value.parse::<u32>() {
                         Ok(v) => limits.depth = Some(v),
-                        Err(_) => return Command::Unknown(line.to_string()),
+                        Err(_) => return unknown(line),
                     }
                 } else {
                     let Ok(v) = value.parse::<u64>() else {
-                        return Command::Unknown(line.to_string());
+                        return unknown(line);
                     };
                     match key {
                         "nodes" => limits.nodes = Some(v),
@@ -244,7 +277,7 @@ fn parse_go<'a>(line: &str, parts: impl Iterator<Item = &'a str>) -> Command {
                 }
                 i += 2;
             }
-            _ => return Command::Unknown(line.to_string()),
+            _ => return unknown(line),
         }
     }
     Command::Go(limits)
@@ -257,20 +290,20 @@ fn parse_setoption<'a>(parts: impl Iterator<Item = &'a str>) -> Command {
     let tokens: Vec<&str> = parts.collect();
     let mut iter = tokens.iter();
     let Some(&kw) = iter.next() else {
-        return Command::Unknown(format!("setoption {}", tokens.join(" ")));
+        return unknown_setoption(&tokens);
     };
     if kw != "name" {
-        return Command::Unknown(format!("setoption {}", tokens.join(" ")));
+        return unknown_setoption(&tokens);
     }
     let Some(&name) = iter.next() else {
-        return Command::Unknown(format!("setoption {}", tokens.join(" ")));
+        return unknown_setoption(&tokens);
     };
     let rest: Vec<&str> = iter.copied().collect();
     let value = match rest.as_slice() {
         [] => String::new(),
         ["value"] => String::new(),
         ["value", rest @ ..] => rest.join(" "),
-        _ => return Command::Unknown(format!("setoption {}", tokens.join(" "))),
+        _ => return unknown_setoption(&tokens),
     };
     Command::SetOption {
         name: name.to_string(),
@@ -349,6 +382,10 @@ mod tests {
         );
     }
 
+    /// The retained text is the `verbose1` half of the variant, so this pins it
+    /// only where it exists; the rest of the unknown-line assertions compare
+    /// against [`unknown`] and hold at every level.
+    #[cfg(feature = "verbose1")]
     #[test]
     fn unknown_command_preserves_trimmed_line() {
         assert_eq!(
@@ -405,13 +442,10 @@ mod tests {
 
     #[test]
     fn position_without_kind_token_is_unknown() {
-        assert_eq!(
-            parse_line("position"),
-            Command::Unknown("position".to_string())
-        );
+        assert_eq!(parse_line("position"), unknown("position"));
         assert_eq!(
             parse_line("position something"),
-            Command::Unknown("position something".to_string())
+            unknown("position something")
         );
     }
 
@@ -420,7 +454,7 @@ mod tests {
         // Only three tokens (missing ply) → cannot form a valid SFEN.
         assert_eq!(
             parse_line("position sfen a b c"),
-            Command::Unknown("position sfen a b c".to_string())
+            unknown("position sfen a b c")
         );
     }
 
@@ -491,17 +525,14 @@ mod tests {
     fn go_with_unknown_subtoken_is_unknown() {
         assert_eq!(
             parse_line("go searchmoves 7g7f"),
-            Command::Unknown("go searchmoves 7g7f".to_string())
+            unknown("go searchmoves 7g7f")
         );
     }
 
     #[cfg(feature = "verbose2")]
     #[test]
     fn go_with_missing_value_is_unknown() {
-        assert_eq!(
-            parse_line("go depth"),
-            Command::Unknown("go depth".to_string())
-        );
+        assert_eq!(parse_line("go depth"), unknown("go depth"));
     }
 
     #[cfg(feature = "verbose2")]
@@ -509,7 +540,7 @@ mod tests {
     fn go_with_non_integer_value_is_unknown() {
         assert_eq!(
             parse_line("go nodes not-a-number"),
-            Command::Unknown("go nodes not-a-number".to_string())
+            unknown("go nodes not-a-number")
         );
     }
 
@@ -610,10 +641,7 @@ mod tests {
     #[cfg(feature = "verbose2")]
     #[test]
     fn go_mate_non_integer_budget_is_unknown() {
-        assert_eq!(
-            parse_line("go mate soon"),
-            Command::Unknown("go mate soon".to_string())
-        );
+        assert_eq!(parse_line("go mate soon"), unknown("go mate soon"));
     }
 
     /// Below `verbose3` — the default build: `bench` is not a command token at
@@ -622,10 +650,10 @@ mod tests {
     #[cfg(not(feature = "verbose3"))]
     #[test]
     fn bench_is_not_a_command_below_verbose3() {
-        assert_eq!(parse_line("bench"), Command::Unknown("bench".to_string()));
+        assert_eq!(parse_line("bench"), unknown("bench"));
         assert_eq!(
             parse_line("bench 16 1 6 default depth"),
-            Command::Unknown("bench 16 1 6 default depth".to_string())
+            unknown("bench 16 1 6 default depth")
         );
     }
 
@@ -696,7 +724,7 @@ mod tests {
         // A genuinely unknown sub-token is still `Unknown`, not a gate report.
         assert_eq!(
             parse_line("go searchmoves 7g7f"),
-            Command::Unknown("go searchmoves 7g7f".to_string())
+            unknown("go searchmoves 7g7f")
         );
     }
 
@@ -707,9 +735,9 @@ mod tests {
     fn tt_is_not_a_command_below_verbose3() {
         assert_eq!(
             parse_line("tt probe startpos"),
-            Command::Unknown("tt probe startpos".to_string())
+            unknown("tt probe startpos")
         );
-        assert_eq!(parse_line("tt"), Command::Unknown("tt".to_string()));
+        assert_eq!(parse_line("tt"), unknown("tt"));
     }
 
     /// At `verbose3`: `tt` splits into verbatim tokens for
@@ -726,8 +754,8 @@ mod tests {
 
     #[test]
     fn empty_line_is_unknown_empty() {
-        assert_eq!(parse_line(""), Command::Unknown(String::new()));
-        assert_eq!(parse_line("   \n"), Command::Unknown(String::new()));
+        assert_eq!(parse_line(""), unknown(""));
+        assert_eq!(parse_line("   \n"), unknown(""));
     }
 
     #[test]
@@ -741,6 +769,6 @@ mod tests {
     fn line_at_max_size_is_parsed_normally() {
         // 64 KB exactly — still parses (becomes Unknown since it's not a command).
         let line = "x".repeat(MAX_LINE_BYTES);
-        assert!(matches!(parse_line(&line), Command::Unknown(_)));
+        assert_eq!(parse_line(&line), unknown(&line));
     }
 }
