@@ -36,8 +36,7 @@ use crate::driver::{PAWN_VALUE, VALUE_MATE, VALUE_TB_WIN_IN_MAX_PLY};
 
 /// Largest mate distance the value encoding can carry: `VALUE_MATE - n` must
 /// stay decisive (`|v| >= VALUE_TB_WIN_IN_MAX_PLY`), and that threshold is
-/// `VALUE_MATE - MAX_PLY` with the reference's `MAX_PLY == 246`
-/// (`source/types.h`).
+/// `VALUE_MATE - MAX_PLY` with the reference's `MAX_PLY == 246`.
 pub const MAX_MATE_DISTANCE: i64 = (VALUE_MATE - VALUE_TB_WIN_IN_MAX_PLY) as i64;
 
 /// Smallest `depth` an entry can carry. [`yorkie_storage::tt`] stores
@@ -306,9 +305,9 @@ fn parse_bound(tok: &str) -> Result<Bound, TtParseError> {
 }
 
 /// USI centipawns → an internal search value: the inverse of the reference
-/// `to_cp` (`100 * v / PawnValue`, `usi.cpp`), with C++-style truncating
-/// division. Rejected when the result would land in the decisive band, where
-/// it would read back as a mate score instead of a centipawn one.
+/// `to_cp` (`100 * v / PawnValue`), with C++-style truncating division.
+/// Rejected when the result would land in the decisive band, where it would
+/// read back as a mate score instead of a centipawn one.
 pub fn cp_to_value(cp: i64) -> Result<Value, TtParseError> {
     let v = cp * PAWN_VALUE as i64 / 100;
     if v.abs() >= VALUE_TB_WIN_IN_MAX_PLY as i64 {
@@ -321,8 +320,8 @@ pub fn cp_to_value(cp: i64) -> Result<Value, TtParseError> {
 }
 
 /// A USI mate distance → an internal search value: `mate_in` / `mated_in`
-/// (`source/types.h`) measured from the named position.
-/// Positive is a win for the side to move, negative a loss.
+/// measured from the named position. Positive is a win for the side to move,
+/// negative a loss.
 pub fn mate_to_value(n: i64) -> Result<Value, TtParseError> {
     if n.abs() > MAX_MATE_DISTANCE {
         return Err(err(format!(
@@ -338,9 +337,9 @@ pub fn mate_to_value(n: i64) -> Result<Value, TtParseError> {
     })
 }
 
-/// `value_to_tt(v, ply)` (`yaneuraou-search.cpp`) — shift a mate score away
-/// from the root before storing, making the stored value position-absolute.
-/// Identical to the search's private copy in `yorkie-search`.
+/// `value_to_tt(v, ply)` — shift a mate score away from the root before
+/// storing, making the stored value position-absolute. Identical to the
+/// search's private copy in `yorkie-search`.
 pub fn value_to_tt(v: Value, ply: i32) -> Value {
     if v >= VALUE_TB_WIN_IN_MAX_PLY {
         v + ply
@@ -351,8 +350,8 @@ pub fn value_to_tt(v: Value, ply: i32) -> Value {
     }
 }
 
-/// `value_from_tt(v, ply)` (`yaneuraou-search.cpp`) — shift a stored mate
-/// score back toward the root. `VALUE_NONE` passes through unchanged.
+/// `value_from_tt(v, ply)` — shift a stored mate score back toward the root.
+/// `VALUE_NONE` passes through unchanged.
 pub fn value_from_tt(v: Value, ply: i32) -> Value {
     if v == yorkie_storage::VALUE_NONE {
         yorkie_storage::VALUE_NONE

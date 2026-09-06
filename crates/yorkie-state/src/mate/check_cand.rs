@@ -1,5 +1,5 @@
 //! Compile-time `CHECK_CAND_BB` candidate-origin tables, ported from
-//! `init_check_bb` (`mate1ply_without_effect.cpp`).
+//! `init_check_bb`.
 //!
 //! For each enemy-king square, mover colour, and piece-kind, the entry is the
 //! **superset** of origins from which such a piece could deliver the relevant

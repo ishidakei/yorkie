@@ -1,5 +1,5 @@
 //! The `bench` command's argument parsing and default position set — a port of
-//! the reference `setup_bench` and its `Defaults` list (`benchmark.cpp`).
+//! the reference `setup_bench` and its `Defaults` list.
 //!
 //! The whole module exists only under the `verbose3` cargo feature, so the
 //! default build has neither this parse nor the `bench` command token.
@@ -25,9 +25,8 @@ use yorkie_state::format_sfen;
 
 use crate::parser::GoLimits;
 
-/// The reference `Defaults` position list (`benchmark.cpp`), transcribed
-/// verbatim (every SFEN, same order). Used when the position source is
-/// `default` (or omitted).
+/// The reference `Defaults` position list, transcribed verbatim (every SFEN,
+/// same order). Used when the position source is `default` (or omitted).
 pub const BENCH_DEFAULT_POSITIONS: [&str; 4] = [
     // 初期局面に近い曲面。
     "lnsgkgsnl/1r7/p1ppp1bpp/1p3pp2/7P1/2P6/PP1PPPP1P/1B3S1R1/LNSGKG1NL b - 9",
@@ -39,7 +38,7 @@ pub const BENCH_DEFAULT_POSITIONS: [&str; 4] = [
     "l6nl/5+P1gk/2np1S3/p1p4Pp/3P2Sp1/1PPb2P1P/P5GS1/R8/LN4bKL w RGgsn5p 1",
 ];
 
-/// The reference non-Stockfish defaults (`benchmark.cpp`).
+/// The reference non-Stockfish defaults.
 const DEFAULT_TT_MB: &str = "1024";
 const DEFAULT_THREADS: &str = "1";
 const DEFAULT_LIMIT: &str = "15000";

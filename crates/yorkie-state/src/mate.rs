@@ -1,5 +1,5 @@
-//! One-ply mate detector, ported from `mate1ply_without_effect.cpp` — the
-//! table-driven implementation the reference's build guards select.
+//! One-ply mate detector — a port of the table-driven implementation the
+//! reference's build guards select.
 //!
 //! **The detector is deliberately incomplete**, and does not find every legal
 //! one-ply mate: the reference compiles out its distant dropped-rook and

@@ -1,6 +1,5 @@
 //! Root search data types and helpers, ported from the reference's
-//! `start_searching` / `iterative_deepening` / `search<Root>`
-//! (`yaneuraou-search.cpp`, `thread.cpp`).
+//! `start_searching` / `iterative_deepening` / `search<Root>`.
 //!
 //! This module holds the *pure* pieces: the [`RootMove`] / [`RootOutcome`]
 //! value types, the [`generate_root_moves`] list builder, and the
@@ -12,39 +11,36 @@
 use yorkie_state::{Color, ExtMove, Move, PieceKind, Position, Square};
 use yorkie_storage::Value;
 
-/// `VALUE_INFINITE` (`types.h`), duplicated from [`crate::qsearch`] so the
-/// pure root-move initialisation does not reach into that module's private
-/// constants.
+/// `VALUE_INFINITE`, duplicated from [`crate::qsearch`] so the pure root-move
+/// initialisation does not reach into that module's private constants.
 const VALUE_INFINITE: Value = 32001;
 
-/// `MAX_PLY` (`config.h` → `types.h`), used by the proven-win / proven- loss
-/// thresholds below.
+/// `MAX_PLY`, used by the proven-win / proven-loss thresholds below.
 const MAX_PLY: Value = 246;
-/// `VALUE_MATE` (`types.h`).
+/// `VALUE_MATE`.
 const VALUE_MATE: Value = 32000;
-/// `VALUE_TB_WIN_IN_MAX_PLY` (`types.h`): the `is_win` / `is_loss` threshold,
+/// `VALUE_TB_WIN_IN_MAX_PLY`: the `is_win` / `is_loss` threshold,
 /// `VALUE_MATE - MAX_PLY`.
 const VALUE_TB_WIN_IN_MAX_PLY: Value = VALUE_MATE - MAX_PLY;
 
-/// `is_win(v)` (`types.h`): a proven-win (mate/TB-win) score.
+/// `is_win(v)`: a proven-win (mate/TB-win) score.
 fn is_win(v: Value) -> bool {
     v >= VALUE_TB_WIN_IN_MAX_PLY
 }
 
-/// `is_loss(v)` (`types.h`): a proven-loss (mated/TB-loss) score.
+/// `is_loss(v)`: a proven-loss (mated/TB-loss) score.
 fn is_loss(v: Value) -> bool {
     v <= -VALUE_TB_WIN_IN_MAX_PLY
 }
 
-/// `RootMove::meanSquaredScore` initial value (`search.h`). The reference holds
-/// this in an `int`; it is `i64` here so the `value * abs(value)` moving
-/// average cannot overflow. Only the first iteration's `delta` reads it, so the
-/// widening is unobservable.
+/// `RootMove::meanSquaredScore` initial value. The reference holds this in an
+/// `int`; it is `i64` here so the `value * abs(value)` moving average cannot
+/// overflow. Only the first iteration's `delta` reads it, so the widening is
+/// unobservable.
 const MEAN_SQUARED_INIT: i64 = -(VALUE_INFINITE as i64 * VALUE_INFINITE as i64);
 
 /// One root move and the per-iteration statistics `search<Root>` maintains for
-/// it (`source/search.h`). Only the fields the depth-1 path
-/// reads or writes are kept.
+/// it. Only the fields the depth-1 path reads or writes are kept.
 #[derive(Clone, Debug)]
 pub struct RootMove {
     /// `pv[0]` — the move itself.
@@ -79,8 +75,8 @@ pub struct RootMove {
 }
 
 impl RootMove {
-    /// A fresh root move (`RootMove(Move)` — `search.h`): `pv == [m]`, every
-    /// score at its `-VALUE_INFINITE` / `MEAN_SQUARED_INIT` sentinel.
+    /// A fresh root move: `pv == [m]`, every score at its `-VALUE_INFINITE` /
+    /// `MEAN_SQUARED_INIT` sentinel.
     pub fn new(m: Move) -> Self {
         Self {
             mv: m,
@@ -152,8 +148,8 @@ pub struct WorkerVote {
     pub completed_depth: i32,
 }
 
-/// `YaneuraOuWorker::get_best_thread` (`yaneuraou-search.cpp`): pick the index
-/// of the worker whose result the engine reports.
+/// `YaneuraOuWorker::get_best_thread`: pick the index of the worker whose
+/// result the engine reports.
 ///
 /// `workers[0]` must be the main worker, and the slice is never empty.
 pub fn select_best_worker(workers: &[WorkerVote]) -> usize {
@@ -222,7 +218,7 @@ pub fn select_best_worker(workers: &[WorkerVote]) -> usize {
 }
 
 /// Build the root-move list in `MoveList<LEGAL>` order — the reference's
-/// `ThreadPool::start_thinking` (`thread.cpp`).
+/// `ThreadPool::start_thinking`.
 ///
 /// The legality compaction of `generateMoves<LEGAL>` overwrites an illegal move
 /// at the cursor with the current last move and shrinks the list. That is *not*
@@ -256,8 +252,7 @@ pub fn generate_root_moves(pos: &Position, all: bool) -> Vec<RootMove> {
 
 /// The entering-king (nyugyoku) declaration rule, selected by the
 /// `EnteringKingRule` USI option. Order and semantics mirror the reference
-/// `enum EnteringKingRule` (`types.h`); the option-string spellings are
-/// `EKR_STRINGS` (`types.cpp`).
+/// `enum EnteringKingRule`; the option-string spellings are `EKR_STRINGS`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnteringKingRule {
     /// `EKR_NONE` / `NoEnteringKing` — declaration disabled everywhere.
@@ -275,8 +270,8 @@ pub enum EnteringKingRule {
 }
 
 impl EnteringKingRule {
-    /// The `EKR_STRINGS` choice list (`types.cpp`) in the reference's exact
-    /// order — the `var` values of the `EnteringKingRule` combo option.
+    /// The `EKR_STRINGS` choice list in the reference's exact order — the `var`
+    /// values of the `EnteringKingRule` combo option.
     pub const STRINGS: [&'static str; 6] = [
         "NoEnteringKing",
         "CSARule24",
@@ -286,8 +281,7 @@ impl EnteringKingRule {
         "TryRule",
     ];
 
-    /// Map an option string to its rule (`to_entering_king_rule`,
-    /// `types.cpp`). An unrecognised string falls back to
+    /// Map an option string to its rule. An unrecognised string falls back to
     /// [`EnteringKingRule::None`]; the option layer only ever hands over a
     /// declared `var`, so the fallback is unreachable in practice.
     pub fn from_option(s: &str) -> Self {
@@ -318,7 +312,7 @@ pub struct EnteringKingConfig {
 
 impl EnteringKingConfig {
     /// Snapshot `rule` against `root` and precompute `enteringKingPoint[]`
-    /// (`Position::update_entering_point`, `position.cpp`).
+    /// (`Position::update_entering_point`).
     pub fn new(rule: EnteringKingRule, root: &Position) -> Self {
         Self {
             rule,
@@ -345,8 +339,8 @@ impl Default for EnteringKingConfig {
     }
 }
 
-/// `Position::update_entering_point` (`position.cpp`): the per-side
-/// entering-king point thresholds for `rule`, computed from `pos`.
+/// `Position::update_entering_point`: the per-side entering-king point
+/// thresholds for `rule`, computed from `pos`.
 fn entering_king_points(rule: EnteringKingRule, pos: &Position) -> [i32; Color::COUNT] {
     let mut points = match rule {
         EnteringKingRule::Point24 | EnteringKingRule::Point24H => [31, 31],
@@ -383,7 +377,7 @@ fn entering_king_points(rule: EnteringKingRule, pos: &Position) -> [i32; Color::
                 + (c(PieceKind::Bishop) + c(PieceKind::Rook)) * 5;
         }
         // The deficit from a full set is charged to White only — the handicap
-        // giver is treated as White (AobaZero convention, `position.cpp`).
+        // giver is treated as White (AobaZero convention).
         if p != 56 {
             points[Color::White.index()] -= 56 - p;
         }
@@ -392,8 +386,8 @@ fn entering_king_points(rule: EnteringKingRule, pos: &Position) -> [i32; Color::
     points
 }
 
-/// `Position::DeclarationWin()` (`position.cpp`), selecting behaviour by the
-/// configured [`EnteringKingRule`]:
+/// `Position::DeclarationWin()`, selecting behaviour by the configured
+/// [`EnteringKingRule`]:
 ///
 /// * [`EnteringKingRule::None`] — always `None`.
 /// * point rules — [`Move::win`] when the side to move may declare: its king is
@@ -414,8 +408,8 @@ pub fn declaration_win(pos: &Position, config: &EnteringKingConfig) -> Option<Mo
     }
 }
 
-/// The CSA point-law branch (`position.cpp`) with the per-side threshold taken
-/// from the precomputed `points` (`enteringKingPoint[us]`).
+/// The CSA point-law branch with the per-side threshold taken from the
+/// precomputed `points` (`enteringKingPoint[us]`).
 fn declaration_win_points(pos: &Position, points: [i32; Color::COUNT]) -> Option<Move> {
     let us = pos.side_to_move();
 
@@ -474,8 +468,8 @@ fn declaration_win_points(pos: &Position, points: [i32; Color::COUNT]) -> Option
     Some(Move::win())
 }
 
-/// The try-rule branch (`position.cpp`): return the king move onto the
-/// opponent king's initial square when the three try conditions hold.
+/// The try-rule branch: return the king move onto the opponent king's initial
+/// square when the three try conditions hold.
 fn declaration_win_try(pos: &Position) -> Option<Move> {
     let us = pos.side_to_move();
 
@@ -769,7 +763,7 @@ mod tests {
         assert!(declaration_win(&p, &cfg(EnteringKingRule::None, &p)).is_none());
     }
 
-    // --- TryRule (position.cpp). ---
+    // --- TryRule. ---
 
     fn sq(file: u8, rank: u8) -> Square {
         Square::new(file, rank).expect("on-board square")
@@ -907,7 +901,7 @@ mod tests {
     fn vote_proven_loss_prefers_the_lower_score() {
         let (a, b) = two_moves();
         // Incumbent (index 0) is a proven loss; a *lower* proven-loss score
-        // wins (yaneuraou-search.cpp — `newThreadScore < bestThreadScore`).
+        // wins (`newThreadScore < bestThreadScore`).
         let mated_in = |ply: Value| -VALUE_MATE + ply;
         let workers = [vote(mated_in(7), a, 1, 8), vote(mated_in(3), b, 1, 8)];
         assert_eq!(select_best_worker(&workers), 1);

@@ -1,9 +1,9 @@
 //! Layer-stack forward pass, bucket selection, and the public `evaluate` entry
 //! point.
 //!
-//! Ported from `Network::Propagate` (`sfnn-1536.h`) and `ComputeScore` /
-//! `stack_index_for_nnue` (`evaluate_nnue.cpp`). The accumulator lives in
-//! [`crate::transformer`], the kernels in [`crate::simd`].
+//! Ported from `Network::Propagate` and `ComputeScore` /
+//! `stack_index_for_nnue`. The accumulator lives in [`crate::transformer`], the
+//! kernels in [`crate::simd`].
 //!
 //! The prose here follows the reference's naming: the **FT layer** is the
 //! feature transformer, and **L1 / L2 / L3** are the dense layers after it.

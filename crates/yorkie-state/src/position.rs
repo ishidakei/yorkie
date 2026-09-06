@@ -19,12 +19,12 @@ const HAND_KINDS: [PieceKind; 7] = [
 ];
 
 /// Maximum look-back, in plies, for repetition detection
-/// (`Position::max_repetition_ply`, `position.cpp`). Searching further back is
-/// rarely productive and measurably slows the engine, so the walk is capped
-/// here regardless of `plies_from_null`.
+/// (`Position::max_repetition_ply`). Searching further back is rarely
+/// productive and measurably slows the engine, so the walk is capped here
+/// regardless of `plies_from_null`.
 const MAX_REPETITION_PLY: i32 = 16;
 
-/// Classification of a repeated position (`RepetitionState`, `types.h`).
+/// Classification of a repeated position (`RepetitionState`).
 ///
 /// `Win` and `Lose` are from the viewpoint of the **side to move** in the
 /// position asked about, not of whoever delivered the checks. Getting this
@@ -46,7 +46,7 @@ pub enum RepetitionState {
 }
 
 /// `true` iff `superior` holds an equal-or-greater count of **every** hand
-/// piece kind than `inferior` (`hand_is_equal_or_superior`, `types.h`).
+/// piece kind than `inferior` (`hand_is_equal_or_superior`).
 fn hand_is_equal_or_superior(superior: &Hand, inferior: &Hand) -> bool {
     HAND_KINDS
         .iter()
@@ -75,7 +75,7 @@ fn post_move_gives_check(board: &Board, side_to_move: Color) -> bool {
 }
 
 /// Snapshot pushed onto `Position::history` after every `do_move`, porting the
-/// reference `StateInfo` (`position.cpp`).
+/// reference `StateInfo`.
 ///
 /// It stores no board copy: `undo_move` reconstructs the board by
 /// reverse-applying the move, and position identity is carried by `board_key`.
@@ -295,8 +295,8 @@ impl Position {
     }
 
     /// XOR `piece`'s `psq` term into the partial keys it belongs to
-    /// (`xor_piece_for_partial_key`, `position.cpp`). XOR is self-inverse, so
-    /// the same call both places and removes a piece.
+    /// (`xor_piece_for_partial_key`). XOR is self-inverse, so the same call
+    /// both places and removes a piece.
     fn xor_piece_partial(&mut self, piece: Piece, sq: Square) {
         let term = crate::key::psq(piece, sq);
         if piece.kind == PieceKind::Pawn && !piece.promoted {
@@ -335,7 +335,7 @@ impl Position {
     }
 
     /// Recompute the three partial keys from scratch over the current board,
-    /// mirroring the per-piece walk in `Position::set` (`position.cpp`).
+    /// mirroring the per-piece walk in `Position::set`.
     fn recomputed_partial_keys(&self) -> (u64, u64, [u64; Color::COUNT]) {
         let mut scratch = Position::empty();
         for index in 0..Square::COUNT as u8 {
@@ -366,14 +366,14 @@ impl Position {
     }
 
     /// Play `m`, deciding check status from the parent's cached check info
-    /// before touching the board — `do_move(m, newSt)` (`position.h`).
+    /// before touching the board — `do_move(m, newSt)`.
     pub fn do_move(&mut self, m: Move) -> Undo {
         let gc = self.gives_check(m);
         self.do_move_with_check(m, gc)
     }
 
-    /// Play `m` given the pre-computed `gives_check` predicate
-    /// (`do_move(m, newSt, givesCheck)`, `position.h`). `gives_check` must equal
+    /// Play `m` given the pre-computed `gives_check` predicate (the reference
+    /// `do_move(m, newSt, givesCheck)`). `gives_check` must equal
     /// `self.gives_check(m)` evaluated from the pre-move position.
     pub fn do_move_with_check(&mut self, m: Move, gives_check: bool) -> Undo {
         // Snapshot the pre-move state as the lookback root, so it always
@@ -511,8 +511,7 @@ impl Position {
         undo
     }
 
-    /// The setup-root `StateInfo` — the `set` / `set_state` initial state
-    /// (`position.cpp`).
+    /// The setup-root `StateInfo` — the `set` / `set_state` initial state.
     fn root_state(&self) -> StateInfo {
         StateInfo {
             hands: self.hands,
@@ -587,8 +586,7 @@ impl Position {
     }
 
     /// Play a null move: pass the turn without touching the board or hands
-    /// (`Position::do_null_move`, `position.cpp`). Undo with
-    /// [`Self::undo_null_move`].
+    /// (`Position::do_null_move`). Undo with [`Self::undo_null_move`].
     ///
     /// `plies_from_null` resets to 0, so repetition detection never looks back
     /// across the null move and rebuilds its window one ply at a time.
@@ -626,7 +624,7 @@ impl Position {
             side_to_move: self.side_to_move,
             gives_check: false,
             board_key: self.board_key,
-            // `st->pliesFromNull = 0` (`position.cpp`).
+            // `st->pliesFromNull = 0`.
             plies_from_null: 0,
             continuous_check,
             // `st->repetition = st->repetition_times = 0`; a state reached
@@ -712,8 +710,7 @@ impl Position {
     }
 
     /// Compute the repetition triple for the current position, walking the
-    /// `StateInfo` chain back `min(16, plies_from_null)` plies in steps of two
-    /// (`position.cpp`).
+    /// `StateInfo` chain back `min(16, plies_from_null)` plies in steps of two.
     ///
     /// It reads the *stored* `repetition_times` / `repetition_type` of the
     /// nearest prior occurrence, so the chain it builds on must already carry
@@ -775,9 +772,9 @@ impl Position {
         (0, 0, RepetitionState::None)
     }
 
-    /// Classify the current position as a repetition from the search's viewpoint
-    /// at search distance `ply` from the root (`Position::is_repetition`,
-    /// `position.cpp`).
+    /// Classify the current position as a repetition from the search's
+    /// viewpoint at search distance `ply` from the root
+    /// (`Position::is_repetition`).
     ///
     /// The `repetition < ply` gate reports a twofold or threefold only when the
     /// earlier occurrence lies after the search root, while a forced fourfold —

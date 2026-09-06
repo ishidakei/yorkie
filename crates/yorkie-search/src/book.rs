@@ -3,7 +3,7 @@
 //! This is the Search-layer half of the opening book: it turns raw `.ybb`
 //! readers ([`yorkie_storage::Book`]) plus a [`Position`] into a chosen book
 //! move, porting `BookMoveSelector::probe_impl` /
-//! `BookMoveSelector::find_in_books` / `MemoryBook::find` (`book.cpp`).
+//! `BookMoveSelector::find_in_books` / `MemoryBook::find`.
 //!
 //! The raw reader speaks only packed keys and move fragments; everything that
 //! needs [`Position`] or movegen knowledge — packing, flipping, widening a
@@ -98,8 +98,8 @@ impl Prng {
 
     /// A generator seeded from process entropy ([`Self::random_seed`]) — the
     /// port's stand-in for the reference's default-constructed `PRNG` /
-    /// `AsyncPRNG` (`book.h`, `timeman.cpp`). Tests inject a fixed seed via
-    /// [`Self::new`] for determinism.
+    /// `AsyncPRNG`. Tests inject a fixed seed via [`Self::new`] for
+    /// determinism.
     pub fn from_entropy() -> Self {
         Prng::new(Self::random_seed())
     }
@@ -168,19 +168,19 @@ pub struct BookConfig {
 }
 
 impl BookConfig {
-    /// `NarrowBook`, forced false under V2 (`book.cpp`).
+    /// `NarrowBook`, forced false under V2.
     fn narrow_book_active(&self) -> bool {
         !self.book_options_v2 && self.narrow_book
     }
 
-    /// `ConsiderBookMoveCount`, forced false under V2 (`book.cpp`).
+    /// `ConsiderBookMoveCount`, forced false under V2.
     fn consider_move_count_active(&self) -> bool {
         !self.book_options_v2 && self.consider_move_count
     }
 
-    /// The depth-floor option actually consulted at the root, as a `(name,
-    /// value)` pair. Under V2 the NAME is side-to-move dependent (`book.cpp`)
-    /// and the name is what the info string reports.
+    /// The depth-floor option actually consulted at the root, as a
+    /// `(name, value)` pair. Under V2 the NAME is side-to-move dependent and
+    /// the name is what the info string reports.
     fn depth_limit_for(&self, stm: Color) -> (OptionName, i64) {
         match (self.book_options_v2, stm) {
             (false, _) => (option_name!("BookDepthLimit"), self.depth_limit),
@@ -189,8 +189,7 @@ impl BookConfig {
         }
     }
 
-    /// The eval-gap option actually consulted at the root, likewise
-    /// (`book.cpp`).
+    /// The eval-gap option actually consulted at the root, likewise.
     fn eval_diff_for(&self, stm: Color) -> (OptionName, i64) {
         match (self.book_options_v2, stm) {
             (false, _) => (option_name!("BookEvalDiff"), self.eval_diff),
@@ -199,8 +198,8 @@ impl BookConfig {
         }
     }
 
-    /// The per-side eval floor and its option name — unchanged between
-    /// profiles (already side-to-move dependent under V1, `book.cpp`).
+    /// The per-side eval floor and its option name — unchanged between profiles
+    /// (already side-to-move dependent under V1).
     fn eval_limit_for(&self, stm: Color) -> (OptionName, i64) {
         if stm == Color::Black {
             (option_name!("BookEvalBlackLimit"), self.eval_black_limit)
@@ -517,8 +516,8 @@ fn build_pv(
     pv
 }
 
-/// `BookMoveSelector::find_in_books` (`book.cpp`): consult the books in
-/// priority order and return the first non-empty hit.
+/// `BookMoveSelector::find_in_books`: consult the books in priority order and
+/// return the first non-empty hit.
 ///
 /// A hit in an upper book never falls through to a lower one and results are
 /// never merged, so a position present in book 0 is answered by book 0 alone.

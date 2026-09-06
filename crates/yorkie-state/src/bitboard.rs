@@ -3,13 +3,13 @@
 //!
 //! # Bit convention
 //!
-//! A [`Bitboard`] uses the reference's two-lane layout (`bitboard.h`): a
-//! 16-byte-aligned pair of `u64` lanes. Contiguous square index `k` maps to
-//! `p[0]` bit `k` for `k = 0..=62` and `p[1]` bit `k - 63` for `k = 63..=80`.
-//! **Bit 63 of `p[0]` is deliberately unused** — the reference reserves it so
-//! lance and pawn-drop borrow tricks cannot carry across the lane boundary — as
-//! are `p[1]` bits `18..`. Every value a public constructor or operator returns
-//! keeps those spare bits clear.
+//! A [`Bitboard`] uses the reference's two-lane layout: a 16-byte-aligned pair
+//! of `u64` lanes. Contiguous square index `k` maps to `p[0]` bit `k` for
+//! `k = 0..=62` and `p[1]` bit `k - 63` for `k = 63..=80`. **Bit 63 of `p[0]`
+//! is deliberately unused** — the reference reserves it so lance and pawn-drop
+//! borrow tricks cannot carry across the lane boundary — as are `p[1]` bits
+//! `18..`. Every value a public constructor or operator returns keeps those
+//! spare bits clear.
 //!
 //! [`Bitboard::raw`] / [`Bitboard::from_raw`] present a *logical* contiguous
 //! 81-bit `u128` view that closes the gap. They cross the lane boundary on
@@ -32,7 +32,7 @@ const FILES: usize = Square::FILES as usize; // 9
 /// All 81 valid square bits set in the *contiguous* `u128` domain.
 const BOARD_MASK: u128 = (1u128 << N) - 1;
 
-/// The highest contiguous square index in lane `p[0]` (`part`, `bitboard.h`).
+/// The highest contiguous square index in lane `p[0]` (`part`).
 const LANE_SPLIT: usize = 62;
 /// Width of lane 0 in the contiguous domain (`p[0]` bit 63 is the unused gap).
 const LANE0_SPAN: u32 = 63;
@@ -53,8 +53,8 @@ pub struct Bitboard {
     p: [u64; 2],
 }
 
-/// Per-square single-bit table (`SquareBB`, `bitboard.cpp`), so
-/// [`Bitboard::from_square`] is a table load rather than a lane branch.
+/// Per-square single-bit table (`SquareBB`), so [`Bitboard::from_square`] is a
+/// table load rather than a lane branch.
 const SQUARE_BB: [Bitboard; N] = {
     let mut t = [Bitboard::EMPTY; N];
     let mut idx = 0;
@@ -276,8 +276,7 @@ fn lane_xor(a: [u64; 2], b: [u64; 2]) -> [u64; 2] {
     }
 }
 
-/// SSE4.1 zero-overlap test: `(a & b) == 0`, the reference's
-/// `_mm_testz_si128` (`bitboard.cpp`).
+/// SSE4.1 zero-overlap test: `(a & b) == 0`, the reference's `_mm_testz_si128`.
 ///
 /// SAFETY: SSE4.1 is part of the target's assumed base (this repo builds with
 /// `-C target-cpu`/`target-feature` covering it, as the rest of the SSE helpers
@@ -955,8 +954,8 @@ pub fn promotion_zone(color: Color) -> Bitboard {
 }
 
 // Occupancy-limited slider attack queries — the Qugiy (2021) scheme, ported
-// from `bitboard.h` / `bitboard.cpp`. Each query cuts every ray at and
-// including the first occupied square, branchlessly.
+// from the reference. Each query cuts every ray at and including the first
+// occupied square, branchlessly.
 //
 // A file ray never straddles the lane split, so lance and rook-file rays are
 // computed per lane with plain `u64` borrow arithmetic. Rank and diagonal rays
@@ -965,7 +964,7 @@ pub fn promotion_zone(color: Color) -> Bitboard {
 // lowest bit, so subtracting 1 propagates the borrow to it. The masks for
 // decreasing-index directions are therefore stored *already* byte-reversed.
 
-/// Which lane a square belongs to (`part`, `bitboard.h`).
+/// Which lane a square belongs to (`part`).
 const fn part(idx: usize) -> usize {
     (idx > LANE_SPLIT) as usize
 }
@@ -988,8 +987,7 @@ const fn cunpack(hi_in: [u64; 2], lo_in: [u64; 2]) -> ([u64; 2], [u64; 2]) {
 }
 
 /// `[sq][0]` is the rank ray toward file 0 packed as the `lo` unpack lane,
-/// `[sq][1]` the byte-reversed ray toward file 8 as the `hi` lane
-/// (`bitboard.cpp`).
+/// `[sq][1]` the byte-reversed ray toward file 8 as the `hi` lane.
 const fn build_qugiy_rook_mask() -> [[Bitboard; 2]; N] {
     let mut t = [[Bitboard::EMPTY; 2]; N];
     let mut s = 0;
@@ -1010,17 +1008,16 @@ static QUGIY_ROOK_MASK: [[Bitboard; 2]; N] = build_qugiy_rook_mask();
 
 /// The four bishop diagonals in [`DIRECTIONS`] order, and whether each runs
 /// toward *decreasing* square index — so that its mask is byte-reversed and the
-/// query byte-reverses the occupancy. The reference `bishopEffect`
-/// (`bitboard.cpp`) calls the increasing pair LU/LD and the decreasing one
-/// RU/RD, and packs the mask as `[LU, RU, LD, RD]` per 64-bit lane so the
-/// unpacked halves feed `occ` to the non-reversed diagonals and `rocc` to the
-/// reversed ones.
+/// query byte-reverses the occupancy. The reference `bishopEffect` calls the
+/// increasing pair LU/LD and the decreasing one RU/RD, and packs the mask as
+/// `[LU, RU, LD, RD]` per 64-bit lane so the unpacked halves feed `occ` to the
+/// non-reversed diagonals and `rocc` to the reversed ones.
 const BISHOP_DIAG_DIRS: [usize; 4] = [4, 5, 6, 7];
 const BISHOP_DIAG_REV: [bool; 4] = [false, true, false, true];
 
-/// Two [`Bitboard`]s packed into one 256-bit value (`Bitboard256`,
-/// `bitboard.h`), so `bishop_attacks` covers all four diagonals in one pass.
-/// Only the operations that query consumes are ported.
+/// Two [`Bitboard`]s packed into one 256-bit value (`Bitboard256`), so
+/// `bishop_attacks` covers all four diagonals in one pass. Only the operations
+/// that query consumes are ported.
 #[derive(Clone, Copy)]
 #[repr(C, align(32))]
 struct Bitboard256 {
@@ -1223,8 +1220,7 @@ use bb256_unpack_scalar as bb256_unpack;
 use bb256_xor_scalar as bb256_xor;
 
 /// `[sq][i]` is the four diagonal step effects packed as the `Bitboard256` pair
-/// `[LU, RU, LD, RD]` in 64-bit lane `i`, with RU and RD stored byte-reversed
-/// (`bitboard.cpp`).
+/// `[LU, RU, LD, RD]` in 64-bit lane `i`, with RU and RD stored byte-reversed.
 const fn build_qugiy_bishop_mask() -> [[Bitboard256; 2]; N] {
     let mut t = [[Bitboard256 { p: [0; 4] }; 2]; N];
     let mut s = 0;
@@ -1324,7 +1320,7 @@ fn rook_rank(s: usize, occ: Bitboard) -> Bitboard {
 }
 
 /// Squares a bishop on `sq` attacks under occupancy `occ` — all four diagonals
-/// in one `Bitboard256` pass (`bishopEffect`, `bitboard.cpp`).
+/// in one `Bitboard256` pass (`bishopEffect`).
 pub fn bishop_attacks(sq: Square, occ: Bitboard) -> Bitboard {
     let s = sq.index() as usize;
     let mask_lo = QUGIY_BISHOP_MASK[s][0].p;
@@ -1623,7 +1619,7 @@ mod tests {
     // A third bishop oracle: one `rayEffect` per diagonal, at `Bitboard` rather
     // than `Bitboard256` width, so its masks are rebuilt here.
 
-    /// One diagonal's occupancy-limited ray via `rayEffect` (`bitboard.h`).
+    /// One diagonal's occupancy-limited ray via `rayEffect`.
     fn diag_ray_oracle(mask: [u64; 2], occ: [u64; 2], reverse: bool) -> [u64; 2] {
         let mut bb = if reverse { lane_byte_reverse(occ) } else { occ };
         bb = lane_and(bb, mask);

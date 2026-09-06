@@ -1,9 +1,9 @@
 //! Feature-transformer accumulator and its output transform.
 //!
-//! Ported from `nnue_feature_transformer.h`. The per-lane kernels go through
-//! [`crate::simd`], which picks the AVX-512 backend or the scalar baseline at
-//! compile time — bit-identical either way. The layer-stack forward pass lives
-//! in [`crate::network`].
+//! Ported from the reference. The per-lane kernels go through [`crate::simd`],
+//! which picks the AVX-512 backend or the scalar baseline at compile time —
+//! bit-identical either way. The layer-stack forward pass lives in
+//! [`crate::network`].
 //!
 //! Because the accumulator is a linear sum of `i16` weight columns,
 //! `prev - removed + added` equals a from-scratch refresh of the post-move

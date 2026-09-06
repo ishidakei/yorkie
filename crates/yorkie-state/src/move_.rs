@@ -1,7 +1,7 @@
 //! Packed 32-bit move encoding.
 //!
-//! The bit layout matches the reference's (`types.h`) exactly, so that move
-//! encodings round-trip through TT entries unchanged.
+//! The bit layout matches the reference's exactly, so that move encodings
+//! round-trip through TT entries unchanged.
 //!
 //! ```text
 //! bit:  31         21 20    16 15 14 13         7 6          0
@@ -30,9 +30,9 @@ use crate::piece::{Piece, PieceKind};
 use crate::position::Position;
 use crate::square::Square;
 
-/// Reference flag: drop (`MOVE_DROP` in `types.h`).
+/// Reference flag: drop (`MOVE_DROP`).
 const FLAG_DROP: u32 = 1 << 14;
-/// Reference flag: promote (`MOVE_PROMOTE` in `types.h`).
+/// Reference flag: promote (`MOVE_PROMOTE`).
 const FLAG_PROMOTE: u32 = 1 << 15;
 /// Reference offset: PIECE_PROMOTE.
 const PIECE_PROMOTE: u32 = 8;
@@ -250,8 +250,8 @@ impl Move {
 }
 
 /// Flip a 16-bit move fragment to the one that plays the identical move on the
-/// board rotated 180° (`flip_move`, `types.h`). A drop keeps its dropped-piece
-/// code and flips only the to-square.
+/// board rotated 180° (`flip_move`). A drop keeps its dropped-piece code and
+/// flips only the to-square.
 ///
 /// The result is a raw fragment that must still be widened against the real
 /// position's legal moves. Fields are masked to 7 bits, so a malformed input
@@ -436,7 +436,7 @@ mod tests {
     use super::*;
 
     /// Each row is derived by hand from the reference's `make_move*` formulas
-    /// (`types.h`) and the bit layout at the top of this module.
+    /// and the bit layout at the top of this module.
     struct Fixture {
         bits: u32,
         from: Option<(u8, u8)>,

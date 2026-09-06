@@ -1,5 +1,5 @@
 //! Shared huge-page-backed allocator, a port of the reference's
-//! `aligned_large_pages_alloc` / `make_unique_large_page` (`memory.cpp`).
+//! `aligned_large_pages_alloc` / `make_unique_large_page`.
 //!
 //! The transposition table, the history tables and the loaded NNUE parameters
 //! all allocate through here, so the huge-page policy lives in one place: base

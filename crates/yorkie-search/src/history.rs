@@ -24,40 +24,40 @@ use std::sync::atomic::{AtomicI16, Ordering};
 use yorkie_state::{Color, Move, Piece, Square};
 use yorkie_storage::{LargePageArray, LargePageBox};
 
-/// Number of low-ply planes the reference keeps (`LOW_PLY_HISTORY_SIZE`,
-/// `history.h`): `lowPlyHistory` is indexed by `ply` for `ply < 5`.
+/// Number of low-ply planes the reference keeps (`LOW_PLY_HISTORY_SIZE`):
+/// `lowPlyHistory` is indexed by `ply` for `ply < 5`.
 pub const LOW_PLY_HISTORY_SIZE: usize = 5;
 
-/// Per-table gravity limits `D` (the `StatsEntry<T, D>` template parameter,
-/// `history.h`), one constant per history table. Every update is clamped and
-/// pulled toward zero relative to its table's `D` — see [`apply_gravity`].
+/// Per-table gravity limits `D` (the `StatsEntry<T, D>` template parameter),
+/// one constant per history table. Every update is clamped and pulled toward
+/// zero relative to its table's `D` — see [`apply_gravity`].
 pub const MAIN_HISTORY_D: i32 = 7183;
 /// `lowPlyHistory` gravity limit (`ButterflyHistory` shares `D = 7183`).
 pub const LOW_PLY_HISTORY_D: i32 = 7183;
-/// `captureHistory` gravity limit (`history.h`).
+/// `captureHistory` gravity limit.
 pub const CAPTURE_HISTORY_D: i32 = 10692;
-/// `continuationHistory` plane gravity limit (`PieceToHistory`, `history.h`).
+/// `continuationHistory` plane gravity limit (`PieceToHistory`).
 pub const CONTINUATION_HISTORY_D: i32 = 30000;
-/// `pawnHistory` gravity limit (`history.h`).
+/// `pawnHistory` gravity limit.
 pub const PAWN_HISTORY_D: i32 = 8192;
-/// Correction-history gravity limit `CORRECTION_HISTORY_LIMIT` (`history.h`).
+/// Correction-history gravity limit `CORRECTION_HISTORY_LIMIT`.
 pub const CORRECTION_HISTORY_D: i32 = 1024;
-/// `ttMoveHistory` gravity limit (`history.h`).
+/// `ttMoveHistory` gravity limit.
 pub const TT_MOVE_HISTORY_D: i32 = 8192;
 
 /// Number of pawn-structure planes in [`PawnHistory`]
-/// (`PAWN_HISTORY_BASE_SIZE`, `history.h`; a power of two, thread count 1 ×
-/// base 8192). The reference multiplies this by the thread count; this engine
-/// shares one table per NUMA node instead, so the base size stands.
+/// (`PAWN_HISTORY_BASE_SIZE`; a power of two, thread count 1 × base 8192). The
+/// reference multiplies this by the thread count; this engine shares one table
+/// per NUMA node instead, so the base size stands.
 pub const PAWN_HISTORY_BASE_SIZE: usize = 8192;
 
-/// Number of correction-history slots (`CORRHIST_BASE_SIZE`, `history.h`;
-/// `u16::MAX + 1`, a power of two, thread count 1).
+/// Number of correction-history slots (`CORRHIST_BASE_SIZE`; `u16::MAX + 1`, a
+/// power of two, thread count 1).
 pub const CORRHIST_BASE_SIZE: usize = 65536;
 
-/// The reference `StatsEntry::operator<<` gravity update (`history.h`), in
-/// integer arithmetic throughout. The result satisfies `|entry| <= d`, and
-/// every `d` here is below `i16::MAX`, so it always fits back into `i16`.
+/// The reference `StatsEntry::operator<<` gravity update, in integer arithmetic
+/// throughout. The result satisfies `|entry| <= d`, and every `d` here is below
+/// `i16::MAX`, so it always fits back into `i16`.
 pub fn apply_gravity(entry: i16, bonus: i32, d: i32) -> i16 {
     debug_assert!(d > 0);
     let clamped = bonus.clamp(-d, d);
@@ -118,7 +118,7 @@ impl CapturePieceToHistory {
     }
 
     /// Overwrite every entry with `v` — the reference's
-    /// `captureHistory.fill(v)` (`yaneuraou-search.cpp`, init `-678`).
+    /// `captureHistory.fill(v)` (init `-678`).
     pub fn fill(&mut self, v: i16) {
         self.table.iter_mut().for_each(|e| *e = v);
     }
@@ -135,8 +135,7 @@ impl CapturePieceToHistory {
 
     /// The entry for `moved` moving to an **empty** `to` — the `NO_PIECE`
     /// (index `0`) victim slot the main search reads for a non-capturing check
-    /// (`captureHistory[movedPiece][to][type_of(NO_PIECE)]`,
-    /// `yaneuraou-search.cpp`).
+    /// (`captureHistory[movedPiece][to][type_of(NO_PIECE)]`).
     pub fn get_empty(&self, moved: Piece, to: Square) -> i32 {
         self.table[(piece_code(moved) * SQ_NB + to.index() as usize) * CAPTURED_NB] as i32
     }
@@ -178,7 +177,7 @@ impl ButterflyHistory {
     }
 
     /// Overwrite every entry with `v` — the reference's `mainHistory.fill(v)`
-    /// (`yaneuraou-search.cpp`, init `0`).
+    /// (init `0`).
     pub fn fill(&mut self, v: i16) {
         self.table.iter_mut().for_each(|e| *e = v);
     }
@@ -222,7 +221,7 @@ impl PieceToHistory {
     }
 
     /// Overwrite every entry with `v` — the reference fills each
-    /// `continuationHistory` plane with `-523` (`yaneuraou-search.cpp`).
+    /// `continuationHistory` plane with `-523`.
     pub fn fill(&mut self, v: i16) {
         self.table.iter_mut().for_each(|e| *e = v);
     }
@@ -276,8 +275,8 @@ impl LowPlyHistory {
         self.table.backing_region()
     }
 
-    /// Overwrite every entry with `v` — the reference's
-    /// `lowPlyHistory.fill(v)` (`yaneuraou-search.cpp`, init `98`).
+    /// Overwrite every entry with `v` — the reference's `lowPlyHistory.fill(v)`
+    /// (init `98`).
     pub fn fill(&mut self, v: i16) {
         self.table.iter_mut().for_each(|e| *e = v);
     }
@@ -300,7 +299,7 @@ impl LowPlyHistory {
     }
 }
 
-/// The four correction channels of a `CorrectionBundle` (`history.h`). Each
+/// The four correction channels of a `CorrectionBundle`. Each
 /// unified-correction slot holds one `i16` per channel, per side to move.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CorrChannel {
@@ -321,8 +320,8 @@ impl CorrChannel {
     }
 }
 
-/// Reference `SharedHistories::clear()` init values (`yaneuraou-search.cpp`):
-/// correction entries `0`, pawn entries `-1238`.
+/// Reference `SharedHistories::clear()` init values: correction entries `0`,
+/// pawn entries `-1238`.
 const CORRECTION_INIT: i16 = 0;
 const PAWN_INIT: i16 = -1238;
 
@@ -341,16 +340,15 @@ fn apply_gravity_atomic(cell: &AtomicI16, bonus: i32, d: i32) {
 }
 
 /// Number of `i16` channels a correction slot holds: one [`CorrChannel`] per
-/// side to move (`MultiArray<CorrectionBundle, COLOR_NB>`, `history.h`).
+/// side to move (`MultiArray<CorrectionBundle, COLOR_NB>`).
 const CORR_SLOT_LEN: usize = Color::COUNT * CorrChannel::COUNT;
-/// Number of `i16` entries a pawn-history slot holds (`[pc][to]`,
-/// `history.h`).
+/// Number of `i16` entries a pawn-history slot holds (`[pc][to]`).
 const PAWN_SLOT_LEN: usize = PIECE_NB * SQ_NB;
 
-/// The reference `SharedHistories` (`history.h`): the unified correction
-/// history and the pawn history, shared between the worker threads of one NUMA
-/// node and sized by that node's thread count, so a larger node gets a
-/// proportionally larger, less-contended table.
+/// The reference `SharedHistories`: the unified correction history and the pawn
+/// history, shared between the worker threads of one NUMA node and sized by
+/// that node's thread count, so a larger node gets a proportionally larger,
+/// less-contended table.
 ///
 /// `thread_count` must be a non-zero power of two (asserted) so slot selection
 /// is a single mask over the full 64-bit key.
@@ -473,8 +471,8 @@ impl SharedHistories {
     }
 }
 
-/// `CorrectionHistory<Continuation>` (`history.h`): a `[pc][to]` table whose
-/// every cell is itself a `[pc][to]` `i16` table.
+/// `CorrectionHistory<Continuation>`: a `[pc][to]` table whose every cell is
+/// itself a `[pc][to]` `i16` table.
 ///
 /// The outer `[pc][to]` selects a *plane* — the one a search stack cell's
 /// `continuationCorrectionHistory` points at — and the inner `[pc][to]` indexes
@@ -517,7 +515,7 @@ impl ContinuationCorrectionHistory {
     }
 
     /// Overwrite every entry with `v` — the reference fills each continuation
-    /// correction plane with `6` (`yaneuraou-search.cpp`).
+    /// correction plane with `6`.
     pub fn fill(&mut self, v: i16) {
         self.table
             .iter_mut()
@@ -544,7 +542,7 @@ impl ContinuationCorrectionHistory {
     }
 }
 
-/// The worker's `continuationHistory` (`history.h`): planes keyed by
+/// The worker's `continuationHistory`: planes keyed by
 /// `(in_check, capture, moved_piece, to)`, each plane a `[pc][to]` `i16` table.
 ///
 /// A search stack cell's `continuationHistory` points at one such plane, and
@@ -582,7 +580,7 @@ impl ContinuationHistory {
     }
 
     /// Overwrite every entry with `v` — the reference fills each continuation
-    /// plane with `-523` (`yaneuraou-search.cpp`).
+    /// plane with `-523`.
     pub fn fill(&mut self, v: i16) {
         self.table.iter_mut().for_each(|e| *e = v);
     }
@@ -621,8 +619,7 @@ impl ContinuationHistory {
     }
 }
 
-/// `TTMoveHistory` (`history.h`): a single gravity entry with `D = 8192`, init
-/// `0` (cleared at `yaneuraou-search.cpp`).
+/// `TTMoveHistory`: a single gravity entry with `D = 8192`, init `0`.
 #[derive(Default)]
 pub struct TtMoveHistory {
     entry: i16,
@@ -676,7 +673,7 @@ mod shared_tests {
         }
     }
 
-    /// The `thread_count` power-of-two assert (`history.h`).
+    /// The `thread_count` power-of-two assert.
     #[test]
     #[should_panic(expected = "power of two")]
     fn rejects_non_power_of_two() {
@@ -767,7 +764,7 @@ mod shared_tests {
 
     /// Atomicity smoke: two threads hammering the same entry with `<<`
     /// terminates and leaves a value within `[-D, D]` (the reference accepts
-    /// lost updates but the gravity bound always holds — `history.h`).
+    /// lost updates but the gravity bound always holds).
     #[cfg_attr(miri, ignore)]
     #[test]
     fn concurrent_updates_terminate_within_limit() {

@@ -1,7 +1,7 @@
 //! SFNN-1536 network-file (`nn.bin`) parsing and validation.
 //!
-//! The format is ported from `ReadHeader` / `ReadParameters`
-//! (`evaluate_nnue.cpp`). Which failures are fatal follows the reference:
+//! The format is ported from `ReadHeader` / `ReadParameters`. Which failures
+//! are fatal follows the reference:
 //!
 //! - The **version word** is a hard failure on mismatch: the file is a
 //!   different serialization format, so parsing cannot continue.

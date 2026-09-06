@@ -1,13 +1,13 @@
-//! Transposition table, ported from the reference (`tt.h` / `tt.cpp`) and
-//! specialised to the engine's default build configuration.
+//! Transposition table, ported from the reference and specialised to the
+//! engine's default build configuration.
 //!
 //! The reference is heavily `#define`-parameterised; this mirrors its default
-//! build (`config.h`): a plain 64-bit position key, and clusters of three
-//! 10-byte entries whose stored key fragment is the position key's low 16 bits.
-//! Those choices are load-bearing for search-node parity — the cluster size and
-//! the `clusterCount = mb·2²⁰ / sizeof(Cluster)` arithmetic decide which
-//! positions collide, and the in-cluster replacement policy decides which entry
-//! survives, both of which feed into how many nodes qsearch visits.
+//! build: a plain 64-bit position key, and clusters of three 10-byte entries
+//! whose stored key fragment is the position key's low 16 bits. Those choices
+//! are load-bearing for search-node parity — the cluster size and the
+//! `clusterCount = mb·2²⁰ / sizeof(Cluster)` arithmetic decide which positions
+//! collide, and the in-cluster replacement policy decides which entry survives,
+//! both of which feed into how many nodes qsearch visits.
 //!
 //! # The `tt-entry16` feature
 //!
@@ -104,11 +104,11 @@ pub type Value = i32;
 /// offset by [`DEPTH_NONE`] and truncated to `u8`.
 pub type Depth = i32;
 
-/// `DEPTH_NONE` (`types.h`). Entries store `depth8 = depth − DEPTH_NONE`, so an
-/// all-zero entry reads back as `DEPTH_NONE` and counts as unoccupied.
+/// `DEPTH_NONE`. Entries store `depth8 = depth − DEPTH_NONE`, so an all-zero
+/// entry reads back as `DEPTH_NONE` and counts as unoccupied.
 pub const DEPTH_NONE: Depth = -3;
 
-/// `VALUE_NONE` (`types.h`), the sentinel returned for a miss.
+/// `VALUE_NONE`, the sentinel returned for a miss.
 pub const VALUE_NONE: Value = 32002;
 
 /// The reference's default `USI_Hash` in MiB, matched so a run's conditions
@@ -116,8 +116,7 @@ pub const VALUE_NONE: Value = 32002;
 /// `resize`: a fresh table is still empty.
 pub const DEFAULT_HASH_MB: usize = 1024;
 
-// The `genBound8` bit layout (`tt.cpp`):
-// `generation (5) | bound (2) << 5 | pv (1) << 7`.
+// The `genBound8` bit layout: `generation (5) | bound (2) << 5 | pv (1) << 7`.
 const GENERATION_BITS: u8 = 5;
 const GENERATION_MASK: u8 = (1 << GENERATION_BITS) - 1;
 const BOUND_SHIFT: u8 = GENERATION_BITS;
@@ -209,9 +208,8 @@ fn key_matches(stored: TteKey, k: TteKey) -> bool {
     }
 }
 
-/// Bound type of a stored value (`types.h`). The discriminants are
-/// load-bearing: `Exact == Upper | Lower`, and the value packs into
-/// `genBound8`.
+/// Bound type of a stored value. The discriminants are load-bearing:
+/// `Exact == Upper | Lower`, and the value packs into `genBound8`.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Bound {
@@ -541,7 +539,7 @@ const TT_ALLOC_ALIGN: usize = crate::large_page::LARGE_PAGE_ALIGN;
 
 /// The transposition table's owned backing store: a raw, [`TT_ALLOC_ALIGN`]-
 /// aligned, zero-initialised block of [`Cluster`]s, mirroring the reference's
-/// `aligned_large_pages_alloc` / `_free` pair (`memory.cpp`).
+/// `aligned_large_pages_alloc` / `_free` pair.
 ///
 /// The allocation size is rounded **up** to a whole multiple of the alignment;
 /// the tail beyond `len` clusters stays unused and the exposed slice covers
@@ -634,8 +632,8 @@ impl DerefMut for ClusterArray {
     }
 }
 
-/// High 64 bits of the 128-bit product `a · b` (`mul_hi64`, `misc.h`), which
-/// maps a key onto `0..clusterCount` without a power-of-two table size.
+/// High 64 bits of the 128-bit product `a · b` (`mul_hi64`), which maps a key
+/// onto `0..clusterCount` without a power-of-two table size.
 #[inline]
 fn mul_hi64(a: u64, b: u64) -> u64 {
     ((a as u128 * b as u128) >> 64) as u64

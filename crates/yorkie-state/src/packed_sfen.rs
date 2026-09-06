@@ -1,5 +1,5 @@
 //! PackedSfen — the 32-byte Huffman position encoding, ported bit-for-bit from
-//! `sfen_packer.cpp`.
+//! the reference.
 //!
 //! A `.ybb` opening-book index keys positions by this exact encoding, so any
 //! single-bit divergence from the reference writer makes the index binary
@@ -219,9 +219,9 @@ mod tests {
         parse_sfen(&with_ply).expect("valid sfen")
     }
 
-    /// Vectors transcribed from the reference's own PackedSfen unit test
-    /// (`position.cpp`), whose bytes came from a third implementation. They
-    /// exercise the board, both hands, and the piece box.
+    /// Vectors transcribed from the reference's own PackedSfen unit test, whose
+    /// bytes came from a third implementation. They exercise the board, both
+    /// hands, and the piece box.
     #[test]
     fn matches_reference_cshogi_vectors() {
         let cases: [(&str, [u8; 32]); 4] = [

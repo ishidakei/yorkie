@@ -1,9 +1,8 @@
 //! Search-oriented move generation: the `CAPTURES` / `QUIETS` / `EVASIONS` /
 //! `NON_EVASIONS` candidate lists the `MovePicker` consumes, plus the
-//! `gives_check` / `in_check` / `is_legal` predicates. Ports
-//! `generate_general` / `generate_evasions` / `generate<LEGAL_ALL>`
-//! (`movegen.cpp`); the emission order is reproduced move-for-move because
-//! node-count parity depends on it.
+//! `gives_check` / `in_check` / `is_legal` predicates. Ports `generate_general`
+//! / `generate_evasions` / `generate<LEGAL_ALL>`; the emission order is
+//! reproduced move-for-move because node-count parity depends on it.
 //!
 //! The per-stage generators emit **pseudo-legal** moves — king safety is not
 //! checked, and callers filter with [`Position::is_legal`].
@@ -22,9 +21,9 @@ use crate::piece::{Piece, PieceKind};
 use crate::position::Position;
 use crate::square::Square;
 
-/// A move paired with its ordering score (reference `ExtMove`, `movegen.h`).
-/// Generators emit into the `MovePicker`'s buffer with `value` at `0`; the
-/// picker fills it in at its scoring stage.
+/// A move paired with its ordering score (reference `ExtMove`). Generators emit
+/// into the `MovePicker`'s buffer with `value` at `0`; the picker fills it in
+/// at its scoring stage.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ExtMove {
     pub mv: Move,
@@ -37,8 +36,8 @@ pub struct ExtMove {
 #[cfg(test)]
 mod scan_oracle;
 
-/// Droppable kinds in the order `GenerateDropMoves` (`movegen.cpp`) lays them
-/// into `drops[]`. Pawn drops are generated separately, and first.
+/// Droppable kinds in the order `GenerateDropMoves` lays them into `drops[]`.
+/// Pawn drops are generated separately, and first.
 const DROP_ORDER: [PieceKind; 6] = [
     PieceKind::Knight,
     PieceKind::Lance,
@@ -162,8 +161,8 @@ fn last_rank(color: Color) -> u8 {
 }
 
 /// Non-promotion is allowed for a knight landing on `to` — suppressed on the
-/// enemy first two ranks, where a non-promoted knight would be stuck
-/// (`movegen.cpp`). Unlike the other guards this one carries no `All` term.
+/// enemy first two ranks, where a non-promoted knight would be stuck. Unlike
+/// the other guards this one carries no `All` term.
 fn nonpromote_rank_ok(to: Square, color: Color) -> bool {
     match color {
         Color::Black => to.rank() >= 2,
@@ -173,7 +172,7 @@ fn nonpromote_rank_ok(to: Square, color: Color) -> bool {
 
 /// Non-promotion is allowed for a lance landing on `to`. `All == false`
 /// suppresses the enemy first two ranks, `All == true` only the last rank where
-/// the lance would be stuck (`movegen.cpp`, `ForwardRanksBB`).
+/// the lance would be stuck (`ForwardRanksBB`).
 fn lance_nonpromote_rank_ok(to: Square, color: Color, all: bool) -> bool {
     if all {
         match color {
@@ -185,7 +184,7 @@ fn lance_nonpromote_rank_ok(to: Square, color: Color, all: bool) -> bool {
     }
 }
 
-/// Emit a pawn's move to its single forward `to` (`movegen.cpp`).
+/// Emit a pawn's move to its single forward `to`.
 fn emit_pawn(from: Square, targets: Bitboard, piece: Piece, all: bool, out: &mut Vec<ExtMove>) {
     for to in targets.squares() {
         if is_in_promotion_zone(to, piece.color) {
@@ -200,7 +199,7 @@ fn emit_pawn(from: Square, targets: Bitboard, piece: Piece, all: bool, out: &mut
 }
 
 /// Emit a lance's moves: all promotions into the enemy field first, then the
-/// rank-masked non-promotions (`movegen.cpp`).
+/// rank-masked non-promotions.
 fn emit_lance(from: Square, targets: Bitboard, piece: Piece, all: bool, out: &mut Vec<ExtMove>) {
     for to in targets.squares() {
         if is_in_promotion_zone(to, piece.color) {
@@ -214,7 +213,7 @@ fn emit_lance(from: Square, targets: Bitboard, piece: Piece, all: bool, out: &mu
     }
 }
 
-/// Emit a knight's moves (`movegen.cpp`).
+/// Emit a knight's moves.
 fn emit_knight(from: Square, targets: Bitboard, piece: Piece, out: &mut Vec<ExtMove>) {
     for to in targets.squares() {
         if is_in_promotion_zone(to, piece.color) {
@@ -226,9 +225,9 @@ fn emit_knight(from: Square, targets: Bitboard, piece: Piece, out: &mut Vec<ExtM
     }
 }
 
-/// Emit a silver's moves (`movegen.cpp`). When `from` is outside the enemy
-/// field the reference emits the into-zone destinations before the rest, so
-/// this runs as two passes.
+/// Emit a silver's moves. When `from` is outside the enemy field the reference
+/// emits the into-zone destinations before the rest, so this runs as two
+/// passes.
 fn emit_silver(from: Square, targets: Bitboard, piece: Piece, out: &mut Vec<ExtMove>) {
     if is_in_promotion_zone(from, piece.color) {
         for to in targets.squares() {
@@ -250,9 +249,9 @@ fn emit_silver(from: Square, targets: Bitboard, piece: Piece, out: &mut Vec<ExtM
     }
 }
 
-/// Emit a bishop's / rook's moves (`movegen.cpp`). The in-zone non-promotion is
-/// `All`-only, and is interleaved right after each promotion rather than
-/// batched into the second pass.
+/// Emit a bishop's / rook's moves. The in-zone non-promotion is `All`-only, and
+/// is interleaved right after each promotion rather than batched into the
+/// second pass.
 fn emit_bishop_rook(
     from: Square,
     targets: Bitboard,
@@ -284,8 +283,7 @@ fn emit_bishop_rook(
     }
 }
 
-/// Emit a never-promoting piece's moves — gold-likes, horse, dragon, king
-/// (`movegen.cpp`).
+/// Emit a never-promoting piece's moves — gold-likes, horse, dragon, king.
 fn emit_plain_only(from: Square, targets: Bitboard, piece: Piece, out: &mut Vec<ExtMove>) {
     for to in targets.squares() {
         push_plain(from, to, piece, out);
@@ -354,9 +352,9 @@ impl Group {
 }
 
 /// Compile-time specialization of one piece group's emit pipeline, mirroring
-/// the reference's `GeneratePieceMoves<…, Pt, …>` template specializations
-/// (`movegen.cpp`). Naming a concrete type per call site keeps the
-/// per-from-square loop free of an indirect branch.
+/// the reference's `GeneratePieceMoves<…, Pt, …>` template specializations.
+/// Naming a concrete type per call site keeps the per-from-square loop free of
+/// an indirect branch.
 trait GroupSpec {
     /// The side-to-move's pieces belonging to this group, read from the board's
     /// incrementally maintained pattern sets.
@@ -528,8 +526,7 @@ fn nifu_blocked_files_scan(board: &Board, stm: Color) -> [bool; Square::FILES as
     blocked
 }
 
-// Per-position-state check info, ported from `Position::set_check_info`
-// (`position.cpp`).
+// Per-position-state check info, ported from `Position::set_check_info`.
 
 /// The number of distinct check-attack patterns keyed by [`check_pattern`].
 const CHECK_PATTERN_COUNT: usize = crate::board::PATTERN_COUNT;
@@ -598,9 +595,9 @@ fn ray_dir(king: Square, sq: Square) -> Option<(i8, i8)> {
     crate::bitboard::ray_dir(king, sq)
 }
 
-/// The reference `aligned(s1, s2, ksq)` (`types.h`): are `s1` and `s2` on the
-/// same ray *emanating from* `king`? A straight line passing through the king
-/// does not count — the two must be on the same side of it.
+/// The reference `aligned(s1, s2, ksq)`: are `s1` and `s2` on the same ray
+/// *emanating from* `king`? A straight line passing through the king does not
+/// count — the two must be on the same side of it.
 fn aligned(king: Square, s1: Square, s2: Square) -> bool {
     match (ray_dir(king, s1), ray_dir(king, s2)) {
         (Some(a), Some(b)) => a == b,
@@ -706,8 +703,8 @@ impl CheckSquares {
 
 impl Position {
     /// Compute this position's [`CheckInfo`] from scratch — the port of
-    /// `Position::set_check_info` (`position.cpp`), with `in_check` probed from
-    /// the board. Called once per position state, never on the per-move path.
+    /// `Position::set_check_info`, with `in_check` probed from the board.
+    /// Called once per position state, never on the per-move path.
     pub(crate) fn compute_check_info(&self) -> CheckInfo {
         self.compute_check_info_impl(None, None)
     }
@@ -835,11 +832,11 @@ impl Position {
         }
     }
 
-    /// Build the child state's `checkersBB` differentially from the parent check
-    /// info and the move just played, mirroring `do_move_impl`
-    /// (`position.cpp`). `self` is already advanced to the post-move position
-    /// while `parent` is still the pre-move info, so `parent`'s `enemy_king` /
-    /// `check_squares` / `blockers` describe `mover`'s frame.
+    /// Build the child state's `checkersBB` differentially from the parent
+    /// check info and the move just played, mirroring `do_move_impl`. `self` is
+    /// already advanced to the post-move position while `parent` is still the
+    /// pre-move info, so `parent`'s `enemy_king` / `check_squares` / `blockers`
+    /// describe `mover`'s frame.
     pub(crate) fn differential_child_checkers(
         &self,
         m: Move,
@@ -887,7 +884,7 @@ impl Position {
     }
 
     /// True iff `sq` is attacked by any piece of `attacker`, with `discount`
-    /// treated as empty — `effected_to(attacker, sq, discount)` (`position.h`).
+    /// treated as empty — `effected_to(attacker, sq, discount)`.
     ///
     /// Removing `discount` models the moving king vacating its from-square: it
     /// drops the king as a defender and reveals any enemy slider the king was
@@ -899,10 +896,10 @@ impl Position {
     }
 
     /// True iff playing `m` would leave the opponent's king in check —
-    /// `Position::gives_check` (`position.cpp`), covering direct checks,
-    /// discovered checks and checking drops. If `m` captures the opponent's king
-    /// — a pseudo-legal probe move, never a real one — there is no king left to
-    /// check and the result is `false`.
+    /// `Position::gives_check`, covering direct checks, discovered checks and
+    /// checking drops. If `m` captures the opponent's king — a pseudo-legal
+    /// probe move, never a real one — there is no king left to check and the
+    /// result is `false`.
     pub fn gives_check(&self, m: Move) -> bool {
         let ci = self.check_info();
         let to = m.to_sq();
@@ -931,10 +928,10 @@ impl Position {
     }
 
     /// True iff `m` gives a **direct** check by the moved piece — the
-    /// quiet-ordering term `check_squares(type_of(moved_piece(m))) & to`
-    /// (`movepick.cpp`). Computed against the occupancy *before* the move, so a
-    /// slider whose vacated from-square lay on the ray does not count, and
-    /// discovered checks are not detected.
+    /// quiet-ordering term `check_squares(type_of(moved_piece(m))) & to`.
+    /// Computed against the occupancy *before* the move, so a slider whose
+    /// vacated from-square lay on the ray does not count, and discovered checks
+    /// are not detected.
     pub fn gives_direct_check(&self, m: Move) -> bool {
         let ci = self.check_info();
         ci.check_squares[check_pattern(m.moved_piece_after())].test(m.to_sq())
@@ -949,9 +946,9 @@ impl Position {
     }
 
     /// True iff `m` leaves the mover's own king out of check — the reference
-    /// `Position::legal` (`position.cpp`). Repetition-blind, like the reference;
-    /// uchifuzume is enforced at generation instead, so no drop-pawn-mate ever
-    /// reaches this predicate.
+    /// `Position::legal`. Repetition-blind, like the reference; uchifuzume is
+    /// enforced at generation instead, so no drop-pawn-mate ever reaches this
+    /// predicate.
     ///
     /// **Contract.** `m` must come from a search move generator matching the
     /// current check state (evasions when in check, captures / quiets /
@@ -999,8 +996,8 @@ impl Position {
     }
 
     /// Widen a stored 16-bit TT fragment into a full [`Move`] — the reference
-    /// `Position::to_move(Move16)` (`position.cpp`). Attaches the moving-piece
-    /// bits the `move16` layout drops; it does not prove legality.
+    /// `Position::to_move(Move16)`. Attaches the moving-piece bits the `move16`
+    /// layout drops; it does not prove legality.
     ///
     /// A non-`is_ok` fragment (`MOVE_WIN`, `from == to`) comes back verbatim as
     /// `Some` rather than folding to `None`, so the search's `tt_move.is_none()`
@@ -1041,9 +1038,9 @@ impl Position {
         Some(Move::make(from, to, moved))
     }
 
-    /// True iff `m` is pseudo-legal for the side to move — `pseudo_legal_s<All>`
-    /// (`position.cpp`). Pseudo-legal still allows a king suicide; it is the
-    /// pre-`do_move` guard for a TT or killer move, deciding whether the
+    /// True iff `m` is pseudo-legal for the side to move —
+    /// `pseudo_legal_s<All>`. Pseudo-legal still allows a king suicide; it is
+    /// the pre-`do_move` guard for a TT or killer move, deciding whether the
     /// fragment is even well-shaped for this position.
     ///
     /// `all` is the `GenerateAllLegalMoves` flag, widening which non-promotions
@@ -1182,10 +1179,10 @@ impl Position {
         true
     }
 
-    /// The reference `legal_pawn_drop(us, to)` (`position.cpp`): a pawn
-    /// drop on `to` is legal iff it is not nifu (二歩 — no own un-promoted pawn
-    /// already on the file) and not uchifuzume (打ち歩詰め — an unanswerable
-    /// drop-pawn-mate). Reuses the same drop-pawn-mate probe the generators use
+    /// The reference `legal_pawn_drop(us, to)`: a pawn drop on `to` is legal
+    /// iff it is not nifu (二歩 — no own un-promoted pawn already on the file)
+    /// and not uchifuzume (打ち歩詰め — an unanswerable drop-pawn-mate). Reuses the
+    /// same drop-pawn-mate probe the generators use
     /// ([`Self::pawn_drop_is_uchifuzume`]), fired only when the dropped pawn
     /// would actually attack the enemy king.
     fn legal_pawn_drop(&self, us: Color, to: Square) -> bool {
@@ -1217,8 +1214,8 @@ impl Position {
     }
 
     /// Append the pseudo-legal `CAPTURES` candidates to `out`
-    /// (`generate_general<CAPTURES>`, `movegen.cpp`). No drops, and no
-    /// non-capturing pawn promotion — that is `CAPTURES_PRO_PLUS`.
+    /// (`generate_general<CAPTURES>`). No drops, and no non-capturing pawn
+    /// promotion — that is `CAPTURES_PRO_PLUS`.
     pub fn generate_captures(&self, all: bool, out: &mut Vec<ExtMove>) {
         let board = self.board();
         let stm = self.side_to_move();
@@ -1231,9 +1228,9 @@ impl Position {
     }
 
     /// Append the pseudo-legal `QUIETS` candidates to `out`
-    /// (`generate_general<QUIETS>`, `movegen.cpp`) — piece moves onto empty
-    /// squares, then every drop. Non-capturing pawn promotions belong here, not
-    /// to [`Position::generate_captures`], so the two generators partition the
+    /// (`generate_general<QUIETS>`) — piece moves onto empty squares, then
+    /// every drop. Non-capturing pawn promotions belong here, not to
+    /// [`Position::generate_captures`], so the two generators partition the
     /// destinations with no overlap.
     pub fn generate_quiets(&self, all: bool, out: &mut Vec<ExtMove>) {
         let board = self.board();
@@ -1248,10 +1245,9 @@ impl Position {
     }
 
     /// Append the pseudo-legal `EVASIONS` candidates to `out`
-    /// (`generate_evasions`, `movegen.cpp`): king moves first, then — on a
-    /// single check — the non-king moves restricted to capture-or-interpose,
-    /// then interposition drops. [`Position::is_legal`] removes the remaining
-    /// suicide king steps.
+    /// (`generate_evasions`): king moves first, then — on a single check — the
+    /// non-king moves restricted to capture-or-interpose, then interposition
+    /// drops. [`Position::is_legal`] removes the remaining suicide king steps.
     ///
     /// **Entry contract:** the side to move is in check.
     pub fn generate_evasions(&self, all: bool, out: &mut Vec<ExtMove>) {
@@ -1316,9 +1312,9 @@ impl Position {
     }
 
     /// Append the pseudo-legal `NON_EVASIONS` candidates to `out`
-    /// (`generate_general<NON_EVASIONS>`, `movegen.cpp`). The single target
-    /// `~pieces(Us)` interleaves captures and quiets per piece and per
-    /// destination; concatenating [`Position::generate_captures`] and
+    /// (`generate_general<NON_EVASIONS>`). The single target `~pieces(Us)`
+    /// interleaves captures and quiets per piece and per destination;
+    /// concatenating [`Position::generate_captures`] and
     /// [`Position::generate_quiets`] would put every capture first and change
     /// which move the root search sees as its first legal one.
     pub fn generate_non_evasions(&self, all: bool, out: &mut Vec<ExtMove>) {
@@ -1334,8 +1330,8 @@ impl Position {
     }
 
     /// Append every legal move for the side to move to `out` — the reference
-    /// `generate<LEGAL_ALL>` (`movegen.cpp`). The buffer is **not** cleared
-    /// first, so a caller may reuse it across calls.
+    /// `generate<LEGAL_ALL>`. The buffer is **not** cleared first, so a caller
+    /// may reuse it across calls.
     ///
     /// Repetition-blind, like the reference: a repetition makes the game drawn
     /// rather than the move illegal, and the search scores it. Uchifuzume and
@@ -1354,8 +1350,8 @@ impl Position {
         }
     }
 
-    /// Emit the pseudo-legal drops on empty squares in `GenerateDropMoves` order
-    /// (`movegen.cpp`): pawn drops first, then the other kinds in rank bands.
+    /// Emit the pseudo-legal drops on empty squares in `GenerateDropMoves`
+    /// order: pawn drops first, then the other kinds in rank bands.
     fn emit_drops(&self, out: &mut Vec<ExtMove>) {
         self.emit_drops_masked(ALL_SQUARES, out);
     }

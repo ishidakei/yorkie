@@ -4,10 +4,10 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
-# NUMA topology discovery, a port of the reference's `NumaConfig` machinery
-# (`numa.h`). Depends on std, plus `libc` on Linux for the affinity and
-# memory-policy syscalls. All sysfs topology parsing is pure and takes an
-# injectable root path, so it is exercised against fixture directories.
+# NUMA topology discovery, a port of the reference's `NumaConfig` machinery.
+# Depends on std, plus `libc` on Linux for the affinity and memory-policy
+# syscalls. All sysfs topology parsing is pure and takes an injectable root
+# path, so it is exercised against fixture directories.
 [dependencies]
 
 # Every syscall here is Linux-gated in code; the dependency is

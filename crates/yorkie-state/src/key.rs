@@ -1,5 +1,5 @@
 //! Zobrist position hashing for [`crate::position::Position`], mirroring the
-//! reference's `board_key` / `hand_key` split (`position.h`).
+//! reference's `board_key` / `hand_key` split.
 //!
 //! `board_key` accumulates by XOR, which is its own inverse, so one operation
 //! both places and removes a term. `hand_key` accumulates by **addition** of a
@@ -7,10 +7,10 @@
 //! change is a single add or subtract.
 //!
 //! **The 64-bit constants must equal the reference's**, not merely share its
-//! structure. The pawn and correction histories are hash tables indexed by these
-//! keys masked to a few low bits, so a different table aliases differently and
-//! diverges the search at the first collision that flips a quiet's ordering.
-//! They are therefore reproduced from `Position::init` (`position.cpp`): the
+//! structure. The pawn and correction histories are hash tables indexed by
+//! these keys masked to a few low bits, so a different table aliases
+//! differently and diverges the search at the first collision that flips a
+//! quiet's ordering. They are therefore reproduced from `Position::init`: the
 //! same `xorshift64*` PRNG and seed, the same four-draws-keep-the-first
 //! `set_rand`, and the same draw order.
 
@@ -22,14 +22,14 @@ use crate::square::Square;
 /// never realised, but reserving a slot keeps [`piece_code`] branch-free.
 const PIECE_CODES: usize = 2 * Color::COUNT * PieceKind::COUNT;
 
-/// The reference Zobrist PRNG seed (`position.cpp`).
+/// The reference Zobrist PRNG seed.
 const REF_SEED: u64 = 20151225;
 
-/// The `xorshift64*` output multiplier (`misc.h`).
+/// The `xorshift64*` output multiplier.
 const REF_MULT: u64 = 2685821657736338717;
 
-/// One `PRNG::rand64()` step (`misc.h`), returning `(next_state, value)`. The
-/// next draw consumes `next_state`, **not** `value`.
+/// One `PRNG::rand64()` step, returning `(next_state, value)`. The next draw
+/// consumes `next_state`, **not** `value`.
 const fn rand64(s: u64) -> (u64, u64) {
     let mut x = s;
     x ^= x >> 12;
@@ -38,8 +38,8 @@ const fn rand64(s: u64) -> (u64, u64) {
     (x, x.wrapping_mul(REF_MULT))
 }
 
-/// The reference `set_rand` (`position.cpp`): draw four words and keep the
-/// first. The other three are discarded but still advance the stream.
+/// The reference `set_rand`: draw four words and keep the first. The other
+/// three are discarded but still advance the stream.
 const fn set_rand(s: u64) -> (u64, u64) {
     let (s, v) = rand64(s);
     let (s, _) = rand64(s);
@@ -48,9 +48,9 @@ const fn set_rand(s: u64) -> (u64, u64) {
     (s, v)
 }
 
-/// Map a reference `Piece` code (`types.h`) to this port's [`piece_code`] slot,
-/// or `None` for a code never realised on a board. A `None` code is still
-/// *drawn*, to keep the PRNG stream aligned, but not stored.
+/// Map a reference `Piece` code to this port's [`piece_code`] slot, or `None`
+/// for a code never realised on a board. A `None` code is still *drawn*, to
+/// keep the PRNG stream aligned, but not stored.
 ///
 /// The reference's `PieceType` order puts `BISHOP` before `GOLD` where
 /// [`PieceKind`] does the reverse, so the kind is remapped explicitly.
@@ -100,10 +100,10 @@ struct Zobrist {
     hand: [[u64; PieceKind::COUNT]; Color::COUNT],
     /// Side-to-move term, XORed into `board_key` while White is to move.
     side: u64,
-    /// The empty-board value of `pawn_key`: a dedicated non-zero constant
-    /// (the reference's `Zobrist::noPawns`, `position.cpp`). `pawn_key`
-    /// starts here — *not* at zero — so that a position with no board pawns
-    /// still carries a distinct pawn-structure key.
+    /// The empty-board value of `pawn_key`: a dedicated non-zero constant (the
+    /// reference's `Zobrist::noPawns`). `pawn_key` starts here — *not* at zero
+    /// — so that a position with no board pawns still carries a distinct
+    /// pawn-structure key.
     no_pawns: u64,
 }
 
@@ -191,8 +191,8 @@ pub(crate) fn side() -> u64 {
 }
 
 /// Whether `piece` is a *minor piece* for the `minor_piece_key`
-/// (`minor_piece_table`, `position.cpp`). Bishop, rook, horse, dragon, king and
-/// pawn are **not** minor.
+/// (`minor_piece_table`). Bishop, rook, horse, dragon, king and pawn are
+/// **not** minor.
 pub(crate) fn is_minor_piece(piece: Piece) -> bool {
     if piece.promoted {
         matches!(

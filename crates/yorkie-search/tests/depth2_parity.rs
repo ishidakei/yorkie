@@ -22,11 +22,11 @@ use yorkie_search::{QSearch, RootKind};
 use yorkie_state::{Move, Position, format_usi_move, parse_sfen, parse_usi_move};
 use yorkie_storage::TranspositionTable;
 
-/// `VALUE_MATE` (`types.h`).
+/// `VALUE_MATE`.
 const VALUE_MATE: i32 = 32000;
-/// `VALUE_TB_WIN_IN_MAX_PLY` (`types.h`): the `is_decisive` threshold.
+/// `VALUE_TB_WIN_IN_MAX_PLY`: the `is_decisive` threshold.
 const VALUE_TB_WIN_IN_MAX_PLY: i32 = VALUE_MATE - 246;
-/// `Eval::PawnValue` (`NormalizeToPawnValue`, `usi.cpp`).
+/// `Eval::PawnValue` (`NormalizeToPawnValue`).
 const PAWN_VALUE: i32 = 90;
 /// Engine default `USI_Hash` in MiB.
 const HASH_MB: usize = 1024;
@@ -85,7 +85,7 @@ fn bestmove_usi(best_move: Move, kind: RootKind) -> String {
     }
 }
 
-/// `is_decisive` (`types.h`).
+/// `is_decisive`.
 fn is_decisive(v: i32) -> bool {
     v.abs() >= VALUE_TB_WIN_IN_MAX_PLY
 }

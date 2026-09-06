@@ -1,5 +1,5 @@
 //! Static Exchange Evaluation "greater-or-equal" test, ported from
-//! `Position::see_ge` (`position.cpp`).
+//! `Position::see_ge`.
 //!
 //! `see_ge(m, threshold)` is `true` iff the material swing of the optimal
 //! capture / recapture sequence on `m`'s destination is at least `threshold`.
@@ -26,8 +26,8 @@ use crate::piece::Piece;
 use crate::position::Position;
 use crate::square::Square;
 
-// The Apery material values, ported from `Eval::PieceValue[]` (`evaluate.h`).
-// The four promoted minor pieces all collapse to `GOLD_VALUE` there.
+// The Apery material values, ported from `Eval::PieceValue[]`. The four
+// promoted minor pieces all collapse to `GOLD_VALUE` there.
 const PAWN_VALUE: i32 = 90;
 const LANCE_VALUE: i32 = 315;
 const KNIGHT_VALUE: i32 = 405;

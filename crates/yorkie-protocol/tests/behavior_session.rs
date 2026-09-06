@@ -164,9 +164,9 @@ fn a_lost_position_is_resigned_exactly_when_the_configured_threshold_is_reachabl
             "ResignValue {} must resign a lost position:\n{out}",
             config::RESIGN_VALUE
         );
-        // The final PV must precede `bestmove resign` (`yaneuraou-search.cpp`
-        // in the reference: the PV-output condition includes `|| resign_by_value`), so
-        // the GUI can see the score the resignation was decided on.
+        // The final PV must precede `bestmove resign` (in the reference: the
+        // PV-output condition includes `|| resign_by_value`), so the GUI can
+        // see the score the resignation was decided on.
         let before_bestmove = out
             .split_once("bestmove")
             .map(|(head, _)| head)

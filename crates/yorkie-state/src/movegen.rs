@@ -278,8 +278,8 @@ pub(crate) fn attackers_bb_occ(
 }
 
 /// Both colours' attackers of `sq` under occupancy `occ` in a single pass — the
-/// reference `Position::attackers_to(sq, occ)` (`position.cpp`), bit-identical
-/// to OR-ing the two [`attackers_bb_occ`] calls.
+/// reference `Position::attackers_to(sq, occ)`, bit-identical to OR-ing the two
+/// [`attackers_bb_occ`] calls.
 ///
 /// The two slider walks are shared across colours, and each side's lances are
 /// folded into the rook ray: a `color` lance attacks `sq` iff it lies on the
@@ -431,8 +431,8 @@ pub(crate) fn drop_is_uchifuzume(pre: &Position, m: Move) -> bool {
 }
 
 impl Position {
-    /// Port of `Position::legal_drop(to)` (`position.cpp`): `true` iff dropping
-    /// a side-to-move pawn on `to` is **legal**, that is, not uchifuzume.
+    /// Port of `Position::legal_drop(to)`: `true` iff dropping a side-to-move
+    /// pawn on `to` is **legal**, that is, not uchifuzume.
     ///
     /// **Precondition:** the dropped pawn on `to` checks the enemy king.
     pub(crate) fn legal_drop(&self, to: Square) -> bool {
@@ -478,9 +478,9 @@ impl Position {
 }
 
 /// `c`'s pieces attacking the pawn-drop square `pawn_sq`
-/// (`Position::attackers_to_pawn`, `position.cpp`). The uchifuzume test has
-/// already handled the enemy king, and a lance can never attack `pawn_sq`
-/// because the king stands directly between, so neither is checked here.
+/// (`Position::attackers_to_pawn`). The uchifuzume test has already handled the
+/// enemy king, and a lance can never attack `pawn_sq` because the king stands
+/// directly between, so neither is checked here.
 fn attackers_to_pawn(board: &Board, c: Color, pawn_sq: Square) -> crate::bitboard::Bitboard {
     use crate::bitboard::{
         bishop_attacks, gold_attacks, knight_attacks, rook_attacks, silver_attacks,

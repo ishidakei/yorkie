@@ -565,10 +565,11 @@ fn write_eval_script<W: Write>(out: &mut W, sfen: &str, moves: &str) -> std::io:
     } else {
         writeln!(out, "position sfen {sfen} moves {trimmed_moves}")?;
     }
-    // The `e` command (YaneuraOu-specific, non-Stockfish) calls engine.evaluate()
-    // and prints a single `eval = <integer>` line to stdout. It is available in
-    // both `tournament` and `normal` builds (guarded only by the !STOCKFISH block
-    // in usi.cpp). The `eval` command is a different, unrelated TODO stub.
+    // The `e` command (YaneuraOu-specific, non-Stockfish) calls
+    // engine.evaluate() and prints a single `eval = <integer>` line to stdout.
+    // It is available in both `tournament` and `normal` builds (guarded only by
+    // the !STOCKFISH block). The `eval` command is a different, unrelated TODO
+    // stub.
     writeln!(out, "e")?;
     writeln!(out, "quit")?;
     Ok(())
@@ -732,8 +733,8 @@ fn write_search_script<W: Write>(
     writeln!(out, "usi")?;
     writeln!(out, "setoption name Threads value {threads}")?;
     // Disable the opening book so the search always runs the alpha-beta
-    // routine. BookFile "no_book" is the sentinel value recognised by
-    // book.cpp.
+    // routine. BookFile "no_book" is the sentinel value the reference
+    // recognises.
     writeln!(out, "setoption name BookFile value no_book")?;
     writeln!(out, "isready")?;
     // usinewgame clears the transposition table (threads.clear() → clear_worker())
@@ -880,7 +881,7 @@ fn render_search_fixture(sfen: &str, moves: &str, result: &SearchResult) -> Stri
 
 // capture-book
 
-/// `.ybb` magic (`YbbMagic`, `source/book/book.cpp`).
+/// `.ybb` magic (`YbbMagic`).
 const YBB_MAGIC: &[u8; 16] = b"YANE-BINBOOK-V1\0";
 /// `.ybb` flags bit 0 — per-move depth present (`YbbFlagMoveDepth`).
 const YBB_FLAG_MOVE_DEPTH: u64 = 1;
@@ -1251,8 +1252,8 @@ bestmove 1g1f\n\
 
     #[test]
     fn parses_search_info_mate_score() {
-        // Synthetic line in the same format emitted by format_score() / on_update_full()
-        // in usi.cpp for a mate-in-N result:
+        // Synthetic line in the same format the reference emits for a mate-in-N
+        // result:
         //   "mate " + std::to_string(m)   (no division by 2 in the non-STOCKFISH build)
         // Positive value = mate for the side to move.
         let stdout = "\
@@ -1308,9 +1309,8 @@ bestmove 2g2f\n\
     #[test]
     fn write_search_script_no_moves() {
         // Pins the exact script emitted to the engine stdin for a startpos
-        // search. The script omits `quit` — stdin is closed by the caller
-        // after bestmove is read, which triggers the engine's EOF→quit path
-        // (misc.cpp).
+        // search. The script omits `quit` — stdin is closed by the caller after
+        // bestmove is read, which triggers the engine's EOF→quit path.
         let mut buf = Vec::new();
         write_search_script(&mut buf, STARTPOS_SFEN, "", 3, 1).unwrap();
         let expected = format!(

@@ -1,5 +1,5 @@
 //! Verification that [`crate::key`]'s Zobrist tables and composed position keys
-//! are bit-identical to the reference's (`Position::init`, `position.cpp`).
+//! are bit-identical to the reference's (`Position::init`).
 //!
 //! It re-derives the reference's generation from scratch and touches none of
 //! `key.rs`'s internals, reading only the tables under test through their
@@ -14,13 +14,13 @@ use crate::piece::{Piece, PieceKind};
 use crate::position::Position;
 use crate::square::Square;
 
-/// The reference PRNG seed (`position.cpp`).
+/// The reference PRNG seed.
 const SEED: u64 = 20151225;
-/// The `xorshift64*` output multiplier (`misc.h`).
+/// The `xorshift64*` output multiplier.
 const MULT: u64 = 2685821657736338717;
 
-/// The reference's `PieceType` order (`types.h`), restated rather than derived
-/// from [`PieceKind`] so that the mapping between the two is exercised.
+/// The reference's `PieceType` order, restated rather than derived from
+/// [`PieceKind`] so that the mapping between the two is exercised.
 const ALL_KINDS: [PieceKind; PieceKind::COUNT] = [
     PieceKind::Pawn,
     PieceKind::Lance,
@@ -43,7 +43,7 @@ impl Prng {
         Self { state: seed }
     }
 
-    /// One `PRNG::rand64()` step (`misc.h`).
+    /// One `PRNG::rand64()` step.
     fn rand64(&mut self) -> u64 {
         let mut x = self.state;
         x ^= x >> 12;
@@ -53,8 +53,7 @@ impl Prng {
         x.wrapping_mul(MULT)
     }
 
-    /// The reference `set_rand` (`position.cpp`): draw four words, keep the
-    /// first.
+    /// The reference `set_rand`: draw four words, keep the first.
     fn set_rand(&mut self) -> u64 {
         let r1 = self.rand64();
         let _r2 = self.rand64();
@@ -76,10 +75,10 @@ struct RefTables {
     hand: [[u64; 8]; Color::COUNT],
 }
 
-/// Decode a reference `Piece` code (`types.h`) into `(promoted, color, kind)`,
-/// or `None` for a code that never lands on a board. Re-derived from the
-/// reference enum layout, deliberately not sharing code with
-/// [`crate::key`]'s `ref_code_to_slot`.
+/// Decode a reference `Piece` code into `(promoted, color, kind)`, or `None`
+/// for a code that never lands on a board. Re-derived from the reference enum
+/// layout, deliberately not sharing code with [`crate::key`]'s
+/// `ref_code_to_slot`.
 fn decode_ref_piece(pc: usize) -> Option<(bool, Color, PieceKind)> {
     if pc == 0 || pc == 16 {
         return None; // NO_PIECE and the 16 gap between B_GOLDS and W_PAWN.

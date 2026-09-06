@@ -1,5 +1,5 @@
-//! Time management — a port of the reference `TimeManagement`
-//! (`timeman.cpp`), compiled under `USE_TIME_MANAGEMENT` in a non-DEEP build.
+//! Time management — a port of the reference `TimeManagement`, compiled under
+//! `USE_TIME_MANAGEMENT` in a non-DEEP build.
 //!
 //! For one `go` this computes an **optimum**, **maximum** and **minimum** think
 //! time in milliseconds. The search then shrinks the deadline toward `optimum`
@@ -17,8 +17,8 @@ use std::time::Instant;
 
 use crate::book::Prng;
 
-/// The reference `MoveHorizon` (`timeman.cpp`): the assumed number of plies
-/// still to play when planning the time budget.
+/// The reference `MoveHorizon`: the assumed number of plies still to play when
+/// planning the time budget.
 const MOVE_HORIZON: i32 = 160;
 
 /// The raw inputs [`TimeManagement::init`] needs, extracted by the USI driver
@@ -67,17 +67,17 @@ pub struct TimeManagement {
     /// `startTime` — the origin for [`Self::elapsed`] (`now() - startTime`).
     pub start_time: Instant,
     /// `ponderhitTime` — equal to `start_time` until a `ponderhit`, at which
-    /// point the search stamps it to the ponderhit instant (`set_ponderhit`,
-    /// `yaneuraou-search.cpp`). Used by [`Self::set_search_end`].
+    /// point the search stamps it to the ponderhit instant (`set_ponderhit`).
+    /// Used by [`Self::set_search_end`].
     pub ponderhit_time: Instant,
     /// `search_end` [ms from `start_time`]: `0` means "not yet decided"; once
-    /// set, the search stops when `search_end <= elapsed` (`timeman.h`).
+    /// set, the search stops when `search_end <= elapsed`.
     pub search_end: i64,
-    /// `isFinalPush` — in byoyomi with (almost) no main clock, spend it all
-    /// (`timeman.cpp`); consumed by [`Self::set_search_end`].
+    /// `isFinalPush` — in byoyomi with (almost) no main clock, spend it all;
+    /// consumed by [`Self::set_search_end`].
     pub is_final_push: bool,
-    /// True only for the `MTG <= 0` error path (`timeman.cpp`), so the driver
-    /// can emit the reference `info string Error!` diagnostic.
+    /// True only for the `MTG <= 0` error path, so the driver can emit the
+    /// reference `info string Error!` diagnostic.
     pub mtg_error: bool,
 
     minimum_time: i64,
@@ -91,7 +91,7 @@ pub struct TimeManagement {
 }
 
 impl TimeManagement {
-    /// Compute the think-time budget for one `go` (`timeman.cpp`).
+    /// Compute the think-time budget for one `go`.
     pub fn init(input: &TimeInput, prng: &mut Prng) -> TimeManagement {
         let &TimeInput {
             time_us,
@@ -135,7 +135,7 @@ impl TimeManagement {
         tm.remain_time = remain_time;
 
         // `go rtime`: a randomised minimum-think budget, decaying with ply,
-        // used for self-play variety (`timeman.cpp`).
+        // used for self-play variety.
         if rtime != 0 {
             let mut r = rtime;
             if ply != 0 {
@@ -149,7 +149,7 @@ impl TimeManagement {
             return tm;
         }
 
-        // `go movetime`: spend exactly the given time (`timeman.cpp`).
+        // `go movetime`: spend exactly the given time.
         if movetime != 0 {
             tm.remain_time = movetime;
             tm.minimum_time = movetime;
@@ -158,24 +158,22 @@ impl TimeManagement {
             return tm;
         }
 
-        // Time-forfeit (sudden death): neither increment nor byoyomi
-        // (`timeman.cpp`).
+        // Time-forfeit (sudden death): neither increment nor byoyomi.
         let time_forfeit = inc_us == 0 && byoyomi_us == 0;
 
         // The planning horizon, wider early and narrower once out of the
-        // opening (`timeman.cpp`).
+        // opening.
         let move_horizon = if time_forfeit {
             MOVE_HORIZON + 40 - ply.min(40)
         } else {
             MOVE_HORIZON + 20 - ply.min(80)
         };
 
-        // Own remaining moves until the draw horizon (`timeman.cpp`).
+        // Own remaining moves until the draw horizon.
         let mtg = (max_moves_to_draw - ply + 2).min(move_horizon) / 2;
 
         if mtg <= 0 {
-            // Should be unreachable given a sane MaxMovesToDraw; guard anyway
-            // (`timeman.cpp`).
+            // Should be unreachable given a sane MaxMovesToDraw; guard anyway.
             tm.mtg_error = true;
             tm.minimum_time = 500;
             tm.optimum_time = 500;
@@ -183,14 +181,14 @@ impl TimeManagement {
             return tm;
         }
         if mtg == 1 {
-            // Last move before the horizon: spend everything (`timeman.cpp`).
+            // Last move before the horizon: spend everything.
             tm.minimum_time = remain_time;
             tm.optimum_time = remain_time;
             tm.maximum_time = remain_time;
             return tm;
         }
 
-        // Minimum think time floor (`timeman.cpp`).
+        // Minimum think time floor.
         let minimum_time = (minimum_thinking_time - network_delay).max(if round_up_to_fullsecond {
             1000
         } else {
@@ -198,19 +196,18 @@ impl TimeManagement {
         });
         tm.minimum_time = minimum_time;
 
-        // Time estimated still available across the remaining moves
-        // (`timeman.cpp`).
+        // Time estimated still available across the remaining moves.
         let mut remain_estimate = time_us + inc_us * mtg as i64 + byoyomi_us * mtg as i64;
         if round_up_to_fullsecond {
             remain_estimate -= (mtg as i64 + 1) * 1000;
         }
         remain_estimate = remain_estimate.max(0);
 
-        // optimum candidate (`timeman.cpp`).
+        // optimum candidate.
         let t1 = minimum_time + remain_estimate / mtg as i64;
 
         // maximum candidate: up to `max_ratio`× the optimum, capped at 30% of
-        // the remaining estimate (`timeman.cpp`).
+        // the remaining estimate.
         let mut max_ratio = 5.0f32;
         if time_forfeit {
             max_ratio = max_ratio.min((time_us as f32 / (60.0 * 1000.0)).max(1.0));
@@ -218,17 +215,16 @@ impl TimeManagement {
         let mut t2 = minimum_time + (remain_estimate as f32 * max_ratio / mtg as f32) as i64;
         t2 = t2.min((remain_estimate as f64 * 0.3) as i64);
 
-        // Fold in SlowMover and clamp to the remaining time (`timeman.cpp`).
+        // Fold in SlowMover and clamp to the remaining time.
         tm.optimum_time = t1.min(remain_time) * slow_mover / 100;
         tm.maximum_time = t2.min(remain_time);
 
-        // Ponder bonus (`timeman.cpp`).
+        // Ponder bonus.
         if usi_ponder && !stochastic_ponder {
             tm.optimum_time += tm.optimum_time / 4;
         }
 
-        // Byoyomi with (almost) no main clock: spend it all this move
-        // (`timeman.cpp`).
+        // Byoyomi with (almost) no main clock: spend it all this move.
         tm.is_final_push = false;
         if byoyomi_us != 0 && time_us < (byoyomi_us as f64 * 1.2) as i64 {
             let v = byoyomi_us + time_us;
@@ -238,8 +234,7 @@ impl TimeManagement {
             tm.is_final_push = true;
         }
 
-        // Final clamps: round up minimum/maximum and never exceed remain_time
-        // (`timeman.cpp`).
+        // Final clamps: round up minimum/maximum and never exceed remain_time.
         tm.minimum_time = tm.round_up(tm.minimum_time).min(remain_time);
         tm.optimum_time = tm.optimum_time.min(remain_time);
         tm.maximum_time = tm.round_up(tm.maximum_time).min(remain_time);
@@ -247,9 +242,9 @@ impl TimeManagement {
         tm
     }
 
-    /// Round `t0` up to a whole second (subtracting the network delay),
-    /// floored at `MinimumThinkingTime` and capped at `remain_time`
-    /// (`timeman.cpp`). A no-op rounding when `RoundUpToFullSecond` is off.
+    /// Round `t0` up to a whole second (subtracting the network delay), floored
+    /// at `MinimumThinkingTime` and capped at `remain_time`. A no-op rounding
+    /// when `RoundUpToFullSecond` is off.
     pub fn round_up(&self, t0: i64) -> i64 {
         if self.round_up_to_fullsecond {
             let mut t = (((t0 + 999) / 1000) * 1000).max(self.minimum_thinking_time);
@@ -266,8 +261,8 @@ impl TimeManagement {
     }
 
     /// Fix the search end time from the elapsed time `e` [ms] at which the
-    /// search decided to stop (`timeman.cpp`), rounding the used time up to a
-    /// full second and storing it as an offset from `start_time`.
+    /// search decided to stop, rounding the used time up to a full second and
+    /// storing it as an offset from `start_time`.
     pub fn set_search_end(&mut self, e: i64) {
         // `startTime - ponderhitTime` in ms (0 without ponder; <= 0 with).
         let start_minus_ponderhit = -(self
@@ -352,8 +347,8 @@ mod tests {
 
     #[test]
     fn byoyomi_10min_plus_10s() {
-        // 10 min main + 10 s byoyomi, no increment. Hand-computed against
-        // timeman.cpp with the default options and ply 1.
+        // 10 min main + 10 s byoyomi, no increment. Hand-computed against the
+        // reference with the default options and ply 1.
         let input = TimeInput {
             time_us: 600_000,
             byoyomi_us: 10_000,
