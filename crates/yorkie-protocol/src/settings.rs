@@ -115,9 +115,16 @@ spin_accessors! {
     /// book `info` lines are built.
     #[cfg(feature = "verbose2")]
     book_pv_moves => BOOK_PV_MOVES;
-    /// Per-`go` search-depth ceiling, `0` unlimited (`DepthLimit`).
+    /// Per-`go` search-depth ceiling, `0` unlimited (`DepthLimit`). A ceiling
+    /// bounds a search by something other than the clock, which is what an
+    /// analysis session asks for and a rated game never does, so it shares the
+    /// feature of the `go depth` clause that also sets it; without that feature
+    /// the engine has no depth ceiling and the constant does not exist.
+    #[cfg(feature = "verbose2")]
     depth_limit => DEPTH_LIMIT;
-    /// Per-`go` node ceiling, `0` unlimited (`NodesLimit`).
+    /// Per-`go` node ceiling, `0` unlimited (`NodesLimit`). Gated for the same
+    /// reason as the depth ceiling above, with `go nodes` as its other source.
+    #[cfg(feature = "verbose2")]
     nodes_limit => NODES_LIMIT;
     /// Ply past which the search adjudicates a draw (`MaxMovesToDraw`).
     max_moves_to_draw => MAX_MOVES_TO_DRAW;

@@ -13,15 +13,17 @@ pub enum PositionSfen {
 /// All USI `go` sub-tokens captured verbatim, including the ones the driver does
 /// not act on, so the parse is lossless.
 ///
-/// `depth` and `nodes` stay ungated because the `DepthLimit` / `NodesLimit`
-/// config keys seed the same two fields in every build, so a `go` line is not
-/// their only source. The four clauses nothing else seeds — `movetime`,
-/// `infinite`, `mate` and `rtime` — are `verbose2`, together with the parser
-/// arms that fill them: without that feature no input could make them anything
-/// but their default.
+/// Six clauses are `verbose2`, together with the parser arms that fill them:
+/// `depth`, `nodes`, `movetime`, `infinite`, `mate` and `rtime`. A `go` line is
+/// their only source — the `DepthLimit` / `NodesLimit` config keys that also
+/// seed the first two need the same feature — so without it no input could make
+/// them anything but their default, and the fields carry the feature rather than
+/// standing unfillable.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GoLimits {
+    #[cfg(feature = "verbose2")]
     pub depth: Option<u32>,
+    #[cfg(feature = "verbose2")]
     pub nodes: Option<u64>,
     #[cfg(feature = "verbose2")]
     pub movetime: Option<u64>,
@@ -263,6 +265,7 @@ fn parse_go<'a>(line: &str, parts: impl Iterator<Item = &'a str>) -> Command {
                     i += 2;
                 }
             },
+            #[cfg(feature = "verbose2")]
             "depth" => {
                 let Some(value) = tokens.get(i + 1) else {
                     return unknown(line);
@@ -274,22 +277,22 @@ fn parse_go<'a>(line: &str, parts: impl Iterator<Item = &'a str>) -> Command {
                 i += 2;
             }
             #[cfg(feature = "verbose2")]
-            "movetime" | "rtime" => {
-                let Some(v) = u64_arg(&tokens, i) else {
-                    return unknown(line);
-                };
-                match key {
-                    "movetime" => limits.movetime = Some(v),
-                    _ => limits.rtime = Some(v),
-                }
-                i += 2;
-            }
-            "nodes" | "wtime" | "btime" | "winc" | "binc" | "byoyomi" => {
+            "nodes" | "movetime" | "rtime" => {
                 let Some(v) = u64_arg(&tokens, i) else {
                     return unknown(line);
                 };
                 match key {
                     "nodes" => limits.nodes = Some(v),
+                    "movetime" => limits.movetime = Some(v),
+                    _ => limits.rtime = Some(v),
+                }
+                i += 2;
+            }
+            "wtime" | "btime" | "winc" | "binc" | "byoyomi" => {
+                let Some(v) = u64_arg(&tokens, i) else {
+                    return unknown(line);
+                };
+                match key {
                     "wtime" => limits.wtime = Some(v),
                     "btime" => limits.btime = Some(v),
                     "winc" => limits.winc = Some(v),

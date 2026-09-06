@@ -279,8 +279,28 @@ const SCHEMA: &[Spec] = &[
         "EnteringKingRule",
         ENTERING_KING_RULE_CHOICES,
     ),
-    int("depth_limit", "DepthLimit", 0, 2_147_483_647),
-    int("nodes_limit", "NodesLimit", 0, i64::MAX),
+    gated_int(
+        "depth_limit",
+        "DepthLimit",
+        0,
+        2_147_483_647,
+        "verbose2",
+        0,
+        "a search-depth ceiling is an analysis device, and the `go depth` clause that is its only \
+         other source needs the same feature, so a build without it carries no depth ceiling at \
+         all and bounds every search by the clock",
+    ),
+    gated_int(
+        "nodes_limit",
+        "NodesLimit",
+        0,
+        i64::MAX,
+        "verbose2",
+        0,
+        "a node ceiling is an analysis device, and the `go nodes` clause that is its only other \
+         source needs the same feature, so a build without it carries no node ceiling at all and \
+         bounds every search by the clock",
+    ),
     int("max_moves_to_draw", "MaxMovesToDraw", 0, 100_000),
     int("pv_interval", "PvInterval", 0, 100_000_000),
     boolean("consideration_mode", "ConsiderationMode"),

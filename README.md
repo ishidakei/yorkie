@@ -279,8 +279,8 @@ TOML ファイルを参照してください。
 | `ignore_book_ply` | 真偽値 | `true` / `false` | 定跡照合時に手数を無視する |
 | `flipped_book` | 真偽値 | `true` / `false` | 左右反転した局面も定跡照合する |
 | `entering_king_rule` | 文字列 | `NoEnteringKing` / `CSARule24` / `CSARule24H` / `CSARule27` / `CSARule27H` / `TryRule` | 入玉宣言勝ちのルール |
-| `depth_limit` | 整数 | 0〜2147483647 | 探索深さの上限（0 = 無制限） |
-| `nodes_limit` | 整数 | 0〜9223372036854775807 | 探索ノード数の上限（0 = 無制限） |
+| `depth_limit` | 整数 | 0〜2147483647 | 探索深さの上限（0 = 無制限）。`verbose2` のあるビルドでのみ効き、それのないビルドは深さの上限を持たない（時間と `stop` だけで探索を打ち切る）ため、`0` 以外を書いた config はビルドエラーになる |
+| `nodes_limit` | 整数 | 0〜9223372036854775807 | 探索ノード数の上限（0 = 無制限）。`depth_limit` と同じく `verbose2` のあるビルドでのみ効き、それのないビルドでは `0` 以外を書くとビルドエラーになる |
 | `max_moves_to_draw` | 整数 | 0〜100000 | 引き分けとする手数（0 = 無制限） |
 | `pv_interval` | 整数 | 0〜100000000 | PV 出力の最小間隔 [ms]（0 = 抑制しない） |
 | `consideration_mode` | 真偽値 | `true` / `false` | 検討モード |

@@ -1139,7 +1139,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// only by `bench`; there is no such interval to force below `verbose2`.
     fn prepare_coordinator_job(
         &mut self,
-        mut limits: GoLimits,
+        limits: GoLimits,
         #[cfg(feature = "verbose2")] disable_pv_interval: bool,
     ) -> Option<CoordinatorJob<W>> {
         // Nothing propagates the NNUE fixed-point scale here: the reference's
@@ -1152,18 +1152,25 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // token stand. A seeded depth also disables the parallel-search vote
         // below, exactly like an explicit `go depth N`: the reference's
         // `!limits.depth` guard keys off the final value regardless of source.
-        if limits.depth.is_none() {
-            let dl = self.settings.depth_limit();
-            if dl != 0 {
-                limits.depth = Some(dl as u32);
+        // Both keys need the same feature as the clauses they seed, so a build
+        // without it has neither source and reaches no ceiling at all.
+        #[cfg(feature = "verbose2")]
+        let limits = {
+            let mut limits = limits;
+            if limits.depth.is_none() {
+                let dl = self.settings.depth_limit();
+                if dl != 0 {
+                    limits.depth = Some(dl as u32);
+                }
             }
-        }
-        if limits.nodes.is_none() {
-            let nl = self.settings.nodes_limit();
-            if nl != 0 {
-                limits.nodes = Some(nl as u64);
+            if limits.nodes.is_none() {
+                let nl = self.settings.nodes_limit();
+                if nl != 0 {
+                    limits.nodes = Some(nl as u64);
+                }
             }
-        }
+            limits
+        };
 
         // No network loaded (a non-compliant host `go`, or a `bench` whose
         // `isready` never succeeded). The caller resigns for this position. The
@@ -1179,12 +1186,13 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // / nodes / infinite / mate), where the search runs unbounded by time.
         let us = self.pos.side_to_move();
         let now = Instant::now();
-        let use_time_management = limits.depth.is_none() && limits.nodes.is_none();
-        // The four clauses only `verbose2` can parse narrow it further; without
-        // that feature none of them can be set, so the two option-seeded
-        // ceilings above decide it alone.
+        // Every `go` a build without `verbose2` can be given is bounded by the
+        // clock: the six clauses that bound a search any other way, and the two
+        // config keys that seed two of them, all need that feature. Such a build
+        // has nothing to classify, so it carries no classification at all.
         #[cfg(feature = "verbose2")]
-        let use_time_management = use_time_management
+        let use_time_management = limits.depth.is_none()
+            && limits.nodes.is_none()
             && limits.mate.is_none()
             && limits.movetime.is_none()
             && !limits.infinite;
@@ -1222,13 +1230,15 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 
         // A `go movetime` (or the `go mate <ms>` budget mapped onto one) still
         // needs a `TimeManagement` even though it switches dynamic management
-        // off — and neither clause exists below `verbose2`.
-        #[cfg(feature = "verbose2")]
-        let needs_time_control = use_time_management || movetime.is_some();
-        #[cfg(not(feature = "verbose2"))]
-        let needs_time_control = use_time_management;
-
-        let time = if needs_time_control {
+        // off. Neither clause exists without `verbose2`, where every `go` is
+        // clock-managed and so gets one unconditionally; the label is the early
+        // exit only a `verbose2` build has.
+        #[cfg_attr(not(feature = "verbose2"), allow(unused_labels))]
+        let time = 'time: {
+            #[cfg(feature = "verbose2")]
+            if !(use_time_management || movetime.is_some()) {
+                break 'time None;
+            }
             let (time_opt, inc_opt) = match us {
                 yorkie_state::Color::Black => (limits.btime, limits.binc),
                 yorkie_state::Color::White => (limits.wtime, limits.winc),
@@ -1268,6 +1278,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             }
             Some(TimeControl {
                 tm,
+                #[cfg(feature = "verbose2")]
                 use_time_management,
                 #[cfg(feature = "verbose2")]
                 movetime,
@@ -1276,8 +1287,6 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 best_previous_average_score: best_prev_average_score,
                 previous_time_reduction: self.previous_time_reduction,
             })
-        } else {
-            None
         };
         // The shared `go ponder` signal, seeded active (`ponderMode`), installed on
         // the main worker's control so it (and the coordinator's hold loop) can be
@@ -1286,11 +1295,15 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         let control = SearchControl {
             stop: Some(Arc::new(AtomicBool::new(false))),
             ponder: ponder.as_ref().map(Arc::clone),
+            #[cfg(feature = "verbose2")]
             node_limit: limits.nodes,
             time,
         };
-        // `go depth N` fixes the depth (clamped to the search's ceiling); any
-        // other `go` runs to the ceiling and is bounded by time / `stop`.
+        // `go depth N` fixes the depth (clamped to the search's own maximum); any
+        // other `go` runs to that maximum and is bounded by time / `stop`. Only a
+        // `verbose2` build has a source for a lower ceiling, so only it carries
+        // one.
+        #[cfg(feature = "verbose2")]
         let depth = match limits.depth {
             Some(d) => (d as i32).clamp(1, SEARCH_MAX_DEPTH),
             None => SEARCH_MAX_DEPTH,
@@ -1313,10 +1326,11 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // on the main worker's own line.
         #[cfg(feature = "verbose2")]
         let mate_mode = limits.mate.is_some();
+        // Without `verbose2` none of the three can be set — there is no depth
+        // ceiling, no MultiPV and no mate mode — so there is nothing to decide
+        // and the coordinator consults the vote unconditionally.
         #[cfg(feature = "verbose2")]
         let use_voting = limits.depth.is_none() && multi_pv == 1 && !mate_mode;
-        #[cfg(not(feature = "verbose2"))]
-        let use_voting = limits.depth.is_none();
 
         // PV-output config snapshot for this `go`. `computed_pv_interval` is
         // `0` (never suppress — every iteration prints) under `go infinite`,
@@ -1450,7 +1464,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             search,
             tt,
             pos,
+            #[cfg(feature = "verbose2")]
             depth,
+            #[cfg(feature = "verbose2")]
             use_voting,
             control,
             stop,
@@ -2342,11 +2358,17 @@ struct HelperJob {
     pos: Position,
     /// This helper's own copy of the root-move list.
     root_moves: Vec<RootMove>,
-    /// The iterative-deepening depth ceiling for this `go`.
+    /// The iterative-deepening depth ceiling for this `go`, below the search's
+    /// own maximum. Only a `verbose2` build has a source for one — see
+    /// [`CoordinatorJob::depth`], which this copies.
+    #[cfg(feature = "verbose2")]
     limit_depth: i32,
     /// The one shared stop flag every worker polls (the driver installs it).
     stop: Arc<AtomicBool>,
-    /// Per-worker node counters; the helper publishes `nodes` to `node_slots[index]`.
+    /// Per-worker node counters; the helper publishes `nodes` to
+    /// `node_slots[index]`. The aggregate they form is read by the node ceiling
+    /// and by the search `info` lines, both `verbose2`.
+    #[cfg(feature = "verbose2")]
     node_slots: Arc<Vec<AtomicU64>>,
     /// Per-worker best-move-change counters; the helper `fetch_add`s its own
     /// `bmc_slots[index]` at the root, and the main worker folds every slot
@@ -2490,9 +2512,11 @@ fn helper_loop(slot: Arc<HelperSlot>) {
                 // Helpers never run `check_time` (only the main worker ponders), so
                 // they need no ponder signal — they stop when the coordinator does.
                 ponder: None,
+                #[cfg(feature = "verbose2")]
                 node_limit: None,
                 time: None,
             });
+            #[cfg(feature = "verbose2")]
             qs.set_node_tally(Arc::clone(&job.node_slots), job.index);
             qs.set_best_move_tally(Arc::clone(&job.bmc_slots), job.index);
             qs.set_entering_king(job.entering_king);
@@ -2506,7 +2530,13 @@ fn helper_loop(slot: Arc<HelperSlot>) {
             // Helpers run the MultiPV loop too, but with no sink they never emit.
             #[cfg(feature = "verbose2")]
             qs.set_multi_pv(job.multi_pv);
-            let result = qs.run_worker(&job.pos, job.root_moves, job.limit_depth);
+            // A ceiling below the search's own maximum has two sources, `go
+            // depth N` and the `DepthLimit` key, and both need `verbose2`.
+            #[cfg(feature = "verbose2")]
+            let limit_depth = job.limit_depth;
+            #[cfg(not(feature = "verbose2"))]
+            let limit_depth = SEARCH_MAX_DEPTH;
+            let result = qs.run_worker(&job.pos, job.root_moves, limit_depth);
             (result, qs.into_histories())
         };
         histories = Some(reclaimed);
@@ -2523,6 +2553,7 @@ fn helper_loop(slot: Arc<HelperSlot>) {
         drop(job.tt);
         drop(job.search);
         drop(job.stop);
+        #[cfg(feature = "verbose2")]
         drop(job.node_slots);
 
         *slot.lock() = SlotState::Finished(result);
@@ -2949,8 +2980,17 @@ struct CoordinatorJob<W: Write + Send + 'static> {
     search: Arc<Search>,
     tt: Arc<TranspositionTable>,
     pos: Position,
+    /// The iterative-deepening ceiling for this `go`, below the search's own
+    /// maximum. `go depth` and the `DepthLimit` key, its only two sources, are
+    /// both `verbose2`; without that feature every `go` runs to
+    /// [`SEARCH_MAX_DEPTH`] and there is no ceiling to carry.
+    #[cfg(feature = "verbose2")]
     depth: i32,
-    /// Consult `select_best_worker` (true) or always report the main worker.
+    /// Consult `select_best_worker` (true) or always report the main worker. A
+    /// depth ceiling, MultiPV and mate mode are the only three things that turn
+    /// the vote off, and all three are `verbose2`; without that feature the
+    /// coordinator has no choice to carry and always votes.
+    #[cfg(feature = "verbose2")]
     use_voting: bool,
     /// The main worker's full control (stop + node ceiling + deadlines).
     control: SearchControl,
@@ -3070,7 +3110,9 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         search,
         tt,
         pos,
+        #[cfg(feature = "verbose2")]
         depth,
+        #[cfg(feature = "verbose2")]
         use_voting,
         control,
         stop,
@@ -3221,7 +3263,11 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     }
 
     // Per-worker node counters (index 0 = main, 1.. = helpers) for the aggregate
-    // `go nodes N` ceiling and the final aggregated `info ... nodes`.
+    // `go nodes N` ceiling and the final aggregated `info ... nodes`. Both
+    // readers are `verbose2` — the ceiling with the clauses and keys that set
+    // it, the `info` line with every search line — and each worker's own
+    // `nodes`, which the search itself reads, is a counter of its own.
+    #[cfg(feature = "verbose2")]
     let node_slots: Arc<Vec<AtomicU64>> =
         Arc::new((0..n_threads).map(|_| AtomicU64::new(0)).collect());
     // Per-worker best-move-change counters, same slot-per-worker shape: each
@@ -3238,8 +3284,10 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
             tt: Arc::clone(&tt),
             pos: pos.clone(),
             root_moves: root_moves.clone(),
+            #[cfg(feature = "verbose2")]
             limit_depth: depth,
             stop: Arc::clone(&stop),
+            #[cfg(feature = "verbose2")]
             node_slots: Arc::clone(&node_slots),
             bmc_slots: Arc::clone(&bmc_slots),
             index: h + 1,
@@ -3266,6 +3314,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     let net = search.network();
     let mut qs = QSearch::with_histories(net, &tt, histories);
     qs.set_control(control);
+    #[cfg(feature = "verbose2")]
     qs.set_node_tally(Arc::clone(&node_slots), 0);
     qs.set_best_move_tally(Arc::clone(&bmc_slots), 0);
     qs.set_entering_king(entering_king);
@@ -3285,6 +3334,10 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
             writer: Arc::clone(&writer),
         }),
     );
+    // As in the helper loop: without `verbose2` no `go` carries a ceiling below
+    // the search's own maximum, because neither source of one exists.
+    #[cfg(not(feature = "verbose2"))]
+    let depth = SEARCH_MAX_DEPTH;
     let main_result = qs.run_worker(&pos, root_moves, depth);
 
     // Ponder / infinite hold (the SKIP_SEARCH wait loop): do not emit
@@ -3319,8 +3372,15 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     let total_nodes: u64 = results.iter().map(|r| r.nodes).sum();
 
     // Choose the reported worker: the main worker for a `go depth N`, else the
-    // thread vote (`get_best_thread`).
-    let chosen = if use_voting {
+    // thread vote (`get_best_thread`). Nothing turns the vote off in a build
+    // without `verbose2`, which reaches it for every `go`; the label is the
+    // early exit only a `verbose2` build has.
+    #[cfg_attr(not(feature = "verbose2"), allow(unused_labels))]
+    let chosen = 'vote: {
+        #[cfg(feature = "verbose2")]
+        if !use_voting {
+            break 'vote 0;
+        }
         let votes: Vec<WorkerVote> = results
             .iter()
             .map(|r| WorkerVote {
@@ -3331,8 +3391,6 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
             })
             .collect();
         select_best_worker(&votes)
-    } else {
-        0
     };
     let chosen_result = &results[chosen];
     let mut best = chosen_result.best.clone();

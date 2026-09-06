@@ -295,10 +295,16 @@ pub struct SearchControl {
     /// clears it and stamps the time, so time management resumes.
     pub ponder: Option<Arc<PonderSignal>>,
     /// Hard node ceiling (`go nodes N`): abort once the node counter reaches it.
+    /// `go nodes` and the `NodesLimit` config key, its only two sources, are
+    /// both `verbose2`; without that feature a search is bounded by its clock,
+    /// its depth and `stop` alone. The counter the ceiling reads is not gated —
+    /// the search decides with it (see [`QSearch::nodes`]) — only the ceiling is.
+    #[cfg(feature = "verbose2")]
     pub node_limit: Option<u64>,
     /// The reference `TimeManagement` state plus the limit classification the
     /// search-side time control needs. `Some` only on the main worker of a `go`
-    /// that has a time budget.
+    /// that has a time budget — which, without `verbose2`, is every `go`, since
+    /// the six clauses that bound a search any other way all need that feature.
     pub time: Option<TimeControl>,
 }
 
@@ -312,7 +318,10 @@ pub struct TimeControl {
     pub tm: TimeManagement,
     /// `limits.use_time_management()`: true only for a real clock / `go rtime`,
     /// i.e. not `movetime` / `depth` / `nodes` / `infinite` / `mate`. Gates the
-    /// dynamic optimum-time block and the `maximum()` stop.
+    /// dynamic optimum-time block and the `maximum()` stop. The five shapes it
+    /// excludes all need `verbose2`, so without that feature every `go` is
+    /// clock-managed and the classification does not exist.
+    #[cfg(feature = "verbose2")]
     pub use_time_management: bool,
     /// `limits.movetime` [ms] (`Some` only for `go movetime`): `check_time` stops
     /// the search once `elapsed >= movetime`. `go movetime` and `go mate <ms>`,
@@ -350,7 +359,12 @@ pub struct QSearch<'a> {
     /// its atomics, so the driver can hand each worker a cheap `Arc` clone.
     tt: &'a TranspositionTable,
 
-    /// `nodes` counter — bumped once per `do_move`.
+    /// `nodes` counter — bumped once per `do_move`. A search input in every
+    /// build, not an output: the repetition returns dither their draw value on
+    /// bit 1 of it (`value_draw`), the interior search's root bookkeeping runs on
+    /// `(nodes & 14) == 0`, each root move accumulates its `effort` as a
+    /// difference of it, and the time-management block divides by this worker's
+    /// own count. The ceilings that read it are gated; the count itself is not.
     nodes: u64,
     /// `selDepth`.
     sel_depth: i32,
@@ -480,6 +494,11 @@ pub struct QSearch<'a> {
     /// index. Each checkpoint publishes to its own slot, and the main worker's
     /// node ceiling sums them, reproducing `threads.nodes_searched()`. `None`
     /// on the single-worker path, where `self.nodes` is authoritative.
+    ///
+    /// The aggregate has two readers, the node ceiling and the `nodes` field of
+    /// a search `info` line, and both are `verbose2`; the search itself decides
+    /// on this worker's own [`Self::nodes`], never on the sum.
+    #[cfg(feature = "verbose2")]
     node_tally: Option<(Arc<Vec<AtomicU64>>, usize)>,
     /// Lazy-SMP shared best-move-change counters, in the same slot-per-worker
     /// shape as [`Self::node_tally`]. Every worker adds to its own slot; only
@@ -797,6 +816,7 @@ impl<'a> QSearch<'a> {
             best_move_changes: 0.0,
             stop_on_ponderhit: false,
             ponderhit_synced: false,
+            #[cfg(feature = "verbose2")]
             node_tally: None,
             best_move_tally: None,
             #[cfg(feature = "verbose2")]
@@ -890,6 +910,7 @@ impl<'a> QSearch<'a> {
     /// `check_time` checkpoint publishes `self.nodes` there so the main worker's
     /// `go nodes N` ceiling can sum every worker's count (the reference
     /// `threads.nodes_searched()`). Leave unset for the single-worker path.
+    #[cfg(feature = "verbose2")]
     pub fn set_node_tally(&mut self, slots: Arc<Vec<AtomicU64>>, index: usize) {
         self.node_tally = Some((slots, index));
     }
@@ -938,16 +959,20 @@ impl<'a> QSearch<'a> {
     /// tighter when a small node ceiling is set so the check rate stays at
     /// least ~0.1% of the ceiling.
     fn calls_reset(&self) -> i32 {
-        match self.control.node_limit {
-            Some(n) => CHECK_INTERVAL.min((n / 1024) as i32).max(1),
-            None => CHECK_INTERVAL,
+        // No node ceiling can be set without `verbose2`, so nothing tightens the
+        // checkpoint rate there.
+        #[cfg(feature = "verbose2")]
+        if let Some(n) = self.control.node_limit {
+            return CHECK_INTERVAL.min((n / 1024) as i32).max(1);
         }
+        CHECK_INTERVAL
     }
 
     /// The aggregate node count against the `go nodes` ceiling
     /// (`worker.threads.nodes_searched()`). With a tally installed, sum every
     /// worker's published slot; without one (single worker), this worker's own
     /// `nodes` is the whole search, so the two forms agree bit-for-bit.
+    #[cfg(feature = "verbose2")]
     fn counted_nodes(&self) -> u64 {
         match &self.node_tally {
             Some((slots, _)) => slots.iter().map(|s| s.load(Ordering::Relaxed)).sum(),
@@ -1018,7 +1043,9 @@ impl<'a> QSearch<'a> {
         // (and the final aggregated `nodes` output) can sum every worker — the
         // reference reads a per-worker atomic `nodes` each checkpoint
         // (`threads.nodes_searched()`); this port publishes at the checkpoint
-        // rather than per node. Inert (no slot) on the single-worker path.
+        // rather than per node. Inert (no slot) on the single-worker path, and
+        // absent entirely where neither reader of the sum exists.
+        #[cfg(feature = "verbose2")]
         if let Some((slots, idx)) = &self.node_tally {
             slots[*idx].store(self.nodes, Ordering::Relaxed);
         }
@@ -1052,9 +1079,9 @@ impl<'a> QSearch<'a> {
         }
 
         // 3./4. movetime elapsed or node ceiling reached ⇒ stop immediately.
-        let counted = self.counted_nodes();
+        #[cfg(feature = "verbose2")]
         if let Some(limit) = self.control.node_limit
-            && counted >= limit
+            && self.counted_nodes() >= limit
         {
             self.request_abort();
             return;
@@ -1078,8 +1105,15 @@ impl<'a> QSearch<'a> {
             return;
         }
         // 1./2. the maximum think time (or stopOnPonderhit) is exceeded ⇒ round up
-        // to a whole second via set_search_end rather than stopping now.
-        if tc.use_time_management && (elapsed > tc.tm.maximum() || self.stop_on_ponderhit) {
+        // to a whole second via set_search_end rather than stopping now. Every
+        // `go` a build without `verbose2` accepts is clock-managed, so there the
+        // budget alone decides.
+        #[cfg(feature = "verbose2")]
+        let past_budget =
+            tc.use_time_management && (elapsed > tc.tm.maximum() || self.stop_on_ponderhit);
+        #[cfg(not(feature = "verbose2"))]
+        let past_budget = elapsed > tc.tm.maximum() || self.stop_on_ponderhit;
+        if past_budget {
             self.control
                 .time
                 .as_mut()
@@ -1657,9 +1691,17 @@ impl<'a> QSearch<'a> {
 // qsearch it recurses into share all of that state.
 
 impl QSearch<'_> {
-    /// Run the single-threaded, `MultiPV == 1`, book-free root path on `pos`,
-    /// reproducing the reference's `start_searching` → `iterative_deepening`
-    /// control flow. The caller must have sized the transposition table.
+    /// Run the single-threaded, `MultiPV == 1`, book-free root path on `pos` to
+    /// `limit_depth`, reproducing the reference's `start_searching` →
+    /// `iterative_deepening` control flow. The caller must have sized the
+    /// transposition table.
+    ///
+    /// This is the fixed-depth entry point: the caller names the depth, and the
+    /// reference-captured parity fixtures are compared against it at each of
+    /// theirs. That is a source for a ceiling in every build, which is why
+    /// `limit_depth` here and on [`Self::run_worker`] carries no feature — unlike
+    /// a `go`'s ceiling, which arrives only from clauses and config keys the
+    /// Protocol layer gates.
     pub fn run_root(&mut self, pos: &Position, limit_depth: i32) -> RootOutcome {
         // Advance the TT generation before searching. The Lazy-SMP driver
         // hoists this bump out — one per `go`, before any helper launches — and
@@ -1735,6 +1777,11 @@ impl QSearch<'_> {
     /// **The caller must already have bumped the TT generation exactly once for
     /// this `go`** and built `root_moves`. Every time-management block is gated
     /// on the installed [`SearchControl`], and a helper's is stop-only.
+    ///
+    /// `limit_depth` is the caller's ceiling and is not feature-gated; see
+    /// [`Self::run_root`] for why. A driver that has no ceiling to impose passes
+    /// the search's own maximum, which the `rootDepth + 1 < MAX_PLY` guard below
+    /// reaches on its own.
     pub fn run_worker(
         &mut self,
         root_pos: &Position,
@@ -1981,12 +2028,20 @@ impl QSearch<'_> {
 
             // Whether there is time for another iteration. Only the main
             // worker under active time management, and only until the end time
-            // is fixed.
+            // is fixed. Without `verbose2` a `TimeControl` is only ever the
+            // active kind, so holding one is the whole condition.
+            #[cfg(feature = "verbose2")]
             let time_managed = self
                 .control
                 .time
                 .as_ref()
                 .is_some_and(|tc| tc.use_time_management && tc.tm.search_end == 0);
+            #[cfg(not(feature = "verbose2"))]
+            let time_managed = self
+                .control
+                .time
+                .as_ref()
+                .is_some_and(|tc| tc.tm.search_end == 0);
             if time_managed && !self.stopped && !self.stop_on_ponderhit {
                 // The reference stamps `tm.ponderhitTime` on the USI thread, so
                 // every later time decision sees it at once. This port
@@ -4765,9 +4820,11 @@ mod tests {
         q.set_control(SearchControl {
             stop: None,
             ponder: Some(Arc::clone(&sig)),
+            #[cfg(feature = "verbose2")]
             node_limit: None,
             time: Some(TimeControl {
                 tm,
+                #[cfg(feature = "verbose2")]
                 use_time_management: true,
                 #[cfg(feature = "verbose2")]
                 movetime: None,

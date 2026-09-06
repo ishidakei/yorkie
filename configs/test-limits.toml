@@ -60,7 +60,9 @@ flipped_book = true
 entering_king_rule = "CSARule27"
 
 # DIFFERENCE: both 0 in test.toml. A time-bounded `go` is seeded with these,
-# and an explicit `go depth` / `go nodes` token still overrides them.
+# and an explicit `go depth` / `go nodes` token still overrides them. Both keys
+# need `verbose2`, so a non-zero value here builds only with that feature — this
+# config's runs carry it.
 depth_limit = 2
 nodes_limit = 3000
 

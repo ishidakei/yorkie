@@ -130,8 +130,9 @@ flipped_book = true
 entering_king_rule = "CSARule27"
 
 # Per-`go` depth / node ceilings, `0` meaning unlimited (`DepthLimit` /
-# `NodesLimit`). An explicit `go depth` / `go nodes` token still wins, where the
-# build has one.
+# `NodesLimit`). An explicit `go depth` / `go nodes` token still wins. Honoured
+# with `verbose2`, the feature those two clauses need as well; without it the
+# engine has no ceiling of either kind and only `0` builds.
 depth_limit = 0
 nodes_limit = 0
 

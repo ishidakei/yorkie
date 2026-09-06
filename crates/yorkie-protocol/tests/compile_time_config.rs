@@ -45,6 +45,9 @@ const _: () = assert!(POOL_SIZE >= 1);
 #[cfg(feature = "verbose2")]
 const _: () = assert!(MULTI_PV_SLOTS.len() == config::MULTI_PV as usize);
 const _: () = assert!(!EVAL_SUBPATH.is_empty());
+// The node ceiling is a `verbose2` setting — a build without that feature has no
+// ceiling and no constant — so the assertion follows the feature.
+#[cfg(feature = "verbose2")]
 const _: () = assert!(config::NODES_LIMIT >= 0);
 
 #[test]

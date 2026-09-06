@@ -276,6 +276,33 @@ fn a_gated_key_off_its_fixed_value_is_refused_without_its_feature() {
     }
 }
 
+/// The two search ceilings are gated the same way, and for the same kind of
+/// reason: a ceiling bounds a search by something other than the clock, which is
+/// what an analysis session asks for and a rated game never does, so the `go`
+/// clause and the config key that set one share a feature. A build without it
+/// takes `0` — no ceiling — and nothing else.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn the_two_search_ceilings_need_verbose2() {
+    for (key, value) in [("depth_limit", 4), ("nodes_limit", 1000)] {
+        let text = default_with(key, Some(&format!("{key} = {value}")));
+        for features in [&[][..], &["verbose1"][..]] {
+            let err = compile_at(&text, features).expect_err("must fail without the feature");
+            assert!(
+                err.contains(&format!("`{key}` = {value} needs a `verbose2` build")),
+                "the message must name the key and the feature: {err}"
+            );
+            assert!(
+                err.contains("the only value it accepts is 0"),
+                "the message must say which value does build: {err}"
+            );
+        }
+        for features in [&["verbose2"][..], GATE_FEATURES] {
+            compile_at(&text, features).expect("the feature that implements it accepts a ceiling");
+        }
+    }
+}
+
 /// The fixed value is what every build accepts, with the feature or without —
 /// that is the whole point of gating the *setting* rather than the config file.
 #[cfg_attr(miri, ignore)]
