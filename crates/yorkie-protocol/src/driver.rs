@@ -1256,7 +1256,11 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         };
 
         // MultiPV snapshot for this `go` (read per `go`, like the other search
-        // options — no global). Clamped to the legal-move count inside the worker.
+        // options — no global). Clamped to the legal-move count inside the
+        // worker. A second PV line is reportable only through the search `info`
+        // lines, so below that level the setting does not exist and the root is
+        // single-line.
+        #[cfg(feature = "verbose2")]
         let multi_pv = (self.settings.multi_pv().max(1)) as usize;
 
         // `get_best_thread` is consulted only when no explicit `depth` was given
@@ -1267,7 +1271,10 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // vote is off so every PV line shows. Under `go mate` the vote is off too —
         // a mate proof lives on the main worker's own line.
         let mate_mode = limits.mate.is_some();
+        #[cfg(feature = "verbose2")]
         let use_voting = limits.depth.is_none() && multi_pv == 1 && !mate_mode;
+        #[cfg(not(feature = "verbose2"))]
+        let use_voting = limits.depth.is_none() && !mate_mode;
 
         // PV-output config snapshot for this `go` (`yaneuraou-search.cpp`).
         // `computed_pv_interval` is `0` (never suppress — every iteration
@@ -1426,6 +1433,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             resign_value,
             generate_all_legal_moves,
             mate_mode,
+            #[cfg(feature = "verbose2")]
             multi_pv,
             #[cfg(feature = "verbose2")]
             pv_config,
@@ -2292,6 +2300,9 @@ struct HelperJob {
     mate_mode: bool,
     /// The raw `MultiPV` option value (helpers run the MultiPV loop too, but never
     /// emit — no sink). Clamped to the legal-move count inside `run_worker`.
+    /// Only a build that prints the search `info` lines can report a second PV
+    /// line, so only that one searches for any.
+    #[cfg(feature = "verbose2")]
     multi_pv: usize,
     /// This helper's node-shared correction / pawn tables — a cheap
     /// [`Arc`] clone of `worker_shared[index]`. Stable across `go`s within a pool
@@ -2417,6 +2428,7 @@ fn helper_loop(slot: Arc<HelperSlot>) {
             qs.set_generate_all_legal_moves(job.generate_all_legal_moves);
             qs.set_mate_mode(job.mate_mode);
             // Helpers run the MultiPV loop too, but with no sink they never emit.
+            #[cfg(feature = "verbose2")]
             qs.set_multi_pv(job.multi_pv);
             let result = qs.run_worker(&job.pos, job.root_moves, job.limit_depth);
             (result, qs.into_histories())
@@ -2930,8 +2942,10 @@ struct CoordinatorJob<W: Write + Send + 'static> {
     /// `go mate` mode — disables the early mate break and enables the mate-found
     /// stop rule.
     mate_mode: bool,
-    /// The raw `MultiPV` option value for this `go`. It shapes the search, so
-    /// every build carries it.
+    /// The raw `MultiPV` option value for this `go`. It shapes the search, and
+    /// only a build that prints the search `info` lines can report a second PV
+    /// line, so only that one carries it.
+    #[cfg(feature = "verbose2")]
     multi_pv: usize,
     /// The PV-output config for this `go` — what gets printed, in a build that
     /// prints anything.
@@ -2999,11 +3013,13 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         resign_value,
         generate_all_legal_moves,
         mate_mode,
+        #[cfg(feature = "verbose2")]
         multi_pv,
         #[cfg(feature = "verbose2")]
         pv_config,
         writer,
     } = job;
+    #[cfg(feature = "verbose2")]
     let multi_pv = multi_pv.max(1);
 
     // Bind this coordinator to its assigned NUMA node before any search work,
@@ -3145,17 +3161,18 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
             draw_contempt,
             generate_all_legal_moves,
             mate_mode,
+            #[cfg(feature = "verbose2")]
             multi_pv,
             shared: Arc::clone(&helper_shared[h]),
         });
     }
 
     // The main worker is the only one given a PV sink, and only a `verbose2`
-    // build has one to give: `MultiPV` shapes the search, so it is installed in
-    // every build, while the rest of the PV-output configuration only decides
-    // which lines get printed. Below that level the emission sites are not
-    // compiled at all, so the search itself is identical in all three build
-    // shapes.
+    // build has one to give. `MultiPV` rides on the same level for a different
+    // reason: it shapes the search, but the extra lines it searches are
+    // reportable only through the `info` lines that level brings. Below it the
+    // root is single-line and the emission sites are not compiled at all, so
+    // the search of the first line is identical in all three build shapes.
     let net = search.network();
     let mut qs = QSearch::with_histories(net, &tt, histories);
     qs.set_control(control);
@@ -3166,6 +3183,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     qs.set_draw_value(draw_contempt);
     qs.set_generate_all_legal_moves(generate_all_legal_moves);
     qs.set_mate_mode(mate_mode);
+    #[cfg(feature = "verbose2")]
     qs.set_multi_pv(multi_pv);
     #[cfg(feature = "verbose2")]
     qs.set_pv_output(

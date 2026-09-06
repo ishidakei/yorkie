@@ -31,9 +31,21 @@ const CHECKED_IN_CONFIGS: &[&str] = &[
     "configs/test-limits.toml",
 ];
 
-/// Compile a config body, returning the generated Rust or the error message.
+/// Compile a config body as the top of the verbosity axis sees it — every
+/// level-gated key live — returning the generated Rust or the error message.
 fn compile(text: &str) -> Result<String, String> {
-    compile_config(text, "test.toml", "test.toml", "test")
+    compile_at(text, LEVELS)
+}
+
+/// Compile a config body as a build carrying `levels` sees it.
+fn compile_at(text: &str, levels: &[&str]) -> Result<String, String> {
+    compile_config(
+        text,
+        "test.toml",
+        "test.toml",
+        "test",
+        &Gating::Levels(levels),
+    )
 }
 
 /// The checked-in config with one key's line replaced (or removed, if
@@ -231,6 +243,71 @@ fn an_unlisted_combo_choice_is_an_error() {
         err.contains("is not one of: NoEnteringKing,"),
         "message: {err}"
     );
+}
+
+// --- Fail-loud: a setting the build's level does not implement ------------
+
+/// A key the engine implements only from a verbosity level up may not carry a
+/// value a lower build would have to ignore. `MultiPV` is one: below `verbose2`
+/// nothing can report a second principal variation, so the root search is
+/// single-line and only `multi_pv = 1` builds.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_gated_key_off_its_fixed_value_is_refused_below_its_level() {
+    let text = default_with("multi_pv", Some("multi_pv = 3"));
+    for levels in [&[][..], &["verbose1"][..]] {
+        let err = compile_at(&text, levels).expect_err("must fail below the level");
+        assert!(
+            err.contains("`multi_pv` = 3 needs a `verbose2` build"),
+            "the message must name the key and the level: {err}"
+        );
+        assert!(
+            err.contains("the only value it accepts is 1"),
+            "the message must say which value does build: {err}"
+        );
+    }
+    for levels in [&["verbose2"][..], LEVELS] {
+        compile_at(&text, levels).expect("the level that implements it accepts any value");
+    }
+}
+
+/// The fixed value is what every build accepts, level or no level — that is the
+/// whole point of gating the *setting* rather than the config file.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_gated_key_at_its_fixed_value_compiles_at_every_level() {
+    let text = default_with("multi_pv", Some("multi_pv = 1"));
+    for levels in [&[][..], &["verbose1"][..], &["verbose2"][..], LEVELS] {
+        compile_at(&text, levels).expect("the fixed value builds everywhere");
+    }
+}
+
+/// The generated constant carries its gate's `cfg`, so the build below the level
+/// does not merely leave the setting unread — it does not have it.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_gated_keys_constant_is_generated_behind_its_cfg() {
+    let out = compile(&default_config_text()).expect("compiles");
+    for spec in SCHEMA {
+        let Some(gate) = &spec.gate else { continue };
+        let name = spec.key.to_ascii_uppercase();
+        assert!(
+            out.contains(&format!(
+                "#[cfg(feature = \"{}\")]\npub const {name}: ",
+                gate.level
+            )),
+            "constant {name} must be generated behind `{}`:\n{out}",
+            gate.level
+        );
+    }
+}
+
+/// An ungated key's constant carries no `cfg` — every build has it.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn an_ungated_keys_constant_carries_no_cfg() {
+    let out = compile(&default_config_text()).expect("compiles");
+    assert!(out.contains("/// USI option `USI_Hash`.\npub const USI_HASH: "));
 }
 
 // --- Fail-loud: the accepted TOML subset ----------------------------------

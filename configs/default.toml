@@ -31,7 +31,9 @@ usi_hash = 1024
 # Worker-pool size (`Threads`).
 threads = 4
 
-# Number of principal variations reported per search (`MultiPV`).
+# Number of principal variations reported per search (`MultiPV`). Honoured from
+# `verbose2` up, the level whose search `info` lines can report a second line;
+# below it the root search is single-line and only `1` builds.
 multi_pv = 1
 
 # Directory holding `nn.bin` (`EvalDir`).

@@ -9,7 +9,10 @@
 
 use yorkie_protocol::config;
 
-// An array length is the least forgiving const context there is.
+// An array length is the least forgiving const context there is. `MultiPV` is
+// only a setting from `verbose2` up — below it the root search is single-line
+// and the constant does not exist — so the slot array follows the level.
+#[cfg(feature = "verbose2")]
 const MULTI_PV_SLOTS: [u8; config::MULTI_PV as usize] = [0; config::MULTI_PV as usize];
 const BOOK_PV_SLOTS: [u16; config::BOOK_PV_MOVES as usize] = [0; config::BOOK_PV_MOVES as usize];
 
@@ -39,6 +42,7 @@ const EVAL_SUBPATH: &str = config::EVAL_DIR;
 // could not be substituted for any of these operands.
 const _: () = assert!(HASH_BYTES >= 1024 * 1024);
 const _: () = assert!(POOL_SIZE >= 1);
+#[cfg(feature = "verbose2")]
 const _: () = assert!(MULTI_PV_SLOTS.len() == config::MULTI_PV as usize);
 const _: () = assert!(!EVAL_SUBPATH.is_empty());
 const _: () = assert!(config::NODES_LIMIT >= 0);
@@ -48,6 +52,7 @@ fn generated_values_are_usable_as_compile_time_constants() {
     // The `const` items above are the actual proof — they were evaluated by the
     // compiler before this test existed at run time. Reading them back here
     // keeps them from being dead code and pins the arithmetic.
+    #[cfg(feature = "verbose2")]
     assert_eq!(MULTI_PV_SLOTS.len(), config::MULTI_PV as usize);
     assert_eq!(BOOK_PV_SLOTS.len(), config::BOOK_PV_MOVES as usize);
     assert_eq!(HASH_BYTES, config::USI_HASH as u64 * 1024 * 1024);

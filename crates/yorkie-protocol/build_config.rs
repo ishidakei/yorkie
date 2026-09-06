@@ -66,6 +66,44 @@ enum Kind {
     Choice(&'static [&'static str]),
 }
 
+/// The verbosity levels a build can carry, ascending. Which of them are on is
+/// the caller's to determine — cargo tells a build script through its
+/// `CARGO_FEATURE_*` variables.
+///
+/// Each including build script uses the half of the level machinery its crate
+/// needs — one has the levels, the other has none — so an item only the other
+/// one constructs is not dead code.
+#[allow(dead_code)]
+const LEVELS: &[&str] = &["verbose1", "verbose2", "verbose3"];
+
+/// How a build script treats the level-gated keys (see [`Gate`]).
+#[allow(dead_code)]
+enum Gating<'a> {
+    /// The crate declares the verbosity levels: those in the list are on, a
+    /// gated key holding anything but its fixed value below its level is
+    /// refused, and its constant is generated behind the level's `cfg`.
+    Levels(&'a [&'a str]),
+    /// The crate declares no verbosity feature, so it has no `cfg` to name and
+    /// no level to judge a value against. Every key is rendered plainly; such a
+    /// crate reads only ungated ones, and the crate that owns the axis refuses
+    /// the config the whole build shares.
+    Absent,
+}
+
+/// A setting the engine implements only from a verbosity level up: the
+/// generated constant carries the level's `cfg`, and a build below the level
+/// accepts only the one value its code is fixed to, so a setting that could not
+/// take effect is refused rather than silently ignored.
+struct Gate {
+    /// The Cargo feature the key needs.
+    level: &'static str,
+    /// The only value a build below `level` accepts.
+    fixed: i64,
+    /// Why the lower build is fixed to that value, as the second sentence of
+    /// the error message.
+    because: &'static str,
+}
+
 /// One schema entry. `key` is the TOML key; the generated constant's name is
 /// that key upper-cased. `usi` names the runtime option the constant replaces,
 /// and is carried into the generated doc comment so the mapping is readable
@@ -74,6 +112,7 @@ struct Spec {
     key: &'static str,
     usi: &'static str,
     kind: Kind,
+    gate: Option<Gate>,
 }
 
 const fn int(key: &'static str, usi: &'static str, min: i64, max: i64) -> Spec {
@@ -81,6 +120,29 @@ const fn int(key: &'static str, usi: &'static str, min: i64, max: i64) -> Spec {
         key,
         usi,
         kind: Kind::Int { min, max },
+        gate: None,
+    }
+}
+
+/// An `int` key that only takes effect from `level` up (see [`Gate`]).
+const fn gated_int(
+    key: &'static str,
+    usi: &'static str,
+    min: i64,
+    max: i64,
+    level: &'static str,
+    fixed: i64,
+    because: &'static str,
+) -> Spec {
+    Spec {
+        key,
+        usi,
+        kind: Kind::Int { min, max },
+        gate: Some(Gate {
+            level,
+            fixed,
+            because,
+        }),
     }
 }
 
@@ -89,6 +151,7 @@ const fn boolean(key: &'static str, usi: &'static str) -> Spec {
         key,
         usi,
         kind: Kind::Bool,
+        gate: None,
     }
 }
 
@@ -97,6 +160,7 @@ const fn text(key: &'static str, usi: &'static str) -> Spec {
         key,
         usi,
         kind: Kind::Text,
+        gate: None,
     }
 }
 
@@ -105,6 +169,7 @@ const fn choice(key: &'static str, usi: &'static str, choices: &'static [&'stati
         key,
         usi,
         kind: Kind::Choice(choices),
+        gate: None,
     }
 }
 
@@ -117,7 +182,16 @@ const SCHEMA: &[Spec] = &[
     // --- Engine core.
     int("usi_hash", "USI_Hash", 1, 33_554_432),
     int("threads", "Threads", 1, MAX_THREADS_SANITY),
-    int("multi_pv", "MultiPV", 1, 600),
+    gated_int(
+        "multi_pv",
+        "MultiPV",
+        1,
+        600,
+        "verbose2",
+        1,
+        "a build that prints no search `info` line has no way to report a second principal \
+         variation, so its root search is single-line",
+    ),
     text("eval_dir", "EvalDir"),
     int("fv_scale", "FV_SCALE", 1, 128),
     text("numa_policy", "NumaPolicy"),
@@ -319,11 +393,13 @@ fn at(label: &str, line: usize, msg: &str) -> String {
 ///
 /// `label` names the file in messages, `source` is the path recorded in the
 /// generated header, and `name` is the config's identity (its file stem).
+/// `gating` says how this build treats the level-gated keys.
 fn generate(
     entries: &BTreeMap<String, Entry>,
     label: &str,
     source: &str,
     name: &str,
+    gating: &Gating,
 ) -> Result<String, String> {
     // Unknown keys first: a typo'd key would otherwise be reported as the schema
     // key it was meant to be, going missing.
@@ -355,6 +431,23 @@ fn generate(
             return Err(format!("{label}: required key `{}` is missing", spec.key));
         };
         let const_name = spec.key.to_ascii_uppercase();
+        if let Gating::Levels(levels) = gating
+            && let Some(gate) = &spec.gate
+            && let Value::Int(v) = &entry.value
+            && !levels.contains(&gate.level)
+            && *v != gate.fixed
+        {
+            return Err(at(
+                label,
+                entry.line,
+                &format!(
+                    "`{}` = {v} needs a `{}` build: {}. This build is below that level, so \
+                     the only value it accepts is {} — set the key to that, or build with \
+                     `--features {}`",
+                    spec.key, gate.level, gate.because, gate.fixed, gate.level
+                ),
+            ));
+        }
         let rendered = match (&spec.kind, &entry.value) {
             (Kind::Int { min, max }, Value::Int(v)) => {
                 if v < min || v > max {
@@ -398,6 +491,11 @@ fn generate(
             }
         };
         let _ = writeln!(out, "/// USI option `{}`.", spec.usi);
+        if let Gating::Levels(_) = gating
+            && let Some(gate) = &spec.gate
+        {
+            let _ = writeln!(out, "#[cfg(feature = \"{}\")]", gate.level);
+        }
         let _ = writeln!(out, "{rendered}");
     }
 
@@ -418,9 +516,15 @@ fn escape(s: &str) -> String {
 
 /// Parse and render in one step — the whole pure pipeline, for a caller that has
 /// already read the bytes.
-fn compile_config(contents: &str, label: &str, source: &str, name: &str) -> Result<String, String> {
+fn compile_config(
+    contents: &str,
+    label: &str,
+    source: &str,
+    name: &str,
+    gating: &Gating,
+) -> Result<String, String> {
     let entries = parse_config(contents, label)?;
-    generate(&entries, label, source, name)
+    generate(&entries, label, source, name, gating)
 }
 
 // The config-path resolution is kept here, and kept pure — the caller reads the

@@ -495,14 +495,18 @@ pub struct QSearch<'a> {
     best_move_tally: Option<(Arc<Vec<AtomicU64>>, usize)>,
 
     /// `pvIdx` — the current MultiPV line index (`yaneuraou-search.cpp`). Read
-    /// at the root by the interior-search hooks; `0` on every non-MultiPV
-    /// path, so those hooks are no-ops and the single-PV search stays
-    /// bit-identical.
+    /// at the root by the interior-search hooks; `0` on the first line, so
+    /// those hooks are no-ops and the single-PV search stays bit-identical.
+    ///
+    /// A second PV line can only be reported by a build that prints search
+    /// `info` lines, so below that level the root is single-line, this index
+    /// is the constant 0, and the hooks that read it are not compiled.
+    #[cfg(feature = "verbose2")]
     pv_idx: usize,
     /// `min(options["MultiPV"], rootMoves.size())` input — the raw `MultiPV`
     /// option value. `1` by default (the fixed-depth parity path runs one PV
-    /// line). Set per `go` by [`Self::set_pv_output`] (main) / [`Self::set_multi_pv`]
-    /// (helpers).
+    /// line). Set per `go` by [`Self::set_multi_pv`].
+    #[cfg(feature = "verbose2")]
     multi_pv: usize,
     /// The per-iteration / final PV output sink (`main_manager()->pv()`). `None`
     /// on every worker but the main one, so helpers and the parity path emit
@@ -753,7 +757,9 @@ impl<'a> QSearch<'a> {
             ponderhit_synced: false,
             node_tally: None,
             best_move_tally: None,
+            #[cfg(feature = "verbose2")]
             pv_idx: 0,
+            #[cfg(feature = "verbose2")]
             multi_pv: 1,
             #[cfg(feature = "verbose2")]
             pv_sink: None,
@@ -838,11 +844,16 @@ impl<'a> QSearch<'a> {
         self.best_move_tally = Some((slots, index));
     }
 
-    /// Install the raw `MultiPV` option value for this `go`. `MultiPV` shapes the
-    /// search, so every worker in every build gets it; the main worker's PV
-    /// *output* is configured separately by [`Self::set_pv_output`]. Both clamp
-    /// to `rootMoves.size()` inside [`Self::run_worker`]. Leave unset (`1`) for
-    /// the fixed-depth parity path.
+    /// Install the raw `MultiPV` option value for this `go`. Every worker gets
+    /// it, since it shapes the search; the main worker's PV *output* is
+    /// configured separately by [`Self::set_pv_output`]. Both clamp to
+    /// `rootMoves.size()` inside [`Self::run_worker`]. Leave unset (`1`) for the
+    /// fixed-depth parity path.
+    ///
+    /// A build that prints no search `info` line has no way to report a second
+    /// PV, so below that level the root is single-line and there is no value to
+    /// install.
+    #[cfg(feature = "verbose2")]
     pub fn set_multi_pv(&mut self, multi_pv: usize) {
         self.multi_pv = multi_pv.max(1);
     }
@@ -1753,6 +1764,7 @@ impl QSearch<'_> {
 
         // The reference's Skill-driven `max(multiPV, 4)` bump is skipped:
         // Skill is disabled in the non-Stockfish build.
+        #[cfg(feature = "verbose2")]
         let multi_pv = self.multi_pv.min(root_moves.len()).max(1);
 
         // The last *completed* iteration's root move — the stable result an
@@ -1792,89 +1804,31 @@ impl QSearch<'_> {
                 uci_pv_sent = false;
             }
 
-            // The iteration's last search value, read by the MultiPV == 1
-            // early-mate break below.
+            // The iteration's last search value, read by the early-mate break
+            // below.
+            #[cfg(feature = "verbose2")]
             let mut iter_best_value = -VALUE_INFINITE;
 
+            // The MultiPV loop. A second PV line can only be reported by a
+            // build that prints search `info` lines, so below that level the
+            // root is single-line: one aspiration search, on line 0, with no
+            // index and no finished head to step over.
+            #[cfg(feature = "verbose2")]
             for pv_idx in 0..multi_pv {
                 self.pv_idx = pv_idx;
-                // Shogi uses no tbRank banding, so the finished head is
-                // `[0..pv_idx]` and the active tail `[pv_idx..]`.
-                self.sel_depth = 0;
-
-                // Aspiration window. On iteration 1 the seed sentinels make
-                // `delta` huge, so alpha/beta clamp to the full window.
-                let mut delta: Value =
-                    5 + (root_moves[pv_idx].mean_squared_score.unsigned_abs() / 9000) as Value;
-                let avg = root_moves[pv_idx].average_score;
-                let mut alpha = (avg - delta).max(-VALUE_INFINITE);
-                let mut beta = (avg + delta).min(VALUE_INFINITE);
-
-                // Each fail high shaves a ply off `adjusted_depth`.
-                let mut failed_high_cnt = 0;
-
-                let mut best_value;
-
-                loop {
-                    let adjusted_depth =
-                        1.max(root_depth - failed_high_cnt - 3 * (search_again_counter + 1) / 4);
-                    self.root_delta = beta - alpha;
-                    self.root_depth = root_depth;
-                    // Slot 0 still holds the root refresh seeded above.
-                    self.acc_depth = 0;
-                    best_value = self.search(
-                        &mut work,
-                        0,
-                        alpha,
-                        beta,
-                        adjusted_depth,
-                        false,
-                        true,
-                        None,
-                        Some(&mut root_moves),
-                    );
-
-                    // Non-PV moves carry `-VALUE_INFINITE`, so this stable
-                    // sort only raises the PV and leaves the rest in order.
-                    root_moves[pv_idx..].sort_by(root_move_order);
-
-                    // The sort above still leaves `root_moves[0]` a legal
-                    // best-so-far, since it ordered the previous iteration's
-                    // scores.
-                    if self.stopped {
-                        break;
-                    }
-
-                    #[cfg(feature = "verbose2")]
-                    if self.should_output_fail_lh(multi_pv, best_value, alpha, beta, root_depth) {
-                        self.emit_pv(root_pos, &root_moves, pv_idx, root_depth, multi_pv);
-                        self.last_pv_info_time = Instant::now();
-                    }
-
-                    // The reference's fail-low widening is `beta = alpha;
-                    // alpha = bestValue - delta`, not Stockfish's
-                    // `(alpha + beta) / 2`.
-                    if best_value <= alpha {
-                        beta = alpha;
-                        alpha = (best_value - delta).max(-VALUE_INFINITE);
-                        failed_high_cnt = 0;
-                        self.stop_on_ponderhit = false;
-                    } else if best_value >= beta {
-                        alpha = (beta - delta).max(alpha);
-                        beta = (best_value + delta).min(VALUE_INFINITE);
-                        failed_high_cnt += 1;
-                    } else {
-                        break;
-                    }
-                    delta += delta / 3;
-                }
-
-                iter_best_value = best_value;
+                iter_best_value = self.aspiration_search(
+                    &mut work,
+                    &mut root_moves,
+                    root_depth,
+                    search_again_counter,
+                    root_pos,
+                    pv_idx,
+                    multi_pv,
+                );
 
                 // A later line may have out-scored an earlier one.
                 root_moves[..pv_idx + 1].sort_by(root_move_order);
 
-                #[cfg(feature = "verbose2")]
                 if self.pv_sink.is_some()
                     && (self.stopped
                         || pv_idx + 1 == multi_pv
@@ -1891,8 +1845,18 @@ impl QSearch<'_> {
                     break;
                 }
             } // MultiPV loop
+            #[cfg(not(feature = "verbose2"))]
+            let iter_best_value = self.aspiration_search(
+                &mut work,
+                &mut root_moves,
+                root_depth,
+                search_again_counter,
+            );
 
-            self.pv_idx = 0;
+            #[cfg(feature = "verbose2")]
+            {
+                self.pv_idx = 0;
+            }
 
             // The iteration is incomplete, so discard it and keep the last
             // completed ordering.
@@ -1919,7 +1883,11 @@ impl QSearch<'_> {
             // outruns 2.5× the mate distance. Suppressed for MultiPV > 1, where
             // one PV finding a mate must not stop the others, and under `go
             // mate`, where the search keeps proving within its time budget.
-            if multi_pv == 1 && !self.mate_mode {
+            #[cfg(feature = "verbose2")]
+            let break_on_mate = multi_pv == 1 && !self.mate_mode;
+            #[cfg(not(feature = "verbose2"))]
+            let break_on_mate = !self.mate_mode;
+            if break_on_mate {
                 if iter_best_value >= VALUE_TB_WIN_IN_MAX_PLY
                     && (VALUE_MATE - iter_best_value + 2) * 5 / 2 < root_depth
                 {
@@ -2053,6 +2021,102 @@ impl QSearch<'_> {
             pv_lines: completed_lines,
             time_reduction,
         }
+    }
+
+    /// One root line's aspiration search (`yaneuraou-search.cpp`): widen the
+    /// window around the line's running average until the value lands inside
+    /// it, re-sorting the still-active tail of `root_moves` after each attempt.
+    /// Returns the line's last search value.
+    ///
+    /// Shogi uses no tbRank banding, so the finished head is `[0..pv_idx]` and
+    /// the active tail `[pv_idx..]`. Below `verbose2` the root is single-line:
+    /// the searched line is `root_moves[0]`, the head is empty, and the whole
+    /// list is the active tail.
+    #[allow(clippy::too_many_arguments)]
+    fn aspiration_search(
+        &mut self,
+        work: &mut Position,
+        root_moves: &mut Vec<RootMove>,
+        root_depth: i32,
+        search_again_counter: i32,
+        #[cfg(feature = "verbose2")] root_pos: &Position,
+        #[cfg(feature = "verbose2")] pv_idx: usize,
+        #[cfg(feature = "verbose2")] multi_pv: usize,
+    ) -> Value {
+        self.sel_depth = 0;
+
+        // Aspiration window. On iteration 1 the seed sentinels make `delta`
+        // huge, so alpha/beta clamp to the full window.
+        #[cfg(feature = "verbose2")]
+        let line = &root_moves[pv_idx];
+        #[cfg(not(feature = "verbose2"))]
+        let line = &root_moves[0];
+        let mut delta: Value = 5 + (line.mean_squared_score.unsigned_abs() / 9000) as Value;
+        let avg = line.average_score;
+        let mut alpha = (avg - delta).max(-VALUE_INFINITE);
+        let mut beta = (avg + delta).min(VALUE_INFINITE);
+
+        // Each fail high shaves a ply off `adjusted_depth`.
+        let mut failed_high_cnt = 0;
+
+        let mut best_value;
+
+        loop {
+            let adjusted_depth =
+                1.max(root_depth - failed_high_cnt - 3 * (search_again_counter + 1) / 4);
+            self.root_delta = beta - alpha;
+            self.root_depth = root_depth;
+            // Slot 0 still holds the root refresh seeded by the caller.
+            self.acc_depth = 0;
+            best_value = self.search(
+                work,
+                0,
+                alpha,
+                beta,
+                adjusted_depth,
+                false,
+                true,
+                None,
+                Some(&mut *root_moves),
+            );
+
+            // Non-PV moves carry `-VALUE_INFINITE`, so this stable sort only
+            // raises the PV and leaves the rest in order.
+            #[cfg(feature = "verbose2")]
+            root_moves[pv_idx..].sort_by(root_move_order);
+            #[cfg(not(feature = "verbose2"))]
+            root_moves.sort_by(root_move_order);
+
+            // The sort above still leaves `root_moves[0]` a legal best-so-far,
+            // since it ordered the previous iteration's scores.
+            if self.stopped {
+                break;
+            }
+
+            #[cfg(feature = "verbose2")]
+            if self.should_output_fail_lh(multi_pv, best_value, alpha, beta, root_depth) {
+                self.emit_pv(root_pos, root_moves, pv_idx, root_depth, multi_pv);
+                self.last_pv_info_time = Instant::now();
+            }
+
+            // The reference's fail-low widening is `beta = alpha;
+            // alpha = bestValue - delta`, not Stockfish's `(alpha + beta) / 2`.
+            if best_value <= alpha {
+                beta = alpha;
+                alpha = (best_value - delta).max(-VALUE_INFINITE);
+                failed_high_cnt = 0;
+                self.stop_on_ponderhit = false;
+            } else if best_value >= beta {
+                alpha = (beta - delta).max(alpha);
+                beta = (best_value + delta).min(VALUE_INFINITE);
+                failed_high_cnt += 1;
+            } else {
+                break;
+            }
+            delta += delta / 3;
+        }
+
+        best_value
     }
 
     /// The aggregate node count across every worker: with a Lazy-SMP tally
@@ -2608,7 +2672,13 @@ impl QSearch<'_> {
         // regardless of what the probe returned; the rest of `tt_data` is still
         // consumed as usual.
         let tt_move = if let Some(rms) = root_moves.as_deref() {
-            Some(rms[self.pv_idx].pv[0])
+            // The line the root is currently searching; single-line below
+            // `verbose2`, so line 0.
+            #[cfg(feature = "verbose2")]
+            let line = self.pv_idx;
+            #[cfg(not(feature = "verbose2"))]
+            let line = 0;
+            Some(rms[line].pv[0])
         } else if tt_hit {
             // The MovePicker's TT stage re-validates this.
             pos.to_move(tt_data.move16)
@@ -3030,10 +3100,16 @@ impl QSearch<'_> {
             //
             // At the root, skip moves outside the still-active tail
             // `root_moves[pv_idx..]`, which the earlier PV lines have fixed.
-            if let Some(rms) = root_moves.as_deref()
-                && !rms[self.pv_idx..].iter().any(|rm| rm.mv == mv)
-            {
-                continue;
+            // Below `verbose2` the root is single-line, so the whole list is
+            // active and nothing is skipped.
+            if let Some(rms) = root_moves.as_deref() {
+                #[cfg(feature = "verbose2")]
+                let active = &rms[self.pv_idx..];
+                #[cfg(not(feature = "verbose2"))]
+                let active = rms;
+                if !active.iter().any(|rm| rm.mv == mv) {
+                    continue;
+                }
             }
             move_count += 1;
             self.stack[s].move_count = move_count;
@@ -3419,8 +3495,13 @@ impl QSearch<'_> {
                     // How often the best move changes within an iteration,
                     // for time management. Only the first PV line counts, and
                     // only a *change*. Under Lazy-SMP each worker bumps its own
-                    // shared slot for the main worker to sum.
-                    if move_count > 1 && self.pv_idx == 0 {
+                    // shared slot for the main worker to sum. Below `verbose2`
+                    // the first line is the only one.
+                    #[cfg(feature = "verbose2")]
+                    let counts = move_count > 1 && self.pv_idx == 0;
+                    #[cfg(not(feature = "verbose2"))]
+                    let counts = move_count > 1;
+                    if counts {
                         match &self.best_move_tally {
                             Some((slots, idx)) => {
                                 slots[*idx].fetch_add(1, Ordering::Relaxed);
@@ -3558,7 +3639,11 @@ impl QSearch<'_> {
 
         // At the root, PV lines beyond the first must NOT overwrite the TT:
         // their reduced windows would poison the entry the first line wrote.
+        // Below `verbose2` the root has no line beyond the first.
+        #[cfg(feature = "verbose2")]
         let skip_tt_write = excluded_move.is_ok() || (root_node && self.pv_idx != 0);
+        #[cfg(not(feature = "verbose2"))]
+        let skip_tt_write = excluded_move.is_ok();
         if !skip_tt_write {
             let bound = if best_value >= beta {
                 Bound::Lower

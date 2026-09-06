@@ -49,6 +49,10 @@ fn main() {
         &label,
         &display_source(&repo_root, &path),
         &config_name(&path),
+        // This crate declares no verbosity feature and reads only `fv_scale`,
+        // which no level gates; the crate that declares the levels is where a
+        // config the build's level cannot honour is refused.
+        &Gating::Absent,
     ) {
         Ok(g) => g,
         Err(e) => fail(&e),

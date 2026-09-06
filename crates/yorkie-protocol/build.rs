@@ -13,7 +13,10 @@
 //! Every failure is a hard build error. There is no fallback value for a missing
 //! key, no default for a malformed one, and no tolerance for a key outside the
 //! schema: a config that does not say exactly what the engine will do must not
-//! produce a binary at all.
+//! produce a binary at all. A key the engine implements only from a verbosity
+//! level up is refused the same way when a build below that level gives it
+//! anything but the value that build is fixed to — a setting that cannot take
+//! effect is an error, never something quietly ignored.
 //!
 //! This file is the impure half — environment, filesystem, exit code. The
 //! schema, parser, code generator and path resolution live in
@@ -49,11 +52,13 @@ fn main() {
     };
 
     let label = path.display().to_string();
+    let levels = active_levels();
     let generated = match compile_config(
         &contents,
         &label,
         &display_source(&repo_root, &path),
         &config_name(&path),
+        &Gating::Levels(&levels),
     ) {
         Ok(g) => g,
         Err(e) => fail(&e),
@@ -67,6 +72,19 @@ fn main() {
             out.display()
         ));
     }
+}
+
+/// The verbosity levels this build carries. Cargo exports one
+/// `CARGO_FEATURE_<NAME>` variable per enabled feature to the build script, and
+/// the levels imply one another, so a `verbose3` build reports all three.
+fn active_levels() -> Vec<&'static str> {
+    LEVELS
+        .iter()
+        .copied()
+        .filter(|level| {
+            std::env::var_os(format!("CARGO_FEATURE_{}", level.to_ascii_uppercase())).is_some()
+        })
+        .collect()
 }
 
 /// The repository root: two levels above this crate (`crates/yorkie-protocol`).

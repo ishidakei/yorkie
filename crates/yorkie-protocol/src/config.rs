@@ -21,6 +21,7 @@ include!(concat!(env!("OUT_DIR"), "/engine_config.rs"));
 // loosens the build script's range checks.
 const _: () = assert!(USI_HASH >= 1, "USI_HASH must be at least 1 MiB");
 const _: () = assert!(THREADS >= 1, "THREADS must be at least 1");
+#[cfg(feature = "verbose2")]
 const _: () = assert!(MULTI_PV >= 1, "MULTI_PV must be at least 1");
 const _: () = assert!(BOOK_PV_MOVES >= 1, "BOOK_PV_MOVES must be at least 1");
 const _: () = assert!(
