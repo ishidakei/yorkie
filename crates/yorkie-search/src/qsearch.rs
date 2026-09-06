@@ -315,7 +315,9 @@ pub struct TimeControl {
     /// dynamic optimum-time block and the `maximum()` stop.
     pub use_time_management: bool,
     /// `limits.movetime` [ms] (`Some` only for `go movetime`): `check_time` stops
-    /// the search once `elapsed >= movetime`.
+    /// the search once `elapsed >= movetime`. `go movetime` and `go mate <ms>`,
+    /// its only two sources, are `verbose2` clauses.
+    #[cfg(feature = "verbose2")]
     pub movetime: Option<i64>,
     /// `threads.size()` — the worker count, the divisor of the best-move
     /// instability factor.
@@ -446,7 +448,9 @@ pub struct QSearch<'a> {
     /// early mate/mated break is disabled (the search keeps proving within its
     /// time budget) and the mate-found stop rule is armed so a proven mate
     /// terminates promptly. `false` on every non-mate `go`, so the parity path
-    /// is unchanged. Set per `go` via [`Self::set_mate_mode`].
+    /// is unchanged. Set per `go` via [`Self::set_mate_mode`]. Only a `verbose2`
+    /// build can parse the clause that sets it.
+    #[cfg(feature = "verbose2")]
     mate_mode: bool,
     /// The reference `callsCnt` down-counter: `check_time` fires its real check
     /// once this reaches zero, then reloads it (see [`CHECK_INTERVAL`]).
@@ -785,6 +789,7 @@ impl<'a> QSearch<'a> {
             entering_king: EnteringKingConfig::default(),
             max_moves_to_draw: MAX_MOVES_TO_DRAW,
             generate_all_legal_moves: false,
+            #[cfg(feature = "verbose2")]
             mate_mode: false,
             calls_cnt: CHECK_INTERVAL,
             stopped: false,
@@ -875,6 +880,7 @@ impl<'a> QSearch<'a> {
     /// iterative-deepening early mate/mated break and arms the mate-found stop
     /// rule. Every worker gets the same flag; `false` (the default) leaves the
     /// iterative-deepening loop bit-identical to the parity path.
+    #[cfg(feature = "verbose2")]
     pub fn set_mate_mode(&mut self, mate: bool) {
         self.mate_mode = mate;
     }
@@ -1057,6 +1063,7 @@ impl<'a> QSearch<'a> {
             return;
         };
         let elapsed = tc.tm.elapsed_from(Instant::now());
+        #[cfg(feature = "verbose2")]
         if let Some(movetime) = tc.movetime
             && elapsed >= movetime
         {
@@ -1941,7 +1948,7 @@ impl QSearch<'_> {
             #[cfg(feature = "verbose2")]
             let break_on_mate = multi_pv == 1 && !self.mate_mode;
             #[cfg(not(feature = "verbose2"))]
-            let break_on_mate = !self.mate_mode;
+            let break_on_mate = true;
             if break_on_mate {
                 if iter_best_value >= VALUE_TB_WIN_IN_MAX_PLY
                     && (VALUE_MATE - iter_best_value + 2) * 5 / 2 < root_depth
@@ -1961,6 +1968,7 @@ impl QSearch<'_> {
             // `limits.mate` is a millisecond budget, so the reference's
             // `VALUE_MATE - score <= 2 * limits.mate` distance bound is
             // degenerate and reduces to stopping on a decisive score.
+            #[cfg(feature = "verbose2")]
             if self.mate_mode && (is_win(iter_best_value) || is_loss(iter_best_value)) {
                 break;
             }
@@ -4721,11 +4729,16 @@ mod tests {
         sig.ponderhit();
         let stamped = sig.hit_at().expect("ponderhit stamped an instant");
 
+        // Any budget at all will do — the assertions are about the rounding
+        // origin, not the times — so a plain clock stands in for the `go
+        // movetime` a build below `verbose2` cannot be given.
         let input = crate::timeman::TimeInput {
-            time_us: 0,
+            time_us: 1000,
             inc_us: 0,
             byoyomi_us: 0,
-            movetime: 1000,
+            #[cfg(feature = "verbose2")]
+            movetime: 0,
+            #[cfg(feature = "verbose2")]
             rtime: 0,
             network_delay: 0,
             network_delay2: 0,
@@ -4738,7 +4751,11 @@ mod tests {
             max_moves_to_draw: 100_000,
             start_time: start,
         };
-        let tm = TimeManagement::init(&input, &mut crate::book::Prng::new(1));
+        let tm = TimeManagement::init(
+            &input,
+            #[cfg(feature = "verbose2")]
+            &mut crate::book::Prng::new(1),
+        );
         assert_eq!(
             tm.ponderhit_time, tm.start_time,
             "unsynced: the rounding origin is still go-time"
@@ -4752,6 +4769,7 @@ mod tests {
             time: Some(TimeControl {
                 tm,
                 use_time_management: true,
+                #[cfg(feature = "verbose2")]
                 movetime: None,
                 n_threads: 1,
                 best_previous_score: VALUE_INFINITE,

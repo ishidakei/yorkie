@@ -15,6 +15,7 @@
 
 use std::time::Instant;
 
+#[cfg(feature = "verbose2")]
 use crate::book::Prng;
 
 /// The reference `MoveHorizon`: the assumed number of plies still to play when
@@ -33,9 +34,13 @@ pub struct TimeInput {
     pub inc_us: i64,
     /// `limits.byoyomi[us]` — the side-to-move's byoyomi [ms].
     pub byoyomi_us: i64,
-    /// `limits.movetime` [ms] (`0` when not a `go movetime`).
+    /// `limits.movetime` [ms] (`0` when not a `go movetime`). `go movetime` and
+    /// `go mate <ms>`, its only two sources, are `verbose2` clauses.
+    #[cfg(feature = "verbose2")]
     pub movetime: i64,
-    /// `limits.rtime` [ms] (`0` when not a `go rtime`).
+    /// `limits.rtime` [ms] (`0` when not a `go rtime`). `go rtime` is a
+    /// `verbose2` clause and nothing else seeds it.
+    #[cfg(feature = "verbose2")]
     pub rtime: i64,
     /// `options["NetworkDelay"]` [ms].
     pub network_delay: i64,
@@ -91,13 +96,17 @@ pub struct TimeManagement {
 }
 
 impl TimeManagement {
-    /// Compute the think-time budget for one `go`.
-    pub fn init(input: &TimeInput, prng: &mut Prng) -> TimeManagement {
+    /// Compute the think-time budget for one `go`. The PRNG draws the decaying
+    /// bump on top of a `go rtime` budget and is consulted nowhere else, so it
+    /// is a parameter only where that clause exists.
+    pub fn init(input: &TimeInput, #[cfg(feature = "verbose2")] prng: &mut Prng) -> TimeManagement {
         let &TimeInput {
             time_us,
             inc_us,
             byoyomi_us,
+            #[cfg(feature = "verbose2")]
             movetime,
+            #[cfg(feature = "verbose2")]
             rtime,
             network_delay,
             network_delay2,
@@ -136,6 +145,7 @@ impl TimeManagement {
 
         // `go rtime`: a randomised minimum-think budget, decaying with ply,
         // used for self-play variety.
+        #[cfg(feature = "verbose2")]
         if rtime != 0 {
             let mut r = rtime;
             if ply != 0 {
@@ -150,6 +160,7 @@ impl TimeManagement {
         }
 
         // `go movetime`: spend exactly the given time.
+        #[cfg(feature = "verbose2")]
         if movetime != 0 {
             tm.remain_time = movetime;
             tm.minimum_time = movetime;
@@ -314,7 +325,9 @@ mod tests {
             time_us: 0,
             inc_us: 0,
             byoyomi_us: 0,
+            #[cfg(feature = "verbose2")]
             movetime: 0,
+            #[cfg(feature = "verbose2")]
             rtime: 0,
             network_delay: 120,
             network_delay2: 1120,
@@ -330,10 +343,18 @@ mod tests {
     }
 
     fn init(input: &TimeInput) -> TimeManagement {
+        #[cfg(feature = "verbose2")]
         let mut prng = Prng::new(1);
-        TimeManagement::init(input, &mut prng)
+        TimeManagement::init(
+            input,
+            #[cfg(feature = "verbose2")]
+            &mut prng,
+        )
     }
 
+    /// `go movetime` exists only from `verbose2` up, so the budget it pins does
+    /// too.
+    #[cfg(feature = "verbose2")]
     #[test]
     fn movetime_sets_all_three_to_movetime() {
         let tm = init(&TimeInput {
@@ -574,6 +595,9 @@ mod tests {
         assert_eq!(both.optimum(), plain.optimum());
     }
 
+    /// `go rtime` exists only from `verbose2` up, so the budget it draws does
+    /// too.
+    #[cfg(feature = "verbose2")]
     #[test]
     fn rtime_result_within_bounds() {
         // rtime r plus a decaying random increment in [0, min(r/2, r*10/ply)).
@@ -604,11 +628,11 @@ mod tests {
 
     #[test]
     fn round_up_boundaries_full_second_branch() {
-        // A movetime init leaves round_up parameters at the defaults
-        // (minimum_thinking_time 2000, network_delay 120, remain_time = movetime).
-        // Use a large remain_time so the cap does not bind.
+        // `round_up` reads only the option defaults (minimum_thinking_time 2000,
+        // network_delay 120) and `remain_time`. A large clock keeps the
+        // `remain_time` cap from binding, so the rounding alone is under test.
         let tm = init(&TimeInput {
-            movetime: 1_000_000,
+            time_us: 1_000_000,
             ..base()
         });
         // Exactly on a whole second: 3000 -> ((3000+999)/1000)*1000 = 3000;
@@ -624,7 +648,7 @@ mod tests {
     #[test]
     fn round_up_no_round_branch() {
         let tm = init(&TimeInput {
-            movetime: 1_000_000,
+            time_us: 1_000_000,
             round_up_to_fullsecond: false,
             ..base()
         });

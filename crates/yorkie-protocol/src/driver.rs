@@ -31,7 +31,9 @@ use yorkie_storage::{TTData, VALUE_NONE};
 #[cfg(feature = "verbose3")]
 use crate::bench;
 use crate::formatter::Formatter;
-use crate::parser::{Command, GoLimits, MATE_UNLIMITED_MS, PositionSfen, parse_line};
+#[cfg(feature = "verbose2")]
+use crate::parser::MATE_UNLIMITED_MS;
+use crate::parser::{Command, GoLimits, PositionSfen, parse_line};
 #[cfg(feature = "random")]
 use crate::settings::RANDOM_AMPLITUDE;
 use crate::settings::Settings;
@@ -1177,20 +1179,26 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // / nodes / infinite / mate), where the search runs unbounded by time.
         let us = self.pos.side_to_move();
         let now = Instant::now();
-        let use_time_management = limits.mate.is_none()
+        let use_time_management = limits.depth.is_none() && limits.nodes.is_none();
+        // The four clauses only `verbose2` can parse narrow it further; below
+        // that level none of them can be set, so the two option-seeded ceilings
+        // above decide it alone.
+        #[cfg(feature = "verbose2")]
+        let use_time_management = use_time_management
+            && limits.mate.is_none()
             && limits.movetime.is_none()
-            && limits.depth.is_none()
-            && limits.nodes.is_none()
             && !limits.infinite;
         // DELIBERATE DIVERGENCE (see `GoLimits::mate` in the parser): the reference
         // leaves `go mate`'s enforcement to a separate mate engine, but this port has
         // none, so a concrete `go mate <ms>` budget is mapped onto a `movetime`-style
         // time bound. A bare / `infinite` `go mate` (the `MATE_UNLIMITED_MS`
         // sentinel) carries no bound and runs until `stop`.
+        #[cfg(feature = "verbose2")]
         let mate_budget = match limits.mate {
             Some(m) if m != MATE_UNLIMITED_MS => Some(m as i64),
             _ => None,
         };
+        #[cfg(feature = "verbose2")]
         let movetime = limits.movetime.map(|m| m as i64).or(mate_budget);
 
         // Side-flip continuity: when the side to move alternated between the
@@ -1212,7 +1220,15 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             a => a,
         };
 
-        let time = if use_time_management || movetime.is_some() {
+        // A `go movetime` (or the `go mate <ms>` budget mapped onto one) still
+        // needs a `TimeManagement` even though it switches dynamic management
+        // off — and neither clause exists below `verbose2`.
+        #[cfg(feature = "verbose2")]
+        let needs_time_control = use_time_management || movetime.is_some();
+        #[cfg(not(feature = "verbose2"))]
+        let needs_time_control = use_time_management;
+
+        let time = if needs_time_control {
             let (time_opt, inc_opt) = match us {
                 yorkie_state::Color::Black => (limits.btime, limits.binc),
                 yorkie_state::Color::White => (limits.wtime, limits.winc),
@@ -1220,13 +1236,18 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             let mmtd = remap_max_moves_to_draw(self.settings.max_moves_to_draw());
             // A distinct PRNG stream from the book selection, so `go rtime`'s
             // randomised budget never perturbs (or is perturbed by) book choice.
+            // `go rtime` is the stream's only consumer, so it is drawn only in a
+            // build that has the clause.
+            #[cfg(feature = "verbose2")]
             let mut prng = Prng::new(self.book_seed ^ 0xA5A5_5A5A_1234_5678);
             let tm = TimeManagement::init(
                 &TimeInput {
                     time_us: time_opt.unwrap_or(0) as i64,
                     inc_us: inc_opt.unwrap_or(0) as i64,
                     byoyomi_us: limits.byoyomi.unwrap_or(0) as i64,
+                    #[cfg(feature = "verbose2")]
                     movetime: movetime.unwrap_or(0),
+                    #[cfg(feature = "verbose2")]
                     rtime: limits.rtime.unwrap_or(0) as i64,
                     network_delay: self.settings.network_delay(),
                     network_delay2: self.settings.network_delay2(),
@@ -1239,6 +1260,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                     max_moves_to_draw: mmtd,
                     start_time: now,
                 },
+                #[cfg(feature = "verbose2")]
                 &mut prng,
             );
             if tm.mtg_error {
@@ -1247,6 +1269,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             Some(TimeControl {
                 tm,
                 use_time_management,
+                #[cfg(feature = "verbose2")]
                 movetime,
                 n_threads: self.pool.size(),
                 best_previous_score: best_prev_score,
@@ -1288,11 +1311,12 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // stays reproducible, and under MultiPV the vote is off so every PV
         // line shows. Under `go mate` the vote is off too — a mate proof lives
         // on the main worker's own line.
+        #[cfg(feature = "verbose2")]
         let mate_mode = limits.mate.is_some();
         #[cfg(feature = "verbose2")]
         let use_voting = limits.depth.is_none() && multi_pv == 1 && !mate_mode;
         #[cfg(not(feature = "verbose2"))]
-        let use_voting = limits.depth.is_none() && !mate_mode;
+        let use_voting = limits.depth.is_none();
 
         // PV-output config snapshot for this `go`. `computed_pv_interval` is
         // `0` (never suppress — every iteration prints) under `go infinite`,
@@ -1369,7 +1393,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         let book_seed = self.book_seed;
         // Whether the coordinator holds its reply (book or searched) until
         // `stop` / `ponderhit`: `go ponder` (until the ponder flag clears) or
-        // `go infinite` (the SKIP_SEARCH wait loop).
+        // `go infinite` (the SKIP_SEARCH wait loop). Only `verbose2` has the
+        // second of those, so below it `go ponder` is the whole rule.
+        #[cfg(feature = "verbose2")]
         let infinite = limits.infinite;
         // The Stochastic_Ponder teardown flag: when set, the coordinator emits
         // no `bestmove` (nor final PV) for this search.
@@ -1439,6 +1465,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             own_book,
             book_seed,
             ponder,
+            #[cfg(feature = "verbose2")]
             infinite,
             suppress_bestmove,
             #[cfg(feature = "verbose3")]
@@ -1448,6 +1475,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             draw_contempt,
             resign_value,
             generate_all_legal_moves,
+            #[cfg(feature = "verbose2")]
             mate_mode,
             #[cfg(feature = "random")]
             random_seed: self.random_seed,
@@ -2197,6 +2225,20 @@ fn pv_string(pv: &[Move]) -> String {
         .join(" ")
 }
 
+/// The SKIP_SEARCH hold condition, shared by the book-hit and the searched
+/// reply: a `go ponder` holds until its flag clears, a `go infinite` until
+/// `stop`. `go infinite` arrives at `verbose2`, so below that level the ponder
+/// flag is the whole condition.
+fn reply_is_held(
+    ponder: Option<&Arc<PonderSignal>>,
+    #[cfg(feature = "verbose2")] infinite: bool,
+) -> bool {
+    let held = ponder.is_some_and(|p| p.is_active());
+    #[cfg(feature = "verbose2")]
+    let held = held || infinite;
+    held
+}
+
 /// Emit a book hit's output the way the reference does on `search_skipped`: one
 /// `info` line per surviving candidate, then — after the ponder/infinite hold —
 /// a final depth-0 `info` line and the `bestmove [ponder]`.
@@ -2217,7 +2259,7 @@ fn emit_book_hit<W: Write>(
     #[cfg(feature = "verbose2")] hashfull: u32,
     #[cfg(feature = "verbose2")] time_ms: u64,
     ponder: Option<&Arc<PonderSignal>>,
-    infinite: bool,
+    #[cfg(feature = "verbose2")] infinite: bool,
     stop: &AtomicBool,
     suppress_bestmove: &AtomicBool,
     #[cfg(feature = "verbose3")] sent: &AtomicBool,
@@ -2243,7 +2285,13 @@ fn emit_book_hit<W: Write>(
 
     // `go ponder` / `go infinite`: hold the reply until `stop`, or until a
     // `ponderhit` clears the ponder flag (the SKIP_SEARCH wait loop).
-    while !stop.load(Ordering::Relaxed) && (ponder.is_some_and(|p| p.is_active()) || infinite) {
+    while !stop.load(Ordering::Relaxed)
+        && reply_is_held(
+            ponder,
+            #[cfg(feature = "verbose2")]
+            infinite,
+        )
+    {
         std::thread::sleep(Duration::from_millis(1));
     }
 
@@ -2315,7 +2363,9 @@ struct HelperJob {
     draw_contempt: Value,
     /// `GenerateAllLegalMoves` — expose suppressed non-promotions.
     generate_all_legal_moves: bool,
-    /// `go mate` mode — disable early mate break, enable mate-found stop.
+    /// `go mate` mode — disable early mate break, enable mate-found stop. Only
+    /// a `verbose2` build can parse the clause that sets it.
+    #[cfg(feature = "verbose2")]
     mate_mode: bool,
     /// The game's evaluation-noise seed, the same one every worker of this `go`
     /// gets, so they agree on each position's offset.
@@ -2449,6 +2499,7 @@ fn helper_loop(slot: Arc<HelperSlot>) {
             qs.set_max_moves_to_draw(job.max_moves_to_draw);
             qs.set_draw_value(job.draw_contempt);
             qs.set_generate_all_legal_moves(job.generate_all_legal_moves);
+            #[cfg(feature = "verbose2")]
             qs.set_mate_mode(job.mate_mode);
             #[cfg(feature = "random")]
             qs.set_random(RANDOM_AMPLITUDE, job.random_seed);
@@ -2939,7 +2990,9 @@ struct CoordinatorJob<W: Write + Send + 'static> {
     /// until a `ponderhit` clears it (or `stop` fires).
     ponder: Option<Arc<PonderSignal>>,
     /// `limits.infinite` — hold the reply until `stop` regardless of the clock
-    /// (the SKIP_SEARCH wait loop).
+    /// (the SKIP_SEARCH wait loop). Only a `verbose2` build can parse the
+    /// clause that sets it.
+    #[cfg(feature = "verbose2")]
     infinite: bool,
     /// The Stochastic_Ponder teardown flag: when set the coordinator emits no
     /// `bestmove` (nor final PV) for this search.
@@ -2964,7 +3017,8 @@ struct CoordinatorJob<W: Write + Send + 'static> {
     /// search generators.
     generate_all_legal_moves: bool,
     /// `go mate` mode — disables the early mate break and enables the mate-found
-    /// stop rule.
+    /// stop rule. Only a `verbose2` build can parse the clause that sets it.
+    #[cfg(feature = "verbose2")]
     mate_mode: bool,
     /// The evaluation-noise seed for the game this `go` belongs to. Every worker
     /// this coordinator dispatches is given the same one.
@@ -3031,6 +3085,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         own_book,
         book_seed,
         ponder,
+        #[cfg(feature = "verbose2")]
         infinite,
         suppress_bestmove,
         #[cfg(feature = "verbose3")]
@@ -3040,6 +3095,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         draw_contempt,
         resign_value,
         generate_all_legal_moves,
+        #[cfg(feature = "verbose2")]
         mate_mode,
         #[cfg(feature = "random")]
         random_seed,
@@ -3148,6 +3204,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
                 #[cfg(feature = "verbose2")]
                 book_time_ms,
                 ponder.as_ref(),
+                #[cfg(feature = "verbose2")]
                 infinite,
                 &stop,
                 &suppress_bestmove,
@@ -3190,6 +3247,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
             max_moves_to_draw,
             draw_contempt,
             generate_all_legal_moves,
+            #[cfg(feature = "verbose2")]
             mate_mode,
             #[cfg(feature = "random")]
             random_seed,
@@ -3214,6 +3272,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     qs.set_max_moves_to_draw(max_moves_to_draw);
     qs.set_draw_value(draw_contempt);
     qs.set_generate_all_legal_moves(generate_all_legal_moves);
+    #[cfg(feature = "verbose2")]
     qs.set_mate_mode(mate_mode);
     #[cfg(feature = "random")]
     qs.set_random(RANDOM_AMPLITUDE, random_seed);
@@ -3235,7 +3294,11 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     // finished (mate found / depth ceiling) while a `ponderhit` had not yet
     // arrived.
     while !stop.load(Ordering::Relaxed)
-        && (ponder.as_ref().is_some_and(|p| p.is_active()) || infinite)
+        && reply_is_held(
+            ponder.as_ref(),
+            #[cfg(feature = "verbose2")]
+            infinite,
+        )
     {
         std::thread::sleep(Duration::from_millis(1));
     }

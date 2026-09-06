@@ -13,20 +13,24 @@ pub enum PositionSfen {
 /// All USI `go` sub-tokens captured verbatim, including the ones the driver does
 /// not act on, so the parse is lossless.
 ///
-/// The `verbose2` gate sits on the parser *arms*, not on the fields: `depth`
-/// and `nodes` are also seeded from the `DepthLimit` / `NodesLimit` options, so
-/// a field-level gate would have to cut those too. Below that level no `go`
-/// line can reach the gated fields.
+/// `depth` and `nodes` stay ungated because the `DepthLimit` / `NodesLimit`
+/// config keys seed the same two fields in every build, so a `go` line is not
+/// their only source. The four clauses nothing else seeds — `movetime`,
+/// `infinite`, `mate` and `rtime` — are `verbose2`, together with the parser
+/// arms that fill them: below that level no input could make them anything but
+/// their default.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GoLimits {
     pub depth: Option<u32>,
     pub nodes: Option<u64>,
+    #[cfg(feature = "verbose2")]
     pub movetime: Option<u64>,
     pub wtime: Option<u64>,
     pub btime: Option<u64>,
     pub winc: Option<u64>,
     pub binc: Option<u64>,
     pub byoyomi: Option<u64>,
+    #[cfg(feature = "verbose2")]
     pub infinite: bool,
     /// `go ponder` — think on the predicted position; hold the reply until
     /// `ponderhit` or `stop`.
@@ -35,15 +39,18 @@ pub struct GoLimits {
     /// token after `mate` is a time budget in milliseconds, not a move count.
     /// `Some(ms)` carries the budget, with [`MATE_UNLIMITED_MS`] standing for
     /// unlimited.
+    #[cfg(feature = "verbose2")]
     pub mate: Option<u64>,
     /// `go rtime <ms>` — a randomised minimum-thinking-time budget used for
     /// self-play variety. `init_` seeds all three time bounds to `rtime` (plus
     /// a decaying random bump) and returns early. `None` means no `rtime`.
+    #[cfg(feature = "verbose2")]
     pub rtime: Option<u64>,
 }
 
 /// The `go mate` unlimited-budget sentinel (`limits.mate = INT32_MAX`):
 /// `go mate infinite` and a bare `go mate` both map here.
+#[cfg(feature = "verbose2")]
 pub const MATE_UNLIMITED_MS: u64 = i32::MAX as u64;
 
 /// The `go` clauses that arrive at `verbose2`: everything here is analysis
@@ -202,6 +209,12 @@ fn parse_position<'a>(line: &str, parts: impl Iterator<Item = &'a str>) -> Comma
     Command::Position { sfen, moves }
 }
 
+/// The `u64` value of the clause whose keyword sits at `tokens[i]`, or `None`
+/// when it is missing or malformed.
+fn u64_arg(tokens: &[&str], i: usize) -> Option<u64> {
+    tokens.get(i + 1)?.parse::<u64>().ok()
+}
+
 fn parse_go<'a>(line: &str, parts: impl Iterator<Item = &'a str>) -> Command {
     let tokens: Vec<&str> = parts.collect();
     let mut limits = GoLimits::default();
@@ -219,6 +232,7 @@ fn parse_go<'a>(line: &str, parts: impl Iterator<Item = &'a str>) -> Command {
             return Command::GoExtraClause(key.to_string());
         }
         match key {
+            #[cfg(feature = "verbose2")]
             "infinite" => {
                 limits.infinite = true;
                 i += 1;
@@ -231,6 +245,7 @@ fn parse_go<'a>(line: &str, parts: impl Iterator<Item = &'a str>) -> Command {
             // time budget; `infinite`, or nothing following, means unlimited.
             // Anything else that is not a valid `u64` is an error (the
             // reference's `stoi` would throw).
+            #[cfg(feature = "verbose2")]
             "mate" => match tokens.get(i + 1) {
                 None => {
                     limits.mate = Some(MATE_UNLIMITED_MS);
@@ -248,31 +263,39 @@ fn parse_go<'a>(line: &str, parts: impl Iterator<Item = &'a str>) -> Command {
                     i += 2;
                 }
             },
-            "depth" | "nodes" | "movetime" | "wtime" | "btime" | "winc" | "binc" | "byoyomi"
-            | "rtime" => {
+            "depth" => {
                 let Some(value) = tokens.get(i + 1) else {
                     return unknown(line);
                 };
-                if key == "depth" {
-                    match value.parse::<u32>() {
-                        Ok(v) => limits.depth = Some(v),
-                        Err(_) => return unknown(line),
-                    }
-                } else {
-                    let Ok(v) = value.parse::<u64>() else {
-                        return unknown(line);
-                    };
-                    match key {
-                        "nodes" => limits.nodes = Some(v),
-                        "movetime" => limits.movetime = Some(v),
-                        "wtime" => limits.wtime = Some(v),
-                        "btime" => limits.btime = Some(v),
-                        "winc" => limits.winc = Some(v),
-                        "binc" => limits.binc = Some(v),
-                        "byoyomi" => limits.byoyomi = Some(v),
-                        "rtime" => limits.rtime = Some(v),
-                        _ => unreachable!("matched key {key} but no branch"),
-                    }
+                let Ok(v) = value.parse::<u32>() else {
+                    return unknown(line);
+                };
+                limits.depth = Some(v);
+                i += 2;
+            }
+            #[cfg(feature = "verbose2")]
+            "movetime" | "rtime" => {
+                let Some(v) = u64_arg(&tokens, i) else {
+                    return unknown(line);
+                };
+                match key {
+                    "movetime" => limits.movetime = Some(v),
+                    _ => limits.rtime = Some(v),
+                }
+                i += 2;
+            }
+            "nodes" | "wtime" | "btime" | "winc" | "binc" | "byoyomi" => {
+                let Some(v) = u64_arg(&tokens, i) else {
+                    return unknown(line);
+                };
+                match key {
+                    "nodes" => limits.nodes = Some(v),
+                    "wtime" => limits.wtime = Some(v),
+                    "btime" => limits.btime = Some(v),
+                    "winc" => limits.winc = Some(v),
+                    "binc" => limits.binc = Some(v),
+                    "byoyomi" => limits.byoyomi = Some(v),
+                    _ => unreachable!("matched key {key} but no branch"),
                 }
                 i += 2;
             }
