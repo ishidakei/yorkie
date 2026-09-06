@@ -1847,7 +1847,9 @@ fn tt_score_field(v: Value) -> String {
 /// Write one PV `info` line from a [`PvInfo`] — the reference's
 /// `on_update_full` (`usi.cpp`) as this port surfaces it, carrying every field
 /// the reference prints and in its order: `nodes nps hashfull time pv`.
-/// `seldepth` / `multipv` are always emitted.
+/// `seldepth` is emitted only when it is non-zero, as the reference does — a
+/// line with no search behind it (a book hit, a root with no legal move) reads
+/// badly with a ` seldepth 0` on it.
 ///
 /// `verbose2` only: the default build renders no PV line.
 #[cfg(feature = "verbose2")]
@@ -1862,8 +1864,10 @@ fn write_pv_info<W: Write + ?Sized>(w: &mut W, info: &PvInfo) -> io::Result<()> 
     let mut body = String::with_capacity(64);
     body.push_str("depth ");
     body.push_str(info.depth.format_into(&mut ply_digits));
-    body.push_str(" seldepth ");
-    body.push_str(info.sel_depth.format_into(&mut ply_digits));
+    if info.sel_depth != 0 {
+        body.push_str(" seldepth ");
+        body.push_str(info.sel_depth.format_into(&mut ply_digits));
+    }
     body.push_str(" multipv ");
     body.push_str(info.multipv.format_into(&mut index_digits));
     body.push_str(" score ");
@@ -2168,7 +2172,8 @@ fn pv_string(pv: &[Move]) -> String {
 /// until `stop` or `ponderhit`, reusing the async-stop machinery rather than
 /// busy-waiting. `time_ms` is stamped once, when the book answered, so the hold
 /// does not inflate the elapsed time attributed to the reply; no search ran, so
-/// both `nodes` and `nps` are 0 on every line.
+/// both `nodes` and `nps` are 0 on every line and none of them carries a
+/// `seldepth` (the reference's zero `selDepth`, which it omits).
 ///
 /// Both `info` blocks are `verbose2`; the hold and the `bestmove` are not, so
 /// a default build answers a book hit with the move and nothing else.
@@ -2192,7 +2197,7 @@ fn emit_book_hit<W: Write>(
         let mut f = Formatter::new(&mut *guard);
         for line in &hit.info_lines {
             let body = format!(
-                "depth {} seldepth 0 multipv {} score {} nodes 0 nps 0 \
+                "depth {} multipv {} score {} nodes 0 nps 0 \
                  hashfull {hashfull} time {time_ms} pv {}",
                 line.depth,
                 line.multipv,
@@ -2235,7 +2240,7 @@ fn emit_book_hit<W: Write>(
     let mut f = Formatter::new(&mut *guard);
     #[cfg(feature = "verbose2")]
     let _ = f.info(&format!(
-        "depth 0 seldepth 0 multipv 1 score {} nodes 0 nps 0 \
+        "depth 0 multipv 1 score {} nodes 0 nps 0 \
          hashfull {hashfull} time {time_ms} pv {pv}",
         format_score(Value::from(hit.value)),
     ));
@@ -3416,7 +3421,8 @@ mod tests {
 
     /// A drop move, the `depth 0` / `nodes 0` / `nps 0` extremes, the floored
     /// `time 1`, and both ends of the `hashfull` permille range still round-trip
-    /// byte-for-byte (the digit paths that `NumBuffer` now owns).
+    /// byte-for-byte (the digit paths that `NumBuffer` owns). A zero
+    /// `sel_depth` drops the field entirely, which is what the reference prints.
     #[cfg(feature = "verbose2")]
     #[test]
     fn pv_info_line_covers_zero_and_drop_extremes() {
@@ -3430,7 +3436,7 @@ mod tests {
         info.time_ms = 1;
         assert_eq!(
             pv_line(&info),
-            "info depth 0 seldepth 0 multipv 1 score cp 0 nodes 0 nps 0 hashfull 0 time 1\n"
+            "info depth 0 multipv 1 score cp 0 nodes 0 nps 0 hashfull 0 time 1\n"
         );
 
         let pos = parse_sfen("4k4/9/9/9/9/9/9/9/4K4 b P 1").expect("sfen parses");
@@ -3438,7 +3444,7 @@ mod tests {
         info.hashfull = 1000;
         assert_eq!(
             pv_line(&info),
-            "info depth 0 seldepth 0 multipv 1 score cp 0 nodes 0 nps 0 hashfull 1000 time 1 pv P*5e\n"
+            "info depth 0 multipv 1 score cp 0 nodes 0 nps 0 hashfull 1000 time 1 pv P*5e\n"
         );
     }
 
