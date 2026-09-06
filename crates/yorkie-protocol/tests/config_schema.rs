@@ -31,20 +31,21 @@ const CHECKED_IN_CONFIGS: &[&str] = &[
     "configs/test-limits.toml",
 ];
 
-/// Compile a config body as the top of the verbosity axis sees it — every
-/// level-gated key live — returning the generated Rust or the error message.
+/// Compile a config body as the build with every gating feature on sees it —
+/// every gated key live — returning the generated Rust or the error message.
 fn compile(text: &str) -> Result<String, String> {
-    compile_at(text, LEVELS)
+    compile_at(text, GATE_FEATURES).map(|g| g.code)
 }
 
-/// Compile a config body as a build carrying `levels` sees it.
-fn compile_at(text: &str, levels: &[&str]) -> Result<String, String> {
+/// Compile a config body as a build carrying `features` sees it, keeping the
+/// warnings.
+fn compile_at(text: &str, features: &[&str]) -> Result<Generated, String> {
     compile_config(
         text,
         "test.toml",
         "test.toml",
         "test",
-        &Gating::Levels(levels),
+        &Gating::Features(features),
     )
 }
 
@@ -266,7 +267,7 @@ fn a_gated_key_off_its_fixed_value_is_refused_below_its_level() {
             "the message must say which value does build: {err}"
         );
     }
-    for levels in [&["verbose2"][..], LEVELS] {
+    for levels in [&["verbose2"][..], GATE_FEATURES] {
         compile_at(&text, levels).expect("the level that implements it accepts any value");
     }
 }
@@ -277,13 +278,13 @@ fn a_gated_key_off_its_fixed_value_is_refused_below_its_level() {
 #[test]
 fn a_gated_key_at_its_fixed_value_compiles_at_every_level() {
     let text = default_with("multi_pv", Some("multi_pv = 1"));
-    for levels in [&[][..], &["verbose1"][..], &["verbose2"][..], LEVELS] {
+    for levels in [&[][..], &["verbose1"][..], &["verbose2"][..], GATE_FEATURES] {
         compile_at(&text, levels).expect("the fixed value builds everywhere");
     }
 }
 
-/// The generated constant carries its gate's `cfg`, so the build below the level
-/// does not merely leave the setting unread — it does not have it.
+/// The generated constant carries its gate's `cfg`, so the build without the
+/// feature does not merely leave the setting unread — it does not have it.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_gated_keys_constant_is_generated_behind_its_cfg() {
@@ -294,11 +295,77 @@ fn a_gated_keys_constant_is_generated_behind_its_cfg() {
         assert!(
             out.contains(&format!(
                 "#[cfg(feature = \"{}\")]\npub const {name}: ",
-                gate.level
+                gate.feature()
             )),
             "constant {name} must be generated behind `{}`:\n{out}",
-            gate.level
+            gate.feature()
         );
+    }
+}
+
+// --- Report-loud: a setting an orthogonal feature owns ---------------------
+
+/// A key an off-by-default feature owns is not refused below the feature — the
+/// same config file has to build both shapes — but it is not ignored in silence
+/// either: the build that cannot honour it says so, naming the key, its value
+/// and the feature.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_feature_gated_key_off_its_inert_value_warns_without_the_feature() {
+    let text = default_with("random", Some("random = 50"));
+    let warnings = compile_at(&text, &[])
+        .expect("a config the feature is off for still builds")
+        .warnings;
+    assert_eq!(warnings.len(), 1, "exactly one warning: {warnings:?}");
+    for want in [
+        "`random` = 50",
+        "the `random` feature is off",
+        "--features random",
+    ] {
+        assert!(
+            warnings[0].contains(want),
+            "the warning must contain {want:?}: {}",
+            warnings[0]
+        );
+    }
+}
+
+/// With the feature on the setting takes effect, so there is nothing to report.
+/// Its inert value is silent in either build — that is what makes it the value a
+/// build without the feature can ignore.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_feature_gated_key_is_silent_when_honoured_or_inert() {
+    let loud = default_with("random", Some("random = 50"));
+    assert!(
+        compile_at(&loud, &["random"])
+            .expect("compiles")
+            .warnings
+            .is_empty()
+    );
+    let inert = default_with("random", Some("random = 0"));
+    for features in [&[][..], &["random"][..]] {
+        assert!(
+            compile_at(&inert, features)
+                .expect("compiles")
+                .warnings
+                .is_empty()
+        );
+    }
+}
+
+/// The range is still a range: the warning path is for a value the schema
+/// accepts, not an escape from checking it.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_feature_gated_key_out_of_range_is_an_error_in_either_build() {
+    for features in [&[][..], &["random"][..]] {
+        let err = compile_at(&default_with("random", Some("random = 101")), features)
+            .expect_err("must fail");
+        assert!(err.contains("`random` = 101 is outside [0, 100]"), "{err}");
+        let err = compile_at(&default_with("random", Some("random = -1")), features)
+            .expect_err("must fail");
+        assert!(err.contains("`random` = -1 is outside [0, 100]"), "{err}");
     }
 }
 

@@ -527,6 +527,19 @@ pub struct QSearch<'a> {
     /// which entries a repetition judgement is behind.
     #[cfg(feature = "verbose3")]
     path_dep: bool,
+
+    /// The evaluation-noise amplitude for this game, in the unit the search
+    /// scores in: [`Self::static_eval`] offsets every position by
+    /// [`noise`] of this width. `0` — the default, and what a search that never
+    /// installs one keeps — leaves each evaluation exactly as the network
+    /// produced it.
+    #[cfg(feature = "random")]
+    random_amplitude: Value,
+    /// The seed [`noise`] draws against. Set per `go` from the driver's
+    /// game-scoped seed, so every worker of a search agrees on each position's
+    /// offset and no search ever redraws one mid-game.
+    #[cfg(feature = "random")]
+    random_seed: u64,
 }
 
 /// The result one worker's iterative deepening produces, consumed by
@@ -651,6 +664,43 @@ const DRAW_VALUE_OPTION_DEFAULT: i32 = -2;
 /// `Eval::PawnValue`, used to scale the contempt option.
 const PAWN_VALUE: i32 = 90;
 
+/// A fresh evaluation-noise seed for one game.
+///
+/// `RandomState`'s keys come from the operating system's randomness, drawn once
+/// per thread and advanced per instance, so two processes draw different seeds
+/// and one process's successive draws differ from each other.
+#[cfg(feature = "random")]
+pub fn new_game_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher, RandomState};
+
+    RandomState::new().build_hasher().finish()
+}
+
+/// splitmix64's 64-bit finaliser: an avalanche over the whole word, so two keys
+/// differing in a single bit land far apart in the low bits [`noise`] reads.
+/// Without it, positions one move apart would draw neighbouring offsets.
+#[cfg(feature = "random")]
+const fn mix(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// The evaluation offset a position carries throughout one game: a value in
+/// `-amplitude / 2 ..= amplitude - 1 - amplitude / 2`, determined by the
+/// position's Zobrist `key` and the game's `seed` alone, so the same position
+/// always draws the same offset within a game and a different one in the next.
+///
+/// `amplitude == 0` is no noise at all, which is what makes the setting behind
+/// it a true off switch rather than a small perturbation.
+#[cfg(feature = "random")]
+pub fn noise(key: u64, seed: u64, amplitude: Value) -> Value {
+    if amplitude <= 0 {
+        return 0;
+    }
+    (mix(key ^ seed) % amplitude as u64) as Value - amplitude / 2
+}
+
 impl<'a> QSearch<'a> {
     /// Create a driver over `net` and a **pre-sized** `tt` with fresh history
     /// tables. The reference re-fills `lowPlyHistory` to 98 per `go`;
@@ -756,6 +806,10 @@ impl<'a> QSearch<'a> {
             last_pv_info_time: Instant::now(),
             #[cfg(feature = "verbose3")]
             path_dep: false,
+            #[cfg(feature = "random")]
+            random_amplitude: 0,
+            #[cfg(feature = "random")]
+            random_seed: 0,
         }
     }
 
@@ -805,6 +859,16 @@ impl<'a> QSearch<'a> {
     /// (the default) leaves generation bit-identical to the parity path.
     pub fn set_generate_all_legal_moves(&mut self, all: bool) {
         self.generate_all_legal_moves = all;
+    }
+
+    /// Install this game's evaluation noise: `amplitude` in the unit the search
+    /// scores in, and the game's `seed`. Every worker of a `go` is given the
+    /// same pair, so they evaluate a shared position identically, and the pair
+    /// is stable for as long as the game is.
+    #[cfg(feature = "random")]
+    pub fn set_random(&mut self, amplitude: Value, seed: u64) {
+        self.random_amplitude = amplitude;
+        self.random_seed = seed;
     }
 
     /// Install `go mate` mode for this `go`: disables the
@@ -1093,6 +1157,11 @@ impl<'a> QSearch<'a> {
     /// When [`Self::verify_accumulator`] is set — a test-only knob — it also
     /// asserts the differential result equals a from-scratch
     /// [`yorkie_eval::evaluate`] of the current position.
+    ///
+    /// Being the one site every evaluation reaches is also what makes it the
+    /// place the per-game [`noise`] is added: a value the search derives for
+    /// itself — a mate distance, a repetition verdict, the superior / inferior
+    /// scores — never comes through here, and so carries no noise.
     #[inline]
     fn static_eval(&self, pos: &Position) -> Value {
         let value = evaluate_with(self.net, self.acc(), pos);
@@ -1103,6 +1172,8 @@ impl<'a> QSearch<'a> {
                 "differential NNUE accumulator diverged from a full refresh",
             );
         }
+        #[cfg(feature = "random")]
+        let value = value + noise(pos.key(), self.random_seed, self.random_amplitude);
         value
     }
 
@@ -5389,6 +5460,148 @@ mod tests {
                 let pick = legal[ply % legal.len()];
                 let _ = p.do_move(pick);
             }
+        }
+    }
+
+    /// The per-game evaluation noise: what the offset a position draws is
+    /// allowed to be, and that it is the same one every time within a game.
+    #[cfg(feature = "random")]
+    mod evaluation_noise {
+        use super::*;
+
+        /// A spread of keys and seeds, including the degenerate ones (0, all
+        /// ones) and a pair differing in a single bit.
+        const KEYS: &[u64] = &[
+            0,
+            1,
+            2,
+            u64::MAX,
+            0x9E37_79B9_7F4A_7C15,
+            0x0123_4567_89AB_CDEF,
+        ];
+        const SEEDS: &[u64] = &[0, 1, u64::MAX, 0xDEAD_BEEF_CAFE_F00D];
+
+        #[test]
+        fn one_key_and_seed_always_give_the_same_offset() {
+            for &key in KEYS {
+                for &seed in SEEDS {
+                    let first = noise(key, seed, 90);
+                    for _ in 0..8 {
+                        assert_eq!(noise(key, seed, 90), first);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn the_offset_stays_inside_the_amplitude() {
+            for amplitude in [1, 2, 3, 9, 45, 90, 900] {
+                let (lo, hi) = (-(amplitude / 2), amplitude - 1 - amplitude / 2);
+                for &key in KEYS {
+                    for &seed in SEEDS {
+                        let n = noise(key, seed, amplitude);
+                        assert!(
+                            (lo..=hi).contains(&n),
+                            "amplitude {amplitude}: {n} outside [{lo}, {hi}]"
+                        );
+                    }
+                }
+            }
+        }
+
+        /// An amplitude of one leaves exactly one offset to draw, and it is
+        /// zero — so the narrowest noise the setting can ask for is still no
+        /// bias in either direction.
+        #[test]
+        fn an_amplitude_of_one_is_always_zero() {
+            for &key in KEYS {
+                for &seed in SEEDS {
+                    assert_eq!(noise(key, seed, 1), 0);
+                }
+            }
+        }
+
+        /// Zero amplitude is the off switch: no key, no seed, no offset.
+        #[test]
+        fn a_zero_amplitude_is_no_noise() {
+            for &key in KEYS {
+                for &seed in SEEDS {
+                    assert_eq!(noise(key, seed, 0), 0);
+                }
+            }
+        }
+
+        /// The seed is what separates one game from the next, so keys that
+        /// share it must not share an offset, and one key must not keep its
+        /// offset across seeds. A distribution this coarse (`u64` down to 90
+        /// values) collides sometimes; what is asserted is that it does not
+        /// collapse.
+        #[test]
+        fn the_seed_and_the_key_both_move_the_offset() {
+            let spread = |values: Vec<Value>| {
+                let mut v = values;
+                v.sort_unstable();
+                v.dedup();
+                v.len()
+            };
+            let across_keys = spread((0u64..64).map(|k| noise(k, 12345, 90)).collect());
+            assert!(across_keys > 16, "keys collapsed to {across_keys} offsets");
+            let across_seeds = spread((0u64..64).map(|s| noise(0x5A5A, s, 90)).collect());
+            assert!(
+                across_seeds > 16,
+                "seeds collapsed to {across_seeds} offsets"
+            );
+        }
+
+        /// Neighbouring keys — which is what positions one move apart are —
+        /// must not draw neighbouring offsets. That is what the finaliser in
+        /// front of the modulus is for.
+        #[test]
+        fn keys_one_bit_apart_are_not_offsets_one_step_apart() {
+            let base = noise(0x0123_4567_89AB_CDEF, 7, 90);
+            let neighbours: Vec<Value> = (0..64)
+                .map(|b| noise(0x0123_4567_89AB_CDEF ^ (1u64 << b), 7, 90))
+                .collect();
+            let adjacent = neighbours
+                .iter()
+                .filter(|n| (**n - base).abs() <= 1)
+                .count();
+            assert!(
+                adjacent < 8,
+                "{adjacent} of 64 one-bit neighbours landed within one of {base}"
+            );
+        }
+
+        /// What the noise looks like from a search: the zero network evaluates
+        /// every position at 0, so whatever a search returns here is the offset
+        /// and nothing else. A search given no amplitude returns the plain 0 —
+        /// which is what leaves every existing fixed-depth path in this crate
+        /// unchanged when the feature is compiled in.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn a_search_carries_the_offset_of_the_amplitude_and_seed_it_was_given() {
+            let net = zero_net();
+            let p = pos("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1");
+            let run = |amplitude: Value, seed: u64| {
+                let table = fresh_tt();
+                let mut q = QSearch::new(&net, &table);
+                q.set_random(amplitude, seed);
+                let mut work = p.clone();
+                q.run(&mut work, -VALUE_INFINITE, VALUE_INFINITE, true, true)
+                    .value
+            };
+
+            assert_eq!(run(0, 0x1234_5678), 0, "no amplitude is no noise");
+            assert_eq!(
+                run(90, 0x1234_5678),
+                run(90, 0x1234_5678),
+                "one seed evaluates one position one way"
+            );
+            assert_ne!(
+                run(90, 0x1234_5678),
+                run(90, 0x8765_4321),
+                "a new seed is what makes the next game differ"
+            );
         }
     }
 }

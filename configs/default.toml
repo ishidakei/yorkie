@@ -161,6 +161,14 @@ resign_value = 99999
 # (`GenerateAllLegalMoves`).
 generate_all_legal_moves = false
 
+# Amplitude, in centipawns, of the per-position noise the static evaluation
+# carries, so play varies from game to game: within one game a position always
+# evaluates the same, and after `usinewgame` it evaluates differently. `0` is no
+# noise, which is what every build makes of it unless it carries the `random`
+# Cargo feature — a build without the feature ignores this key and says so with
+# a build warning when it is not 0.
+random = 0
+
 # ---------------------------------------------------------------------------
 # Time management
 # ---------------------------------------------------------------------------

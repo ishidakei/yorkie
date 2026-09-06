@@ -66,42 +66,70 @@ enum Kind {
     Choice(&'static [&'static str]),
 }
 
-/// The verbosity levels a build can carry, ascending. Which of them are on is
-/// the caller's to determine — cargo tells a build script through its
-/// `CARGO_FEATURE_*` variables.
+/// Every Cargo feature the schema conditions a constant on: the verbosity
+/// levels, ascending and each implying the one below it, then the features
+/// orthogonal to that axis. Which of them are on is the caller's to determine —
+/// cargo tells a build script through its `CARGO_FEATURE_*` variables.
 ///
-/// Each including build script uses the half of the level machinery its crate
-/// needs — one has the levels, the other has none — so an item only the other
-/// one constructs is not dead code.
+/// Each including build script uses the half of the gating machinery its crate
+/// needs — one declares these features, the other declares none — so an item
+/// only the other one constructs is not dead code.
 #[allow(dead_code)]
-const LEVELS: &[&str] = &["verbose1", "verbose2", "verbose3"];
+const GATE_FEATURES: &[&str] = &["verbose1", "verbose2", "verbose3", "random"];
 
-/// How a build script treats the level-gated keys (see [`Gate`]).
+/// How a build script treats the feature-gated keys (see [`Gate`]).
 #[allow(dead_code)]
 enum Gating<'a> {
-    /// The crate declares the verbosity levels: those in the list are on, a
-    /// gated key holding anything but its fixed value below its level is
-    /// refused, and its constant is generated behind the level's `cfg`.
-    Levels(&'a [&'a str]),
-    /// The crate declares no verbosity feature, so it has no `cfg` to name and
-    /// no level to judge a value against. Every key is rendered plainly; such a
-    /// crate reads only ungated ones, and the crate that owns the axis refuses
-    /// the config the whole build shares.
+    /// The crate declares the gating features: those in the list are on, the
+    /// gated key's constant is generated behind its feature's `cfg`, and a value
+    /// a build without that feature cannot honour meets the gate's own rule.
+    Features(&'a [&'a str]),
+    /// The crate declares none of the gating features, so it has no `cfg` to
+    /// name and no build shape to judge a value against. Every key is rendered
+    /// plainly; such a crate reads only ungated ones, and the crate that owns
+    /// the features judges the config the whole build shares.
     Absent,
 }
 
-/// A setting the engine implements only from a verbosity level up: the
-/// generated constant carries the level's `cfg`, and a build below the level
-/// accepts only the one value its code is fixed to, so a setting that could not
-/// take effect is refused rather than silently ignored.
-struct Gate {
-    /// The Cargo feature the key needs.
-    level: &'static str,
-    /// The only value a build below `level` accepts.
-    fixed: i64,
-    /// Why the lower build is fixed to that value, as the second sentence of
-    /// the error message.
-    because: &'static str,
+/// A setting whose constant is conditioned on a Cargo feature: the generated
+/// constant carries that feature's `cfg`, so a build without the feature does
+/// not merely leave the setting unread — it does not have it. The variants
+/// differ in what such a build may put in the config file.
+enum Gate {
+    /// A setting the engine implements only from a verbosity level up. A build
+    /// below the level accepts only the one value its code is fixed to, so a
+    /// setting that could not take effect is refused rather than silently
+    /// ignored.
+    Level {
+        /// The Cargo feature the key needs.
+        level: &'static str,
+        /// The only value a build below `level` accepts.
+        fixed: i64,
+        /// Why the lower build is fixed to that value, as the second sentence of
+        /// the error message.
+        because: &'static str,
+    },
+    /// A setting an off-by-default feature owns, orthogonal to the verbosity
+    /// axis. One config file has to build every shape, so a build without the
+    /// feature takes any value the range allows; anything but the inert one is
+    /// reported as a build warning, since nothing in that build reads it.
+    Feature {
+        /// The Cargo feature the key needs.
+        feature: &'static str,
+        /// The value that makes the setting a no-op, and so the one value a
+        /// build without the feature ignores without losing anything.
+        inert: i64,
+    },
+}
+
+impl Gate {
+    /// The Cargo feature the generated constant's `cfg` names.
+    fn feature(&self) -> &'static str {
+        match self {
+            Gate::Level { level, .. } => level,
+            Gate::Feature { feature, .. } => feature,
+        }
+    }
 }
 
 /// One schema entry. `key` is the TOML key; the generated constant's name is
@@ -124,7 +152,7 @@ const fn int(key: &'static str, usi: &'static str, min: i64, max: i64) -> Spec {
     }
 }
 
-/// An `int` key that only takes effect from `level` up (see [`Gate`]).
+/// An `int` key that only takes effect from `level` up (see [`Gate::Level`]).
 const fn gated_int(
     key: &'static str,
     usi: &'static str,
@@ -138,11 +166,28 @@ const fn gated_int(
         key,
         usi,
         kind: Kind::Int { min, max },
-        gate: Some(Gate {
+        gate: Some(Gate::Level {
             level,
             fixed,
             because,
         }),
+    }
+}
+
+/// An `int` key an orthogonal feature owns (see [`Gate::Feature`]).
+const fn feature_int(
+    key: &'static str,
+    usi: &'static str,
+    min: i64,
+    max: i64,
+    feature: &'static str,
+    inert: i64,
+) -> Spec {
+    Spec {
+        key,
+        usi,
+        kind: Kind::Int { min, max },
+        gate: Some(Gate::Feature { feature, inert }),
     }
 }
 
@@ -246,6 +291,14 @@ const SCHEMA: &[Spec] = &[
     int("draw_value_white", "DrawValueWhite", -30_000, 30_000),
     int("resign_value", "ResignValue", 0, 99_999),
     boolean("generate_all_legal_moves", "GenerateAllLegalMoves"),
+    feature_int(
+        "random",
+        "(none: the static-evaluation noise amplitude)",
+        0,
+        100,
+        "random",
+        0,
+    ),
     // --- Time management.
     int("network_delay", "NetworkDelay", 0, 10_000),
     int("network_delay2", "NetworkDelay2", 0, 10_000),
@@ -388,19 +441,31 @@ fn at(label: &str, line: usize, msg: &str) -> String {
     format!("{label}:{line}: {msg}")
 }
 
+/// The pure pipeline's output.
+#[derive(Debug)]
+struct Generated {
+    /// The generated Rust module.
+    code: String,
+    /// Settings this build compiles but cannot honour, for the including build
+    /// script to surface. Only the build script whose crate declares the gating
+    /// features can produce, or has to report, any.
+    #[allow(dead_code)]
+    warnings: Vec<String>,
+}
+
 /// Type-check and range-check every schema key against the parsed file, reject
 /// anything left over, and render the generated module.
 ///
 /// `label` names the file in messages, `source` is the path recorded in the
 /// generated header, and `name` is the config's identity (its file stem).
-/// `gating` says how this build treats the level-gated keys.
+/// `gating` says how this build treats the feature-gated keys.
 fn generate(
     entries: &BTreeMap<String, Entry>,
     label: &str,
     source: &str,
     name: &str,
     gating: &Gating,
-) -> Result<String, String> {
+) -> Result<Generated, String> {
     // Unknown keys first: a typo'd key would otherwise be reported as the schema
     // key it was meant to be, going missing.
     let unknown: Vec<&str> = entries
@@ -417,6 +482,7 @@ fn generate(
         ));
     }
 
+    let mut warnings = Vec::new();
     let mut out = String::new();
     let _ = write!(
         out,
@@ -431,22 +497,42 @@ fn generate(
             return Err(format!("{label}: required key `{}` is missing", spec.key));
         };
         let const_name = spec.key.to_ascii_uppercase();
-        if let Gating::Levels(levels) = gating
+        if let Gating::Features(active) = gating
             && let Some(gate) = &spec.gate
             && let Value::Int(v) = &entry.value
-            && !levels.contains(&gate.level)
-            && *v != gate.fixed
+            && !active.contains(&gate.feature())
         {
-            return Err(at(
-                label,
-                entry.line,
-                &format!(
-                    "`{}` = {v} needs a `{}` build: {}. This build is below that level, so \
-                     the only value it accepts is {} — set the key to that, or build with \
-                     `--features {}`",
-                    spec.key, gate.level, gate.because, gate.fixed, gate.level
-                ),
-            ));
+            match gate {
+                Gate::Level {
+                    level,
+                    fixed,
+                    because,
+                } if *v != *fixed => {
+                    return Err(at(
+                        label,
+                        entry.line,
+                        &format!(
+                            "`{}` = {v} needs a `{level}` build: {because}. This build is below \
+                             that level, so the only value it accepts is {fixed} — set the key to \
+                             that, or build with `--features {level}`",
+                            spec.key
+                        ),
+                    ));
+                }
+                Gate::Feature { feature, inert } if *v != *inert => {
+                    warnings.push(at(
+                        label,
+                        entry.line,
+                        &format!(
+                            "`{}` = {v} has no effect: the `{feature}` feature is off in this \
+                             build, so nothing reads the setting — build with \
+                             `--features {feature}`, or set the key to {inert}",
+                            spec.key
+                        ),
+                    ));
+                }
+                _ => {}
+            }
         }
         let rendered = match (&spec.kind, &entry.value) {
             (Kind::Int { min, max }, Value::Int(v)) => {
@@ -491,15 +577,18 @@ fn generate(
             }
         };
         let _ = writeln!(out, "/// USI option `{}`.", spec.usi);
-        if let Gating::Levels(_) = gating
+        if let Gating::Features(_) = gating
             && let Some(gate) = &spec.gate
         {
-            let _ = writeln!(out, "#[cfg(feature = \"{}\")]", gate.level);
+            let _ = writeln!(out, "#[cfg(feature = \"{}\")]", gate.feature());
         }
         let _ = writeln!(out, "{rendered}");
     }
 
-    Ok(out)
+    Ok(Generated {
+        code: out,
+        warnings,
+    })
 }
 
 fn expected(kind: &Kind) -> &'static str {
@@ -522,7 +611,7 @@ fn compile_config(
     source: &str,
     name: &str,
     gating: &Gating,
-) -> Result<String, String> {
+) -> Result<Generated, String> {
     let entries = parse_config(contents, label)?;
     generate(&entries, label, source, name, gating)
 }

@@ -21,7 +21,7 @@
 
 mod common;
 
-use common::stage_configured_eval_dir;
+use common::{NOISY_EVALUATION, evaluation_is_noise_free, stage_configured_eval_dir};
 use yorkie_protocol::{UsiDriver, config};
 use yorkie_search::{QSearch, RootKind, RootOutcome, Search};
 use yorkie_state::{Move, Position, format_usi_move, parse_sfen, parse_usi_move};
@@ -65,6 +65,13 @@ fn bestmove_lines(out: &str) -> Vec<&str> {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn synthetic_network_session_matches_direct_search_choice() {
+    // The direct `run_root` below installs no game seed, so it is the plain
+    // evaluation's choice; only a build whose sessions make the same one can be
+    // compared against it.
+    if !evaluation_is_noise_free() {
+        eprintln!("{NOISY_EVALUATION}");
+        return;
+    }
     let path = stage_configured_eval_dir();
 
     // Independent, direct depth-1 root-search choice for the same network +
@@ -166,6 +173,12 @@ fn isready_keep_alive_emits_bare_newline_during_heavy_load() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn synthetic_network_reuse_reset_and_mate_resign() {
+    // Same reason as above, doubled: the session's second `go` is a new game,
+    // which is exactly where the noise changes.
+    if !evaluation_is_noise_free() {
+        eprintln!("{NOISY_EVALUATION}");
+        return;
+    }
     let nn_bin = stage_configured_eval_dir();
 
     // A single load (one `isready`) serves all three `go`s below: this pins that

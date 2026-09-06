@@ -21,7 +21,10 @@
 
 mod common;
 
-use common::{StreamHarness, bestmove_lines, legal, parse, stage_configured_eval_dir};
+use common::{
+    NOISY_EVALUATION, StreamHarness, bestmove_lines, evaluation_is_noise_free, legal, parse,
+    stage_configured_eval_dir,
+};
 use yorkie_protocol::config;
 use yorkie_state::parse_usi_move;
 
@@ -123,6 +126,12 @@ fn depth_limit_caps_a_time_bounded_search_and_yields_to_an_explicit_depth() {
         eprintln!("skipped: PvInterval is non-zero, so transcripts are wall-clock dependent");
         return;
     }
+    // The two searches compared below sit either side of a `usinewgame`, which is
+    // where a build carrying the evaluation noise changes what it evaluates.
+    if !evaluation_is_noise_free() {
+        eprintln!("{NOISY_EVALUATION}");
+        return;
+    }
 
     // A generous movetime, seeded by the compiled-in DepthLimit, must stop at the
     // limit — and produce exactly what a plain `go depth <limit>` produces. An
@@ -176,6 +185,12 @@ fn nodes_limit_matches_the_same_go_nodes() {
     }
     if !pv_is_deterministic() {
         eprintln!("skipped: PvInterval is non-zero, so transcripts are wall-clock dependent");
+        return;
+    }
+    // Same reason as above: the two node-capped searches are separated by a
+    // `usinewgame`.
+    if !evaluation_is_noise_free() {
+        eprintln!("{NOISY_EVALUATION}");
         return;
     }
 

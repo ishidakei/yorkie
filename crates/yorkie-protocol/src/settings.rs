@@ -15,6 +15,17 @@
 //! [`crate::config::BOOK_OPTIONS_V2`], and the half the selected profile does
 //! not own reads as its type's zero.
 
+/// The evaluation-noise amplitude, in the unit the search scores in.
+///
+/// The `random` setting is in centipawns and a search value is in `PawnValue`
+/// units, so the conversion is `random * PawnValue / 100` — the inverse of the
+/// centipawn rendering, which makes `random = 100` a whole pawn wide. A `const`
+/// rather than an accessor because the search's noise bound is fixed when the
+/// binary is built, like every other setting here.
+#[cfg(feature = "random")]
+pub(crate) const RANDOM_AMPLITUDE: yorkie_storage::Value =
+    (crate::config::RANDOM * crate::driver::PAWN_VALUE as i64 / 100) as yorkie_storage::Value;
+
 /// The engine's settings: the generated constants, addressed by name.
 ///
 /// A zero-sized type — there is no settings state to hold. It exists so the

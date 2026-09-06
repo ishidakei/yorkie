@@ -37,7 +37,15 @@ serde_json = "~1.0"
 #
 # Each level implies the one below it, as on the Protocol layer. All are off by
 # default.
+#
+# `random` is orthogonal to that axis and composes with any level: it makes the
+# static evaluation carry a per-position noise term drawn from a per-game seed,
+# so the engine's play varies between games while staying self-consistent within
+# one. The whole of it — the amplitude, the seed, the noise function and the
+# branch that adds it — is behind the feature, and a build without it evaluates
+# exactly as before. Off by default.
 [features]
+random = []
 tt-entry16 = ["yorkie-storage/tt-entry16"]
 verbose1 = []
 verbose2 = ["verbose1", "yorkie-storage/verbose2"]

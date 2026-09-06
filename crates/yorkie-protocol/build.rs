@@ -52,21 +52,24 @@ fn main() {
     };
 
     let label = path.display().to_string();
-    let levels = active_levels();
+    let gates = active_gates();
     let generated = match compile_config(
         &contents,
         &label,
         &display_source(&repo_root, &path),
         &config_name(&path),
-        &Gating::Levels(&levels),
+        &Gating::Features(&gates),
     ) {
         Ok(g) => g,
         Err(e) => fail(&e),
     };
+    for warning in &generated.warnings {
+        println!("cargo:warning={warning}");
+    }
 
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"))
         .join("engine_config.rs");
-    if let Err(e) = std::fs::write(&out, generated) {
+    if let Err(e) = std::fs::write(&out, generated.code) {
         fail(&format!(
             "cannot write the generated config `{}`: {e}",
             out.display()
@@ -74,15 +77,16 @@ fn main() {
     }
 }
 
-/// The verbosity levels this build carries. Cargo exports one
+/// The gating features this build carries. Cargo exports one
 /// `CARGO_FEATURE_<NAME>` variable per enabled feature to the build script, and
-/// the levels imply one another, so a `verbose3` build reports all three.
-fn active_levels() -> Vec<&'static str> {
-    LEVELS
+/// the verbosity levels imply one another, so a `verbose3` build reports all
+/// three.
+fn active_gates() -> Vec<&'static str> {
+    GATE_FEATURES
         .iter()
         .copied()
-        .filter(|level| {
-            std::env::var_os(format!("CARGO_FEATURE_{}", level.to_ascii_uppercase())).is_some()
+        .filter(|feature| {
+            std::env::var_os(format!("CARGO_FEATURE_{}", feature.to_ascii_uppercase())).is_some()
         })
         .collect()
 }

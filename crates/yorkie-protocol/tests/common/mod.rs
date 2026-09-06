@@ -34,6 +34,28 @@ pub fn require_test_config() {
     assert_eq!(config::PV_INTERVAL, 0, "{WRONG_CONFIG}");
 }
 
+/// Whether a position evaluates to the same value in every game of this build.
+///
+/// A build carrying the `random` feature with a non-zero `random` setting offsets
+/// each position's static evaluation by an amount drawn from a per-game seed, so
+/// two searches taken in different games — and any comparison against a search
+/// driven outside a session, which installs no seed — are not expected to agree.
+/// A test that needs them to agree asks here first and skips when they cannot.
+pub fn evaluation_is_noise_free() -> bool {
+    #[cfg(feature = "random")]
+    {
+        yorkie_protocol::config::RANDOM == 0
+    }
+    #[cfg(not(feature = "random"))]
+    {
+        true
+    }
+}
+
+/// The message [`evaluation_is_noise_free`]'s callers skip with.
+pub const NOISY_EVALUATION: &str =
+    "skipped: this build's per-game evaluation noise makes two games incomparable";
+
 // --- SFNN-1536 file-format constants (mirror yorkie-eval/src/loader.rs).
 const NNUE_VERSION: u32 = 0x7AF3_2F16;
 const NNUE_HASH_VALUE: u32 = 0x3C20_3B32;

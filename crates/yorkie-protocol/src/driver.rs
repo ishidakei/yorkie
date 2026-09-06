@@ -20,6 +20,9 @@ use yorkie_search::{
 // the line's data type, its bound marker, the sink trait and the output config.
 #[cfg(feature = "verbose2")]
 use yorkie_search::{PvBound, PvInfo, PvOutputConfig, PvSink};
+// The per-game evaluation-noise seed: drawn here, read only by the search.
+#[cfg(feature = "random")]
+use yorkie_search::new_game_seed;
 use yorkie_state::{Move, Position, format_usi_move, parse_sfen, parse_usi_move};
 use yorkie_storage::{Book, TranspositionTable, Value};
 #[cfg(feature = "verbose3")]
@@ -29,6 +32,8 @@ use yorkie_storage::{TTData, VALUE_NONE};
 use crate::bench;
 use crate::formatter::Formatter;
 use crate::parser::{Command, GoLimits, MATE_UNLIMITED_MS, PositionSfen, parse_line};
+#[cfg(feature = "random")]
+use crate::settings::RANDOM_AMPLITUDE;
 use crate::settings::Settings;
 #[cfg(feature = "verbose3")]
 use crate::tt_command::{
@@ -97,6 +102,13 @@ const KEEP_ALIVE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// time out while a big `USI_Hash` allocation and the ~215 MiB `nn.bin` load
 /// run between `isready` and `readyok`.
 const KEEP_ALIVE_TICKS_PER_NEWLINE: u32 = 50;
+
+/// The evaluation-noise seed a `bench` runs under. What the command reports is a
+/// node count two runs — and two processes — have to agree on, so the clean
+/// starting state it builds for itself fixes the seed as well as the table and
+/// the histories. A game draws its own.
+#[cfg(all(feature = "verbose3", feature = "random"))]
+const BENCH_RANDOM_SEED: u64 = 0;
 
 // Reference USI score conversion. These are `pub(crate)` so the `verbose3` `tt`
 // commands, which speak the same score surface, do not grow a second copy of
@@ -300,6 +312,15 @@ pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
     /// PRNG and the `rtime` PRNG. Seeded from process entropy by default; tests
     /// pin it via [`UsiDriver::with_book_seed`].
     book_seed: u64,
+    /// The evaluation-noise seed for the game in progress. Drawn from the
+    /// operating system's randomness at construction and again at every
+    /// `usinewgame`, and handed unchanged to every worker of every `go` in
+    /// between: one game evaluates a position the same way throughout, and the
+    /// next game evaluates it differently. It sits beside the transposition
+    /// table rather than inside the Zobrist tables, which stay fixed, so
+    /// nothing about position identity moves with it.
+    #[cfg(feature = "random")]
+    random_seed: u64,
     /// The in-flight search worker, if any.
     search: Option<ActiveSearch>,
     /// Time-management state that persists across `go`s within a game and is
@@ -409,6 +430,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             book: None,
             book_signature: None,
             book_seed,
+            #[cfg(feature = "random")]
+            random_seed: new_game_seed(),
             search: None,
             best_previous_score: VALUE_INFINITE,
             best_previous_average_score: VALUE_INFINITE,
@@ -963,6 +986,12 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         self.histories = Some(WorkerHistories::with_shared(Arc::clone(
             &self.worker_shared[0],
         )));
+        // A new game draws a new evaluation-noise seed, which is what makes the
+        // engine play the next game differently from this one.
+        #[cfg(feature = "random")]
+        {
+            self.random_seed = new_game_seed();
+        }
         // Reset the persistent time-management inputs to their
         // first-move-of-a-game sentinels.
         self.best_previous_score = VALUE_INFINITE;
@@ -1420,6 +1449,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             resign_value,
             generate_all_legal_moves,
             mate_mode,
+            #[cfg(feature = "random")]
+            random_seed: self.random_seed,
             #[cfg(feature = "verbose2")]
             multi_pv,
             #[cfg(feature = "verbose2")]
@@ -1483,6 +1514,12 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // positions: clears the TT, resets histories, and rebuilds the pool — the
         // clean, identical starting state that makes two runs report equal nodes.
         self.handle_usinewgame();
+        // That state covers the evaluation noise too: the seed a new game draws
+        // would give each run its own node count.
+        #[cfg(feature = "random")]
+        {
+            self.random_seed = BENCH_RANDOM_SEED;
+        }
 
         // The reference resets `elapsed` right after `search_clear`, so the timing
         // excludes the clear itself.
@@ -2280,6 +2317,10 @@ struct HelperJob {
     generate_all_legal_moves: bool,
     /// `go mate` mode — disable early mate break, enable mate-found stop.
     mate_mode: bool,
+    /// The game's evaluation-noise seed, the same one every worker of this `go`
+    /// gets, so they agree on each position's offset.
+    #[cfg(feature = "random")]
+    random_seed: u64,
     /// The raw `MultiPV` option value (helpers run the MultiPV loop too, but never
     /// emit — no sink). Clamped to the legal-move count inside `run_worker`.
     /// Only a build that prints the search `info` lines can report a second PV
@@ -2409,6 +2450,8 @@ fn helper_loop(slot: Arc<HelperSlot>) {
             qs.set_draw_value(job.draw_contempt);
             qs.set_generate_all_legal_moves(job.generate_all_legal_moves);
             qs.set_mate_mode(job.mate_mode);
+            #[cfg(feature = "random")]
+            qs.set_random(RANDOM_AMPLITUDE, job.random_seed);
             // Helpers run the MultiPV loop too, but with no sink they never emit.
             #[cfg(feature = "verbose2")]
             qs.set_multi_pv(job.multi_pv);
@@ -2923,6 +2966,10 @@ struct CoordinatorJob<W: Write + Send + 'static> {
     /// `go mate` mode — disables the early mate break and enables the mate-found
     /// stop rule.
     mate_mode: bool,
+    /// The evaluation-noise seed for the game this `go` belongs to. Every worker
+    /// this coordinator dispatches is given the same one.
+    #[cfg(feature = "random")]
+    random_seed: u64,
     /// The raw `MultiPV` option value for this `go`. It shapes the search, and
     /// only a build that prints the search `info` lines can report a second PV
     /// line, so only that one carries it.
@@ -2994,6 +3041,8 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         resign_value,
         generate_all_legal_moves,
         mate_mode,
+        #[cfg(feature = "random")]
+        random_seed,
         #[cfg(feature = "verbose2")]
         multi_pv,
         #[cfg(feature = "verbose2")]
@@ -3142,6 +3191,8 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
             draw_contempt,
             generate_all_legal_moves,
             mate_mode,
+            #[cfg(feature = "random")]
+            random_seed,
             #[cfg(feature = "verbose2")]
             multi_pv,
             shared: Arc::clone(&helper_shared[h]),
@@ -3164,6 +3215,8 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     qs.set_draw_value(draw_contempt);
     qs.set_generate_all_legal_moves(generate_all_legal_moves);
     qs.set_mate_mode(mate_mode);
+    #[cfg(feature = "random")]
+    qs.set_random(RANDOM_AMPLITUDE, random_seed);
     #[cfg(feature = "verbose2")]
     qs.set_multi_pv(multi_pv);
     #[cfg(feature = "verbose2")]

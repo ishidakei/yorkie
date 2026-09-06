@@ -39,6 +39,9 @@ pub use movepick::MovePicker;
 pub use qsearch::{
     PonderSignal, QSearch, QSearchOutcome, SearchControl, TimeControl, WorkerResult,
 };
+// The per-game evaluation noise: only a build that carries it.
+#[cfg(feature = "random")]
+pub use qsearch::{new_game_seed, noise};
 // The PV-output surface: only a build that prints a search `info` line has it.
 #[cfg(feature = "verbose2")]
 pub use qsearch::{PvBound, PvInfo, PvOutputConfig, PvSink, fail_lh_pv_gate};

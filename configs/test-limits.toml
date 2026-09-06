@@ -86,6 +86,13 @@ resign_value = 100
 
 generate_all_legal_moves = false
 
+# DIFFERENCE: 0 (no noise) in test.toml. A whole pawn of per-position noise on
+# the static evaluation, so a session test can see the same game evaluate a
+# position identically twice and the next game evaluate it differently. Only a
+# build carrying the `random` Cargo feature reads it; one without it warns that
+# the setting has no effect.
+random = 100
+
 # ---------------------------------------------------------------------------
 # Time management
 # ---------------------------------------------------------------------------
