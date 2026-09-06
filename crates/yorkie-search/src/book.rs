@@ -29,7 +29,7 @@ type OptionName = &'static str;
 type OptionName = ();
 
 /// One option name, as [`OptionName`]: the literal itself where a diagnostic can
-/// print it, nothing below that level.
+/// print it, nothing without that feature.
 macro_rules! option_name {
     ($name:literal) => {{
         #[cfg(feature = "verbose1")]
@@ -322,7 +322,7 @@ pub fn probe_book(
                 "Error! : Illegal Move In Book DB : move16 = 0x{:04x}",
                 bm.move16
             )),
-            // The entry is dropped either way; only the report is a level.
+            // The entry is dropped either way; only the report is gated.
             #[cfg(not(feature = "verbose1"))]
             None => {}
         }

@@ -19,9 +19,9 @@
 //!
 //! Gated on `verbose2`: the session drives analysis-only `go` clauses, and this
 //! is an NPS measurement payload that reads `nodes` back out of the engine's
-//! transcript — the level at which the whole measurement surface (per-iteration
-//! `info` lines included) is the one a bench round reports on. The spawned
-//! `yorkie` binary reaches that level only when the test binary does.
+//! transcript — the feature that brings the whole measurement surface
+//! (per-iteration `info` lines included) a bench round reports on. The spawned
+//! `yorkie` binary has that feature only when the test binary does.
 
 #![cfg(feature = "verbose2")]
 

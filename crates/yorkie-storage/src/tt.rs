@@ -917,7 +917,7 @@ impl TranspositionTable {
     ///
     /// Nothing a game plays reads it: it exists to pin the table's contents
     /// while the table is being inspected from the outside, which is what the
-    /// `verbose3` level is for, so it is compiled only there.
+    /// `verbose3` feature is for, so it is compiled only there.
     ///
     /// The path-dependence marks are part of what the table stores and so are
     /// mixed in: in the default layout as the cluster's mark word, and under

@@ -14,7 +14,7 @@
 //! also skips itself in a build whose compiled-in `MultiPV` is not 1.
 //!
 //! Gated on `verbose2`: these sessions drive analysis-only `go` clauses, which
-//! a build below that level refuses rather than reinterprets, and the
+//! a build without that feature refuses rather than reinterprets, and the
 //! assertions read a search `info` line.
 
 #![cfg(feature = "verbose2")]

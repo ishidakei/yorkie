@@ -5,7 +5,7 @@
 //! || interval elapsed) && OutputFailLHPV`.
 //!
 //! Gated on `verbose2`: the predicate decides whether a search `info` line is
-//! printed, and only a build at that level has one to print.
+//! printed, and only a build with that feature has one to print.
 
 #![cfg(feature = "verbose2")]
 

@@ -67,9 +67,9 @@ enum Kind {
 }
 
 /// Every Cargo feature the schema conditions a constant on: the verbosity
-/// levels, ascending and each implying the one below it, then the features
-/// orthogonal to that axis. Which of them are on is the caller's to determine —
-/// cargo tells a build script through its `CARGO_FEATURE_*` variables.
+/// features, each implying the one before it, then the features orthogonal to
+/// that axis. Which of them are on is the caller's to determine — cargo tells a
+/// build script through its `CARGO_FEATURE_*` variables.
 ///
 /// Each including build script uses the half of the gating machinery its crate
 /// needs — one declares these features, the other declares none — so an item
@@ -96,14 +96,13 @@ enum Gating<'a> {
 /// not merely leave the setting unread — it does not have it. The variants
 /// differ in what such a build may put in the config file.
 enum Gate {
-    /// A setting the engine implements only from a verbosity level up. A build
-    /// below the level accepts only the one value its code is fixed to, so a
-    /// setting that could not take effect is refused rather than silently
-    /// ignored.
-    Level {
+    /// A setting the engine implements only with a verbosity feature. A build
+    /// without it accepts only the one value its code is fixed to, so a setting
+    /// that could not take effect is refused rather than silently ignored.
+    Verbosity {
         /// The Cargo feature the key needs.
-        level: &'static str,
-        /// The only value a build below `level` accepts.
+        feature: &'static str,
+        /// The only value a build without `feature` accepts.
         fixed: i64,
         /// Why the lower build is fixed to that value, as the second sentence of
         /// the error message.
@@ -126,8 +125,7 @@ impl Gate {
     /// The Cargo feature the generated constant's `cfg` names.
     fn feature(&self) -> &'static str {
         match self {
-            Gate::Level { level, .. } => level,
-            Gate::Feature { feature, .. } => feature,
+            Gate::Verbosity { feature, .. } | Gate::Feature { feature, .. } => feature,
         }
     }
 }
@@ -152,13 +150,13 @@ const fn int(key: &'static str, usi: &'static str, min: i64, max: i64) -> Spec {
     }
 }
 
-/// An `int` key that only takes effect from `level` up (see [`Gate::Level`]).
+/// An `int` key that only takes effect with `feature` (see [`Gate::Verbosity`]).
 const fn gated_int(
     key: &'static str,
     usi: &'static str,
     min: i64,
     max: i64,
-    level: &'static str,
+    feature: &'static str,
     fixed: i64,
     because: &'static str,
 ) -> Spec {
@@ -166,8 +164,8 @@ const fn gated_int(
         key,
         usi,
         kind: Kind::Int { min, max },
-        gate: Some(Gate::Level {
-            level,
+        gate: Some(Gate::Verbosity {
+            feature,
             fixed,
             because,
         }),
@@ -503,8 +501,8 @@ fn generate(
             && !active.contains(&gate.feature())
         {
             match gate {
-                Gate::Level {
-                    level,
+                Gate::Verbosity {
+                    feature,
                     fixed,
                     because,
                 } if *v != *fixed => {
@@ -512,9 +510,9 @@ fn generate(
                         label,
                         entry.line,
                         &format!(
-                            "`{}` = {v} needs a `{level}` build: {because}. This build is below \
-                             that level, so the only value it accepts is {fixed} — set the key to \
-                             that, or build with `--features {level}`",
+                            "`{}` = {v} needs a `{feature}` build: {because}. This build does not \
+                             have that feature, so the only value it accepts is {fixed} — set the \
+                             key to that, or build with `--features {feature}`",
                             spec.key
                         ),
                     ));

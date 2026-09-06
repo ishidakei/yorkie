@@ -3,14 +3,14 @@
 //!
 //! A bridge in a rated game sends only `usi`, `isready`, `setoption`,
 //! `usinewgame`, `position`, a clock-clause or `ponder` `go`, `stop`,
-//! `ponderhit`, `gameover` and `quit`; everything else arrives at a higher
-//! verbosity level.
+//! `ponderhit`, `gameover` and `quit`; everything else arrives with a verbosity
+//! feature.
 //!
 //! [`match_shaped_session_is_byte_identical`] is deliberately *not*
-//! feature-gated: it runs at every level and pins the same bytes, which is the
-//! "raising the level changes nothing a game can see" claim. The two gated
-//! modules below compile only under the level whose absence they pin, and hold
-//! the refusals.
+//! feature-gated: it runs in every build and pins the same bytes, which is the
+//! "adding a verbosity feature changes nothing a game can see" claim. The two
+//! gated modules below compile only without the feature whose absence they pin,
+//! and hold the refusals.
 //!
 //! The diagnostic lines are composed through `common::diag_line`, so the
 //! transcripts stay byte-exact with and without `verbose1`.
@@ -23,7 +23,7 @@ mod common;
 use common::{diag_line, drive};
 
 /// The play part of a game-shaped session, byte-for-byte — the same expectation
-/// at every verbosity level.
+/// in every build on the verbosity axis.
 ///
 /// The handshake in front of it, where the builds legitimately differ, is pinned
 /// separately by [`whole_session_including_the_handshake`].

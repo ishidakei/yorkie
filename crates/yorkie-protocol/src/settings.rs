@@ -99,8 +99,8 @@ spin_accessors! {
     usi_hash => USI_HASH;
     /// Principal variations reported per search (`MultiPV`). Read only where a
     /// second PV line can be reported, which is where the search `info` lines
-    /// are; below that level the root is single-line and the constant does not
-    /// exist.
+    /// are; without that feature the root is single-line and the constant does
+    /// not exist.
     #[cfg(feature = "verbose2")]
     multi_pv => MULTI_PV;
     /// Ply past which the book is no longer consulted (`BookMoves`).

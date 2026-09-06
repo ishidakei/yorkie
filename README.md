@@ -48,16 +48,16 @@ cargo build --release
   `-C target-cpu=native` を適用します。生成されるバイナリはビルドしたマシンの
   CPU に最適化されるため、実行するマシン上でビルドしてください。
 
-エンジンが受け付けるコマンドと出力する行の量は、`verbose1` < `verbose2` <
-`verbose3` という 1 本の Cargo feature の階段で決まります。上の段は下の段を
-すべて含みます。feature を何も指定しないビルドが段の 0 段目（対局用ビルド）
-なので、`verbose0` という feature はありません。
+エンジンが受け付けるコマンドと出力する行は、`verbose1` / `verbose2` /
+`verbose3` という 3 つの Cargo feature で決まります。`verbose2` は `verbose1` が
+持つものを含み、`verbose3` はその両方を含みます。この 3 つをどれも指定しない
+ビルドが対局用ビルドなので、`verbose0` という feature はありません。
 
 | ビルド | 読むもの・出すもの |
 | --- | --- |
 | feature なし | 対局で使うコマンドと、対局で使う出力だけ。探索出力は `bestmove` のみ |
-| `verbose1` | ＋受け付けられない入力（認識できないコマンド、不正な `position`、対局では使わない `go` の指定）や定跡ファイルの異常を `info string` で報告する。入力への対処自体はどの段でも変わらず、報告するかどうかだけが変わる |
-| `verbose2` | ＋探索の経過と結果を伝える `info` 行（反復深化ごとの PV、`bestmove` 直前の最終 PV、定跡ヒット時の multipv ブロック）を出力し、対局では使わない `go` の指定（`depth` / `nodes` / `movetime` / `infinite` / `mate` / `rtime`）を受け付ける。候補手順を複数本探す `multi_pv` 設定が効くのもこの段から（下の段には 2 本目を伝える出力がないため、ルート探索は 1 本だけ）。GUI の検討モードに必要な段 |
+| `verbose1` | ＋受け付けられない入力（認識できないコマンド、不正な `position`、対局では使わない `go` の指定）や定跡ファイルの異常を `info string` で報告する。入力への対処自体はどのビルドでも変わらず、報告するかどうかだけが変わる |
+| `verbose2` | ＋探索の経過と結果を伝える `info` 行（反復深化ごとの PV、`bestmove` 直前の最終 PV、定跡ヒット時の multipv ブロック）を出力し、対局では使わない `go` の指定（`depth` / `nodes` / `movetime` / `infinite` / `mate` / `rtime`）を受け付ける。候補手順を複数本探す `multi_pv` 設定が効くのもこの feature から（これのないビルドには 2 本目を伝える出力がないため、ルート探索は 1 本だけ）。GUI の検討モードに必要な feature |
 | `verbose3` | ＋`tt store` / `tt probe` / `tt children` と `bench` を受け付ける |
 
 ```bash
@@ -67,15 +67,15 @@ cargo build --release -F verbose3   # 解析・計測用ビルド
 ```
 
 `isready` の初期化フェーズで出る `info string`（評価関数の読み込み失敗、定跡の
-読み込み報告、`Using N threads`、NUMA と置換表の確保報告）はどの段でも必ず出力
-されます——起動に失敗したときの唯一の手がかりだからです。段が変えるのは受け付
-けるコマンドと出力で、同じ config からビルドできる段どうしなら、探索の挙動も
-ノード数も同一です。設定のうち段に依存するのは `multi_pv` だけで、これは
-`verbose2` 未満のビルドでは `1` 以外を指定できません（下の段には 2 本目の候補
-手順を伝える出力がないため）。
+読み込み報告、`Using N threads`、NUMA と置換表の確保報告）はどのビルドでも必ず
+出力されます——起動に失敗したときの唯一の手がかりだからです。これらの feature が
+変えるのは受け付けるコマンドと出力で、同じ config からビルドできるビルドどうし
+なら、探索の挙動もノード数も同一です。設定のうち verbosity feature に依存するの
+は `multi_pv` だけで、これは `verbose2` のないビルドでは `1` 以外を指定できませ
+ん（そのビルドには 2 本目の候補手順を伝える出力がないため）。
 
-この階段とは独立に、既定でオフの Cargo feature が 2 つあります。どちらもどの段
-とも組み合わせられます。
+上の 3 つとは別に、既定でオフの Cargo feature が 2 つあります。どちらも
+`verbose1` / `verbose2` / `verbose3` のどれとも組み合わせられます。
 
 | feature | 効果 |
 | --- | --- |
@@ -252,7 +252,7 @@ TOML ファイルを参照してください。
 | --- | --- | --- | --- |
 | `usi_hash` | 整数 | 1〜33554432 | 置換表サイズ [MB] |
 | `threads` | 整数 | 1〜4096 | 探索スレッド数（上限はビルド時の健全性チェック。実際に使える上限はコア数に応じて動的） |
-| `multi_pv` | 整数 | 1〜600 | 出力する候補手順の本数。`verbose2` 以上のビルドでのみ効き、それ未満のビルドではルート探索が 1 本に固定されるため、`1` 以外を書いた config はビルドエラーになる |
+| `multi_pv` | 整数 | 1〜600 | 出力する候補手順の本数。`verbose2` のあるビルドでのみ効き、それのないビルドではルート探索が 1 本に固定されるため、`1` 以外を書いた config はビルドエラーになる |
 | `eval_dir` | 文字列 | 任意 | `nn.bin` を置くディレクトリ |
 | `fv_scale` | 整数 | 1〜128 | NNUE 出力のスケール（固定小数） |
 | `numa_policy` | 文字列 | 任意 | NUMA ノードへの割り当て方針（`auto` / `system` / `hardware` / `none`、または `:` 区切りのノード指定） |
@@ -306,7 +306,7 @@ TOML ファイルを参照してください。
 | `usinewgame` | 新規対局の開始（出力なし） |
 | `position [startpos \| sfen <SFEN>] [moves <手> …]` | 局面を設定する |
 | `go [btime <ms>] [wtime <ms>] [binc <ms>] [winc <ms>] [byoyomi <ms>] [ponder]` | 探索を開始し `bestmove` を返す。対局で使う持ち時間系の指定はすべて既定ビルドで有効 |
-| `go depth <d>` / `go nodes <n>` / `go mate [ms\|infinite]` / `go movetime <ms>` / `go infinite` / `go rtime <ms>` | 対局では使わない探索指定。`verbose2` 以上のビルドでのみ有効。それより下のビルドでは、このコマンドを丸ごと実行しない（探索を開始しない。feature なしのビルドは何も出力せず、`verbose1` 以上では `info string go error: …` で報告される） |
+| `go depth <d>` / `go nodes <n>` / `go mate [ms\|infinite]` / `go movetime <ms>` / `go infinite` / `go rtime <ms>` | 対局では使わない探索指定。`verbose2` のあるビルドでのみ有効。それのないビルドでは、このコマンドを丸ごと実行しない（探索を開始しない。feature なしのビルドは何も出力せず、`verbose1` のあるビルドでは `info string go error: …` で報告される） |
 | `stop` | 探索を停止する |
 | `ponderhit` | 先読みが的中したことを通知する |
 | `gameover` | 対局終了 |
@@ -314,16 +314,16 @@ TOML ファイルを参照してください。
 | `bench [ttSizeMB] [threads] [limit] [default\|current\|<fenFile>] [limitType]` | 固定条件での NPS 計測。引数はすべて省略可で、左から順に既定値（`ttSizeMB=1024`, `threads=1`, `limit=15000`, ソース `default`, `limitType=movetime`）で埋められる。`verbose3` のビルドでのみ有効 |
 | `tt store` / `tt probe` / `tt children` | 置換表を読み書きするコマンド。`verbose3` のビルドでのみ有効（`tt-entry16` と併用した場合は 16 バイトエントリの置換表を読み書きする） |
 
-認識できないコマンドを受け取った場合は読み飛ばします。`verbose3` より下の
+認識できないコマンドを受け取った場合は読み飛ばします。`verbose3` のない
 ビルドでは `bench` と `tt` はコマンドとして存在しないため、この経路で読み
-飛ばされます。`verbose2` 以上でのみ受け付ける `go` の指定を受け取った場合
+飛ばされます。`verbose2` のあるビルドでのみ受け付ける `go` の指定を受け取った場合
 は、指定の一部だけを適用すると探索の条件が黙って変わってしまうため、その
 `go` コマンドを丸ごと実行せず、探索を開始しません。
 
-これらの状況で何が起きたかを出力するのは `verbose1` 以上のビルドだけです
+これらの状況で何が起きたかを出力するのは `verbose1` のあるビルドだけです
 （`info string unknown command: <入力行>` や `info string go error: …` の
 通知行）。feature なしのビルドは同じ状況でも何も出力しませんが、入力への
-対処自体はどの段でも同じです。`tt` 系の応答と `bench` の集計行はコマンドの
+対処自体はどのビルドでも同じです。`tt` 系の応答と `bench` の集計行はコマンドの
 応答そのものなので、`verbose3` のビルドでは必ず出力されます。
 
 コマンドライン用のサブコマンドとして、perft（指し手生成の数え上げ）も利用できます

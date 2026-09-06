@@ -2,9 +2,9 @@
 //! `tt probe` round trips (including the mate convention and the centipawn
 //! quantisation), the one-ply `tt children` sweep, and the error surface.
 //!
-//! Gated on `verbose3`, so below that level this file compiles to nothing. The
-//! complementary "command absent" assertion lives in `src/parser.rs`, compiled
-//! only below it.
+//! Gated on `verbose3`, so without that feature this file compiles to nothing.
+//! The complementary "command absent" assertion lives in `src/parser.rs`,
+//! compiled only without it.
 //!
 //! No network is needed for most of them: `bench` carries its own table size as
 //! a command argument, so it allocates a table on its own and, finding no

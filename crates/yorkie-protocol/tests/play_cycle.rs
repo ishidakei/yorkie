@@ -6,7 +6,7 @@
 //! crashing.
 //!
 //! Gated on `verbose2`: these sessions drive analysis-only `go` clauses, which
-//! a build below that level refuses rather than reinterprets. The cycle is
+//! a build without that feature refuses rather than reinterprets. The cycle is
 //! verified through the per-`go` no-network notice, a diagnostic line that
 //! arrives at `verbose1` — which `verbose2` contains, so the one gate covers
 //! both needs.

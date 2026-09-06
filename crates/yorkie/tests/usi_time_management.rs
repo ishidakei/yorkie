@@ -10,8 +10,8 @@
 //!
 //! Gated on `verbose2`: the session drives analysis-only `go` clauses, every
 //! assertion reads the search `info depth …` line (its `nodes` and `score`
-//! fields), and the spawned `yorkie` binary reaches that level only when the
-//! test binary does.
+//! fields), and the spawned `yorkie` binary has that feature only when the test
+//! binary does.
 
 #![cfg(feature = "verbose2")]
 

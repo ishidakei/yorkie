@@ -13,8 +13,8 @@
 //! Every failure is a hard build error. There is no fallback value for a missing
 //! key, no default for a malformed one, and no tolerance for a key outside the
 //! schema: a config that does not say exactly what the engine will do must not
-//! produce a binary at all. A key the engine implements only from a verbosity
-//! level up is refused the same way when a build below that level gives it
+//! produce a binary at all. A key the engine implements only with a verbosity
+//! feature is refused the same way when a build without that feature gives it
 //! anything but the value that build is fixed to — a setting that cannot take
 //! effect is an error, never something quietly ignored.
 //!
@@ -79,7 +79,7 @@ fn main() {
 
 /// The gating features this build carries. Cargo exports one
 /// `CARGO_FEATURE_<NAME>` variable per enabled feature to the build script, and
-/// the verbosity levels imply one another, so a `verbose3` build reports all
+/// the verbosity features imply one another, so a `verbose3` build reports all
 /// three.
 fn active_gates() -> Vec<&'static str> {
     GATE_FEATURES

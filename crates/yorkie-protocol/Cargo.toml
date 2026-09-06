@@ -16,14 +16,14 @@ yorkie-storage = { path = "../yorkie-storage" }
 serde = { version = "~1.0", features = ["derive"] }
 serde_json = "~1.0"
 
-# One ordinal axis decides how much of the USI surface a build reads and prints.
-# Each level contains the one below it, and "no feature" is level 0, so there is
-# no `verbose0`:
+# One axis decides how much of the USI surface a build reads and prints. Each
+# feature contains the one before it, and a build with no verbosity feature is
+# the tournament build, so there is no `verbose0`:
 #
 #   - no feature — the tournament build: the commands a rated game issues, and
 #     `bestmove` plus the initialisation-phase `info string`s as its only output.
 #     Those initialisation lines are how a failed startup is diagnosed at all, so
-#     no level gates them.
+#     they are emitted in every build.
 #   - `verbose1` — adds the diagnostic `info string` lines emitted outside the
 #     initialisation phase.
 #   - `verbose2` — adds the search `info` lines, and the non-match `go` clauses
@@ -31,21 +31,21 @@ serde_json = "~1.0"
 #     analysis mode needs.
 #   - `verbose3` — adds `tt store` / `tt probe` / `tt children` and `bench`.
 #
-# `tt` and `bench` disappear as command tokens below `verbose3`. The gated `go`
+# `tt` and `bench` disappear as command tokens without `verbose3`. The gated `go`
 # clauses cannot disappear the same way, since `go` itself is a match command, so
-# below `verbose2` a `go` line carrying one is *rejected* and starts no search —
-# silently ignoring the clause would turn `go depth 4` into an unbounded,
-# clock-less search mid-game. The refusal happens at every level; `verbose1` is
+# without `verbose2` a `go` line carrying one is *rejected* and starts no search
+# — silently ignoring the clause would turn `go depth 4` into an unbounded,
+# clock-less search mid-game. The refusal happens in every build; `verbose1` is
 # where it is also reported.
 #
 # The `tt` command family and the `bench` summary line are not diagnostics but
-# the response payload of a `verbose3` command, so they ride on that level alone
-# and no `info` line is involved in gating them.
+# the response payload of a `verbose3` command, so they ride on that feature
+# alone and no `info` line is involved in gating them.
 #
-# Each level also turns on the feature of the same name in every lower layer that
-# has one, because a level's output is not all produced here: what a build prints
-# at a level, and everything that exists only to compute it, is gated at that
-# level in whichever crate it lives, rather than left for the optimizer to
+# Each feature also turns on the feature of the same name in every lower layer
+# that has one, because the output it brings is not all produced here: what a
+# build prints, and everything that exists only to compute it, is gated on the
+# same feature in whichever crate it lives, rather than left for the optimizer to
 # discard.
 #
 #   - `verbose1` → `yorkie-search/verbose1` — the book probe's diagnostic
@@ -56,8 +56,8 @@ serde_json = "~1.0"
 #     `hashfull` occupancy.
 #   - `verbose3` → `yorkie-search/verbose3` and `yorkie-storage/verbose3` — the
 #     per-entry path-dependence mark the `tt` commands read and write, and
-#     `TranspositionTable::checksum`, which serves the table-inspection level and
-#     has no in-game reader.
+#     `TranspositionTable::checksum`, which serves the table-inspection commands
+#     and has no in-game reader.
 #
 # `tt-entry16` is the Storage-layer entry-widening feature, re-exported so this
 # crate's session tests can `cfg` on it. Off by default, and orthogonal to the

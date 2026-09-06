@@ -39,7 +39,7 @@ impl<'w, W: Write + ?Sized> Formatter<'w, W> {
     /// and a build whose sink drops the line (the `verbose1` gate in
     /// [`crate::driver`]) never formats it at all.
     ///
-    /// The diagnostics are its only caller, so it exists only at their level.
+    /// The diagnostics are its only caller, so it exists only with their feature.
     #[cfg(feature = "verbose1")]
     pub fn info_string_fmt(&mut self, body: std::fmt::Arguments<'_>) -> io::Result<()> {
         self.line(format_args!("info string {body}"))
@@ -50,7 +50,7 @@ impl<'w, W: Write + ?Sized> Formatter<'w, W> {
     /// search-progress reports the driver relays go through here.
     ///
     /// Those reports are the `verbose2` surface, and nothing else emits a bare
-    /// `info` line, so this exists only at that level.
+    /// `info` line, so this exists only with that feature.
     #[cfg(feature = "verbose2")]
     pub fn info(&mut self, body: &str) -> io::Result<()> {
         self.line(format_args!("info {body}"))

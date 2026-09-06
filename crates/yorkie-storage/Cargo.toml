@@ -34,18 +34,18 @@ libc = "0.2"
 # Off by default. With it on the probe-hit pattern changes, so search output
 # matches neither the default build's nor the reference's.
 #
-# `verbose2` and `verbose3` are the Protocol layer's verbosity levels, propagated
-# down so the parts of the table that exist only to be printed or inspected at
-# one of those levels are gated here rather than left to the optimizer:
+# `verbose2` and `verbose3` are the Protocol layer's verbosity features,
+# propagated down so the parts of the table that exist only to be printed or
+# inspected under one of them are gated here rather than left to the optimizer:
 #
 #   - `verbose2` — the occupancy statistic the search `info` lines carry, so
-#     below that level the crate compiles without `TranspositionTable::hashfull`
-#     at all.
+#     without it the crate compiles without `TranspositionTable::hashfull` at
+#     all.
 #   - `verbose3` — `TranspositionTable::checksum`, which pins the table's
 #     contents for an outside inspector and has no in-game reader.
 #
-# Each level implies the one below it, exactly as on the Protocol layer, and both
-# are off by default. Neither changes anything else about the table.
+# `verbose3` implies `verbose2`, exactly as on the Protocol layer, and both are
+# off by default. Neither changes anything else about the table.
 [features]
 tt-entry16 = []
 verbose2 = []

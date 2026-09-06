@@ -10,8 +10,8 @@
 use yorkie_protocol::config;
 
 // An array length is the least forgiving const context there is. `MultiPV` is
-// only a setting from `verbose2` up — below it the root search is single-line
-// and the constant does not exist — so the slot array follows the level.
+// only a setting with `verbose2` — without it the root search is single-line
+// and the constant does not exist — so the slot array follows the feature.
 #[cfg(feature = "verbose2")]
 const MULTI_PV_SLOTS: [u8; config::MULTI_PV as usize] = [0; config::MULTI_PV as usize];
 const BOOK_PV_SLOTS: [u16; config::BOOK_PV_MOVES as usize] = [0; config::BOOK_PV_MOVES as usize];

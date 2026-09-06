@@ -20,7 +20,8 @@
 //! value they were *built* with implies and skip themselves when it is 0.
 //!
 //! Gated on `verbose2` as well as on the feature: the assertions read the search
-//! `info` lines' scores, and drive a `go depth`, both of which that level brings.
+//! `info` lines' scores, and drive a `go depth`, both of which that feature
+//! brings.
 
 #![cfg(all(feature = "random", feature = "verbose2"))]
 

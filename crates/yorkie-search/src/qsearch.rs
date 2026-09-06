@@ -493,7 +493,7 @@ pub struct QSearch<'a> {
     /// and the single-PV search stays bit-identical.
     ///
     /// A second PV line can only be reported by a build that prints search
-    /// `info` lines, so below that level the root is single-line, this index
+    /// `info` lines, so without that feature the root is single-line, this index
     /// is the constant 0, and the hooks that read it are not compiled.
     #[cfg(feature = "verbose2")]
     pv_idx: usize,
@@ -908,8 +908,8 @@ impl<'a> QSearch<'a> {
     /// fixed-depth parity path.
     ///
     /// A build that prints no search `info` line has no way to report a second
-    /// PV, so below that level the root is single-line and there is no value to
-    /// install.
+    /// PV, so without that feature the root is single-line and there is no value
+    /// to install.
     #[cfg(feature = "verbose2")]
     pub fn set_multi_pv(&mut self, multi_pv: usize) {
         self.multi_pv = multi_pv.max(1);
@@ -1872,7 +1872,7 @@ impl QSearch<'_> {
             let mut iter_best_value = -VALUE_INFINITE;
 
             // The MultiPV loop. A second PV line can only be reported by a
-            // build that prints search `info` lines, so below that level the
+            // build that prints search `info` lines, so without that feature the
             // root is single-line: one aspiration search, on line 0, with no
             // index and no finished head to step over.
             #[cfg(feature = "verbose2")]
@@ -3531,7 +3531,7 @@ impl QSearch<'_> {
                     rm.sel_depth = self.sel_depth;
                     // The two flags decide only which bound marker a PV line
                     // carries; the `uci_score` clamps beside them feed the
-                    // resign decision, so they happen at every level.
+                    // resign decision, so they happen in every build.
                     #[cfg(feature = "verbose2")]
                     {
                         rm.score_lowerbound = false;

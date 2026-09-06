@@ -19,7 +19,7 @@
 usi_hash = 16
 threads = 1
 # DIFFERENCE: 1 in test.toml. Three ranked PVs per iteration. `MultiPV` is
-# honoured from `verbose2` up, so this file builds only at that level or above.
+# honoured with `verbose2`, so this file builds only with that feature.
 multi_pv = 3
 eval_dir = "eval"
 fv_scale = 16

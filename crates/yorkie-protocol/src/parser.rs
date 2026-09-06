@@ -17,8 +17,8 @@ pub enum PositionSfen {
 /// config keys seed the same two fields in every build, so a `go` line is not
 /// their only source. The four clauses nothing else seeds — `movetime`,
 /// `infinite`, `mate` and `rtime` — are `verbose2`, together with the parser
-/// arms that fill them: below that level no input could make them anything but
-/// their default.
+/// arms that fill them: without that feature no input could make them anything
+/// but their default.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GoLimits {
     pub depth: Option<u32>,
@@ -53,10 +53,10 @@ pub struct GoLimits {
 #[cfg(feature = "verbose2")]
 pub const MATE_UNLIMITED_MS: u64 = i32::MAX as u64;
 
-/// The `go` clauses that arrive at `verbose2`: everything here is analysis
+/// The `go` clauses that arrive with `verbose2`: everything here is analysis
 /// or tooling, not the clock clauses and `ponder` a game bridge sends.
 ///
-/// Below that level these tokens are **rejected**, not ignored: silently
+/// Without that feature these tokens are **rejected**, not ignored: silently
 /// dropping the clause would turn `go depth 4` into an unbounded, clock-less
 /// search in the middle of a game.
 #[cfg(not(feature = "verbose2"))]
@@ -77,9 +77,9 @@ pub enum Command {
     },
     Go(GoLimits),
     /// A `go` line carrying one of the [`EXTRA_GO_CLAUSES`], parsed by a build
-    /// below `verbose2`. Holds the offending clause token so the driver can
-    /// name it; **no search is started**. The variant exists only below that
-    /// level — from `verbose2` up, every one of those clauses parses into
+    /// without `verbose2`. Holds the offending clause token so the driver can
+    /// name it; **no search is started**. The variant exists only without that
+    /// feature — with `verbose2`, every one of those clauses parses into
     /// [`Command::Go`].
     #[cfg(not(feature = "verbose2"))]
     GoExtraClause(String),
@@ -98,16 +98,16 @@ pub enum Command {
     /// `verbose3` only, so the default build cannot even name the command.
     #[cfg(feature = "verbose3")]
     Bench(Vec<String>),
-    /// `tt <store|probe|children> …` — the level-gated transposition-table
+    /// `tt <store|probe|children> …` — the verbosity-gated transposition-table
     /// read/write commands (`verbose3`). Like [`Command::Bench`] the trailing
     /// tokens are carried verbatim; [`crate::tt_command::parse_tt`] gives them
-    /// meaning. The variant exists only at that level, so a lower build cannot
-    /// even name the command.
+    /// meaning. The variant exists only with that feature, so a build without it
+    /// cannot even name the command.
     #[cfg(feature = "verbose3")]
     Tt(Vec<String>),
     Quit,
     /// A line no arm recognised. The line text is retained only so the
-    /// `verbose1` diagnostic can echo it back; below that level nothing can
+    /// `verbose1` diagnostic can echo it back; without that feature nothing can
     /// print it, so the variant carries nothing and the text is never copied.
     /// Every construction goes through [`unknown`], which is where the two
     /// shapes live.
@@ -168,11 +168,11 @@ pub fn parse_line(input: &str) -> Command {
         "ponderhit" => Command::PonderHit,
         // The trailing `bench` tokens are preserved verbatim for the semantic
         // parse in `crate::bench` (which fills defaults and validates them).
-        // `verbose3` only: below that level this arm does not exist and
+        // `verbose3` only: without that feature this arm does not exist and
         // `bench …` falls through to `Command::Unknown`, exactly like `tt`.
         #[cfg(feature = "verbose3")]
         "bench" => Command::Bench(parts.map(str::to_string).collect()),
-        // `verbose3` only. Below that level this arm does not exist, so
+        // `verbose3` only. Without that feature this arm does not exist, so
         // `tt …` falls through to `Command::Unknown` like any other unrecognised
         // line — the default build's behaviour is byte-identical to before the
         // command existed.
@@ -406,7 +406,7 @@ mod tests {
 
     /// The retained text is the `verbose1` half of the variant, so this pins it
     /// only where it exists; the rest of the unknown-line assertions compare
-    /// against [`unknown`] and hold at every level.
+    /// against [`unknown`] and hold in every build.
     #[cfg(feature = "verbose1")]
     #[test]
     fn unknown_command_preserves_trimmed_line() {
@@ -717,8 +717,8 @@ mod tests {
         );
     }
 
-    /// Below `verbose2`: the match clauses are untouched — the tournament
-    /// surface parses byte-identically to a build at or above that level.
+    /// Without `verbose2`: the match clauses are untouched — the tournament
+    /// surface parses byte-identically to a build that has the feature.
     #[cfg(not(feature = "verbose2"))]
     #[test]
     fn match_go_clauses_still_parse_below_verbose2() {

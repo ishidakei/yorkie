@@ -11,7 +11,7 @@
 //! `bestmove resign` or `bestmove win` ends the loop early.
 //!
 //! Gated on `verbose2`: the session drives analysis-only `go` clauses, and the
-//! spawned `yorkie` binary reaches that level only when the test binary does.
+//! spawned `yorkie` binary has that feature only when the test binary does.
 
 #![cfg(feature = "verbose2")]
 

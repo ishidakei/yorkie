@@ -12,7 +12,7 @@
 //! when that value has nothing to show.
 //!
 //! Gated on `verbose2`: these sessions drive analysis-only `go` clauses, which
-//! a build below that level refuses rather than reinterprets, and MultiPV is
+//! a build without that feature refuses rather than reinterprets, and MultiPV is
 //! observed through the `info … multipv <i>` lines, which only a `verbose2`
 //! build emits.
 

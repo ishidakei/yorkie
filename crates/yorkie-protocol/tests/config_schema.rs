@@ -246,40 +246,44 @@ fn an_unlisted_combo_choice_is_an_error() {
     );
 }
 
-// --- Fail-loud: a setting the build's level does not implement ------------
+// --- Fail-loud: a setting the build's features do not implement -----------
 
-/// A key the engine implements only from a verbosity level up may not carry a
-/// value a lower build would have to ignore. `MultiPV` is one: below `verbose2`
-/// nothing can report a second principal variation, so the root search is
-/// single-line and only `multi_pv = 1` builds.
+/// A key the engine implements only with a verbosity feature may not carry a
+/// value a build without it would have to ignore. `MultiPV` is one: without
+/// `verbose2` nothing can report a second principal variation, so the root
+/// search is single-line and only `multi_pv = 1` builds.
 #[cfg_attr(miri, ignore)]
 #[test]
-fn a_gated_key_off_its_fixed_value_is_refused_below_its_level() {
+fn a_gated_key_off_its_fixed_value_is_refused_without_its_feature() {
     let text = default_with("multi_pv", Some("multi_pv = 3"));
-    for levels in [&[][..], &["verbose1"][..]] {
-        let err = compile_at(&text, levels).expect_err("must fail below the level");
+    for features in [&[][..], &["verbose1"][..]] {
+        let err = compile_at(&text, features).expect_err("must fail without the feature");
         assert!(
             err.contains("`multi_pv` = 3 needs a `verbose2` build"),
-            "the message must name the key and the level: {err}"
+            "the message must name the key and the feature: {err}"
+        );
+        assert!(
+            err.contains("This build does not have that feature"),
+            "the message must say this build lacks it: {err}"
         );
         assert!(
             err.contains("the only value it accepts is 1"),
             "the message must say which value does build: {err}"
         );
     }
-    for levels in [&["verbose2"][..], GATE_FEATURES] {
-        compile_at(&text, levels).expect("the level that implements it accepts any value");
+    for features in [&["verbose2"][..], GATE_FEATURES] {
+        compile_at(&text, features).expect("the feature that implements it accepts any value");
     }
 }
 
-/// The fixed value is what every build accepts, level or no level — that is the
-/// whole point of gating the *setting* rather than the config file.
+/// The fixed value is what every build accepts, with the feature or without —
+/// that is the whole point of gating the *setting* rather than the config file.
 #[cfg_attr(miri, ignore)]
 #[test]
-fn a_gated_key_at_its_fixed_value_compiles_at_every_level() {
+fn a_gated_key_at_its_fixed_value_compiles_in_every_build() {
     let text = default_with("multi_pv", Some("multi_pv = 1"));
-    for levels in [&[][..], &["verbose1"][..], &["verbose2"][..], GATE_FEATURES] {
-        compile_at(&text, levels).expect("the fixed value builds everywhere");
+    for features in [&[][..], &["verbose1"][..], &["verbose2"][..], GATE_FEATURES] {
+        compile_at(&text, features).expect("the fixed value builds everywhere");
     }
 }
 
@@ -305,7 +309,7 @@ fn a_gated_keys_constant_is_generated_behind_its_cfg() {
 
 // --- Report-loud: a setting an orthogonal feature owns ---------------------
 
-/// A key an off-by-default feature owns is not refused below the feature — the
+/// A key an off-by-default feature owns is not refused without the feature — the
 /// same config file has to build both shapes — but it is not ignored in silence
 /// either: the build that cannot honour it says so, naming the key, its value
 /// and the feature.

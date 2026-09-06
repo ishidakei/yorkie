@@ -13,7 +13,7 @@
 //! `configs/test-limits.toml` they are on.
 //!
 //! Gated on `verbose2`: these sessions drive analysis-only `go` clauses, which
-//! a build below that level refuses rather than reinterprets, and every
+//! a build without that feature refuses rather than reinterprets, and every
 //! assertion here reads the per-iteration `info depth …` lines, which only a
 //! `verbose2` build emits.
 

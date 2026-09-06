@@ -13,7 +13,7 @@
 //! with more is deliberately not reproducible move-for-move.
 //!
 //! Gated on `verbose2`: these sessions drive analysis-only `go` clauses, which
-//! a build below that level refuses rather than reinterprets, and the
+//! a build without that feature refuses rather than reinterprets, and the
 //! search-report assertions read the `info depth …` lines, which only a
 //! `verbose2` build emits.
 

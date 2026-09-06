@@ -248,7 +248,7 @@ struct ActiveSearch {
     /// afterwards, so it cannot see this as unset.
     ///
     /// The `tt` commands' idle check is its only reader, and they are
-    /// `verbose3`, so a build below that level neither carries nor raises it.
+    /// `verbose3`, so a build without that feature neither carries nor raises it.
     #[cfg(feature = "verbose3")]
     bestmove_sent: Arc<AtomicBool>,
     /// The root game ply this search ran at (`rootPos.game_ply()`), carried so
@@ -495,7 +495,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 #[cfg(feature = "verbose1")]
                 Command::Unknown(line) => self.handle_unknown(&line)?,
                 // The line is consumed and dropped either way; only the report
-                // of it is a level.
+                // of it is gated.
                 #[cfg(not(feature = "verbose1"))]
                 Command::Unknown => {}
                 Command::TooLong => self.handle_too_long()?,
@@ -1100,8 +1100,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         Ok(())
     }
 
-    /// A `go` line carrying a clause that arrives at `verbose2`, seen by a build
-    /// below that level: report it and start nothing.
+    /// A `go` line carrying a clause that arrives with `verbose2`, seen by a
+    /// build without that feature: report it and start nothing.
     ///
     /// Failing loud is deliberate — ignoring the clause would silently change
     /// the search's terms, turning `go depth 4` into a clock-less `go` in the
@@ -1180,9 +1180,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         let us = self.pos.side_to_move();
         let now = Instant::now();
         let use_time_management = limits.depth.is_none() && limits.nodes.is_none();
-        // The four clauses only `verbose2` can parse narrow it further; below
-        // that level none of them can be set, so the two option-seeded ceilings
-        // above decide it alone.
+        // The four clauses only `verbose2` can parse narrow it further; without
+        // that feature none of them can be set, so the two option-seeded
+        // ceilings above decide it alone.
         #[cfg(feature = "verbose2")]
         let use_time_management = use_time_management
             && limits.mate.is_none()
@@ -1299,8 +1299,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // MultiPV snapshot for this `go` (read per `go`, like the other search
         // options — no global). Clamped to the legal-move count inside the
         // worker. A second PV line is reportable only through the search `info`
-        // lines, so below that level the setting does not exist and the root is
-        // single-line.
+        // lines, so without that feature the setting does not exist and the root
+        // is single-line.
         #[cfg(feature = "verbose2")]
         let multi_pv = (self.settings.multi_pv().max(1)) as usize;
 
@@ -1401,7 +1401,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // no `bestmove` (nor final PV) for this search.
         let suppress_bestmove = Arc::new(AtomicBool::new(false));
         // Raised when this `go`'s reply reaches the output sink; the `tt`
-        // commands' idle check is the only reader, so only their level has it.
+        // commands' idle check is the only reader, so only their feature has it.
         #[cfg(feature = "verbose3")]
         let bestmove_sent = Arc::new(AtomicBool::new(false));
 
@@ -1571,8 +1571,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // `+1` mirrors the reference's divide-by-zero guard.
         //
         // The summary is `bench`'s RESULT, not a diagnostic: it is the whole
-        // point of the command, so it rides on `verbose3` alone and no
-        // verbosity level below it can silence it. (`verbose3` also brings the
+        // point of the command, so it rides on `verbose3` alone and no other
+        // verbosity feature can silence it. (`verbose3` also brings the
         // per-position `info` lines a measurement run reads, which is where a
         // bad run shows itself.)
         let time_ms = start.elapsed().as_millis() as u64 + 1;
@@ -1961,7 +1961,7 @@ fn write_pv_info<W: Write + ?Sized>(w: &mut W, info: &PvInfo) -> io::Result<()> 
 /// to the shared USI output. Installed on the main worker only; helpers and the
 /// fixed-depth path get no sink and emit nothing.
 ///
-/// `verbose2` only. Below that level the main worker is given no sink either,
+/// `verbose2` only. Without that feature the main worker is given no sink either,
 /// which is what keeps the tournament build's search free of PV work: the
 /// search's emission sites are all behind `pv_sink.is_some()`.
 #[cfg(feature = "verbose2")]
@@ -2126,7 +2126,7 @@ fn build_position_from(sfen: &PositionSfen, moves: &[String]) -> Option<Position
 /// `sent` is raised before the lock is released, so the reply becoming visible
 /// and this search counting as finished are one indivisible step downstream.
 /// Only the `verbose3` `tt` commands ask that question, so only they carry the
-/// flag; the `bestmove` itself is written identically at every level.
+/// flag; the `bestmove` itself is written identically in every build.
 fn emit_bestmove<W: Write>(
     writer: &Arc<Mutex<W>>,
     #[cfg(feature = "verbose3")] sent: &AtomicBool,
@@ -2227,8 +2227,8 @@ fn pv_string(pv: &[Move]) -> String {
 
 /// The SKIP_SEARCH hold condition, shared by the book-hit and the searched
 /// reply: a `go ponder` holds until its flag clears, a `go infinite` until
-/// `stop`. `go infinite` arrives at `verbose2`, so below that level the ponder
-/// flag is the whole condition.
+/// `stop`. `go infinite` arrives with `verbose2`, so without that feature the
+/// ponder flag is the whole condition.
 fn reply_is_held(
     ponder: Option<&Arc<PonderSignal>>,
     #[cfg(feature = "verbose2")] infinite: bool,
@@ -3258,10 +3258,10 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     }
 
     // The main worker is the only one given a PV sink, and only a `verbose2`
-    // build has one to give. `MultiPV` rides on the same level for a different
+    // build has one to give. `MultiPV` rides on the same feature for a different
     // reason: it shapes the search, but the extra lines it searches are
-    // reportable only through the `info` lines that level brings. Below it the
-    // root is single-line and the emission sites are not compiled at all, so
+    // reportable only through the `info` lines that feature brings. Without it
+    // the root is single-line and the emission sites are not compiled at all, so
     // the search of the first line is identical in all three build shapes.
     let net = search.network();
     let mut qs = QSearch::with_histories(net, &tt, histories);
@@ -3314,7 +3314,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
 
     // Aggregated node count for the `info` line and for `bench` — every worker's
     // exact final count (the reference `threads.nodes_searched()`). Both readers
-    // are levels, so a build with neither does not sum.
+    // are gated, so a build with neither does not sum.
     #[cfg(feature = "verbose2")]
     let total_nodes: u64 = results.iter().map(|r| r.nodes).sum();
 

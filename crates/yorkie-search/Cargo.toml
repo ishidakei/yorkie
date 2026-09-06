@@ -21,9 +21,9 @@ serde_json = "~1.0"
 # gates cannot hold and are compiled out under it. Off by default.
 #
 # `verbose1`, `verbose2` and `verbose3` are the Protocol layer's verbosity
-# levels, propagated down (and on to the Storage layer) so everything this crate
-# computes only to be printed at one of them is absent from the compiled crate
-# below that level rather than merely unused:
+# features, propagated down (and on to the Storage layer) so everything this
+# crate computes only to be printed under one of them is absent from the compiled
+# crate without that feature rather than merely unused:
 #
 #   - `verbose1` — the book probe's diagnostic message bodies, which the Protocol
 #     layer turns into `info string` lines.
@@ -35,10 +35,10 @@ serde_json = "~1.0"
 #     bit the search carries on its return path, and the propagation that
 #     maintains it.
 #
-# Each level implies the one below it, as on the Protocol layer. All are off by
+# Each implies the one before it, as on the Protocol layer. All are off by
 # default.
 #
-# `random` is orthogonal to that axis and composes with any level: it makes the
+# `random` is orthogonal to that axis and composes with any of them: it makes the
 # static evaluation carry a per-position noise term drawn from a per-game seed,
 # so the engine's play varies between games while staying self-consistent within
 # one. The whole of it — the amplitude, the seed, the noise function and the

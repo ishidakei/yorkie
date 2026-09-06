@@ -1,7 +1,7 @@
-//! What the verbosity levels gate on the output side, from the outside: a real
+//! What the verbosity features gate on the output side, from the outside: a real
 //! search in the default (tournament) build says `bestmove` and nothing else,
-//! while the `isready` / initialisation-phase `info string`s survive at every
-//! level.
+//! while the `isready` / initialisation-phase `info string`s survive in every
+//! build.
 //!
 //! The three build shapes this file distinguishes:
 //!
@@ -35,7 +35,7 @@ fn info_lines(out: &str) -> Vec<&str> {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn search_output_is_bestmove_only_below_verbose2() {
-    // --- Part 1: the initialisation phase, which no level gates. ---
+    // --- Part 1: the initialisation phase, which no feature gates. ---
     //
     // No network at the package-root working directory, so `isready` fails the
     // load. That notice (and the withheld `readyok`) is how a bad deployment is

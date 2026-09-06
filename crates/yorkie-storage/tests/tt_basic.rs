@@ -464,7 +464,7 @@ fn resize_to_same_size_is_a_no_op() {
     let k = key(5, 0x9);
     store(&mut tt, k, 0, 5, false, Bound::Exact, 9, 0x9, 5);
     // The byte-level half of the claim rides on `checksum`, which only a
-    // `verbose3` build compiles; the probe below holds at every level.
+    // `verbose3` build compiles; the probe below holds in every build.
     #[cfg(feature = "verbose3")]
     let before = tt.checksum();
 
