@@ -13,6 +13,31 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
+  # This repository compiles for the exact CPU of the machine doing the
+  # building: `.cargo/config.toml` sets `-C target-cpu=native`, which is sound
+  # because a binary it produces never leaves that machine. CI is the one place
+  # where that stops holding. The hosted runner fleet is not a single CPU model,
+  # and `Swatinem/rust-cache` restores a `target/` directory built during an
+  # earlier run, so a natively built artifact can be handed to a runner that
+  # lacks instructions it was compiled with — the first such instruction
+  # executed aborts the process with SIGILL. `target-cpu=native` lets the
+  # compiler auto-vectorise anywhere with whatever the building host had, so any
+  # crate can carry one, not only the hand-written SIMD kernels.
+  #
+  # Pinning a baseline every current x86-64 runner provides (`x86-64-v3` is AVX2
+  # + BMI2 + FMA) makes a cached artifact valid on any of them. An environment
+  # `RUSTFLAGS` overrides `build.rustflags` from `.cargo/config.toml`, and
+  # `rust-cache` mixes `RUSTFLAGS` into its cache key, so natively built caches
+  # from before this pin are not reused. Builds outside CI are unaffected and
+  # still compile native.
+  #
+  # `x86-64-v3` excludes AVX-512, so the compile-time arm of the NNUE forward
+  # pass that `cfg(target_feature = "avx512...")` selects is not compiled here
+  # and CI exercises the portable scalar path. The AVX-512 kernels' own
+  # equivalence tests still run wherever the runner has the instructions: they
+  # reach the kernels through `#[target_feature(enable = ...)]` and probe the
+  # CPU at run time, so what the build enabled does not gate them.
+  RUSTFLAGS: -C target-cpu=x86-64-v3
 
 jobs:
   fmt:

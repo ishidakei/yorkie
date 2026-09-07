@@ -109,14 +109,22 @@ fn position_for(fixture: &EvalFixture) -> Position {
 
 /// Assert that a CPU advertising AVX-512 VNNI got a build with the SIMD
 /// backend, which since selection is compile-time means it was built for its
-/// host. On a CPU without VNNI this only logs the scalar path.
+/// host. On a CPU without VNNI this only logs the scalar path, and so does a
+/// build that pins a portable target CPU rather than compiling for the host:
+/// there the scalar arm is what was asked for, whatever the CPU advertises.
 fn assert_simd_path_selected() {
     #[cfg(target_arch = "x86_64")]
     {
         let has_vnni = std::arch::is_x86_feature_detected!("avx512f")
             && std::arch::is_x86_feature_detected!("avx512bw")
             && std::arch::is_x86_feature_detected!("avx512vnni");
-        if has_vnni {
+        if !cfg!(build_targets_host_cpu) {
+            eprintln!(
+                "eval parity running on the {:?} backend: this build pins a target CPU \
+                 rather than compiling for the host",
+                active_backend()
+            );
+        } else if has_vnni {
             assert_eq!(
                 active_backend(),
                 Backend::Avx512Vnni,

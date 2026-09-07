@@ -205,13 +205,21 @@ mod tests {
         // Backend selection is compile-time, so this checks the *build* was
         // configured for its host: under `-C target-cpu=native` a VNNI-capable
         // CPU must yield a VNNI build. A scalar backend here means the build
-        // silently fell back.
+        // silently fell back. A build that pins a portable target CPU instead
+        // compiles the scalar arm on a VNNI host on purpose, so there the host's
+        // features say nothing about which backend is the right one.
         #[cfg(target_arch = "x86_64")]
         {
             let has_vnni = std::arch::is_x86_feature_detected!("avx512f")
                 && std::arch::is_x86_feature_detected!("avx512bw")
                 && std::arch::is_x86_feature_detected!("avx512vnni");
-            if has_vnni {
+            if !cfg!(build_targets_host_cpu) {
+                eprintln!(
+                    "backend selection unchecked ({:?}): this build pins a target CPU \
+                     rather than compiling for the host",
+                    active_backend()
+                );
+            } else if has_vnni {
                 assert_eq!(
                     active_backend(),
                     Backend::Avx512Vnni,

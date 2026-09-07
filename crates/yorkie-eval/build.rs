@@ -28,6 +28,12 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../yorkie-protocol/build_config.rs");
     println!("cargo:rerun-if-env-changed={CONFIG_ENV}");
+    println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
+
+    println!("cargo::rustc-check-cfg=cfg(build_targets_host_cpu)");
+    if targets_host_cpu() {
+        println!("cargo::rustc-cfg=build_targets_host_cpu");
+    }
 
     let repo_root = repo_root();
     let path = config_path(&repo_root, std::env::var_os(CONFIG_ENV));
@@ -66,6 +72,30 @@ fn main() {
             out.display()
         ));
     }
+}
+
+/// Whether this build compiles for the CPU of the machine doing the building,
+/// which is what `-C target-cpu=native` asks for and what the default build of
+/// this crate gets.
+///
+/// The kernel backend is selected from the target features the build enables,
+/// so only such a build can be held against the building host's own CPU
+/// features; one that pins a portable target CPU compiles the scalar arm even
+/// where the host could have run the SIMD one, and means to. rustc takes the
+/// last `target-cpu` it is given, so this does too.
+fn targets_host_cpu() -> bool {
+    let Ok(flags) = std::env::var("CARGO_ENCODED_RUSTFLAGS") else {
+        return false;
+    };
+    flags
+        .split('\u{1f}')
+        .filter_map(|flag| {
+            flag.strip_prefix("-C")
+                .unwrap_or(flag)
+                .strip_prefix("target-cpu=")
+        })
+        .next_back()
+        .is_some_and(|cpu| cpu == "native")
 }
 
 /// The repository root: two levels above this crate (`crates/yorkie-eval`).
