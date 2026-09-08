@@ -38,6 +38,22 @@ const PV_ON_FAIL: &str = if config::OUTPUT_FAIL_LH_PV {
 /// A `&'static str` constant used where only a constant is accepted.
 const EVAL_SUBPATH: &str = config::EVAL_DIR;
 
+/// One slot per logical NUMA node — an array length again, so the machine's
+/// layout is as much a compile-time value as the settings the file carries.
+const NODE_SLOTS: [u8; config::NUMA_NODES] = [0; config::NUMA_NODES];
+
+/// The CPUs the whole layout covers, counted by the compiler.
+const fn layout_cpus() -> usize {
+    let mut total = 0;
+    let mut n = 0;
+    while n < config::NUMA_NODE_CPUS.len() {
+        total += config::NUMA_NODE_CPUS[n].len();
+        n += 1;
+    }
+    total
+}
+const LAYOUT_CPUS: usize = layout_cpus();
+
 // Const-context assertions: evaluated by the compiler, so a run-time value
 // could not be substituted for any of these operands.
 const _: () = assert!(HASH_BYTES >= 1024 * 1024);
@@ -45,6 +61,8 @@ const _: () = assert!(POOL_SIZE >= 1);
 #[cfg(feature = "verbose2")]
 const _: () = assert!(MULTI_PV_SLOTS.len() == config::MULTI_PV as usize);
 const _: () = assert!(!EVAL_SUBPATH.is_empty());
+const _: () = assert!(NODE_SLOTS.len() == config::NUMA_NODES);
+const _: () = assert!(LAYOUT_CPUS >= config::NUMA_NODES);
 // The node ceiling is a `verbose2` setting — a build without that feature has no
 // ceiling and no constant — so the assertion follows the feature.
 #[cfg(feature = "verbose2")]
@@ -69,6 +87,14 @@ fn generated_values_are_usable_as_compile_time_constants() {
         }
     );
     assert_eq!(EVAL_SUBPATH, config::EVAL_DIR);
+    assert_eq!(NODE_SLOTS.len(), config::NUMA_SYSTEM_NODES.len());
+    assert_eq!(
+        LAYOUT_CPUS,
+        config::NUMA_NODE_CPUS
+            .iter()
+            .map(|n| n.len())
+            .sum::<usize>()
+    );
 
     // A local `const` context, so the proof is not only at module level.
     const RESIGN_IS_REACHABLE: bool = config::RESIGN_VALUE < 99_999;

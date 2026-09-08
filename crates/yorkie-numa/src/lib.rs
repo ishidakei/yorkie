@@ -25,6 +25,7 @@ pub mod mempolicy;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -98,6 +99,54 @@ pub struct SysfsOptions {
     /// The number of hardware threads to assume when a fallback to a single
     /// all-CPU node is required.
     pub system_threads: CpuIndex,
+}
+
+/// A resolved logical NUMA layout, in the form a binary carries it: the ordered
+/// CPU list of every logical node, the *system* node each of them belongs to,
+/// and the custom-affinity flag.
+///
+/// This is everything a [`NumaConfig`] needs to be rebuilt without reading
+/// sysfs, plus the system-node map the kernel's memory policy is indexed by.
+/// Resolving the layout once and carrying it as data is what lets a program
+/// decide its NUMA plan before it runs: the machine is described in the layout,
+/// so nothing downstream of it consults `/sys` again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NumaLayout {
+    /// The ordered system CPU indices of each logical node, in node order.
+    pub nodes: Vec<Vec<CpuIndex>>,
+    /// The system NUMA node each logical node belongs to, aligned with
+    /// [`Self::nodes`] — the replication granularity, which L3-aware
+    /// subdivision makes coarser than the logical node.
+    pub system_nodes: Vec<NumaIndex>,
+    /// Whether the configuration this layout came from was flagged custom (see
+    /// [`NumaConfig::is_custom_affinity`]).
+    pub custom_affinity: bool,
+}
+
+impl NumaLayout {
+    /// The layout `config` describes on the machine `opts` points at.
+    pub fn of(config: &NumaConfig, opts: &SysfsOptions) -> Self {
+        NumaLayout {
+            nodes: config
+                .nodes()
+                .iter()
+                .map(|cpus| cpus.iter().copied().collect())
+                .collect(),
+            system_nodes: config.system_nodes(opts),
+            custom_affinity: config.is_custom_affinity(),
+        }
+    }
+
+    /// The per-node CPU lists in the borrowed form [`NumaConfig::from_const`]
+    /// takes.
+    pub fn node_slices(&self) -> Vec<&[CpuIndex]> {
+        self.nodes.iter().map(Vec::as_slice).collect()
+    }
+
+    /// The runtime configuration this layout describes.
+    pub fn config(&self) -> NumaConfig {
+        NumaConfig::from_const(&self.node_slices(), self.custom_affinity)
+    }
 }
 
 /// A system L3 cache domain: the CPUs sharing one L3, tagged with the *system*
@@ -179,6 +228,60 @@ impl NumaConfig {
         }
 
         cfg.custom_affinity = true;
+        Ok(cfg)
+    }
+
+    /// Rebuilds a configuration from a layout resolved earlier: logical node
+    /// `n` holds `nodes[n]`, in the given order, and `custom_affinity` is
+    /// carried over verbatim.
+    ///
+    /// Reads nothing, so this is the constructor a program uses when its layout
+    /// was decided before the process started.
+    ///
+    /// # Panics
+    /// Panics on a layout no detection run could have produced: an empty node,
+    /// or a CPU claimed by two nodes. Both would silently renumber or lose a
+    /// node, which is the one outcome a compiled-in layout must not have.
+    pub fn from_const(nodes: &[&[CpuIndex]], custom_affinity: bool) -> Self {
+        let mut cfg = Self::empty();
+        for (n, cpus) in nodes.iter().enumerate() {
+            assert!(!cpus.is_empty(), "NUMA node {n} of the layout is empty");
+            for &c in *cpus {
+                assert!(
+                    cfg.add_cpu_to_node(n, c),
+                    "CPU {c} belongs to more than one NUMA node of the layout"
+                );
+            }
+        }
+        cfg.custom_affinity = custom_affinity;
+        cfg
+    }
+
+    /// Maps a `numa_policy` setting to a configuration of the machine `opts`
+    /// describes.
+    ///
+    /// * `auto` / `system` — detect, respecting the allowed CPU set;
+    /// * `hardware` — detect, ignoring it;
+    /// * `none` — one node holding every hardware thread;
+    /// * anything else — a custom node string ([`NumaConfig::from_string`]).
+    ///
+    /// A custom string that fails to parse, and any policy that yields zero
+    /// nodes, is a fail-loud `Err`: a policy that describes no machine must not
+    /// silently become one node.
+    pub fn from_policy(policy: &str, opts: &SysfsOptions) -> Result<Self, String> {
+        let cfg = match policy {
+            "auto" | "system" => Self::from_sysfs(&DEFAULT_POLICY, true, opts),
+            "hardware" => Self::from_sysfs(&DEFAULT_POLICY, false, opts),
+            "none" => {
+                let mut cfg = Self::empty();
+                cfg.add_cpu_range_to_node(0, 0, opts.system_threads.max(1) - 1);
+                cfg
+            }
+            other => Self::from_string(other).map_err(|e| e.to_string())?,
+        };
+        if cfg.num_numa_nodes() == 0 {
+            return Err(format!("`{policy}` yields zero NUMA nodes"));
+        }
         Ok(cfg)
     }
 
@@ -272,43 +375,29 @@ impl NumaConfig {
         self.node_by_cpu.get(&c).copied()
     }
 
-    /// The *system* NUMA node a logical node belongs to (`get_discriminator`).
+    /// The *system* NUMA node of every logical node, in node order
+    /// (`get_discriminator`).
     ///
     /// This is the replication granularity: the hardware NUMA domain, not the
     /// possibly L3-bundled logical node. Two logical nodes that share one system
-    /// node return the same value, which is the signal the port uses to share a
-    /// single network copy between them. An unassigned CPU falls back to system
-    /// node 0.
+    /// node give the same value, which is the signal the port uses to share a
+    /// single network copy between them. A node whose CPUs the system topology
+    /// does not know falls back to system node 0.
     ///
     /// The reference's discriminator carries a textual system-topology prefix
     /// keying its shared-memory segment; this port has no shared-memory layer
     /// and lives in one process, so the system-node index alone suffices.
     ///
-    /// # Panics
-    /// Panics if `idx` is out of range.
-    pub fn system_node_of_logical(&self, idx: NumaIndex, opts: &SysfsOptions) -> NumaIndex {
+    /// Reads sysfs once for the whole map, rather than once per node.
+    pub fn system_nodes(&self, opts: &SysfsOptions) -> Vec<NumaIndex> {
         let cfg_sys = NumaConfig::from_sysfs(&NumaAutoPolicy::SystemNuma, false, opts);
-        self.system_node_of_logical_in(idx, &cfg_sys)
-    }
-
-    /// The system node of every worker's logical node, in `bound` order.
-    ///
-    /// A batch [`Self::system_node_of_logical`] that builds the system config
-    /// once, since it reads sysfs, for resolving a whole binding assignment at
-    /// pool-rebuild time.
-    pub fn system_nodes_for_binding(
-        &self,
-        bound: &[NumaIndex],
-        opts: &SysfsOptions,
-    ) -> Vec<NumaIndex> {
-        let cfg_sys = NumaConfig::from_sysfs(&NumaAutoPolicy::SystemNuma, false, opts);
-        bound
-            .iter()
-            .map(|&logical| self.system_node_of_logical_in(logical, &cfg_sys))
+        (0..self.nodes.len())
+            .map(|idx| self.system_node_of_logical_in(idx, &cfg_sys))
             .collect()
     }
 
-    /// The shared body of the two mappers above, given a prebuilt system config.
+    /// One node's entry of [`Self::system_nodes`], given a prebuilt system
+    /// config.
     fn system_node_of_logical_in(&self, idx: NumaIndex, cfg_sys: &NumaConfig) -> NumaIndex {
         let cpu = *self.nodes[idx]
             .iter()
@@ -535,34 +624,73 @@ impl fmt::Display for NumaConfig {
             if !is_first_node {
                 write!(f, ":")?;
             }
-
-            let v: Vec<CpuIndex> = cpus.iter().copied().collect();
-            let mut is_first_set = true;
-            let mut range_start = 0usize; // index into `v`
-            let mut i = 0usize;
-            while i < v.len() {
-                let at_range_end = i + 1 == v.len() || v[i + 1] != v[i] + 1;
-                if at_range_end {
-                    if !is_first_set {
-                        write!(f, ",")?;
-                    }
-                    let last = v[i];
-                    if i != range_start {
-                        write!(f, "{}-{}", v[range_start], last)?;
-                    } else {
-                        write!(f, "{last}")?;
-                    }
-                    range_start = i + 1;
-                    is_first_set = false;
-                }
-                i += 1;
-            }
-
+            write!(f, "{}", format_cpu_list(cpus.iter().copied()))?;
             is_first_node = false;
         }
 
         Ok(())
     }
+}
+
+/// Renders an ascending CPU sequence in the shortened form the sysfs files and
+/// the custom node syntax both use: `','` between entries, `"a-b"` for a run of
+/// consecutive indices.
+///
+/// The inverse of [`indices_from_shortened_string`], so a rendered list parses
+/// back to the sequence it came from.
+pub fn format_cpu_list(cpus: impl IntoIterator<Item = CpuIndex>) -> String {
+    let v: Vec<CpuIndex> = cpus.into_iter().collect();
+    let mut out = String::new();
+    let mut range_start = 0usize; // index into `v`
+    for i in 0..v.len() {
+        let at_range_end = i + 1 == v.len() || v[i + 1] != v[i] + 1;
+        if !at_range_end {
+            continue;
+        }
+        if range_start != 0 {
+            out.push(',');
+        }
+        if i != range_start {
+            let _ = write!(out, "{}-{}", v[range_start], v[i]);
+        } else {
+            let _ = write!(out, "{}", v[i]);
+        }
+        range_start = i + 1;
+    }
+    out
+}
+
+/// The [`SysfsOptions`] describing the whole machine under `root`: every online
+/// CPU, whatever the calling process happens to be allowed to run on.
+///
+/// A layout resolved from these describes the machine rather than one process's
+/// share of it, which is what a layout that outlives the process has to be.
+///
+/// Fail-loud: a tree without the two `online` files is not a machine whose
+/// layout can be read, and answering "one node" for it would be a wrong answer
+/// where a missing one is called for.
+pub fn machine_sysfs_options(root: &Path) -> Result<SysfsOptions, String> {
+    let missing = |rel: &str| format!("cannot read `{}`", root.join(rel).display());
+    let cpu_online = "devices/system/cpu/online";
+    let node_online = "devices/system/node/online";
+    let online = read_sysfs(root, cpu_online).ok_or_else(|| missing(cpu_online))?;
+    if read_sysfs(root, node_online).is_none() {
+        return Err(missing(node_online));
+    }
+    let allowed: BTreeSet<CpuIndex> = indices_from_shortened_string(&remove_whitespace(&online))
+        .into_iter()
+        .collect();
+    if allowed.is_empty() {
+        return Err(format!(
+            "`{}` lists no online CPU",
+            root.join(cpu_online).display()
+        ));
+    }
+    Ok(SysfsOptions {
+        root: root.to_path_buf(),
+        system_threads: allowed.len(),
+        allowed_cpus: allowed,
+    })
 }
 
 /// Reads a sysfs file under `root`, returning its contents.
@@ -1082,6 +1210,87 @@ mod tests {
         assert_eq!(cfg.num_numa_nodes(), 2);
         assert_eq!(cfg.nodes()[0], set(&[0, 1, 2, 3]));
         assert_eq!(cfg.nodes()[1], set(&[4, 5]));
+    }
+
+    // -- from_const -------------------------------------------------------
+
+    #[test]
+    fn from_const_rebuilds_the_nodes_and_the_flag() {
+        let cfg = NumaConfig::from_const(&[&[0, 1, 2, 3], &[8, 9]], false);
+        assert_eq!(cfg.num_numa_nodes(), 2);
+        assert_eq!(cfg.nodes()[0], set(&[0, 1, 2, 3]));
+        assert_eq!(cfg.nodes()[1], set(&[8, 9]));
+        assert_eq!(cfg.node_of_cpu(9), Some(1));
+        assert_eq!(cfg.num_cpus(), 6);
+        assert!(!cfg.is_custom_affinity());
+        assert_eq!(cfg.to_string(), "0-3:8-9");
+
+        assert!(NumaConfig::from_const(&[&[0]], true).is_custom_affinity());
+    }
+
+    #[test]
+    #[should_panic(expected = "is empty")]
+    fn from_const_rejects_an_empty_node() {
+        // An empty node would renumber every node after it, so it is refused
+        // rather than dropped.
+        NumaConfig::from_const(&[&[0, 1], &[], &[2]], false);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one NUMA node")]
+    fn from_const_rejects_a_repeated_cpu() {
+        NumaConfig::from_const(&[&[0, 1], &[1, 2]], false);
+    }
+
+    // -- from_policy ------------------------------------------------------
+
+    /// Options for the policies that describe a machine without reading one:
+    /// the root is never opened, so these tests run where a fixture tree
+    /// cannot be.
+    fn in_memory_opts(system_threads: CpuIndex) -> SysfsOptions {
+        SysfsOptions {
+            root: PathBuf::from("/nonexistent-sysfs-root"),
+            allowed_cpus: (0..system_threads).collect(),
+            system_threads,
+        }
+    }
+
+    #[test]
+    fn policy_none_is_one_node_of_every_hardware_thread() {
+        let cfg = NumaConfig::from_policy("none", &in_memory_opts(4)).expect("`none` resolves");
+        assert_eq!(cfg.num_numa_nodes(), 1);
+        assert_eq!(cfg.nodes()[0], set(&[0, 1, 2, 3]));
+        assert!(!cfg.is_custom_affinity());
+    }
+
+    #[test]
+    fn policy_custom_string_is_parsed_and_flagged() {
+        let cfg =
+            NumaConfig::from_policy("0-1:2-3", &in_memory_opts(4)).expect("a valid node string");
+        assert_eq!(cfg.num_numa_nodes(), 2);
+        assert!(cfg.is_custom_affinity());
+    }
+
+    #[test]
+    fn policy_that_describes_no_machine_is_an_error() {
+        // A duplicate CPU (unparsable) and a string yielding no node at all.
+        assert!(NumaConfig::from_policy("0,0", &in_memory_opts(4)).is_err());
+        assert!(NumaConfig::from_policy("", &in_memory_opts(4)).is_err());
+    }
+
+    // -- CPU-list rendering -----------------------------------------------
+
+    #[test]
+    fn cpu_list_rendering_compresses_runs() {
+        assert_eq!(format_cpu_list([0, 1, 2, 3, 8]), "0-3,8");
+        assert_eq!(format_cpu_list([5]), "5");
+        assert_eq!(format_cpu_list([]), "");
+        assert_eq!(format_cpu_list([1, 3, 5]), "1,3,5");
+        // The inverse of the parser it renders for.
+        assert_eq!(
+            indices_from_shortened_string(&format_cpu_list([0, 1, 2, 7, 8])),
+            vec![0, 1, 2, 7, 8]
+        );
     }
 
     // -- default construction ---------------------------------------------

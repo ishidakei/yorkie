@@ -50,6 +50,23 @@ impl Settings {
     pub(crate) fn book_options_v2(&self) -> bool {
         crate::config::BOOK_OPTIONS_V2
     }
+
+    /// The CPUs of every logical NUMA node, in node order: the layout this
+    /// binary was built for, under [`Self::numa_policy`].
+    pub(crate) fn numa_node_cpus(&self) -> &'static [&'static [usize]] {
+        crate::config::NUMA_NODE_CPUS
+    }
+
+    /// The system NUMA node of every logical node, aligned with
+    /// [`Self::numa_node_cpus`].
+    pub(crate) fn numa_system_nodes(&self) -> &'static [usize] {
+        crate::config::NUMA_SYSTEM_NODES
+    }
+
+    /// Whether the compiled layout is flagged custom-affinity.
+    pub(crate) fn numa_custom_affinity(&self) -> bool {
+        crate::config::NUMA_CUSTOM_AFFINITY
+    }
 }
 
 /// Define the `spin`-valued accessors: each is its generated constant.

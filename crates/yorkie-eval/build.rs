@@ -10,9 +10,12 @@
 //! because a build script cannot depend on a member of the workspace it is
 //! building.
 //!
-//! The generated module carries every schema key, not just `fv_scale`: the
-//! generator renders the schema as a whole, and allowing the unused ones is
-//! cheaper than a second, divergent code path here.
+//! The generated module carries every schema key it can render on its own, not
+//! just `fv_scale`: the generator renders the schema as a whole, and allowing
+//! the unused ones is cheaper than a second, divergent code path here. The one
+//! it leaves out is the NUMA layout, which is not a value in the file but the
+//! machine's own, and which only the crate that plans thread binding compiles
+//! in.
 
 include!("../yorkie-protocol/build_config.rs");
 
@@ -59,6 +62,9 @@ fn main() {
         // `fv_scale`, which no feature gates; the crate that declares them is
         // where a config a build cannot honour is refused or reported.
         &Gating::Absent,
+        // Nothing here plans thread binding, so this crate compiles in no NUMA
+        // layout and reads none.
+        &Layout::Absent,
     ) {
         Ok(g) => g,
         Err(e) => fail(&e),

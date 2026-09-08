@@ -12,6 +12,11 @@ yorkie-search = { path = "../yorkie-search" }
 yorkie-state = { path = "../yorkie-state" }
 yorkie-storage = { path = "../yorkie-storage" }
 
+# The build script resolves the building machine's NUMA layout with the same
+# code the engine would have detected it with, and compiles it in.
+[build-dependencies]
+yorkie-numa = { path = "../yorkie-numa" }
+
 [dev-dependencies]
 serde = { version = "~1.0", features = ["derive"] }
 serde_json = "~1.0"

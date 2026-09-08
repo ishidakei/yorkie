@@ -30,6 +30,7 @@ multi_pv = 1
 eval_dir = "eval"
 fv_scale = 16
 numa_policy = "auto"
+numa_nodes = "auto"
 usi_ponder = false
 stochastic_ponder = false
 

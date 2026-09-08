@@ -1,7 +1,7 @@
 // Only the score / PV renderers use it, and both are optional surfaces.
 #[cfg(feature = "verbose2")]
 use core::fmt::NumBuffer;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use yorkie_numa::{DEFAULT_POLICY, NumaConfig, NumaIndex, SysfsOptions, mempolicy};
+use yorkie_numa::{NumaConfig, NumaIndex, NumaLayout, mempolicy};
 use yorkie_search::{
     BookConfig, BookHit, EnteringKingConfig, EnteringKingRule, PonderSignal, Prng, QSearch,
     RootMove, Search, SearchControl, SharedHistories, TimeControl, TimeInput, TimeManagement,
@@ -99,6 +99,11 @@ pub const ENGINE_AUTHOR: &str = "Kei Ishida <ishida.kei@gmail.com>";
 /// the clamp for an out-of-range `go depth N`. It sits one below `MAX_PLY` so
 /// the loop guard never has to truncate it.
 const SEARCH_MAX_DEPTH: i32 = 245;
+
+/// Where the running machine's NUMA layout is read from, for the one check that
+/// reads it: `isready`'s, which holds the machine against the layout this binary
+/// was built for.
+const SYSFS_ROOT: &str = "/sys";
 
 // --- isready keep-alive (reference `Engine::run_heavy_job`).
 /// How often the keep-alive helper thread polls the stop flag while the heavy
@@ -203,11 +208,13 @@ struct LoadedEval {
 
 /// The result of the heavy `isready` initialisation, produced inside the
 /// [`KeepAlive`] scope and consumed by [`UsiDriver::handle_isready`] once the
-/// keep-alive helper has stopped: either the network is ready (`readyok`) or the
-/// load failed (`info string eval load failed: …`, no `readyok`).
+/// keep-alive helper has stopped: the network is ready (`readyok`), the load
+/// failed, or the machine is not the one this binary plans its threads for.
+/// Each failure is one `info string` and no `readyok`.
 enum IsreadyOutcome {
     Ready,
     LoadFailed(String),
+    LayoutMismatch(String),
 }
 
 /// The opened opening books plus the `IgnoreBookPly` value captured at load
@@ -361,9 +368,9 @@ pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
     /// — the one command that carries a worker count as an argument. Nothing
     /// on the match path ever writes it.
     pool_threads: usize,
-    /// The active NUMA layout, detected once at construction from
-    /// the engine default policy (`NumaConfig::from_system(BundledL3{32}, true)`).
-    /// Never replaced: the mapping policy is the `numa_policy` config constant.
+    /// The active NUMA layout, rebuilt at construction from the layout constants
+    /// this binary was built with — no `/sys` read, and no topology decision, on
+    /// any path a game touches. Never replaced: the layout is a constant.
     numa_config: NumaConfig,
     /// The current worker → NUMA-node binding assignment, empty when binding is
     /// inactive. Recomputed at every pool (re)build and stable until the next
@@ -371,8 +378,7 @@ pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
     numa_bound: Vec<NumaIndex>,
     /// The shareable form of the binding assignment, including the worker →
     /// *system*-node map the memory policy is indexed by. `None` when binding is
-    /// inactive. Rebuilt with the pool, so the sysfs read behind the system-node
-    /// map happens once per pool rebuild rather than once per `go`.
+    /// inactive. Rebuilt with the pool.
     numa_plan: Option<Arc<NumaBindPlan>>,
     /// Per-worker handles to the node-shared correction / pawn tables, rebuilt
     /// at every pool (re)build from [`Self::numa_bound`]. Length equals the pool
@@ -387,6 +393,10 @@ pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
     /// overridable via [`Self::with_keep_alive_poll`] so a test can drive the
     /// mechanism with a short interval.
     keep_alive_poll: Duration,
+    /// The sysfs root the `isready` layout check reads the running machine from
+    /// — `/sys`, overridable via [`Self::with_sysfs_root`] so a test can hold
+    /// the binary against a machine other than the one it is running on.
+    sysfs_root: PathBuf,
 }
 
 impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
@@ -403,19 +413,15 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     pub fn with_book_seed(reader: R, writer: Arc<Mutex<W>>, book_seed: u64) -> Self {
         let settings = Settings::new();
         let threads = settings.threads();
-        // Detect the active NUMA layout once, from the engine default policy.
-        //
-        // A configured policy that does not resolve — an unparsable custom node
-        // string, or one yielding zero nodes — is a build the engine cannot
-        // run, so fail loudly at construction rather than silently searching on
-        // the wrong layout.
-        let policy = settings.numa_policy();
-        let numa_config = match numa_config_from_policy(policy, &real_sysfs_options()) {
-            Ok(cfg) => cfg,
-            Err(msg) => panic!("configured numa_policy `{policy}` is unusable: {msg}"),
-        };
-        let numa_bound = compute_numa_binding(&numa_config, policy, threads);
-        let numa_plan = bind_plan(&numa_config, &numa_bound);
+        // Rebuild the active NUMA layout from the constants this binary was
+        // built with: the machine was mapped to logical nodes under
+        // `numa_policy` when the binary was, so nothing here reads `/sys` and
+        // nothing decides a topology. Whether the machine still matches is the
+        // `isready` check's question, asked once, before a game.
+        let numa_config =
+            NumaConfig::from_const(settings.numa_node_cpus(), settings.numa_custom_affinity());
+        let numa_bound = compute_numa_binding(&numa_config, settings.numa_policy(), threads);
+        let numa_plan = bind_plan(&numa_config, &numa_bound, settings.numa_system_nodes());
         let pool = ThreadPool::with_binding(threads, numa_plan.clone());
         // Build the per-node shared correction / pawn tables and give the
         // coordinator (worker 0) its node's set.
@@ -456,6 +462,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             // No network loaded yet; populated by the first `isready`.
             worker_networks: Vec::new(),
             keep_alive_poll: KEEP_ALIVE_POLL_INTERVAL,
+            sysfs_root: PathBuf::from(SYSFS_ROOT),
         }
     }
 
@@ -465,6 +472,14 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// the whole cadence.
     pub fn with_keep_alive_poll(mut self, poll: Duration) -> Self {
         self.keep_alive_poll = poll;
+        self
+    }
+
+    /// Override the sysfs root the `isready` layout check reads, so a test can
+    /// present a machine other than the one it runs on and see the check refuse
+    /// it.
+    pub fn with_sysfs_root(mut self, root: PathBuf) -> Self {
+        self.sysfs_root = root;
         self
     }
 
@@ -620,7 +635,11 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         if let Some(h) = self.histories.as_mut() {
             h.set_shared(Arc::clone(&self.worker_shared[0]));
         }
-        self.numa_plan = bind_plan(&self.numa_config, &self.numa_bound);
+        self.numa_plan = bind_plan(
+            &self.numa_config,
+            &self.numa_bound,
+            self.settings.numa_system_nodes(),
+        );
         // The coordinator's per-worker tables outlive a pool rebuild and were
         // faulted on the USI thread, so re-assert their placement for the fresh
         // assignment. Helpers need nothing here: they are respawned and each
@@ -655,15 +674,13 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 
         // Resolve the per-worker system node and a representative logical node per
         // distinct system node while `self.eval` is not yet borrowed (these read
-        // `numa_config` / `numa_bound`). `sys_nodes[i]` is worker `i`'s system
-        // node — the reference's `get_discriminator` per worker; the
-        // representative logical node is the lowest-indexed worker's logical node
-        // on that system node (stable, and any logical node on the system node
-        // first-touches the copy's pages there).
+        // `numa_bound`). `sys_nodes[i]` is worker `i`'s system node — the
+        // reference's `get_discriminator` per worker; the representative logical
+        // node is the lowest-indexed worker's logical node on that system node
+        // (stable, and any logical node on the system node first-touches the
+        // copy's pages there).
         let (sys_nodes, rep_logical) = if replication_active {
-            let sys = self
-                .numa_config
-                .system_nodes_for_binding(&self.numa_bound, &real_sysfs_options());
+            let sys = worker_system_nodes(&self.numa_bound, self.settings.numa_system_nodes());
             let mut rep: BTreeMap<NumaIndex, NumaIndex> = BTreeMap::new();
             for (&s, &logical) in sys.iter().zip(self.numa_bound.iter()) {
                 rep.entry(s).or_insert(logical);
@@ -888,6 +905,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 // untouched so a bad reload does not drop a working net.
                 self.info_string(&format!("eval load failed: {reason}"))
             }
+            IsreadyOutcome::LayoutMismatch(reason) => {
+                self.info_string(&format!("NUMA layout mismatch: {reason}"))
+            }
         }
     }
 
@@ -896,6 +916,13 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// `readyok` / the load-failure notice *after* the keep-alive helper has
     /// stopped — the terminal reply never races the keep-alive newlines.
     fn isready_heavy_job(&mut self) -> io::Result<IsreadyOutcome> {
+        // Before anything is allocated for a machine: is this the machine? The
+        // whole thread plan was folded from the layout the binary was built on,
+        // so a difference here is a wrong answer that is available now, and one
+        // no later stage would report.
+        if let Some(reason) = self.numa_layout_refusal() {
+            return Ok(IsreadyOutcome::LayoutMismatch(reason));
+        }
         // Load / reload the opening book (the reference does this in isready).
         self.reload_book()?;
         let path = self.nn_bin_path();
@@ -941,6 +968,29 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             }
             Err(e) => Ok(IsreadyOutcome::LoadFailed(e.to_string())),
         }
+    }
+
+    /// How the machine this process runs on differs from the one the binary was
+    /// built for, or `None` when they agree.
+    ///
+    /// The live layout is resolved exactly as the build resolved it: the same
+    /// mapping policy, over every online CPU, so what is compared is machine
+    /// against machine and not machine against process. A tree that cannot be
+    /// read is itself a refusal — an unverifiable layout is not a matching one.
+    fn numa_layout_refusal(&self) -> Option<String> {
+        let opts = match yorkie_numa::machine_sysfs_options(&self.sysfs_root) {
+            Ok(opts) => opts,
+            Err(e) => return Some(e),
+        };
+        let live = match NumaConfig::from_policy(self.settings.numa_policy(), &opts) {
+            Ok(cfg) => NumaLayout::of(&cfg, &opts),
+            Err(e) => return Some(e),
+        };
+        numa_layout_difference(
+            &live,
+            yorkie_numa::startup_affinity(),
+            self.settings.numa_node_cpus(),
+        )
     }
 
     /// `setoption name <N> value <V>`: the USI minimum, in every build.
@@ -2738,44 +2788,6 @@ struct NumaBindPlan {
     system_nodes: Vec<NumaIndex>,
 }
 
-/// The `SysfsOptions` for the live machine: the real `/sys` root, the startup
-/// affinity snapshot, and the real hardware-thread count.
-/// The option→config mapping ([`numa_config_from_policy`]) takes these
-/// injectably so tests can substitute a fixture tree.
-fn real_sysfs_options() -> SysfsOptions {
-    SysfsOptions {
-        root: PathBuf::from("/sys"),
-        allowed_cpus: yorkie_numa::startup_affinity().clone(),
-        system_threads: yorkie_numa::system_threads(),
-    }
-}
-
-/// Map a `NumaPolicy` option value to a [`NumaConfig`].
-///
-/// * `auto` / `system` → detect from the system respecting process affinity;
-/// * `hardware` → detect ignoring process affinity;
-/// * `none` → the default single all-threads node;
-/// * anything else → a custom node string via [`NumaConfig::from_string`].
-///
-/// A custom string that fails to parse, or that yields zero nodes, is a
-/// fail-loud `Err`. The `opts` are injectable so tests drive the detection paths
-/// with fixture trees.
-fn numa_config_from_policy(policy: &str, opts: &SysfsOptions) -> Result<NumaConfig, String> {
-    let cfg = match policy {
-        "auto" | "system" => NumaConfig::from_sysfs(&DEFAULT_POLICY, true, opts),
-        "hardware" => NumaConfig::from_sysfs(&DEFAULT_POLICY, false, opts),
-        "none" => NumaConfig::default(),
-        other => {
-            let cfg = NumaConfig::from_string(other).map_err(|e| e.to_string())?;
-            if cfg.num_numa_nodes() == 0 {
-                return Err(format!("NumaPolicy `{other}` yields zero NUMA nodes"));
-            }
-            cfg
-        }
-    };
-    Ok(cfg)
-}
-
 /// The worker → NUMA-node assignment for `requested` threads under `policy`.
 /// When binding is off the assignment is empty.
 fn compute_numa_binding(config: &NumaConfig, policy: &str, requested: usize) -> Vec<NumaIndex> {
@@ -2795,21 +2807,81 @@ fn compute_numa_binding(config: &NumaConfig, policy: &str, requested: usize) -> 
 /// Wrap a non-empty binding assignment into a shareable [`NumaBindPlan`]; an
 /// empty assignment yields `None`, and no thread binds.
 ///
-/// The worker → *system* node map is resolved here, once per pool (re)build and
-/// never on the search path, because it reads sysfs. The kernel's memory policy
-/// is indexed by system node while `bound` holds *logical* nodes that L3-aware
-/// bundling may have renumbered; building both together keeps them the same
-/// length, so one worker id indexes both.
-fn bind_plan(config: &NumaConfig, bound: &[NumaIndex]) -> Option<Arc<NumaBindPlan>> {
+/// `system_nodes` is the compiled layout's logical → *system* node map. The
+/// kernel's memory policy is indexed by system node while `bound` holds
+/// *logical* nodes that L3-aware bundling may have renumbered, so the plan
+/// carries the per-worker system nodes beside the logical ones, both the same
+/// length, and one worker id indexes both.
+fn bind_plan(
+    config: &NumaConfig,
+    bound: &[NumaIndex],
+    system_nodes: &[NumaIndex],
+) -> Option<Arc<NumaBindPlan>> {
     if bound.is_empty() {
         None
     } else {
         Some(Arc::new(NumaBindPlan {
             config: config.clone(),
             bound: bound.to_vec(),
-            system_nodes: config.system_nodes_for_binding(bound, &real_sysfs_options()),
+            system_nodes: worker_system_nodes(bound, system_nodes),
         }))
     }
+}
+
+/// How a machine whose layout is `live`, and on which this process may run on
+/// `affinity`, differs from the `built` layout — one line, or `None` when they
+/// agree.
+///
+/// Three ways to differ, in the order a reader wants them: a different number of
+/// nodes, a node holding different CPUs, and a process that cannot use the CPUs
+/// the layout names. The last is what a `taskset` or a `cpuset` around the
+/// engine produces: the machine is right, but the workers would be pinned to
+/// CPUs this process is not allowed on, which the pin refuses at the point of no
+/// return — inside a spawned worker, mid-game.
+fn numa_layout_difference(
+    live: &NumaLayout,
+    affinity: &BTreeSet<usize>,
+    built: &[&[usize]],
+) -> Option<String> {
+    if live.nodes.len() != built.len() {
+        return Some(format!(
+            "this binary is built for {} NUMA node(s), this host has {}",
+            built.len(),
+            live.nodes.len()
+        ));
+    }
+    for (n, (live_cpus, built_cpus)) in live.nodes.iter().zip(built).enumerate() {
+        if live_cpus.as_slice() != *built_cpus {
+            return Some(format!(
+                "node {n} holds CPUs {} on this host, {} in the layout this binary is built \
+                 for",
+                yorkie_numa::format_cpu_list(live_cpus.iter().copied()),
+                yorkie_numa::format_cpu_list(built_cpus.iter().copied())
+            ));
+        }
+    }
+    let all: BTreeSet<usize> = built.iter().flat_map(|cpus| cpus.iter().copied()).collect();
+    if *affinity != all {
+        return Some(format!(
+            "this process may run on CPUs {}, the layout this binary is built for holds {}",
+            yorkie_numa::format_cpu_list(affinity.iter().copied()),
+            yorkie_numa::format_cpu_list(all)
+        ));
+    }
+    None
+}
+
+/// The *system* NUMA node of every worker in a binding assignment, read off the
+/// compiled layout's logical → system node map.
+fn worker_system_nodes(bound: &[NumaIndex], system_nodes: &[NumaIndex]) -> Vec<NumaIndex> {
+    bound
+        .iter()
+        .map(|&logical| {
+            // A logical node outside the compiled layout cannot arise: `bound`
+            // is an assignment over that same layout's nodes.
+            system_nodes[logical]
+        })
+        .collect()
 }
 
 /// Worker 0's system NUMA node under `plan`, or `None` when binding is inactive.
@@ -4105,60 +4177,62 @@ mod tests {
         assert!(out.contains("info string Using 2 threads"), "{out}");
     }
 
-    // -- NUMA policy mapping / info strings ------------------------------
+    // -- the compiled layout, and the machine it is held against ---------
 
-    /// A miniature 2-node sysfs fixture tree (system-NUMA path; no L3 cache
-    /// dirs). Returned root is cleaned up by the caller.
-    fn write_two_node_sysfs_fixture() -> PathBuf {
-        let mut root = std::env::temp_dir();
-        root.push(format!("numa367_optmap_{}", std::process::id()));
-        let node = root.join("devices/system/node");
-        std::fs::create_dir_all(node.join("node0")).expect("mkdir node0");
-        std::fs::create_dir_all(node.join("node1")).expect("mkdir node1");
-        std::fs::write(node.join("online"), "0-1\n").expect("write online");
-        std::fs::write(node.join("node0/cpulist"), "0-1\n").expect("write node0");
-        std::fs::write(node.join("node1/cpulist"), "2-3\n").expect("write node1");
-        root
+    /// A layout with `nodes` as its logical nodes, every one of them its own
+    /// system node.
+    fn layout(nodes: &[&[usize]]) -> NumaLayout {
+        NumaLayout {
+            nodes: nodes.iter().map(|cpus| cpus.to_vec()).collect(),
+            system_nodes: (0..nodes.len()).collect(),
+            custom_affinity: false,
+        }
     }
 
-    #[cfg_attr(miri, ignore)]
+    fn affinity(cpus: &[usize]) -> BTreeSet<usize> {
+        cpus.iter().copied().collect()
+    }
+
     #[test]
-    fn numa_policy_option_mapping() {
-        let root = write_two_node_sysfs_fixture();
-        let opts = SysfsOptions {
-            root: root.clone(),
-            allowed_cpus: [0usize, 1, 2, 3].into_iter().collect(),
-            system_threads: 4,
-        };
+    fn a_machine_matching_the_compiled_layout_is_no_difference() {
+        let built: &[&[usize]] = &[&[0, 1], &[2, 3]];
+        assert_eq!(
+            numa_layout_difference(&layout(built), &affinity(&[0, 1, 2, 3]), built),
+            None
+        );
+    }
 
-        // auto / system: detect respecting affinity → two nodes, not custom.
-        let auto = numa_config_from_policy("auto", &opts).unwrap();
-        assert_eq!(auto.num_numa_nodes(), 2);
-        assert!(!auto.is_custom_affinity());
-        let system = numa_config_from_policy("system", &opts).unwrap();
-        assert_eq!(system.num_numa_nodes(), 2);
-        assert!(!system.is_custom_affinity());
+    #[test]
+    fn a_machine_with_another_node_count_is_reported_with_both_counts() {
+        let built: &[&[usize]] = &[&[0, 1], &[2, 3]];
+        let live = layout(&[&[0, 1, 2, 3]]);
+        let msg = numa_layout_difference(&live, &affinity(&[0, 1, 2, 3]), built)
+            .expect("one node is not two");
+        assert!(msg.contains("built for 2 NUMA node(s)"), "message: {msg}");
+        assert!(msg.contains("this host has 1"), "message: {msg}");
+    }
 
-        // hardware: ignore affinity → two nodes, flagged custom.
-        let hardware = numa_config_from_policy("hardware", &opts).unwrap();
-        assert_eq!(hardware.num_numa_nodes(), 2);
-        assert!(hardware.is_custom_affinity());
+    #[test]
+    fn a_node_holding_other_cpus_is_reported_with_both_cpu_lists() {
+        let built: &[&[usize]] = &[&[0, 1], &[2, 3]];
+        let live = layout(&[&[0, 1], &[2, 3, 4]]);
+        let msg = numa_layout_difference(&live, &affinity(&[0, 1, 2, 3, 4]), built)
+            .expect("node 1 grew a CPU");
+        assert!(msg.contains("node 1"), "message: {msg}");
+        assert!(msg.contains("2-4"), "message: {msg}");
+        assert!(msg.contains("2-3"), "message: {msg}");
+    }
 
-        // none: the default single all-threads node, not custom.
-        let none = numa_config_from_policy("none", &opts).unwrap();
-        assert_eq!(none.num_numa_nodes(), 1);
-        assert!(!none.is_custom_affinity());
-
-        // A custom node string: two nodes, flagged custom.
-        let custom = numa_config_from_policy("0-3:4-7", &opts).unwrap();
-        assert_eq!(custom.num_numa_nodes(), 2);
-        assert!(custom.is_custom_affinity());
-
-        // Fail-loud: a duplicate CPU (parse error) and a zero-node config.
-        assert!(numa_config_from_policy("0,0", &opts).is_err());
-        assert!(numa_config_from_policy("", &opts).is_err());
-
-        let _ = std::fs::remove_dir_all(&root);
+    #[test]
+    fn a_process_confined_to_part_of_the_machine_is_refused() {
+        // The machine is the one the binary was built for; the *process* is not
+        // allowed on all of it — a `taskset` around the engine, whose workers
+        // would then pin themselves to CPUs they may not run on.
+        let built: &[&[usize]] = &[&[0, 1], &[2, 3]];
+        let msg = numa_layout_difference(&layout(built), &affinity(&[0, 1]), built)
+            .expect("half the machine is not the machine");
+        assert!(msg.contains("may run on CPUs 0-1"), "message: {msg}");
+        assert!(msg.contains("holds 0-3"), "message: {msg}");
     }
 
     #[cfg(feature = "verbose3")]
@@ -4303,36 +4377,28 @@ mod tests {
         // The single-node host case: no assignment, so no plan, so no thread
         // ever pins itself and nothing touches a memory policy.
         let cfg = NumaConfig::from_string("0-3").unwrap();
-        assert!(bind_plan(&cfg, &[]).is_none());
+        assert!(bind_plan(&cfg, &[], &[0]).is_none());
         assert_eq!(coordinator_system_node(None), None);
     }
 
     #[cfg_attr(miri, ignore)]
     #[test]
     fn bind_plan_carries_one_system_node_per_worker() {
-        // A custom node string always suggests binding. Whatever the host's
-        // real topology is, the map must be one entry per worker and every entry
-        // must be a system node the machine actually has — this is the vector
-        // both the pin site and the placement calls index with a worker id, so a
-        // length mismatch would be an out-of-bounds panic on a worker thread.
-        let cfg = NumaConfig::from_string("0:1").unwrap();
-        let bound = vec![0, 1, 0];
-        let plan = bind_plan(&cfg, &bound).expect("a non-empty assignment yields a plan");
+        // The plan's system-node vector is what both the pin site and the
+        // placement calls index with a worker id, so it is one entry per worker
+        // — the *logical* node each worker sits on, resolved through the
+        // layout's logical → system map, which L3 bundling makes a many-to-one.
+        let cfg = NumaConfig::from_string("0:1:2").unwrap();
+        let bound = vec![0, 1, 2, 0];
+        let plan =
+            bind_plan(&cfg, &bound, &[3, 3, 7]).expect("a non-empty assignment yields a plan");
         assert_eq!(plan.bound, bound);
         assert_eq!(
-            plan.system_nodes.len(),
-            bound.len(),
-            "one system node per worker"
-        );
-        assert_eq!(
             plan.system_nodes,
-            cfg.system_nodes_for_binding(&bound, &real_sysfs_options()),
-            "the plan's map is exactly the config's resolution"
+            vec![3, 3, 7, 3],
+            "one system node per worker, through the layout's map"
         );
-        assert_eq!(
-            coordinator_system_node(Some(&plan)),
-            Some(plan.system_nodes[0])
-        );
+        assert_eq!(coordinator_system_node(Some(&plan)), Some(3));
     }
 
     /// With a NUMA layout that forces binding, every large-page block behind the
@@ -4357,9 +4423,8 @@ mod tests {
         // binding on even on a single-node host. The node is the one CPU the
         // process is certain to be allowed on, so the (fail-loud) pin the
         // rebuild's helper threads perform cannot hit a forbidden CPU.
-        driver.numa_config =
-            numa_config_from_policy(&forced_binding_policy(), &real_sysfs_options())
-                .expect("a one-CPU custom node string is a valid config");
+        driver.numa_config = NumaConfig::from_string(&forced_binding_policy())
+            .expect("a one-CPU custom node string is a valid config");
         driver.rebuild_pool();
 
         let node = coordinator_system_node(driver.numa_plan.as_ref())

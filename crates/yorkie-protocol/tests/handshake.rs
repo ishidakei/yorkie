@@ -63,6 +63,49 @@ fn isready_without_network_reports_load_failure() {
     );
 }
 
+/// A binary plans its worker binding from the layout of the machine it was built
+/// on, so a machine laid out differently is one it must not play on: `isready`
+/// names the difference and withholds `readyok`, before it has allocated
+/// anything for a machine that is not there.
+///
+/// The machine is presented through a sysfs tree describing CPUs no host has,
+/// so the difference is certain whatever the host running the test looks like.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn isready_refuses_a_machine_that_is_not_the_one_the_binary_was_built_for() {
+    let root = std::env::temp_dir().join(format!("yorkie-numa-check-{}", std::process::id()));
+    let cpu = root.join("devices/system/cpu");
+    let node = root.join("devices/system/node");
+    std::fs::create_dir_all(cpu.join("cpu900")).expect("mkdir cpu900");
+    std::fs::create_dir_all(node.join("node0")).expect("mkdir node0");
+    std::fs::create_dir_all(node.join("node1")).expect("mkdir node1");
+    std::fs::write(cpu.join("online"), "900-901\n").expect("write cpu online");
+    std::fs::write(node.join("online"), "0-1\n").expect("write node online");
+    std::fs::write(node.join("node0/cpulist"), "900\n").expect("write node0");
+    std::fs::write(node.join("node1/cpulist"), "901\n").expect("write node1");
+
+    let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let driver =
+        UsiDriver::new(&b"isready\nquit\n"[..], Arc::clone(&output)).with_sysfs_root(root.clone());
+    driver.run().expect("driver run");
+    let out = String::from_utf8(output.lock().expect("output lock").clone()).expect("utf-8");
+
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(
+        out.contains("info string NUMA layout mismatch:"),
+        "expected the layout notice, got: {out:?}"
+    );
+    assert!(
+        !out.contains("readyok"),
+        "readyok must not appear on a layout the binary was not built for: {out:?}"
+    );
+    assert!(
+        !out.contains("eval load failed"),
+        "the check runs before anything is loaded: {out:?}"
+    );
+}
+
 #[cfg_attr(miri, ignore)]
 #[test]
 fn unknown_command_emits_info_string() {

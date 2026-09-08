@@ -47,6 +47,25 @@ fv_scale = 16
 # `':'`-separated node string.
 numa_policy = "auto"
 
+# How many logical NUMA nodes the machine this binary is built on has to come to
+# under `numa_policy` above.
+#
+# The layout itself — the node count and each node's CPUs — is read off the
+# building machine's sysfs and compiled in, so the engine never discovers it at
+# run time. Building therefore needs a Linux host whose `/sys` reports a
+# topology; a host without NUMA hardware still reports one node and builds
+# normally.
+#
+# `"auto"` takes whatever that machine has. An integer additionally requires the
+# resolved count to equal it, so a config pinned to the machine the engine plays
+# on cannot be built somewhere else by accident.
+#
+# Either way the binary is built for one machine: on any other — or under a
+# `taskset` / `cpuset` that hides part of this one — `isready` reports the
+# difference and withholds `readyok` rather than playing on a layout that is not
+# there.
+numa_nodes = "auto"
+
 # Ponder toggles (`USI_Ponder` / `Stochastic_Ponder`). At the option layer these
 # only feed the optimum-time bonus.
 usi_ponder = false

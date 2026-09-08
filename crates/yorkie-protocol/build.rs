@@ -18,11 +18,18 @@
 //! anything but the value that build is fixed to — a setting that cannot take
 //! effect is an error, never something quietly ignored.
 //!
+//! One setting is not a value in the file but a fact about the machine: the
+//! NUMA layout. The config says which layout the engine maps the machine to and
+//! how many nodes that must come to, and the build reads the layout off the
+//! building host and compiles it in, so the engine's binding plan is fixed
+//! before it starts rather than discovered while it runs.
+//!
 //! This file is the impure half — environment, filesystem, exit code. The
 //! schema, parser, code generator and path resolution live in
-//! `build_config.rs`.
+//! `build_config.rs`, and the machine's layout in `build_numa.rs`.
 
 include!("build_config.rs");
+include!("build_numa.rs");
 
 /// Report a build-stopping configuration error and exit. `process::exit` rather
 /// than `panic!` so the message cargo surfaces is the message, without a
@@ -35,6 +42,7 @@ fn fail(msg: &str) -> ! {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build_config.rs");
+    println!("cargo:rerun-if-changed=build_numa.rs");
     println!("cargo:rerun-if-env-changed={CONFIG_ENV}");
 
     let repo_root = repo_root();
@@ -59,6 +67,7 @@ fn main() {
         &display_source(&repo_root, &path),
         &config_name(&path),
         &Gating::Features(&gates),
+        &Layout::Resolve(&resolve_numa_layout),
     ) {
         Ok(g) => g,
         Err(e) => fail(&e),

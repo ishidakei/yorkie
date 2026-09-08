@@ -40,13 +40,36 @@ fn compile(text: &str) -> Result<String, String> {
 /// Compile a config body as a build carrying `features` sees it, keeping the
 /// warnings.
 fn compile_at(text: &str, features: &[&str]) -> Result<Generated, String> {
+    compile_on(text, features, &machine_with(1))
+}
+
+/// Compile a config body as a build carrying `features` sees it, on a given
+/// machine.
+fn compile_on(
+    text: &str,
+    features: &[&str],
+    machine: &dyn Fn(&str) -> Result<ResolvedLayout, String>,
+) -> Result<Generated, String> {
     compile_config(
         text,
         "test.toml",
         "test.toml",
         "test",
         &Gating::Features(features),
+        &Layout::Resolve(machine),
     )
+}
+
+/// A stand-in for the machine a build runs on: one that resolves to `nodes`
+/// logical NUMA nodes. These tests are about what the schema does with an
+/// answer, so no `/sys` is read for one.
+fn machine_with(nodes: usize) -> impl Fn(&str) -> Result<ResolvedLayout, String> {
+    move |_policy| {
+        Ok(ResolvedLayout {
+            nodes,
+            items: "pub const NUMA_NODE_CPUS: &[&[usize]] = &[&[0]];".to_string(),
+        })
+    }
 }
 
 /// The checked-in config with one key's line replaced (or removed, if
@@ -330,6 +353,106 @@ fn a_gated_keys_constant_is_generated_behind_its_cfg() {
             )),
             "constant {name} must be generated behind `{}`:\n{out}",
             gate.feature()
+        );
+    }
+}
+
+// --- The one setting the machine, not the file, answers -------------------
+
+/// `"auto"` takes the machine's own layout, whatever it is, and the count it
+/// resolved to is what the binary carries — alongside the layout itself.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn an_auto_node_count_takes_whatever_the_machine_has() {
+    for nodes in [1usize, 4] {
+        let out = compile_on(&default_config_text(), GATE_FEATURES, &machine_with(nodes))
+            .expect("`auto` accepts any machine")
+            .code;
+        assert!(
+            out.contains(&format!("pub const NUMA_NODES: usize = {nodes};")),
+            "the resolved count is generated: {out}"
+        );
+        assert!(
+            out.contains("pub const NUMA_NODE_CPUS: &[&[usize]] ="),
+            "the layout itself is generated too: {out}"
+        );
+    }
+}
+
+/// A pinned count is a promise about the machine, and a build on another one
+/// breaks it loudly rather than producing a binary for a layout that is not
+/// there.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_pinned_node_count_must_be_what_the_machine_resolves_to() {
+    let text = default_with("numa_nodes", Some("numa_nodes = 3"));
+    compile_on(&text, GATE_FEATURES, &machine_with(3)).expect("3 nodes is 3 nodes");
+
+    let err = compile_on(&text, GATE_FEATURES, &machine_with(1))
+        .expect_err("a one-node machine must not build a three-node binary");
+    for want in ["`numa_nodes` = 3", "resolves to 1", "\"auto\""] {
+        assert!(err.contains(want), "the message must carry {want:?}: {err}");
+    }
+}
+
+/// A machine whose layout cannot be read produces no binary — there is no
+/// fallback to one node, because a guessed layout is a wrong one rather than a
+/// missing one.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_machine_that_cannot_be_read_is_a_build_error() {
+    let unreadable = |_: &str| Err("cannot read `/sys/devices/system/node/online`".to_string());
+    let err = compile_on(&default_config_text(), GATE_FEATURES, &unreadable)
+        .expect_err("no layout, no binary");
+    assert!(
+        err.contains("cannot resolve the NUMA layout of this host"),
+        "{err}"
+    );
+    assert!(err.contains("Linux host whose sysfs reports one"), "{err}");
+}
+
+/// The key takes an integer or `"auto"`, and nothing else.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_node_count_outside_the_accepted_values_is_an_error() {
+    for (line, want) in [
+        ("numa_nodes = 0", "is outside [1, 1024]"),
+        ("numa_nodes = 2048", "is outside [1, 1024]"),
+        ("numa_nodes = \"all\"", "must be an integer or \"auto\""),
+        ("numa_nodes = true", "must be an integer or \"auto\""),
+    ] {
+        let err = compile(&default_with("numa_nodes", Some(line))).expect_err("must fail");
+        assert!(
+            err.contains(want),
+            "for {line:?} expected {want:?}, got {err}"
+        );
+    }
+}
+
+/// A crate that plans no thread binding compiles no layout in: the key is still
+/// type-checked for it, but nothing about the machine reaches its generated
+/// module.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_build_without_a_layout_generates_none_of_it() {
+    let out = compile_config(
+        &default_config_text(),
+        "test.toml",
+        "test.toml",
+        "test",
+        &Gating::Absent,
+        &Layout::Absent,
+    )
+    .expect("compiles")
+    .code;
+    assert!(
+        out.contains("pub const FV_SCALE: "),
+        "the keys it reads: {out}"
+    );
+    for absent in ["NUMA_NODES", "NUMA_NODE_CPUS", "NUMA_SYSTEM_NODES"] {
+        assert!(
+            !out.contains(absent),
+            "{absent} must not reach a build that compiles no layout: {out}"
         );
     }
 }

@@ -28,6 +28,12 @@ const DEFAULT_CONFIG: &str = "configs/default.toml";
 /// to get right.
 const MAX_THREADS_SANITY: i64 = 4096;
 
+/// A sanity bound on the pinned NUMA-node count, in the spirit of
+/// [`MAX_THREADS_SANITY`]: the real answer is the building machine's, which the
+/// resolution below produces exactly, so this only catches a slipped digit
+/// before the machine is consulted at all.
+const MAX_NUMA_NODES_SANITY: i64 = 1024;
+
 /// The `EnteringKingRule` choice list (`EKR_STRINGS`, in the reference's order).
 const ENTERING_KING_RULE_CHOICES: &[&str] = &[
     "NoEnteringKing",
@@ -64,6 +70,12 @@ enum Kind {
     /// `&'static str`, restricted to a fixed list — the corresponding USI combo
     /// option's choices.
     Choice(&'static [&'static str]),
+    /// The expected number of logical NUMA nodes: an integer, or the string
+    /// `"auto"` for whatever the building machine has. Either way the layout is
+    /// resolved from that machine and generated as constants; an integer also
+    /// has to equal what was resolved, so a binary meant for one machine cannot
+    /// be built on another by accident.
+    NodeCount,
 }
 
 /// Every Cargo feature the schema conditions a constant on: the verbosity
@@ -88,6 +100,35 @@ enum Gating<'a> {
     /// name and no build shape to judge a value against. Every key is rendered
     /// plainly; such a crate reads only ungated ones, and the crate that owns
     /// the features judges the config the whole build shares.
+    Absent,
+}
+
+/// The logical NUMA layout of the machine a build ran on, as the resolver
+/// handed it back.
+///
+/// The count is what a pinned `numa_nodes` is checked against; the items are the
+/// generated constants describing the layout itself — the CPU list of every
+/// logical node and the system node each belongs to — which the engine builds
+/// its binding plan and its replica set from, without ever reading `/sys`.
+#[allow(dead_code)]
+struct ResolvedLayout {
+    /// The number of logical NUMA nodes resolved.
+    nodes: usize,
+    /// The generated items describing the layout, appended to the generated
+    /// module after the node count itself.
+    items: String,
+}
+
+/// How a build script comes by the layout behind the `numa_nodes` key.
+#[allow(dead_code)]
+enum Layout<'a> {
+    /// Resolve it from the machine doing the building, under the config's own
+    /// `numa_policy`. The crate that compiles the layout in passes this.
+    Resolve(&'a dyn Fn(&str) -> Result<ResolvedLayout, String>),
+    /// The crate compiles no layout in, so it neither resolves one nor
+    /// generates the constants describing it. Such a crate reads no layout, and
+    /// the crate that does is where a `numa_nodes` the machine does not satisfy
+    /// is refused.
     Absent,
 }
 
@@ -189,6 +230,16 @@ const fn feature_int(
     }
 }
 
+/// The `numa_nodes` key: the layout expectation (see [`Kind::NodeCount`]).
+const fn node_count(key: &'static str, usi: &'static str) -> Spec {
+    Spec {
+        key,
+        usi,
+        kind: Kind::NodeCount,
+        gate: None,
+    }
+}
+
 const fn boolean(key: &'static str, usi: &'static str) -> Spec {
     Spec {
         key,
@@ -238,6 +289,10 @@ const SCHEMA: &[Spec] = &[
     text("eval_dir", "EvalDir"),
     int("fv_scale", "FV_SCALE", 1, 128),
     text("numa_policy", "NumaPolicy"),
+    node_count(
+        "numa_nodes",
+        "(none: the logical NUMA-node count the build host must have)",
+    ),
     boolean("usi_ponder", "USI_Ponder"),
     boolean("stochastic_ponder", "Stochastic_Ponder"),
     // --- Opening book. `book_options_v2` is the one key with no USI option
@@ -476,13 +531,15 @@ struct Generated {
 ///
 /// `label` names the file in messages, `source` is the path recorded in the
 /// generated header, and `name` is the config's identity (its file stem).
-/// `gating` says how this build treats the feature-gated keys.
+/// `gating` says how this build treats the feature-gated keys, and `layout` how
+/// it comes by the machine's NUMA layout.
 fn generate(
     entries: &BTreeMap<String, Entry>,
     label: &str,
     source: &str,
     name: &str,
     gating: &Gating,
+    layout: &Layout,
 ) -> Result<Generated, String> {
     // Unknown keys first: a typo'd key would otherwise be reported as the schema
     // key it was meant to be, going missing.
@@ -581,6 +638,80 @@ fn generate(
                 }
                 format!("pub const {const_name}: &str = \"{}\";", escape(v))
             }
+            (Kind::NodeCount, value) => {
+                let Layout::Resolve(resolve) = layout else {
+                    // This crate compiles no layout in, so there is nothing to
+                    // resolve it against and no constant to generate from it.
+                    continue;
+                };
+                let pinned = match value {
+                    Value::Str(s) if s == "auto" => None,
+                    Value::Int(v) if (1..=MAX_NUMA_NODES_SANITY).contains(v) => Some(*v),
+                    Value::Int(v) => {
+                        return Err(at(
+                            label,
+                            entry.line,
+                            &format!(
+                                "`{}` = {v} is outside [1, {MAX_NUMA_NODES_SANITY}]",
+                                spec.key
+                            ),
+                        ));
+                    }
+                    other => {
+                        return Err(at(
+                            label,
+                            entry.line,
+                            &format!(
+                                "`{}` must be an integer or \"auto\", got {}",
+                                spec.key,
+                                other.type_name()
+                            ),
+                        ));
+                    }
+                };
+                let Some(policy) = numa_policy_of(entries) else {
+                    return Err(at(
+                        label,
+                        entry.line,
+                        &format!(
+                            "`{}` is resolved under `numa_policy`, which this config does not \
+                             give as a string",
+                            spec.key
+                        ),
+                    ));
+                };
+                let resolved = resolve(policy).map_err(|e| {
+                    at(
+                        label,
+                        entry.line,
+                        &format!(
+                            "cannot resolve the NUMA layout of this host under \
+                             `numa_policy` = \"{policy}\": {e}\n       \
+                             the engine compiles the layout of the machine it is built on into \
+                             the binary, so building it needs a Linux host whose sysfs reports \
+                             one"
+                        ),
+                    )
+                })?;
+                if let Some(pinned) = pinned
+                    && pinned as usize != resolved.nodes
+                {
+                    return Err(at(
+                        label,
+                        entry.line,
+                        &format!(
+                            "`{}` = {pinned} is not what this host has: it resolves to {} \
+                             logical NUMA node(s) under `numa_policy` = \"{policy}\" — build on a \
+                             machine with {pinned}, or set the key to \"auto\"",
+                            spec.key, resolved.nodes
+                        ),
+                    ));
+                }
+                format!(
+                    "pub const {const_name}: usize = {};\n{}",
+                    resolved.nodes, resolved.items
+                )
+            }
             (kind, value) => {
                 return Err(at(
                     label,
@@ -614,6 +745,17 @@ fn expected(kind: &Kind) -> &'static str {
         Kind::Int { .. } => "an integer",
         Kind::Bool => "a boolean",
         Kind::Text | Kind::Choice(_) => "a string",
+        Kind::NodeCount => "an integer or \"auto\"",
+    }
+}
+
+/// The `numa_policy` value the layout is resolved under. `None` when the key is
+/// missing or is not a string, which the schema entry for `numa_policy` — read
+/// before this one — reports as the error it is.
+fn numa_policy_of(entries: &BTreeMap<String, Entry>) -> Option<&str> {
+    match entries.get("numa_policy").map(|e| &e.value) {
+        Some(Value::Str(s)) => Some(s.as_str()),
+        _ => None,
     }
 }
 
@@ -629,9 +771,10 @@ fn compile_config(
     source: &str,
     name: &str,
     gating: &Gating,
+    layout: &Layout,
 ) -> Result<Generated, String> {
     let entries = parse_config(contents, label)?;
-    generate(&entries, label, source, name, gating)
+    generate(&entries, label, source, name, gating, layout)
 }
 
 // The config-path resolution is kept here, and kept pure — the caller reads the
