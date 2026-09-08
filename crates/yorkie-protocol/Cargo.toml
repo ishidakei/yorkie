@@ -49,7 +49,8 @@ serde_json = "~1.0"
 # discard.
 #
 #   - `verbose1` → `yorkie-search/verbose1` — the book probe's diagnostic
-#     message bodies.
+#     message bodies — and `yorkie-storage/verbose1` — the counting global
+#     allocator behind the per-reply statistics line.
 #   - `verbose2` → `yorkie-search/verbose2` (and through it
 #     `yorkie-storage/verbose2`) — the PV-output surface, the root moves' fail
 #     bounds, the book hit's per-candidate lines, and the transposition table's
@@ -68,7 +69,7 @@ serde_json = "~1.0"
 # seed the search is handed, so the constant, the seed and its hand-over are all
 # behind the feature here too. Off by default.
 [features]
-verbose1 = ["yorkie-search/verbose1"]
+verbose1 = ["yorkie-search/verbose1", "yorkie-storage/verbose1"]
 verbose2 = ["verbose1", "yorkie-search/verbose2"]
 verbose3 = ["verbose2", "yorkie-search/verbose3", "yorkie-storage/verbose3"]
 tt-entry16 = ["yorkie-search/tt-entry16", "yorkie-storage/tt-entry16"]

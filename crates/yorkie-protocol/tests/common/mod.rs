@@ -258,6 +258,19 @@ pub fn diag_line(body: &str) -> String {
     }
 }
 
+/// A transcript with the per-reply statistics line taken out.
+///
+/// That line counts what the *process* allocated since the previous reply, so
+/// two runs of one session do not agree on it. A transcript pinned byte-for-byte
+/// is about what the engine decided, and the number says nothing about that.
+/// Below `verbose1` there is no such line and this is the identity.
+pub fn without_stats(out: &str) -> String {
+    out.lines()
+        .filter(|l| !l.starts_with("info string stats "))
+        .map(|l| format!("{l}\n"))
+        .collect()
+}
+
 pub fn bestmove_lines(out: &str) -> Vec<&str> {
     out.lines()
         .filter_map(|l| l.strip_prefix("bestmove "))

@@ -56,7 +56,7 @@ cargo build --release
 | ビルド | 読むもの・出すもの |
 | --- | --- |
 | feature なし | 対局で使うコマンドと、対局で使う出力だけ。探索出力は `bestmove` のみ |
-| `verbose1` | ＋受け付けられない入力（認識できないコマンド、不正な `position`、対局では使わない `go` の指定）や定跡ファイルの異常を `info string` で報告する。入力への対処自体はどのビルドでも変わらず、報告するかどうかだけが変わる |
+| `verbose1` | ＋受け付けられない入力（認識できないコマンド、不正な `position`、対局では使わない `go` の指定）や定跡ファイルの異常を `info string` で報告する。入力への対処自体はどのビルドでも変わらず、報告するかどうかだけが変わる。あわせて、探索を終える `bestmove` の直前に 1 応答ぶんの統計行を出力する（後述） |
 | `verbose2` | ＋探索の経過と結果を伝える `info` 行（反復深化ごとの PV、`bestmove` 直前の最終 PV、定跡ヒット時の multipv ブロック）を出力し、対局では使わない `go` の指定（`depth` / `nodes` / `movetime` / `infinite` / `mate` / `rtime`）を受け付ける。候補手順を複数本探す `multi_pv` 設定が効くのもこの feature から（これのないビルドには 2 本目を伝える出力がないため、ルート探索は 1 本だけ）。GUI の検討モードに必要な feature |
 | `verbose3` | ＋`tt store` / `tt probe` / `tt children` と `bench` を受け付ける |
 
@@ -334,6 +334,31 @@ yorkie perft startpos <depth>
 yorkie perft sfen <SFEN> <depth>
 yorkie perft sfen <SFEN> moves <m1> [<m2> …] <depth>
 ```
+
+### 1 応答ぶんの統計行
+
+このエンジンは、対局中はヒープを一切確保しない（必要なものはすべて初期化時に
+確保して使い回す）ことを設計上の目標にしています。そこまであとどれだけ残って
+いるかを 1 手ごとに見るために、`verbose1` 以上のビルドは、探索を終える
+`bestmove`（`bestmove resign` と `bestmove win` を含む）の直前に統計行を 1 行
+出力します。
+
+```
+info string stats alloc=40321
+bestmove 7g7f ponder 3c3d
+```
+
+固定の接頭辞 `info string stats` のあとに `key=value` の項目を半角空白区切りで
+並べた行です。値が 0 の項目は書かれず、項目が 1 つも残らない場合は行そのものを
+出力しません。項目は現在 `alloc` の 1 つだけで、これは前回の応答からこの応答まで
+にプロセスがヒープから受け取った確保の回数です（`position` の解析、`go` の準備、
+全スレッドの探索、`bestmove` の文字列の組み立てを含みます）。この数は `readyok`
+の直後と `usinewgame` の最後にも 0 に戻るので、起動時の確保と対局開始の準備は
+最初の指し手には計上されません。
+
+`verbose2` / `verbose3` のビルドでは、`info` 行を組み立てて書き出すこと自体の
+確保も同じ数に含まれます。対局用ビルドに最も近い値を見たい場合は `verbose1`
+だけを付けたビルドで測ってください。
 
 ## 実装上の特記事項
 

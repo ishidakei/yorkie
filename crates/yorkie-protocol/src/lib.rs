@@ -6,6 +6,9 @@ pub mod driver;
 pub mod formatter;
 pub mod parser;
 pub(crate) mod settings;
+/// The per-reply statistics line, which only a `verbose1` build writes.
+#[cfg(feature = "verbose1")]
+pub(crate) mod stats;
 /// The feature-gated `tt` command family — present only under `verbose3`.
 #[cfg(feature = "verbose3")]
 pub mod tt_command;

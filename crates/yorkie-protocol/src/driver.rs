@@ -27,6 +27,10 @@ use yorkie_state::{Move, Position, format_usi_move, parse_sfen, parse_usi_move};
 use yorkie_storage::{Book, TranspositionTable, Value};
 #[cfg(feature = "verbose3")]
 use yorkie_storage::{TTData, VALUE_NONE};
+// The per-reply allocation tally: raised by the counting global allocator this
+// feature installs, and read by the statistics line that reports it.
+#[cfg(feature = "verbose1")]
+use yorkie_storage::{clear_alloc_count, take_alloc_count};
 
 #[cfg(feature = "verbose3")]
 use crate::bench;
@@ -37,6 +41,8 @@ use crate::parser::{Command, GoLimits, PositionSfen, parse_line};
 #[cfg(feature = "random")]
 use crate::settings::RANDOM_AMPLITUDE;
 use crate::settings::Settings;
+#[cfg(feature = "verbose1")]
+use crate::stats::StatsBuf;
 #[cfg(feature = "verbose3")]
 use crate::tt_command::{
     TtCommand, TtPosition, TtStoreArgs, bound_name, parse_tt, value_from_tt, value_to_tt,
@@ -531,9 +537,13 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         Formatter::new(&mut *self.lock_writer()).info_string_fmt(body)
     }
 
-    /// Emit one `bestmove <mv>` line.
+    /// Emit one `bestmove <mv>` line, preceded by the statistics of the interval
+    /// it ends.
     fn bestmove(&self, mv: &str) -> io::Result<()> {
-        Formatter::new(&mut *self.lock_writer()).bestmove(mv)
+        let mut guard = self.lock_writer();
+        #[cfg(feature = "verbose1")]
+        emit_stats(&mut *guard);
+        Formatter::new(&mut *guard).bestmove(mv)
     }
 
     /// Emit one `readyok` line.
@@ -862,7 +872,15 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         };
 
         match outcome {
-            IsreadyOutcome::Ready => self.readyok(),
+            IsreadyOutcome::Ready => {
+                self.readyok()?;
+                // The initialisation phase allocates the table, the network and
+                // the pool, and none of that belongs to a reply: the first
+                // reported interval starts here.
+                #[cfg(feature = "verbose1")]
+                clear_alloc_count();
+                Ok(())
+            }
             IsreadyOutcome::LoadFailed(reason) => {
                 // Contract: on a load failure, emit
                 // `info string eval load failed: <reason>` and do NOT emit
@@ -1011,6 +1029,10 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // Routing through `rebuild_pool` keeps the NUMA binding assignment
         // consistent with the recreated helpers.
         self.rebuild_pool();
+        // The pool and the history tables just rebuilt are a new game's setup,
+        // not the first move's work, so they are not counted against it.
+        #[cfg(feature = "verbose1")]
+        clear_alloc_count();
     }
 
     /// Snapshot the book-selection options into a [`BookConfig`] for one `go`.
@@ -2136,8 +2158,8 @@ fn build_position_from(sfen: &PositionSfen, moves: &[String]) -> Option<Position
 }
 
 /// Emit a bare `bestmove <mv>` for the resign / declaration-win short-circuits,
-/// which produce no `info` line. Best-effort: a broken pipe must not panic the
-/// coordinator.
+/// which produce no `info` line, preceded by the statistics of the interval it
+/// ends. Best-effort: a broken pipe must not panic the coordinator.
 ///
 /// `sent` is raised before the lock is released, so the reply becoming visible
 /// and this search counting as finished are one indivisible step downstream.
@@ -2149,9 +2171,31 @@ fn emit_bestmove<W: Write>(
     mv: &str,
 ) {
     let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "verbose1")]
+    emit_stats(&mut *guard);
     let _ = Formatter::new(&mut *guard).bestmove(mv);
     #[cfg(feature = "verbose3")]
     sent.store(true, Ordering::Relaxed);
+}
+
+/// Take the statistics of the interval that ends here and write their line into
+/// an already-locked sink, so it lands directly before the `bestmove` the caller
+/// writes next and after any final PV line already out.
+///
+/// Taking the counters is what starts the next interval, so every reply calls
+/// this — including one whose statistics are all zero and therefore print
+/// nothing, which would otherwise carry its interval into the following reply.
+/// The caller composes its `bestmove` text *before* calling, so the composing's
+/// own allocations stay inside the interval being reported.
+///
+/// Best-effort, like the `bestmove` itself: a broken pipe must not panic the
+/// coordinator.
+#[cfg(feature = "verbose1")]
+fn emit_stats<W: Write + ?Sized>(w: &mut W) {
+    let mut buf = StatsBuf::new();
+    if let Some(line) = crate::stats::render(&mut buf, take_alloc_count()) {
+        let _ = Formatter::new(w).composed_line(line);
+    }
 }
 
 /// Emit one diagnostic `info string <msg>` from the coordinator (best-effort) —
@@ -2332,14 +2376,17 @@ fn emit_book_hit<W: Write>(
         bm.push_str(&format_usi_move(p));
     }
     let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
-    let mut f = Formatter::new(&mut *guard);
     #[cfg(feature = "verbose2")]
-    let _ = f.info(&format!(
+    let _ = Formatter::new(&mut *guard).info(&format!(
         "depth 0 multipv 1 score {} nodes 0 nps 0 \
          hashfull {hashfull} time {time_ms} pv {pv}",
         format_score(Value::from(hit.value)),
     ));
-    let _ = f.bestmove(&bm);
+    // After that line, so the statistics cover composing it too, and directly
+    // before the reply.
+    #[cfg(feature = "verbose1")]
+    emit_stats(&mut *guard);
+    let _ = Formatter::new(&mut *guard).bestmove(&bm);
     #[cfg(feature = "verbose3")]
     sent.store(true, Ordering::Relaxed);
 }
@@ -3826,6 +3873,19 @@ mod tests {
         }
     }
 
+    /// A transcript with the per-reply statistics line dropped.
+    ///
+    /// That line counts what the *process* allocated since the previous reply,
+    /// so two runs of one session do not agree on it, and neither would two
+    /// sessions being compared for the decisions they took. Without `verbose1`
+    /// there is no such line and this is the identity.
+    fn without_stats(out: &str) -> String {
+        out.lines()
+            .filter(|l| !l.starts_with("info string stats "))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    }
+
     /// Consuming the line really is inert: a `setoption name Threads` an older
     /// build would have acted on leaves the pool exactly as it was, so the
     /// following `go` behaves as if the line had never arrived — and the
@@ -3841,7 +3901,7 @@ mod tests {
              quit\n",
         );
         let without = run_with("position startpos\ngo btime 1000 wtime 1000\nquit\n");
-        assert_eq!(with_setoption, without);
+        assert_eq!(without_stats(&with_setoption), without_stats(&without));
     }
 
     #[cfg_attr(miri, ignore)]
@@ -4017,7 +4077,10 @@ mod tests {
         assert_eq!(run_with("stop\nquit\n"), "");
         // `stop` with no network resolves the same as `go` alone: the no-network
         // notice plus a single `bestmove resign`, and nothing more.
-        assert_eq!(run_with("go\nstop\nquit\n"), run_with("go\nquit\n"));
+        assert_eq!(
+            without_stats(&run_with("go\nstop\nquit\n")),
+            without_stats(&run_with("go\nquit\n"))
+        );
     }
 
     /// `bench` is the one command that resizes the worker pool, and a pool

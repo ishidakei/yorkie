@@ -13,6 +13,8 @@ pub mod book;
 pub mod large_page;
 pub mod tt;
 
+#[cfg(feature = "verbose1")]
+pub use allocator::{CountingAlloc, clear_alloc_count, take_alloc_count};
 pub use arena::{ARENA_SUB_ALIGN, ArenaLayout, ArenaSlice, LargePageArena, Section};
 pub use book::{Book, BookError, BookMove};
 pub use large_page::{LARGE_PAGE_ALIGN, LargePageArray, LargePageBox, Zeroable};

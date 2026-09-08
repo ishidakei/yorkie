@@ -60,6 +60,19 @@ impl<'w, W: Write + ?Sized> Formatter<'w, W> {
         self.line(format_args!("bestmove {move_str}"))
     }
 
+    /// Emit one already-composed line — the per-reply statistics line, whose
+    /// caller rendered it into a stack buffer precisely so that reporting an
+    /// allocation count does not itself allocate. The bytes go to the writer as
+    /// they are, with no formatting machinery between.
+    ///
+    /// That line is the only caller, so this exists only with its feature.
+    #[cfg(feature = "verbose1")]
+    pub fn composed_line(&mut self, text: &str) -> io::Result<()> {
+        self.writer.write_all(text.as_bytes())?;
+        self.writer.write_all(b"\n")?;
+        self.writer.flush()
+    }
+
     /// Emit a verbatim line with no USI keyword prefix — the `isready`
     /// keep-alive's bare newline, routed through the single output sink like
     /// every other line.
@@ -119,6 +132,13 @@ mod tests {
     fn info_body_format() {
         let s = captured(|f| f.info("depth 1 score cp 12 nodes 30 pv 7g7f").unwrap());
         assert_eq!(s, "info depth 1 score cp 12 nodes 30 pv 7g7f\n");
+    }
+
+    #[cfg(feature = "verbose1")]
+    #[test]
+    fn composed_line_is_written_verbatim() {
+        let s = captured(|f| f.composed_line("info string stats alloc=12").unwrap());
+        assert_eq!(s, "info string stats alloc=12\n");
     }
 
     #[test]

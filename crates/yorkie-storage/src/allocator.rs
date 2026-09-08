@@ -33,11 +33,105 @@
 //! linking this one. `#[cfg(not(miri))]` drops the declaration there, leaving
 //! the standard allocator in place. It gates the *static* only, so the set of
 //! tests miri executes is unchanged.
+//!
+//! With `verbose1` the installed allocator is [`CountingAlloc`] wrapping
+//! mimalloc, which tallies the blocks the process is handed. The design rule is
+//! that a game allocates nothing on the heap — everything is taken at
+//! initialisation and reused — and the tally is how far the engine still is from
+//! that, measured per reply. Without the feature mimalloc is installed directly:
+//! no wrapper, no counter, no branch on the allocation path.
+
+#[cfg(feature = "verbose1")]
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The process-wide allocation tally the installed [`CountingAlloc`] raises.
+#[cfg(feature = "verbose1")]
+static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// The process-wide allocator.
-#[cfg(not(miri))]
+#[cfg(all(not(miri), not(feature = "verbose1")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// The process-wide allocator, counting the blocks it hands out.
+#[cfg(all(not(miri), feature = "verbose1"))]
+#[global_allocator]
+static GLOBAL: CountingAlloc<mimalloc::MiMalloc> =
+    CountingAlloc::new(mimalloc::MiMalloc, &ALLOC_COUNT);
+
+/// An allocator that raises a counter for every block it hands out and forwards
+/// every call to the allocator it wraps.
+///
+/// Three of the four [`GlobalAlloc`](std::alloc::GlobalAlloc) entry points
+/// produce a block and are counted: `alloc`, `alloc_zeroed` and `realloc`.
+/// `dealloc` is not — what the tally answers is how many blocks were taken, and
+/// a free says nothing about that. `alloc_zeroed` is forwarded rather than left
+/// to the trait's default (which would allocate and then memset), so the inner
+/// allocator's fresh-zero-page path stays intact; that path is what the
+/// over-aligned [`crate::large_page`] requests, the biggest in the process,
+/// depend on.
+///
+/// The counter is borrowed rather than fixed, so a test can weigh a wrapper of
+/// its own against a counter nothing else touches.
+#[cfg(feature = "verbose1")]
+pub struct CountingAlloc<A> {
+    inner: A,
+    count: &'static AtomicU64,
+}
+
+#[cfg(feature = "verbose1")]
+impl<A> CountingAlloc<A> {
+    pub const fn new(inner: A, count: &'static AtomicU64) -> Self {
+        Self { inner, count }
+    }
+}
+
+// SAFETY: every method forwards to `inner`, whose own `GlobalAlloc` impl upholds
+// the contract; the wrapper returns exactly what it returns and passes each
+// pointer and layout through unchanged. The added counter increment is a relaxed
+// read-modify-write on an unrelated atomic, which allocates nothing and so
+// cannot re-enter the allocator.
+#[cfg(feature = "verbose1")]
+unsafe impl<A: std::alloc::GlobalAlloc> std::alloc::GlobalAlloc for CountingAlloc<A> {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: `layout` is the caller's, forwarded unchanged.
+        unsafe { self.inner.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: `layout` is the caller's, forwarded unchanged.
+        unsafe { self.inner.alloc_zeroed(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: `ptr` was handed out by `inner` under `layout`, since every
+        // allocating method forwards to it.
+        unsafe { self.inner.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: `ptr` was handed out by `inner` under `layout`, and `new_size`
+        // is the caller's, forwarded unchanged.
+        unsafe { self.inner.realloc(ptr, layout, new_size) }
+    }
+}
+
+/// Read the allocation tally and reset it to zero in one step, so the value
+/// returned covers exactly the interval since the previous take (or the last
+/// [`clear_alloc_count`]) and nothing spills into the next one.
+#[cfg(feature = "verbose1")]
+pub fn take_alloc_count() -> u64 {
+    ALLOC_COUNT.swap(0, Ordering::Relaxed)
+}
+
+/// Drop the allocation tally, so what came before is attributed to no interval.
+#[cfg(feature = "verbose1")]
+pub fn clear_alloc_count() {
+    ALLOC_COUNT.store(0, Ordering::Relaxed);
+}
 
 #[cfg(test)]
 mod tests {
@@ -69,5 +163,54 @@ mod tests {
             // SAFETY: `ptr` came from `alloc_zeroed` with exactly `layout`.
             unsafe { std::alloc::dealloc(ptr, layout) };
         }
+    }
+
+    /// Weighed against a counter of its own, over the system allocator, so the
+    /// tally is exactly what this test asked for: the process-wide counter moves
+    /// under every other test in the binary, and mimalloc is FFI that miri cannot
+    /// run.
+    #[cfg(feature = "verbose1")]
+    #[test]
+    fn the_counting_allocator_counts_each_block_handed_out_and_no_free() {
+        use std::alloc::{GlobalAlloc, System};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use super::CountingAlloc;
+
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        let alloc = CountingAlloc::new(System, &COUNT);
+        let small = Layout::from_size_align(64, 8).unwrap();
+        let grown = Layout::from_size_align(128, 8).unwrap();
+
+        // SAFETY: `small` has non-zero size.
+        let ptr = unsafe { alloc.alloc(small) };
+        assert!(!ptr.is_null(), "alloc failed");
+        assert_eq!(COUNT.load(Ordering::Relaxed), 1, "alloc must count");
+
+        // SAFETY: `ptr` came from this allocator under `small`, and the new size
+        // is non-zero and rounds up to no more than `isize::MAX`.
+        let ptr = unsafe { alloc.realloc(ptr, small, grown.size()) };
+        assert!(!ptr.is_null(), "realloc failed");
+        assert_eq!(COUNT.load(Ordering::Relaxed), 2, "realloc must count");
+
+        // SAFETY: `ptr` came from `realloc` and so is held under `grown`.
+        unsafe { alloc.dealloc(ptr, grown) };
+        assert_eq!(
+            COUNT.load(Ordering::Relaxed),
+            2,
+            "a free hands out no block and must not count"
+        );
+
+        // SAFETY: `small` has non-zero size.
+        let zeroed = unsafe { alloc.alloc_zeroed(small) };
+        assert!(!zeroed.is_null(), "alloc_zeroed failed");
+        assert_eq!(
+            COUNT.load(Ordering::Relaxed),
+            3,
+            "alloc_zeroed hands out a block and must count"
+        );
+        // SAFETY: `zeroed` came from this allocator under exactly `small`.
+        unsafe { alloc.dealloc(zeroed, small) };
+        assert_eq!(COUNT.load(Ordering::Relaxed), 3);
     }
 }

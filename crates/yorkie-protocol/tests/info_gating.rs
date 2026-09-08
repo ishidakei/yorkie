@@ -5,11 +5,11 @@
 //!
 //! The three build shapes this file distinguishes:
 //!
-//! | build | search `info` | diagnostic `info string` | init-phase `info string` |
-//! |---|---|---|---|
-//! | no feature | — | — | yes |
-//! | `verbose1` | — | yes | yes |
-//! | `verbose2` | yes | yes | yes |
+//! | build | search `info` | diagnostic `info string` | per-reply `info string stats` | init-phase `info string` |
+//! |---|---|---|---|---|
+//! | no feature | — | — | — | yes |
+//! | `verbose1` | — | yes | yes | yes |
+//! | `verbose2` | yes | yes | yes | yes |
 //!
 //! The positive side is pinned by the session tests; this file pins the negative
 //! side, which no other test can make.
@@ -76,10 +76,25 @@ fn search_output_is_bestmove_only_below_verbose2() {
         // ran, produced a move, and printed not one `info` line — search info
         // and diagnostics alike. A clean load emits no initialisation-phase
         // line either, so the expected count really is zero.
-        assert!(
-            infos.is_empty(),
-            "a build without `verbose2` must emit no info line during a \
-             search, got {infos:?} in:\n{out}"
+        //
+        // `verbose1` adds exactly one line to this session, and it is not about
+        // the search: the per-reply statistics line before the `bestmove`,
+        // which reports what the process allocated.
+        let stats: Vec<&&str> = infos
+            .iter()
+            .filter(|l| l.starts_with("info string stats "))
+            .collect();
+        assert_eq!(
+            stats.len(),
+            usize::from(cfg!(feature = "verbose1")),
+            "the statistics line arrives with `verbose1` and with nothing \
+             below it, got {infos:?} in:\n{out}"
+        );
+        assert_eq!(
+            infos.len(),
+            stats.len(),
+            "a build without `verbose2` must emit no info line about the \
+             search itself, got {infos:?} in:\n{out}"
         );
     }
 }

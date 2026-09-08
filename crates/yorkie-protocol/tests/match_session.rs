@@ -13,14 +13,17 @@
 //! and hold the refusals.
 //!
 //! The diagnostic lines are composed through `common::diag_line`, so the
-//! transcripts stay byte-exact with and without `verbose1`.
+//! transcripts stay byte-exact with and without `verbose1`. The per-reply
+//! statistics line, whose number counts what the process allocated and so
+//! differs from run to run, is taken out through `common::without_stats`
+//! instead: what these transcripts pin is what the engine decided.
 //!
 //! No network is loaded, so every `go` resolves through the no-eval path — the
 //! one search outcome that is deterministic to the byte.
 
 mod common;
 
-use common::{diag_line, drive};
+use common::{diag_line, drive, without_stats};
 
 /// The play part of a game-shaped session, byte-for-byte — the same expectation
 /// in every build on the verbosity axis.
@@ -48,7 +51,10 @@ gameover lose\n";
 #[cfg_attr(miri, ignore)]
 #[test]
 fn match_shaped_session_is_byte_identical() {
-    assert_eq!(drive(&format!("{PLAY_SESSION}quit\n")), play_output());
+    assert_eq!(
+        without_stats(&drive(&format!("{PLAY_SESSION}quit\n"))),
+        play_output()
+    );
 }
 
 /// The same session with the handshake a bridge actually sends in front of it:
@@ -64,7 +70,7 @@ fn whole_session_including_the_handshake() {
         "usi\nsetoption name USI_Hash value 256\n{PLAY_SESSION}quit\n"
     ));
     assert_eq!(
-        out,
+        without_stats(&out),
         format!(
             "id name Yorkie 3.1.0\n\
              id author Kei Ishida <ishida.kei@gmail.com>\n\
@@ -87,7 +93,7 @@ fn go_ponder_and_ponderhit_are_match_commands() {
         ponderhit\n\
         quit\n";
     assert_eq!(
-        drive(session),
+        without_stats(&drive(session)),
         format!(
             "{}bestmove resign\n",
             diag_line("no eval network loaded; run isready")
@@ -116,7 +122,7 @@ mod below_verbose3 {
 /// loudly.
 #[cfg(not(feature = "verbose2"))]
 mod below_verbose2 {
-    use super::{diag_line, drive};
+    use super::{diag_line, drive, without_stats};
 
     /// Every gated `go` clause is refused by name, and no search starts: no
     /// `bestmove`, no `info` beyond the one error line. Silently dropping the
@@ -169,7 +175,7 @@ mod below_verbose2 {
             go btime 60000 wtime 60000 byoyomi 5000\n\
             quit\n";
         assert_eq!(
-            drive(session),
+            without_stats(&drive(session)),
             format!(
                 "{}{}bestmove resign\n",
                 diag_line("go error: `depth` requires a verbose2 build; no search started"),
