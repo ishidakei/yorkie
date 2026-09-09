@@ -32,10 +32,11 @@
 //! tests whose walk-through only reads correctly for one count carry a
 //! `cfg`-selected pair of bodies rather than skipping under the other.
 //!
-//! Every test here is ignored under miri: clearing the table alone is millions
-//! of interpreted atomic writes — tens of minutes per test. What the `static`
-//! itself has to be is covered there by the crate's own unit tests, over a
-//! prefix miri can finish.
+//! Every test here is ignored under miri: each starts by clearing the table,
+//! and a clear touches every entry there is — six interpreted atomic writes
+//! apiece, tens of thousands of entries even at the small cluster count a miri
+//! build fixes. What the `static` itself has to be is covered there by the
+//! crate's own unit tests, which only read it.
 
 use std::ops::Deref;
 use std::sync::{Mutex, MutexGuard};
@@ -469,11 +470,16 @@ fn the_table_is_sized_and_aligned_before_anything_runs() {
     let tt = fresh_tt();
     let (addr, bytes) = tt.backing_region();
 
+    // A miri build fixes the count instead of folding it from `usi_hash`, so
+    // the MiB it is a whole number of is not a property it has.
+    #[cfg(not(miri))]
     assert_eq!(
         CLUSTER_COUNT % 32_768,
         0,
         "a whole number of MiB of clusters"
     );
+    #[cfg(miri)]
+    assert_eq!(CLUSTER_COUNT, 8192, "the count a miri build fixes");
     assert_eq!(addr % TT_ALIGN, 0, "the table starts on a huge page");
     assert_eq!(bytes % TT_ALIGN, 0, "and covers whole ones");
     assert!(bytes >= CLUSTER_COUNT * 32);

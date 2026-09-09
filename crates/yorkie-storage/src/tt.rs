@@ -67,9 +67,11 @@
 //! before anything touches it.
 //!
 //! Miri interprets Rust and cannot resolve a symbol that only an assembler
-//! defines, so a miri build gets the same table as a Rust `static` array. The
-//! const-evaluation that rules out for a real build is affordable at the size
-//! the tests are built with.
+//! defines, so a miri build gets the same table as a Rust `static` array. Its
+//! initialiser is const-evaluated byte by byte and every access to it is
+//! interpreted, both of which scale with the cluster count, so that build fixes
+//! [`CLUSTER_COUNT`] at a small count of its own instead of folding it from
+//! `usi_hash`.
 //!
 //! # Threading
 //!
@@ -595,8 +597,19 @@ const _: () = assert!(TT_ALIGN >= crate::large_page::LARGE_PAGE_ALIGN);
 ///
 /// It is always even, which is what lets the side to move be folded into
 /// cluster-index bit 0 and stay in range.
+#[cfg(not(miri))]
 pub const CLUSTER_COUNT: usize =
     crate::config::USI_HASH as usize * 1024 * 1024 / size_of::<Cluster>();
+
+/// Clusters in the table under miri, which const-evaluates the `static`'s
+/// initialiser and interprets every access to it — both linear in this count,
+/// and minutes of it at the count `usi_hash` folds to. 8192 clusters, 256 KiB,
+/// is the smallest count that leaves every property the storage tests read off
+/// the table intact: it is even, it is well past the 1000 clusters `hashfull`
+/// samples, it is a power of two like every configured count, and the two
+/// 4096-cluster ends the emptiness check walks still meet without overlapping.
+#[cfg(miri)]
+pub const CLUSTER_COUNT: usize = 8192;
 
 const _: () = assert!(CLUSTER_COUNT.is_multiple_of(2));
 // `hashfull` samples the first 1000 clusters, and the smallest `usi_hash` the
@@ -1029,7 +1042,13 @@ mod static_table_tests {
 
     /// [`CLUSTER_COUNT`], recomputed from the setting rather than read from the
     /// constant, so a change to either arithmetic fails this.
+    #[cfg(not(miri))]
     const EXPECTED_CLUSTERS: usize = crate::config::USI_HASH as usize * 1024 * 1024 / 32;
+
+    /// The count a miri build fixes instead of folding from the setting,
+    /// restated rather than read from the constant for the same reason.
+    #[cfg(miri)]
+    const EXPECTED_CLUSTERS: usize = 8192;
 
     #[test]
     fn cluster_count_follows_the_configured_hash_size() {
