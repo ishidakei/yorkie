@@ -14,7 +14,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use yorkie_numa::{CpuIndex, NumaAutoPolicy, NumaConfig, NumaLayout, SysfsOptions};
+use yorkie_numa::{CpuIndex, L3Domain, NumaLayout, SysfsOptions};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -27,15 +27,10 @@ fn all_cpus(n: CpuIndex) -> BTreeSet<CpuIndex> {
     (0..n).collect()
 }
 
-fn set(cpus: &[CpuIndex]) -> BTreeSet<CpuIndex> {
-    cpus.iter().copied().collect()
-}
-
-fn opts(name: &str, allowed: BTreeSet<CpuIndex>, system_threads: CpuIndex) -> SysfsOptions {
+fn opts(name: &str, online: BTreeSet<CpuIndex>) -> SysfsOptions {
     SysfsOptions {
         root: fixture(name),
-        allowed_cpus: allowed,
-        system_threads,
+        online_cpus: online,
     }
 }
 
@@ -43,189 +38,84 @@ fn opts(name: &str, allowed: BTreeSet<CpuIndex>, system_threads: CpuIndex) -> Sy
 
 #[cfg_attr(miri, ignore)]
 #[test]
-fn system_numa_two_nodes() {
-    let o = opts("two_node_l3", all_cpus(8), 8);
-    let cfg = NumaConfig::from_sysfs(&NumaAutoPolicy::SystemNuma, true, &o);
-    assert_eq!(cfg.num_numa_nodes(), 2);
-    assert_eq!(cfg.nodes()[0], set(&[0, 1, 2, 3]));
-    assert_eq!(cfg.nodes()[1], set(&[4, 5, 6, 7]));
-    // Two nodes require replication even without a custom string.
-    assert!(cfg.requires_memory_replication());
+fn a_two_node_machine_reads_back_as_two_nodes() {
+    let layout = NumaLayout::of_machine(&opts("two_node_l3", all_cpus(8)));
+    assert_eq!(layout.nodes, vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]]);
+    assert_eq!(layout.system_nodes, vec![0, 1]);
+    assert_eq!(layout.system_node_of_cpu(5), Some(1));
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn an_offline_cpu_is_left_out_of_its_node() {
+    // The node `cpulist` names CPUs 4-7; only 4 and 5 are online, so the node
+    // holds those two and nothing else.
+    let online: BTreeSet<CpuIndex> = (0..6).collect();
+    let layout = NumaLayout::of_machine(&opts("two_node_l3", online));
+    assert_eq!(layout.nodes, vec![vec![0, 1, 2, 3], vec![4, 5]]);
 }
 
 // -- missing-file fallbacks ----------------------------------------------
 
 #[cfg_attr(miri, ignore)]
 #[test]
-fn missing_cpulist_falls_back_to_single_node() {
-    // node1/cpulist is absent, so detection discards the partial config and
-    // falls back to a single node with all allowed CPUs `0..system_threads`.
-    let o = opts("missing_cpulist", all_cpus(8), 8);
-    let cfg = NumaConfig::from_sysfs(&NumaAutoPolicy::SystemNuma, true, &o);
-    assert_eq!(cfg.num_numa_nodes(), 1);
-    assert_eq!(cfg.nodes()[0], all_cpus(8));
+fn a_node_without_a_cpulist_falls_back_to_one_node() {
+    // node1/cpulist is absent, so the partial topology is discarded in favour of
+    // the single node holding every online CPU.
+    let layout = NumaLayout::of_machine(&opts("missing_cpulist", all_cpus(8)));
+    assert_eq!(layout.nodes, vec![(0..8).collect::<Vec<_>>()]);
+    assert_eq!(layout.system_nodes, vec![0]);
 }
 
 #[cfg_attr(miri, ignore)]
 #[test]
-fn missing_online_falls_back_to_single_node() {
-    let o = opts("no_online", all_cpus(4), 4);
-    let cfg = NumaConfig::from_sysfs(&NumaAutoPolicy::SystemNuma, true, &o);
-    assert_eq!(cfg.num_numa_nodes(), 1);
-    assert_eq!(cfg.nodes()[0], all_cpus(4));
+fn a_tree_without_a_node_list_falls_back_to_one_node() {
+    let layout = NumaLayout::of_machine(&opts("no_online", all_cpus(4)));
+    assert_eq!(layout.nodes, vec![(0..4).collect::<Vec<_>>()]);
 }
 
-// -- affinity filtering: respect vs hardware ------------------------------
+// -- L3 domains -----------------------------------------------------------
 
 #[cfg_attr(miri, ignore)]
 #[test]
-fn respect_affinity_filters_disallowed_cpus() {
-    // Only CPUs 0..3 are allowed; node1 (CPUs 4..7) becomes empty and is
-    // removed.
-    let o = opts("two_node_l3", set(&[0, 1, 2, 3]), 8);
-    let cfg = NumaConfig::from_sysfs(&NumaAutoPolicy::SystemNuma, true, &o);
-    assert_eq!(cfg.num_numa_nodes(), 1);
-    assert_eq!(cfg.nodes()[0], set(&[0, 1, 2, 3]));
-    assert!(!cfg.is_custom_affinity());
-}
-
-#[cfg_attr(miri, ignore)]
-#[test]
-fn hardware_policy_ignores_affinity_but_marks_custom() {
-    // respect_affinity = false: the allowed set is ignored, so both nodes
-    // survive; the result is flagged custom.
-    let o = opts("two_node_l3", set(&[0, 1, 2, 3]), 8);
-    let cfg = NumaConfig::from_sysfs(&NumaAutoPolicy::SystemNuma, false, &o);
-    assert_eq!(cfg.num_numa_nodes(), 2);
-    assert_eq!(cfg.nodes()[0], set(&[0, 1, 2, 3]));
-    assert_eq!(cfg.nodes()[1], set(&[4, 5, 6, 7]));
-    assert!(cfg.is_custom_affinity());
-}
-
-// -- L3-aware detection + bundling from a fixture -------------------------
-
-#[cfg_attr(miri, ignore)]
-#[test]
-fn l3_domains_policy_one_node_per_domain() {
-    let o = opts("two_node_l3", all_cpus(8), 8);
-    let cfg = NumaConfig::from_sysfs(&NumaAutoPolicy::L3Domains, true, &o);
-    // Four L3 domains: {0,1}, {2,3}, {4,5}, {6,7}; no bundling.
-    assert_eq!(cfg.num_numa_nodes(), 4);
-    assert_eq!(cfg.nodes()[0], set(&[0, 1]));
-    assert_eq!(cfg.nodes()[1], set(&[2, 3]));
-    assert_eq!(cfg.nodes()[2], set(&[4, 5]));
-    assert_eq!(cfg.nodes()[3], set(&[6, 7]));
-}
-
-#[cfg_attr(miri, ignore)]
-#[test]
-fn bundled_l3_merges_within_system_node() {
-    let o = opts("two_node_l3", all_cpus(8), 8);
-    let cfg = NumaConfig::from_sysfs(&NumaAutoPolicy::BundledL3 { bundle_size: 4 }, true, &o);
-    // Within each system node the two 2-CPU domains merge (2 + 2 <= 4).
-    assert_eq!(cfg.num_numa_nodes(), 2);
-    assert_eq!(cfg.nodes()[0], set(&[0, 1, 2, 3]));
-    assert_eq!(cfg.nodes()[1], set(&[4, 5, 6, 7]));
-}
-
-#[cfg_attr(miri, ignore)]
-#[test]
-fn bundled_l3_below_boundary_does_not_merge() {
-    let o = opts("two_node_l3", all_cpus(8), 8);
-    let cfg = NumaConfig::from_sysfs(&NumaAutoPolicy::BundledL3 { bundle_size: 2 }, true, &o);
-    // 2 + 2 = 4 > 2, so no domains merge.
-    assert_eq!(cfg.num_numa_nodes(), 4);
-}
-
-#[cfg_attr(miri, ignore)]
-#[test]
-fn bundled_l3_respects_affinity_filter() {
-    // Only node0's CPUs are allowed; the L3 domains on node1 vanish.
-    let o = opts("two_node_l3", set(&[0, 1, 2, 3]), 8);
-    let cfg = NumaConfig::from_sysfs(&NumaAutoPolicy::BundledL3 { bundle_size: 32 }, true, &o);
-    assert_eq!(cfg.num_numa_nodes(), 1);
-    assert_eq!(cfg.nodes()[0], set(&[0, 1, 2, 3]));
-}
-
-// -- logical -> system NUMA node mapping (replication granularity) --------
-
-#[cfg_attr(miri, ignore)]
-#[test]
-fn bundled_l3_logical_nodes_map_to_their_system_node() {
-    // BundledL3{4} over two_node_l3 bundles each system node's two L3 domains
-    // back into one logical node, so logical == system here: logical 0 -> system
-    // 0, logical 1 -> system 1.
-    let o = opts("two_node_l3", all_cpus(8), 8);
-    let cfg = NumaConfig::from_sysfs(&NumaAutoPolicy::BundledL3 { bundle_size: 4 }, true, &o);
-    assert_eq!(cfg.num_numa_nodes(), 2);
-    assert_eq!(cfg.system_nodes(&o), vec![0, 1]);
-}
-
-#[cfg_attr(miri, ignore)]
-#[test]
-fn l3_bundled_logical_nodes_in_one_system_node_share_discriminator() {
-    // BundledL3{2} keeps all four L3 domains as distinct logical nodes, but the
-    // first two ({0,1},{2,3}) live on system node 0 and the last two on system
-    // node 1. Two logical nodes sharing a system node therefore map to the same
-    // discriminator — the signal to share one network copy between them.
-    let o = opts("two_node_l3", all_cpus(8), 8);
-    let cfg = NumaConfig::from_sysfs(&NumaAutoPolicy::BundledL3 { bundle_size: 2 }, true, &o);
-    assert_eq!(cfg.num_numa_nodes(), 4);
-    assert_eq!(cfg.system_nodes(&o), vec![0, 0, 1, 1]);
-}
-
-#[cfg_attr(miri, ignore)]
-#[test]
-fn unassigned_cpu_falls_back_to_system_node_zero() {
-    // A custom logical config whose sole CPU does not appear in the fixture's
-    // system topology; the lookup falls back to system node 0.
-    let o = opts("two_node_l3", all_cpus(8), 8);
-    let cfg = NumaConfig::from_string("100").expect("valid custom config");
-    assert_eq!(cfg.system_nodes(&o), vec![0]);
-}
-
-// -- the layout a binary carries -----------------------------------------
-
-#[cfg_attr(miri, ignore)]
-#[test]
-fn layout_round_trips_a_multi_node_config() {
-    // The layout is the whole of what a detection run found: rebuilding a
-    // config from it must give back the same nodes, the same reverse map and
-    // the same custom-affinity answer, without touching sysfs again.
-    let o = opts("two_node_l3", all_cpus(8), 8);
-    let cfg = NumaConfig::from_sysfs(&NumaAutoPolicy::BundledL3 { bundle_size: 2 }, true, &o);
-    let layout = NumaLayout::of(&cfg, &o);
-
+fn l3_domains_are_ordered_by_system_node_then_lowest_cpu() {
+    let o = opts("two_node_l3", all_cpus(8));
+    let layout = NumaLayout::of_machine(&o);
     assert_eq!(
-        layout.nodes,
-        vec![vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7]]
+        yorkie_numa::l3_domains(&o, &layout),
+        vec![
+            L3Domain {
+                system_node: 0,
+                cpus: vec![0, 1]
+            },
+            L3Domain {
+                system_node: 0,
+                cpus: vec![2, 3]
+            },
+            L3Domain {
+                system_node: 1,
+                cpus: vec![4, 5]
+            },
+            L3Domain {
+                system_node: 1,
+                cpus: vec![6, 7]
+            },
+        ]
     );
-    assert_eq!(layout.system_nodes, vec![0, 0, 1, 1]);
-    assert!(!layout.custom_affinity);
-
-    let rebuilt = layout.config();
-    assert_eq!(rebuilt.nodes(), cfg.nodes());
-    assert_eq!(rebuilt.to_string(), cfg.to_string());
-    assert_eq!(rebuilt.num_cpus(), cfg.num_cpus());
-    assert_eq!(rebuilt.is_custom_affinity(), cfg.is_custom_affinity());
-    assert!(rebuilt.requires_memory_replication());
-    for c in 0..8 {
-        assert_eq!(rebuilt.node_of_cpu(c), cfg.node_of_cpu(c));
-    }
-    // The layout of the rebuilt config is the layout it came from.
-    assert_eq!(NumaLayout::of(&rebuilt, &o), layout);
 }
 
 #[cfg_attr(miri, ignore)]
 #[test]
-fn layout_round_trips_a_custom_affinity_config() {
-    let o = opts("two_node_l3", all_cpus(8), 8);
-    let cfg = NumaConfig::from_sysfs(&NumaAutoPolicy::SystemNuma, false, &o);
-    let layout = NumaLayout::of(&cfg, &o);
-    assert!(layout.custom_affinity, "`hardware` detection is custom");
-    let rebuilt = layout.config();
-    assert!(rebuilt.is_custom_affinity());
-    assert_eq!(rebuilt.nodes(), cfg.nodes());
+fn a_cpu_without_a_reported_l3_is_a_domain_of_its_own() {
+    // The fixture reports no cache tree at all, so each online CPU shares an L3
+    // with nothing and stands alone.
+    let o = opts("missing_cpulist", all_cpus(3));
+    let layout = NumaLayout::of_machine(&o);
+    let domains = yorkie_numa::l3_domains(&o, &layout);
+    assert_eq!(domains.len(), 3);
+    for (n, domain) in domains.iter().enumerate() {
+        assert_eq!(domain.cpus, vec![n]);
+    }
 }
 
 // -- the machine behind a sysfs root --------------------------------------
@@ -234,13 +124,8 @@ fn layout_round_trips_a_custom_affinity_config() {
 #[test]
 fn machine_options_describe_every_online_cpu() {
     let o = yorkie_numa::machine_sysfs_options(&fixture("two_node_l3")).expect("a full tree");
-    assert_eq!(o.allowed_cpus, all_cpus(8));
-    assert_eq!(o.system_threads, 8);
-    // The policies resolve against it exactly as they do against the real
-    // machine.
-    let cfg = NumaConfig::from_policy("auto", &o).expect("`auto` resolves");
-    assert_eq!(cfg.num_numa_nodes(), 2);
-    assert_eq!(cfg.nodes()[0], set(&[0, 1, 2, 3]));
+    assert_eq!(o.online_cpus, all_cpus(8));
+    assert_eq!(NumaLayout::of_machine(&o).num_nodes(), 2);
 }
 
 #[cfg_attr(miri, ignore)]
@@ -260,14 +145,26 @@ fn machine_options_refuse_a_root_without_sysfs() {
 #[cfg(target_os = "linux")]
 #[cfg_attr(miri, ignore)]
 #[test]
-fn smoke_from_system_real_sys() {
+fn smoke_the_real_machine_parses() {
     // Structure-only assertions: the real /sys parses without error and yields
-    // at least one non-empty node. We do NOT assert any values, since those are
-    // machine-specific.
-    let cfg = NumaConfig::from_system(&NumaAutoPolicy::BundledL3 { bundle_size: 32 }, true);
-    assert!(cfg.num_numa_nodes() >= 1);
-    for n in 0..cfg.num_numa_nodes() {
-        assert!(cfg.num_cpus_in_numa_node(n) >= 1);
-    }
-    assert!(cfg.num_cpus() >= 1);
+    // at least one non-empty node covering every online CPU, and every one of
+    // those CPUs lands in exactly one L3 domain. We do NOT assert any values,
+    // since those are machine-specific.
+    let o = yorkie_numa::machine_sysfs_options(std::path::Path::new("/sys"))
+        .expect("a Linux host reports a topology");
+    let layout = NumaLayout::of_machine(&o);
+    assert!(layout.num_nodes() >= 1);
+    assert_eq!(layout.cpus(), o.online_cpus);
+
+    let domains = yorkie_numa::l3_domains(&o, &layout);
+    let covered: BTreeSet<CpuIndex> = domains
+        .iter()
+        .flat_map(|d| d.cpus.iter().copied())
+        .collect();
+    assert_eq!(covered, o.online_cpus);
+    assert_eq!(
+        covered.len(),
+        domains.iter().map(|d| d.cpus.len()).sum::<usize>(),
+        "no CPU belongs to two L3 domains"
+    );
 }

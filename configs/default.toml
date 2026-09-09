@@ -30,8 +30,11 @@
 # exactly the table it will play with.
 usi_hash = 1024
 
-# Worker-pool size (`Threads`).
-threads = 4
+# Worker-pool size (`Threads`). Each worker is pinned to one logical CPU of the
+# machine the binary is built on (`cpu_assignment` below), so this may not exceed
+# that machine's online CPU count — a larger value is a build error, not a
+# quietly oversubscribed pool.
+threads = 1
 
 # Number of principal variations reported per search (`MultiPV`). Honoured with
 # `verbose2`, the feature whose search `info` lines can report a second line;
@@ -52,13 +55,37 @@ eval_dir = "eval"
 # NNUE fixed-point output scale (`FV_SCALE`).
 fv_scale = 16
 
-# How the machine is mapped to logical NUMA nodes, and whether worker threads
-# bind (`NumaPolicy`): `auto` / `system` / `hardware` / `none`, or a custom
-# `':'`-separated node string.
-numa_policy = "auto"
+# Which logical CPU each worker thread is pinned to. Every worker gets exactly
+# one, chosen when the binary is built; nothing at run time revisits the choice,
+# and the memory each worker uses follows the NUMA node of its CPU.
+#
+# `"auto"` picks `threads` CPUs from those `cpu_ledger` below does not already
+# record as taken, round-robin over the machine's L3 cache domains: one worker on
+# the first free CPU of the first domain, the next on the first free CPU of the
+# second, and so on, wrapping around. The pick has no randomness in it, so the
+# same machine and the same ledger always give the same CPUs.
+#
+# The other form is an explicit list in the usual `0,2,4-7` shorthand. It must
+# name exactly `threads` CPUs, all online, none twice. Such a list consults no
+# ledger and appears in none: it says which CPUs this binary runs on, and keeping
+# it clear of the other builds on the machine is the business of whoever wrote
+# it.
+cpu_assignment = "auto"
 
-# How many logical NUMA nodes the machine this binary is built on has to come to
-# under `numa_policy` above.
+# The file recording which CPUs each build on the same machine took: one build per
+# line, so building several engines on one machine gives each its own CPUs
+# instead of all of them the same ones, and so an orchestrator can read which
+# binary owns which CPU. A relative path is taken from the repository root.
+#
+# Read and written only under `cpu_assignment = "auto"`, which is also the only
+# form that requires a file here; a config naming its CPUs outright leaves this
+# empty.
+#
+# A build already in the file keeps its line, so rebuilding takes nothing more.
+# Deleting the file hands every CPU back and starts the allocation over.
+cpu_ledger = ".yorkie-cpu-ledger"
+
+# How many NUMA nodes the machine this binary is built on has to have.
 #
 # The layout itself — the node count and each node's CPUs — is read off the
 # building machine's sysfs and compiled in, so the engine never discovers it at
@@ -71,9 +98,9 @@ numa_policy = "auto"
 # on cannot be built somewhere else by accident.
 #
 # Either way the binary is built for one machine: on any other — or under a
-# `taskset` / `cpuset` that hides part of this one — `isready` reports the
-# difference and withholds `readyok` rather than playing on a layout that is not
-# there.
+# `taskset` / `cpuset` that hides a CPU a worker is pinned to — `isready` reports
+# the difference and withholds `readyok` rather than playing on a machine that is
+# not there.
 numa_nodes = "auto"
 
 # Ponder toggles (`USI_Ponder` / `Stochastic_Ponder`). At the option layer these

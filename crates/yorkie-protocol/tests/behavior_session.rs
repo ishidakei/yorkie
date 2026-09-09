@@ -91,6 +91,7 @@ fn go_and_wait(h: &StreamHarness, position: &str, go: &str, expect_bestmoves: us
 #[cfg_attr(miri, ignore)]
 #[test]
 fn the_configured_draw_contempt_shows_up_in_the_root_side_score() {
+    let _tt = common::serial_tt();
     // At ply 100 with the draw horizon behind us, every child adjudicates a
     // draw, so the root reports the root side's draw contempt: `value * Pawn /
     // 100`. A quiet default (`-2` ⇒ `-1 cp`) reports a small non-positive cp; a
@@ -130,6 +131,7 @@ fn the_configured_draw_contempt_shows_up_in_the_root_side_score() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_lost_position_is_resigned_exactly_when_the_configured_threshold_is_reachable() {
+    let _tt = common::serial_tt();
     // A forced mated-in-2 for the side to move. With a reachable `ResignValue`
     // the search's decisive negative score drops below `-value cp`, so the reply
     // is `bestmove resign`; with the unreachable default it plays its one legal
@@ -185,6 +187,7 @@ fn a_lost_position_is_resigned_exactly_when_the_configured_threshold_is_reachabl
 #[cfg_attr(miri, ignore)]
 #[test]
 fn go_mate_finds_the_mate_and_terminates_on_quiet() {
+    let _tt = common::serial_tt();
     // `go mate 5000` on a mate-in-1 replies the mating move within the budget
     // (the mate-found stop fires at depth 1); `go mate 2000` on a quiet position
     // terminates by the budget with a legal bestmove (no hang).
@@ -225,6 +228,7 @@ fn go_mate_finds_the_mate_and_terminates_on_quiet() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn go_mate_infinite_releases_on_stop() {
+    let _tt = common::serial_tt();
     // `go mate infinite` carries no time bound, but whether it is unbounded at
     // all is decided by the build: `go mate` names no depth / nodes token, so
     // `DepthLimit` / `NodesLimit` seed it like any other search, and unlike

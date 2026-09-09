@@ -24,7 +24,8 @@ multi_pv = 3
 original_eval_dir = "eval"
 eval_dir = "eval"
 fv_scale = 16
-numa_policy = "auto"
+cpu_assignment = "0"
+cpu_ledger = ""
 numa_nodes = "auto"
 usi_ponder = false
 # DIFFERENCE: false in test.toml. The rewind-and-re-issue ponder path.

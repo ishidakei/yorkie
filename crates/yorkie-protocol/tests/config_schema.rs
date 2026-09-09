@@ -48,7 +48,7 @@ fn compile_at(text: &str, features: &[&str]) -> Result<Generated, String> {
 fn compile_on(
     text: &str,
     features: &[&str],
-    machine: &dyn Fn(&str) -> Result<ResolvedLayout, String>,
+    machine: &dyn Fn() -> Result<ResolvedLayout, String>,
 ) -> Result<Generated, String> {
     compile_config(
         text,
@@ -57,19 +57,35 @@ fn compile_on(
         "test",
         &Gating::Features(features),
         &Layout::Resolve(machine),
+        &Assignment::Resolve(&assign_one_cpu),
     )
 }
 
 /// A stand-in for the machine a build runs on: one that resolves to `nodes`
-/// logical NUMA nodes. These tests are about what the schema does with an
-/// answer, so no `/sys` is read for one.
-fn machine_with(nodes: usize) -> impl Fn(&str) -> Result<ResolvedLayout, String> {
-    move |_policy| {
+/// NUMA nodes. These tests are about what the schema does with an answer, so no
+/// `/sys` is read for one.
+fn machine_with(nodes: usize) -> impl Fn() -> Result<ResolvedLayout, String> {
+    move || {
         Ok(ResolvedLayout {
             nodes,
             items: "pub const NUMA_NODE_CPUS: &[&[usize]] = &[&[0]];".to_string(),
         })
     }
+}
+
+/// A stand-in for the CPU assignment: one CPU per worker, taken from 0 upwards.
+/// The picking and the ledger are the CPU-assignment tests' subject; here the
+/// only question is what the schema does with the answer.
+fn assign_one_cpu(request: &AssignmentRequest) -> Result<ResolvedAssignment, String> {
+    let cpus: Vec<String> = (0..request.threads).map(|c| c.to_string()).collect();
+    Ok(ResolvedAssignment {
+        items: format!(
+            "pub const WORKER_CPUS: &[usize] = &[{}];\n\
+             pub const WORKER_SYSTEM_NODES: &[usize] = &[{}];",
+            cpus.join(", "),
+            vec!["0"; cpus.len()].join(", ")
+        ),
+    })
 }
 
 /// The checked-in config with one key's line replaced (or removed, if
@@ -401,7 +417,7 @@ fn a_pinned_node_count_must_be_what_the_machine_resolves_to() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_machine_that_cannot_be_read_is_a_build_error() {
-    let unreadable = |_: &str| Err("cannot read `/sys/devices/system/node/online`".to_string());
+    let unreadable = || Err("cannot read `/sys/devices/system/node/online`".to_string());
     let err = compile_on(&default_config_text(), GATE_FEATURES, &unreadable)
         .expect_err("no layout, no binary");
     assert!(
@@ -429,12 +445,14 @@ fn a_node_count_outside_the_accepted_values_is_an_error() {
     }
 }
 
-/// A crate that plans no thread binding compiles no layout in: the key is still
-/// type-checked for it, but nothing about the machine reaches its generated
-/// module.
+/// A crate that places no memory per node and pins no worker compiles neither
+/// the layout nor the assignment in: both keys are still type-checked for it, but
+/// nothing about the machine reaches its generated module — and, crucially, it
+/// takes no CPU from the ledger, which exactly one build script per binary may
+/// do.
 #[cfg_attr(miri, ignore)]
 #[test]
-fn a_build_without_a_layout_generates_none_of_it() {
+fn a_build_without_a_layout_or_an_assignment_generates_neither() {
     let out = compile_config(
         &default_config_text(),
         "test.toml",
@@ -442,6 +460,7 @@ fn a_build_without_a_layout_generates_none_of_it() {
         "test",
         &Gating::Absent,
         &Layout::Absent,
+        &Assignment::Absent,
     )
     .expect("compiles")
     .code;
@@ -449,12 +468,68 @@ fn a_build_without_a_layout_generates_none_of_it() {
         out.contains("pub const FV_SCALE: "),
         "the keys it reads: {out}"
     );
-    for absent in ["NUMA_NODES", "NUMA_NODE_CPUS", "NUMA_SYSTEM_NODES"] {
+    for absent in [
+        "NUMA_NODES",
+        "NUMA_NODE_CPUS",
+        "NUMA_SYSTEM_NODES",
+        "CPU_ASSIGNMENT",
+        "WORKER_CPUS",
+        "WORKER_SYSTEM_NODES",
+    ] {
         assert!(
             !out.contains(absent),
-            "{absent} must not reach a build that compiles no layout: {out}"
+            "{absent} must not reach a build that compiles neither in: {out}"
         );
     }
+}
+
+// --- The other setting the machine answers: which CPU each worker runs on --
+
+/// The setting the build asked for, and the CPUs it came back with, are both
+/// compiled in.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_cpu_assignment_generates_the_setting_and_the_cpus_it_resolved_to() {
+    let out = compile(&default_with("threads", Some("threads = 3"))).expect("compiles");
+    assert!(
+        out.contains("pub const CPU_ASSIGNMENT: &str = \"auto\";"),
+        "{out}"
+    );
+    assert!(
+        out.contains("pub const WORKER_CPUS: &[usize] = &[0, 1, 2];"),
+        "one CPU per worker: {out}"
+    );
+    assert!(
+        out.contains("pub const WORKER_SYSTEM_NODES: &[usize] = &[0, 0, 0];"),
+        "one node per worker: {out}"
+    );
+}
+
+/// The key takes a string, and a resolver that refuses is a build error carrying
+/// the reason it gave.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_cpu_assignment_that_is_not_a_string_or_not_resolvable_is_an_error() {
+    let err = compile(&default_with("cpu_assignment", Some("cpu_assignment = 3")))
+        .expect_err("must fail");
+    assert!(
+        err.contains("`cpu_assignment` must be \"auto\" or a CPU list such as \"0,2,4-7\""),
+        "message: {err}"
+    );
+
+    let refuses = |_: &AssignmentRequest| Err("no free CPU is left".to_string());
+    let err = compile_config(
+        &default_config_text(),
+        "test.toml",
+        "test.toml",
+        "test",
+        &Gating::Features(GATE_FEATURES),
+        &Layout::Resolve(&machine_with(1)),
+        &Assignment::Resolve(&refuses),
+    )
+    .expect_err("no CPUs, no binary");
+    assert!(err.contains("no free CPU is left"), "message: {err}");
+    assert!(err.starts_with("test.toml:"), "message: {err}");
 }
 
 // --- Report-loud: a setting an orthogonal feature owns ---------------------

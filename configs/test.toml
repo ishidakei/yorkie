@@ -21,16 +21,27 @@
 # build time on the initializer and clear a gibibyte per test process.
 usi_hash = 16
 
-# TEST VALUE: the play value is 4. The session tests pin a deterministic
-# `bestmove` against a direct single-worker search; Lazy-SMP with more than one
-# worker is deliberately not reproducible move-for-move.
+# The session tests pin a deterministic `bestmove` against a direct
+# single-worker search; Lazy-SMP with more than one worker is deliberately not
+# reproducible move-for-move.
 threads = 1
 
 multi_pv = 1
 original_eval_dir = "eval"
 eval_dir = "eval"
 fv_scale = 16
-numa_policy = "auto"
+# TEST VALUE: the play config says `"auto"`. A test run builds the same config
+# into several output directories at once — a debug build, a release build, a
+# miri build — and each of those is a binary of its own, so under `"auto"` each
+# would take a CPU of its own and a small machine would run out. The single
+# worker of a test build is pinned to CPU 0 instead, which every machine has.
+cpu_assignment = "0"
+
+# TEST VALUE: the play config names `.yorkie-cpu-ledger`. Only `"auto"` picks
+# from a ledger, and the assignment above names its CPU outright, so a test build
+# takes nothing from any ledger and leaves the machine's CPUs to whatever is
+# playing on it.
+cpu_ledger = ""
 numa_nodes = "auto"
 usi_ponder = false
 stochastic_ponder = false

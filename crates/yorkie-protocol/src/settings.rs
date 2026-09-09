@@ -55,21 +55,27 @@ impl Settings {
         crate::config::BOOK_OPTIONS_V2
     }
 
-    /// The CPUs of every logical NUMA node, in node order: the layout this
-    /// binary was built for, under [`Self::numa_policy`].
+    /// The CPUs of every NUMA node, in node order: the layout this binary was
+    /// built for.
     pub(crate) fn numa_node_cpus(&self) -> &'static [&'static [usize]] {
         crate::config::NUMA_NODE_CPUS
     }
 
-    /// The system NUMA node of every logical node, aligned with
+    /// The kernel's node number for each node, aligned with
     /// [`Self::numa_node_cpus`].
     pub(crate) fn numa_system_nodes(&self) -> &'static [usize] {
         crate::config::NUMA_SYSTEM_NODES
     }
 
-    /// Whether the compiled layout is flagged custom-affinity.
-    pub(crate) fn numa_custom_affinity(&self) -> bool {
-        crate::config::NUMA_CUSTOM_AFFINITY
+    /// The logical CPU each worker is pinned to, indexed by worker id.
+    pub(crate) fn worker_cpus(&self) -> &'static [usize] {
+        crate::config::WORKER_CPUS
+    }
+
+    /// The system NUMA node of each worker's CPU, aligned with
+    /// [`Self::worker_cpus`].
+    pub(crate) fn worker_system_nodes(&self) -> &'static [usize] {
+        crate::config::WORKER_SYSTEM_NODES
     }
 }
 
@@ -202,8 +208,6 @@ text_accessors! {
     book_dir => BOOK_DIR;
     /// Entering-king declaration rule (`EnteringKingRule`).
     entering_king_rule => ENTERING_KING_RULE;
-    /// NUMA mapping / binding policy (`NumaPolicy`).
-    numa_policy => NUMA_POLICY;
 }
 
 // --- Profile-dependent book options (see the module docs for the masking). ---

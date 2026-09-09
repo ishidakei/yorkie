@@ -57,9 +57,12 @@ fn main() {
         // that declares the gating features is where a config a build cannot
         // honour is refused or reported.
         &Gating::Absent,
-        // Nothing here plans thread binding, so this crate compiles in no NUMA
+        // Nothing here places memory per node, so this crate compiles in no NUMA
         // layout and reads none.
         &Layout::Absent,
+        // Exactly one build script per binary may take CPUs from the ledger, and
+        // it is not this one.
+        &Assignment::Absent,
     ) {
         Ok(g) => g,
         Err(e) => fail(&e),

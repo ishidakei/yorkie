@@ -17,12 +17,18 @@ yorkie-search = { path = "../yorkie-search" }
 yorkie-state = { path = "../yorkie-state" }
 yorkie-storage = { path = "../yorkie-storage" }
 
-# The build script resolves the building machine's NUMA layout with the same
-# code the engine would have detected it with, and compiles it in.
+# The build script reads the building machine's NUMA layout and L3 domains with
+# the same code the engine would have read them with, and compiles the result in.
+# `libc` is for the `flock` that makes the CPU ledger safe against two builds
+# running at once on one machine.
 [build-dependencies]
+libc = "0.2"
 yorkie-numa = { path = "../yorkie-numa" }
 
+# `libc` is here for the same reason it is a build dependency: the CPU-assignment
+# tests `include!` the build script's half of it, `flock` and all.
 [dev-dependencies]
+libc = "0.2"
 serde = { version = "~1.0", features = ["derive"] }
 serde_json = "~1.0"
 

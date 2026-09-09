@@ -18,18 +18,21 @@
 //! anything but the value that build is fixed to — a setting that cannot take
 //! effect is an error, never something quietly ignored.
 //!
-//! One setting is not a value in the file but a fact about the machine: the
-//! NUMA layout. The config says which layout the engine maps the machine to and
-//! how many nodes that must come to, and the build reads the layout off the
-//! building host and compiles it in, so the engine's binding plan is fixed
-//! before it starts rather than discovered while it runs.
+//! Two settings are not values in the file but facts about the machine. The
+//! NUMA layout is read off the building host and compiled in, so the engine's
+//! memory placement is fixed before it starts rather than discovered while it
+//! runs. The CPU each worker thread pins itself to is chosen here too, from the
+//! CPUs no earlier build on the same machine has taken, and recorded in a ledger so
+//! the next build picks different ones.
 //!
 //! This file is the impure half — environment, filesystem, exit code. The
 //! schema, parser, code generator and path resolution live in
-//! `build_config.rs`, and the machine's layout in `build_numa.rs`.
+//! `build_config.rs`, the machine's layout in `build_numa.rs`, and the CPU
+//! assignment in `build_cpus.rs`.
 
 include!("build_config.rs");
 include!("build_numa.rs");
+include!("build_cpus.rs");
 
 /// Report a build-stopping configuration error and exit. `process::exit` rather
 /// than `panic!` so the message cargo surfaces is the message, without a
@@ -43,6 +46,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build_config.rs");
     println!("cargo:rerun-if-changed=build_numa.rs");
+    println!("cargo:rerun-if-changed=build_cpus.rs");
     println!("cargo:rerun-if-env-changed={CONFIG_ENV}");
 
     let repo_root = repo_root();
@@ -59,6 +63,13 @@ fn main() {
         )),
     };
 
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
+    let identity = BuildIdentity {
+        out_dir: exe_dir(&out_dir).display().to_string(),
+        config: display_source(&repo_root, &path),
+        version: std::env::var("CARGO_PKG_VERSION").unwrap_or_default(),
+    };
+
     let label = path.display().to_string();
     let gates = active_gates();
     let generated = match compile_config(
@@ -68,6 +79,7 @@ fn main() {
         &config_name(&path),
         &Gating::Features(&gates),
         &Layout::Resolve(&resolve_numa_layout),
+        &Assignment::Resolve(&|request| resolve_cpu_assignment(request, &identity, &repo_root)),
     ) {
         Ok(g) => g,
         Err(e) => fail(&e),
@@ -76,8 +88,7 @@ fn main() {
         println!("cargo:warning={warning}");
     }
 
-    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"))
-        .join("engine_config.rs");
+    let out = out_dir.join("engine_config.rs");
     if let Err(e) = std::fs::write(&out, generated.code) {
         fail(&format!(
             "cannot write the generated config `{}`: {e}",
@@ -98,6 +109,21 @@ fn active_gates() -> Vec<&'static str> {
             std::env::var_os(format!("CARGO_FEATURE_{}", feature.to_ascii_uppercase())).is_some()
         })
         .collect()
+}
+
+/// The directory the engine binary this build produces will sit in: three levels
+/// above `OUT_DIR` (`<target>/[<triple>/]<profile>/build/<pkg>-<hash>/out`).
+///
+/// This is what tells two builds apart in the CPU ledger — two binaries in one
+/// directory are the same binary, and one in another directory is another one,
+/// whichever features or profile produced it.
+fn exe_dir(out_dir: &Path) -> PathBuf {
+    out_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| out_dir.to_path_buf())
 }
 
 /// The repository root: two levels above this crate (`crates/yorkie-protocol`).

@@ -92,6 +92,7 @@ fn noisy_build() -> bool {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn the_reported_score_is_noise_within_the_configured_amplitude() {
+    let _tt = common::serial_tt();
     if !noisy_build() {
         return;
     }
@@ -117,6 +118,7 @@ fn the_reported_score_is_noise_within_the_configured_amplitude() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_new_game_evaluates_the_position_differently() {
+    let _tt = common::serial_tt();
     if !noisy_build() {
         return;
     }

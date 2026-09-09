@@ -51,6 +51,7 @@ gameover lose\n";
 #[cfg_attr(miri, ignore)]
 #[test]
 fn match_shaped_session_is_byte_identical() {
+    let _tt = common::serial_tt();
     assert_eq!(
         without_stats(&drive(&format!("{PLAY_SESSION}quit\n"))),
         play_output()
@@ -66,6 +67,7 @@ fn match_shaped_session_is_byte_identical() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn whole_session_including_the_handshake() {
+    let _tt = common::serial_tt();
     let out = drive(&format!(
         "usi\nsetoption name USI_Hash value 256\n{PLAY_SESSION}quit\n"
     ));
@@ -86,6 +88,7 @@ fn whole_session_including_the_handshake() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn go_ponder_and_ponderhit_are_match_commands() {
+    let _tt = common::serial_tt();
     let session = "\
         usinewgame\n\
         position startpos moves 7g7f\n\
@@ -110,6 +113,7 @@ mod below_verbose3 {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn bench_is_an_unknown_command() {
+        let _tt = crate::common::serial_tt();
         assert_eq!(drive("bench\nquit\n"), diag_line("unknown command: bench"));
         assert_eq!(
             drive("bench 16 1 6 default depth\nquit\n"),
@@ -131,6 +135,7 @@ mod below_verbose2 {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn gated_go_clauses_are_refused_and_start_no_search() {
+        let _tt = crate::common::serial_tt();
         for clause in [
             "depth 4",
             "nodes 1000",
@@ -157,6 +162,7 @@ mod below_verbose2 {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_gated_clause_poisons_the_whole_go_line() {
+        let _tt = crate::common::serial_tt();
         assert_eq!(
             drive("go btime 60000 wtime 60000 depth 4\nquit\n"),
             diag_line("go error: `depth` requires a verbose2 build; no search started")
@@ -168,6 +174,7 @@ mod below_verbose2 {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_refused_go_leaves_the_session_usable() {
+        let _tt = crate::common::serial_tt();
         let session = "\
             usinewgame\n\
             position startpos\n\

@@ -31,9 +31,16 @@ const _: () = assert!(
 const _: () = assert!(SLOW_MOVER >= 1, "SLOW_MOVER is a percentage, never 0");
 const _: () = assert!(!EVAL_DIR.is_empty(), "EVAL_DIR must name a directory");
 const _: () = assert!(!BOOK_DIR.is_empty(), "BOOK_DIR must name a directory");
-const _: () = assert!(!NUMA_POLICY.is_empty(), "NUMA_POLICY must name a policy");
 const _: () = assert!(NUMA_NODES >= 1, "a machine has at least one NUMA node");
 const _: () = assert!(
     NUMA_NODE_CPUS.len() == NUMA_NODES && NUMA_SYSTEM_NODES.len() == NUMA_NODES,
-    "both layout tables are indexed by logical node, so both are NUMA_NODES long"
+    "both layout tables are indexed by node, so both are NUMA_NODES long"
+);
+const _: () = assert!(
+    WORKER_CPUS.len() == THREADS as usize,
+    "one worker, one CPU: the assignment covers exactly the configured workers"
+);
+const _: () = assert!(
+    WORKER_SYSTEM_NODES.len() == WORKER_CPUS.len(),
+    "both worker tables are indexed by worker id"
 );

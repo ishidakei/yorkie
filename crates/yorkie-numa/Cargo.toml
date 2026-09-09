@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
-# NUMA topology discovery, a port of the reference's `NumaConfig` machinery.
+# NUMA topology discovery and per-CPU worker pinning.
 # Depends on std, plus `libc` on Linux for the affinity and memory-policy
 # syscalls. All sysfs topology parsing is pure and takes an injectable root
 # path, so it is exercised against fixture directories.

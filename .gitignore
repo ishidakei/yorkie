@@ -27,3 +27,7 @@ settings.local.json
 # Evaluation network files placed at the repository root. `nn.bin` is obtained
 # out-of-band and must never be committed.
 /eval/
+
+# The per-machine record of which logical CPUs each build took. It describes one
+# machine's allocation and means nothing on another, so it is never committed.
+/.yorkie-cpu-ledger*

@@ -13,10 +13,11 @@
 //!
 //! The generated module carries every schema key it can render on its own, not
 //! just `fv_scale`: the generator renders the schema as a whole, and allowing
-//! the unused ones is cheaper than a second, divergent code path here. The one
-//! it leaves out is the NUMA layout, which is not a value in the file but the
-//! machine's own, and which only the crate that plans thread binding compiles
-//! in.
+//! the unused ones is cheaper than a second, divergent code path here. The two
+//! it leaves out are the NUMA layout and the worker → CPU assignment, which are
+//! not values in the file but the machine's own. The assignment in particular
+//! takes CPUs from a ledger shared across builds, which exactly one build script
+//! per binary may do.
 //!
 //! The other half of the work here is the network. `original_eval_dir/nn.bin`
 //! is decoded, scaled and laid out exactly as the kernels read it, once, and
@@ -84,9 +85,12 @@ fn main() {
         // `fv_scale`, which no feature gates; the crate that declares them is
         // where a config a build cannot honour is refused or reported.
         &Gating::Absent,
-        // Nothing here plans thread binding, so this crate compiles in no NUMA
+        // Nothing here places memory per node, so this crate compiles in no NUMA
         // layout and reads none.
         &Layout::Absent,
+        // Exactly one build script per binary may take CPUs from the ledger, and
+        // it is not this one.
+        &Assignment::Absent,
     ) {
         Ok(g) => g,
         Err(e) => fail(&e),
@@ -329,8 +333,7 @@ fn exe_dir(out_dir: &Path) -> PathBuf {
 
 /// How many NUMA nodes the building machine has.
 ///
-/// The machine's own count, not the logical one the mapping policy produces:
-/// what it decides is whether the network can be one mapping every process on
+/// What it decides is whether the network can be one mapping every process on
 /// the machine shares, or has to be a copy per node the workers read it from. A
 /// host whose sysfs reports no topology is one node, which is the answer that
 /// makes the engine share one mapping.
@@ -343,10 +346,9 @@ fn machine_nodes() -> usize {
              binary, so building it needs a Linux host whose sysfs reports one"
         )),
     };
-    match yorkie_numa::NumaConfig::from_policy("system", &opts) {
-        Ok(config) => config.num_numa_nodes().max(1),
-        Err(e) => fail(&format!("cannot read this host's NUMA topology: {e}")),
-    }
+    yorkie_numa::NumaLayout::of_machine(&opts)
+        .num_nodes()
+        .max(1)
 }
 
 /// Whether this build compiles for the CPU of the machine doing the building,

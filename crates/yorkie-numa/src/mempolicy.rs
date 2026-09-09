@@ -1,5 +1,6 @@
 //! Linux NUMA **memory**-policy calls — the placement half of the NUMA work
-//! ([`NumaConfig`](crate::NumaConfig) owns the thread-pinning half).
+//! ([`pin_current_thread_to_cpu`](crate::pin_current_thread_to_cpu) owns the
+//! thread-pinning half).
 //!
 //! The recommended launch line on a many-core host wraps the engine in
 //! `numactl --interleave=all`. That process-wide policy is right for the one
@@ -23,11 +24,10 @@
 //!    by a worker right after it pins itself. Being per-thread, it can never
 //!    disturb the table's interleave or another thread's placement.
 //!
-//! The kernel's nodemask is indexed by **system** NUMA node, while a
-//! [`NumaIndex`] is a *logical* node that L3-aware bundling can renumber, so
-//! callers must map through
-//! [`NumaConfig::system_node_of_logical`](crate::NumaConfig::system_node_of_logical)
-//! before calling anything here.
+//! The kernel's nodemask is indexed by **system** NUMA node, which a layout's
+//! logical node order need not match, so callers resolve a node through
+//! [`NumaLayout::system_nodes`](crate::NumaLayout::system_nodes) before calling
+//! anything here.
 //!
 //! Every syscall wrapper returns a plain `bool` / `Option` and never panics: a
 //! kernel that refuses the call simply leaves today's placement in force.

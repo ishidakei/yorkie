@@ -49,6 +49,7 @@ fn bench_summary_positions(out: &str) -> u64 {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn bare_bench_runs_the_four_default_positions() {
+    let _tt = common::serial_tt();
     // No network loaded → each of the four default positions resigns instantly,
     // and the summary reports positions=4, nodes=0. This proves the default
     // position list and the summary plumbing without a 60-second real search.
@@ -77,6 +78,7 @@ fn bare_bench_runs_the_four_default_positions() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn garbage_argument_fails_loudly_without_panicking() {
+    let _tt = common::serial_tt();
     // A non-integer TT size is a loud parse error, not a panic and not a search.
     let out = drive("bench notanumber\nquit\n");
     if cfg!(feature = "verbose1") {
@@ -95,6 +97,7 @@ fn garbage_argument_fails_loudly_without_panicking() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn unsupported_limit_type_fails_loudly() {
+    let _tt = common::serial_tt();
     // `perft` / `eval` are out of NPS-bench scope; they are reported, not run.
     let out = drive("bench 16 1 5 default perft\nquit\n");
     assert!(
@@ -106,6 +109,7 @@ fn unsupported_limit_type_fails_loudly() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn current_source_benches_the_set_position() {
+    let _tt = common::serial_tt();
     // `current` benches exactly one position (the session position). With no
     // network it resigns, but the summary must report positions=1.
     let session = "position startpos moves 7g7f\n\
@@ -137,6 +141,7 @@ fn bench_session(bench_line: &str) -> String {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn two_runs_in_one_process_report_identical_nodes() {
+    let _tt = common::serial_tt();
     stage_configured_eval_dir();
 
     // Two bench runs in ONE process (one network load). Each resets the TT and
@@ -168,6 +173,7 @@ fn two_runs_in_one_process_report_identical_nodes() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn two_process_launches_report_identical_nodes() {
+    let _tt = common::serial_tt();
     // Two independent driver runs (separate "process launches") with identical
     // input must report the same total nodes — determinism does not depend on
     // in-process carry-over.
@@ -187,6 +193,7 @@ fn two_process_launches_report_identical_nodes() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn threads_two_bench_completes_and_reports() {
+    let _tt = common::serial_tt();
     let out = bench_session("bench 16 2 3 default depth");
     assert_eq!(
         bench_summary_positions(&out),

@@ -10,7 +10,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use yorkie_eval::{NnueError, network_file};
-use yorkie_numa::{NumaConfig, NumaIndex, NumaLayout, mempolicy};
+use yorkie_numa::{NumaIndex, NumaLayout, mempolicy};
 use yorkie_search::{
     BookConfig, BookHit, EnteringKingConfig, EnteringKingRule, PonderSignal, Prng, QSearch,
     RootMove, Search, SearchControl, SharedHistories, TimeControl, TimeInput, TimeManagement,
@@ -370,20 +370,17 @@ pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
     /// — the one command that carries a worker count as an argument. Nothing
     /// on the match path ever writes it.
     pool_threads: usize,
-    /// The active NUMA layout, rebuilt at construction from the layout constants
-    /// this binary was built with — no `/sys` read, and no topology decision, on
-    /// any path a game touches. Never replaced: the layout is a constant.
-    numa_config: NumaConfig,
-    /// The current worker → NUMA-node binding assignment, empty when binding is
-    /// inactive. Recomputed at every pool (re)build and stable until the next
-    /// one. Slot 0 is the per-`go` coordinator; `1..` are the helper threads.
-    numa_bound: Vec<NumaIndex>,
-    /// The shareable form of the binding assignment, including the worker →
-    /// *system*-node map the memory policy is indexed by. `None` when binding is
-    /// inactive. Rebuilt with the pool.
-    numa_plan: Option<Arc<NumaBindPlan>>,
+    /// The NUMA layout of the machine this binary was built for, rebuilt at
+    /// construction from the compiled constants — no `/sys` read, and no
+    /// topology decision, on any path a game touches. Never replaced: the layout
+    /// is a constant.
+    numa_layout: NumaLayout,
+    /// Which CPU each worker pins itself to and which system node its memory
+    /// belongs on, for the current pool size. Rebuilt with the pool. Slot 0 is
+    /// the per-`go` coordinator; `1..` are the helper threads.
+    worker_plan: Arc<WorkerPlan>,
     /// Per-worker handles to the node-shared correction / pawn tables, rebuilt
-    /// at every pool (re)build from [`Self::numa_bound`]. Length equals the pool
+    /// at every pool (re)build from [`Self::worker_plan`]. Length equals the pool
     /// size, so `[0]` is the coordinator's and `[1..]` the helpers'.
     worker_shared: Vec<Arc<SharedHistories>>,
     /// Per-worker handles to the NNUE network the worker evaluates with — a
@@ -425,26 +422,26 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     pub fn with_book_seed(reader: R, writer: Arc<Mutex<W>>, book_seed: u64) -> Self {
         let settings = Settings::new();
         let threads = settings.threads();
-        // Rebuild the active NUMA layout from the constants this binary was
-        // built with: the machine was mapped to logical nodes under
-        // `numa_policy` when the binary was, so nothing here reads `/sys` and
-        // nothing decides a topology. Whether the machine still matches is the
-        // `isready` check's question, asked once, before a game.
-        let numa_config =
-            NumaConfig::from_const(settings.numa_node_cpus(), settings.numa_custom_affinity());
-        let numa_bound = compute_numa_binding(&numa_config, settings.numa_policy(), threads);
-        let numa_plan = bind_plan(&numa_config, &numa_bound, settings.numa_system_nodes());
-        let pool = ThreadPool::with_binding(threads, numa_plan.clone());
+        // Rebuild the machine's NUMA layout and the worker → CPU assignment from
+        // the constants this binary was built with: both were decided when the
+        // binary was, so nothing here reads `/sys` and nothing decides a
+        // topology. Whether the machine still matches is the `isready` check's
+        // question, asked once, before a game.
+        let numa_layout =
+            NumaLayout::from_const(settings.numa_node_cpus(), settings.numa_system_nodes());
+        let worker_plan = Arc::new(WorkerPlan::of(
+            settings.worker_cpus(),
+            settings.worker_system_nodes(),
+            threads,
+        ));
+        let pool = ThreadPool::with_binding(threads, Arc::clone(&worker_plan));
         // Build the per-node shared correction / pawn tables and give the
         // coordinator (worker 0) its node's set.
-        let worker_shared = build_worker_shared(&numa_config, &numa_bound, threads);
+        let worker_shared = build_worker_shared(&worker_plan);
         let histories = Some(WorkerHistories::with_shared(Arc::clone(&worker_shared[0])));
         // The coordinator's bundle is built (and filled) right here, on the USI
         // thread — so place it explicitly; see `place_coordinator_histories`.
-        place_coordinator_histories(
-            histories.as_ref(),
-            coordinator_system_node(numa_plan.as_ref()),
-        );
+        place_coordinator_histories(histories.as_ref(), worker_plan.system_nodes[0]);
         Self {
             reader,
             writer,
@@ -468,9 +465,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             last_go: None,
             pool,
             pool_threads: threads,
-            numa_config,
-            numa_bound,
-            numa_plan,
+            numa_layout,
+            worker_plan,
             worker_shared,
             // No network loaded yet; populated by the first `isready`.
             worker_networks: Vec::new(),
@@ -639,15 +635,12 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// decide is where its pages come from, and both halves are asked for
     /// before anything faults one in:
     ///
-    /// 1. A memory policy naming exactly the system NUMA nodes the compiled
-    ///    thread plan's workers run on ([`table_placement`]): `MPOL_INTERLEAVE`
-    ///    over the set when they span several, so no node's memory controller
-    ///    carries the whole engine's probe traffic, and a preference for the one
-    ///    node when they share it. The policy goes on first, because it decides
-    ///    where the *first touch* of every page lands. A plan that pins no
-    ///    worker gets no policy at all: the process's own is the better answer
-    ///    there, since it is the one an operator confining the process to a node
-    ///    already gave.
+    /// 1. A memory policy naming exactly the system NUMA nodes this binary's
+    ///    workers run on ([`table_placement`]): `MPOL_INTERLEAVE` over the set
+    ///    when they span several, so no node's memory controller carries the
+    ///    whole engine's probe traffic, and a preference for the one node when
+    ///    they share it. The policy goes on first, because it decides where the
+    ///    *first touch* of every page lands.
     /// 2. `madvise(MADV_HUGEPAGE)`, so the region a huge-page boundary starts is
     ///    actually backed by huge pages.
     ///
@@ -671,7 +664,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // `usi_hash` setting asked for.
         let (addr, span) = self.tt.backing_region();
         let outcome = |accepted: bool| if accepted { "applied" } else { "refused" };
-        let placement = match table_placement(&self.numa_bound, self.settings.numa_system_nodes()) {
+        let placement = match table_placement(&self.worker_plan) {
             TablePlacement::OnNode(node) => format!(
                 "preferred on node {node} {}",
                 outcome(mempolicy::prefer_region_on_node(addr, span, node))
@@ -681,7 +674,6 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 yorkie_numa::format_cpu_list(nodes.iter().copied()),
                 outcome(mempolicy::interleave_region_over_nodes(addr, span, &nodes))
             ),
-            TablePlacement::ProcessDefault => "process default policy".to_string(),
         };
         let huge = yorkie_storage::advise_huge_pages(addr, span);
 
@@ -692,41 +684,35 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         ))
     }
 
-    /// Recompute the worker → NUMA-node binding for the current pool size and
-    /// the configured mapping policy, and rebuild the worker pool with it.
-    /// Every pool (re)build routes through here so [`Self::numa_bound`] stays
-    /// consistent with the live pool. Helper threads bind once at spawn; the
-    /// per-`go` coordinator binds at each `go`.
+    /// Recompute the worker → CPU assignment for the current pool size and
+    /// rebuild the worker pool with it. Every pool (re)build routes through here
+    /// so [`Self::worker_plan`] stays consistent with the live pool. Helper
+    /// threads pin once at spawn; the per-`go` coordinator pins at each `go`.
     ///
     /// Callers must have joined any running search first, since a resize
     /// destroys and recreates the helper threads.
     fn rebuild_pool(&mut self) {
         let requested = self.pool_threads;
-        let policy = self.settings.numa_policy();
-        self.numa_bound = compute_numa_binding(&self.numa_config, policy, requested);
+        self.worker_plan = Arc::new(WorkerPlan::of(
+            self.settings.worker_cpus(),
+            self.settings.worker_system_nodes(),
+            requested,
+        ));
         // Rebuild the per-node shared correction / pawn tables from the fresh
-        // binding assignment, so every pool rebuild resets them as the
-        // reference does. The coordinator's own game-scoped per-worker tables
-        // persist, so only its shared handle is swapped.
-        self.worker_shared = build_worker_shared(&self.numa_config, &self.numa_bound, requested);
+        // assignment, so every pool rebuild resets them. The coordinator's own
+        // game-scoped per-worker tables persist, so only its shared handle is
+        // swapped.
+        self.worker_shared = build_worker_shared(&self.worker_plan);
         if let Some(h) = self.histories.as_mut() {
             h.set_shared(Arc::clone(&self.worker_shared[0]));
         }
-        self.numa_plan = bind_plan(
-            &self.numa_config,
-            &self.numa_bound,
-            self.settings.numa_system_nodes(),
-        );
         // The coordinator's per-worker tables outlive a pool rebuild and were
         // faulted on the USI thread, so re-assert their placement for the fresh
         // assignment. Helpers need nothing here: they are respawned and each
         // allocates its own bundle on-thread after pinning.
-        place_coordinator_histories(
-            self.histories.as_ref(),
-            coordinator_system_node(self.numa_plan.as_ref()),
-        );
+        place_coordinator_histories(self.histories.as_ref(), self.worker_plan.system_nodes[0]);
         self.pool
-            .set_with_binding(requested, self.numa_plan.clone());
+            .set_with_binding(requested, Arc::clone(&self.worker_plan));
         // Re-resolve the per-worker network handles for the fresh binding /
         // pool size: the reference forces replication right after
         // `resize_threads` (`ensure_network_replicated`).
@@ -743,13 +729,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// [`Arc`]s to them.
     fn rebuild_networks(&mut self) {
         let requested = self.pool.size().max(1);
-        // Worker `i`'s system node — the reference's `get_discriminator` per
-        // worker. Read before `self.eval` is borrowed.
-        let sys_nodes = if self.numa_bound.is_empty() {
-            Vec::new()
-        } else {
-            worker_system_nodes(&self.numa_bound, self.settings.numa_system_nodes())
-        };
+        // Worker `i`'s system node, read before `self.eval` is borrowed.
+        let sys_nodes = self.worker_plan.system_nodes.clone();
 
         let Some(eval) = self.eval.as_ref() else {
             // No network loaded; `go` before an `isready` resigns anyway.
@@ -774,13 +755,12 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         Ok(())
     }
 
-    /// Emit the `Using N thread[s][ with NUMA node thread binding: ...]` line.
+    /// Emit the `Using N thread[s] on CPUs ...` line.
     #[cfg(feature = "verbose3")]
     fn emit_thread_allocation_information(&self) -> io::Result<()> {
         self.emit_info_string_lines(&thread_allocation_information_as_string(
             self.pool.size(),
-            &self.numa_config,
-            &self.numa_bound,
+            &self.worker_plan,
         ))
     }
 
@@ -960,7 +940,15 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         if let Some(reason) = self.numa_layout_refusal() {
             return Ok(IsreadyOutcome::LayoutMismatch(reason));
         }
-        // The machine is the one the binary was built for, so the thread plan's
+        // Which CPUs this binary plays on. An operator running several engines
+        // on one machine has to be able to see, from the engine itself, that
+        // each got the CPUs meant for it — so the line is an
+        // initialisation-phase `info string`, present in every build.
+        self.info_string(&format!(
+            "workers on CPUs {}",
+            yorkie_numa::format_cpu_list(self.worker_plan.distinct_cpus())
+        ))?;
+        // The machine is the one the binary was built for, so the workers'
         // nodes are the ones the table belongs on. Done before anything else
         // here, so the policy is in force before the first page of it is
         // touched.
@@ -1011,8 +999,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// Read the evaluation file into the memory the machine calls for, and
     /// report where it went.
     ///
-    /// One mapping on a single-node machine; one copy per system NUMA node the
-    /// thread plan's workers run on otherwise, each region placed on its node
+    /// One mapping on a single-node machine; one copy per system NUMA node this
+    /// binary's workers run on otherwise, each region placed on its node
     /// *before* the copy so every page's first touch lands there, and hinted
     /// for huge pages either way. Every placement call is best-effort: a kernel
     /// without `CONFIG_NUMA`, a seccomp filter or a restricted cgroup refuses
@@ -1044,34 +1032,21 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             instances.push(Arc::new(search));
             format!("one shared mapping; huge pages {}", outcome(huge))
         } else {
-            let nodes = network_regions(&self.numa_bound, self.settings.numa_system_nodes());
+            let nodes = network_regions(&self.worker_plan);
             let mut reported = Vec::new();
-            // A plan that binds no worker gets one region under the process's
-            // own policy, which is the policy an operator confining the process
-            // already chose.
-            let slots: Vec<Option<NumaIndex>> = if nodes.is_empty() {
-                vec![None]
-            } else {
-                nodes.iter().copied().map(Some).collect()
-            };
-            for (slot, node) in slots.iter().enumerate() {
+            for (slot, node) in nodes.iter().copied().enumerate() {
                 let (addr, span) = network_file::region_backing(slot);
-                let placed = match node {
-                    Some(node) => format!(
-                        "node {node} {}",
-                        outcome(mempolicy::migrate_region_to_node(addr, span, *node))
-                    ),
-                    None => "the process default policy".to_string(),
-                };
+                let placed = format!(
+                    "node {node} {}",
+                    outcome(mempolicy::migrate_region_to_node(addr, span, node))
+                );
                 let huge = yorkie_storage::advise_huge_pages(addr, span);
                 // SAFETY: every handle to a network over these regions was
                 // dropped above, and a search that could have held one was
                 // joined before this `isready` reached here, so nothing is
                 // reading the region being filled.
                 let (search, w) = unsafe { Search::load_evaluation_file_into_region(slot, path)? };
-                if let Some(node) = node {
-                    by_node.insert(*node, slot);
-                }
+                by_node.insert(node, slot);
                 // Every region reads the same file, so its complaints are the
                 // same each time; they are worth reporting once.
                 warnings = w;
@@ -1098,30 +1073,20 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// How the machine this process runs on differs from the one the binary was
     /// built for, or `None` when they agree.
     ///
-    /// The live layout is resolved exactly as the build resolved it: the same
-    /// mapping policy, over every online CPU, so what is compared is machine
-    /// against machine and not machine against process. A tree that cannot be
-    /// read is itself a refusal — an unverifiable layout is not a matching one.
+    /// The live layout is resolved exactly as the build resolved it, over every
+    /// online CPU, so what is compared is machine against machine and not
+    /// machine against process. A tree that cannot be read is itself a refusal —
+    /// an unverifiable layout is not a matching one.
     fn numa_layout_refusal(&self) -> Option<String> {
         let opts = match yorkie_numa::machine_sysfs_options(&self.sysfs_root) {
             Ok(opts) => opts,
             Err(e) => return Some(e),
         };
-        let live = match NumaConfig::from_policy(self.settings.numa_policy(), &opts) {
-            Ok(cfg) => NumaLayout::of(&cfg, &opts),
-            Err(e) => return Some(e),
-        };
-        numa_layout_difference(
-            &live,
+        machine_refusal(
+            &NumaLayout::of_machine(&opts),
             &self.startup_affinity,
-            // What a confined process hides is a CPU some worker was going to
-            // pin itself to, so the question is only asked of a build whose
-            // compiled plan pins one, and only of the CPUs that plan uses. A
-            // build that binds nothing — a single thread, or
-            // `numa_policy = "none"` — has no such CPU, and starting it under a
-            // `taskset` or in a cpuset takes nothing away from it.
-            &self.numa_bound,
-            self.settings.numa_node_cpus(),
+            &self.worker_plan,
+            &self.numa_layout,
         )
     }
 
@@ -1654,13 +1619,11 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // shares the flag.
         let generate_all_legal_moves = self.settings.generate_all_legal_moves();
 
-        // The per-`go` coordinator (worker slot 0) binds itself to its assigned
-        // NUMA node — and points its allocations at that node's memory — at the
-        // start of every `go` when binding is active. The reference binds pool
-        // thread 0 once at creation; the port's coordinator is spawned per
-        // `go`, so it re-binds each time — same target node, idempotent. `None`
-        // (single-node host) → no bind, no policy.
-        let numa_bind = self.numa_plan.clone();
+        // The per-`go` coordinator (worker slot 0) pins itself to its assigned
+        // CPU — and points its allocations at that CPU's node — at the start of
+        // every `go`. It is spawned per `go`, so it re-pins each time: same
+        // target CPU, idempotent.
+        let worker_plan = Arc::clone(&self.worker_plan);
 
         Some(CoordinatorJob {
             search,
@@ -1677,7 +1640,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             helper_shared,
             helper_networks,
             n_threads,
-            numa_bind,
+            worker_plan,
             book,
             book_config,
             own_book,
@@ -2794,18 +2757,18 @@ struct ThreadPool {
 
 impl ThreadPool {
     /// Build a pool of `size` slots (one main + `size − 1` helpers), spawning the
-    /// helper threads parked and idle. No NUMA binding (the driver uses
-    /// [`Self::with_binding`]; the pool unit tests use this).
+    /// helper threads parked and idle, each pinned to the CPU a plan built for
+    /// this process's own affinity gives it — the pool unit tests use this, so
+    /// they never pin a test thread to a CPU the test runner may not use.
     #[cfg(test)]
     fn new(size: usize) -> Self {
-        Self::with_binding(size, None)
+        Self::with_binding(size, Arc::new(WorkerPlan::of_allowed_cpus(size)))
     }
 
-    /// Build a pool of `size` slots with an optional NUMA binding plan. Each
-    /// helper thread (worker `1..`) binds itself to its assigned node once at
-    /// spawn (mirroring the reference per-thread bind at creation) before it
+    /// Build a pool of `size` slots with a worker plan. Each helper thread
+    /// (worker `1..`) pins itself to its assigned CPU once at spawn, before it
     /// parks.
-    fn with_binding(size: usize, plan: Option<Arc<NumaBindPlan>>) -> Self {
+    fn with_binding(size: usize, plan: Arc<WorkerPlan>) -> Self {
         let mut pool = ThreadPool {
             slots: Vec::new(),
             handles: Vec::new(),
@@ -2814,10 +2777,11 @@ impl ThreadPool {
         pool
     }
 
-    /// Resize to `size` slots with no binding — used only by the pool unit tests.
+    /// Resize to `size` slots over this process's own CPUs — used only by the
+    /// pool unit tests.
     #[cfg(test)]
     fn set(&mut self, size: usize) {
-        self.set_with_binding(size, None);
+        self.set_with_binding(size, Arc::new(WorkerPlan::of_allowed_cpus(size)));
     }
 
     /// Resize to `size` slots, mirroring the reference `ThreadPool::set`: it
@@ -2826,30 +2790,25 @@ impl ThreadPool {
     /// any running search to finish first, so every helper is parked when this
     /// runs.
     ///
-    /// When `plan` is `Some` and its assignment is non-empty, each helper binds
-    /// itself to its assigned NUMA node at spawn and makes that node its
-    /// preferred allocation target. The memory half matters because the
-    /// affinity pin alone places nothing: under `numactl --interleave=all` the inherited
-    /// process policy would still spread the helper's private history tables
-    /// across every node. Setting the preference at spawn is what makes
+    /// Each helper pins itself to its assigned CPU at spawn and makes that CPU's
+    /// node its preferred allocation target. The memory half matters because the
+    /// affinity pin alone places nothing: under `numactl --interleave=all` the
+    /// inherited process policy would still spread the helper's private history
+    /// tables across every node. Setting the preference at spawn is what makes
     /// [`helper_loop`]'s lazy allocation land node-locally, and it is per-thread,
     /// so the shared transposition table's interleave is untouched.
-    fn set_with_binding(&mut self, size: usize, plan: Option<Arc<NumaBindPlan>>) {
+    fn set_with_binding(&mut self, size: usize, plan: Arc<WorkerPlan>) {
         self.shutdown();
         let size = size.max(1);
         for worker_id in 1..size {
             let slot = Arc::new(HelperSlot::new());
             let slot_for_thread = Arc::clone(&slot);
-            let plan_for_thread = plan.clone();
+            let plan_for_thread = Arc::clone(&plan);
             self.handles.push(std::thread::spawn(move || {
-                if let Some(p) = &plan_for_thread
-                    && !p.bound.is_empty()
-                {
-                    p.config.bind_current_thread_with_local_memory(
-                        p.bound[worker_id],
-                        p.system_nodes[worker_id],
-                    );
-                }
+                yorkie_numa::pin_current_thread_to_cpu_with_local_memory(
+                    plan_for_thread.cpus[worker_id],
+                    plan_for_thread.system_nodes[worker_id],
+                );
                 helper_loop(slot_for_thread);
             }));
             self.slots.push(slot);
@@ -2891,94 +2850,92 @@ impl Drop for ThreadPool {
     }
 }
 
-/// The NUMA binding plan shared with the helper threads: the active layout plus
-/// the worker → node assignment. Held behind an [`Arc`] so a pool rebuild can
-/// cheaply hand each helper thread a clone.
-struct NumaBindPlan {
-    /// The active NUMA layout, used to resolve a node index to its CPU set.
-    config: NumaConfig,
-    /// The worker → node assignment (index `i` = worker `i`). Empty means no
-    /// binding; `set_with_binding` then leaves every helper unbound.
-    bound: Vec<NumaIndex>,
-    /// The worker → **system** NUMA node map, aligned with [`Self::bound`]: the
-    /// node each worker's private memory should live on. Distinct from `bound`
-    /// because L3-aware bundling renumbers logical nodes, while the kernel's
-    /// memory policy is indexed by system node
-    /// ([`NumaConfig::system_nodes_for_binding`]).
+/// Which CPU each worker runs on, and which system NUMA node its private memory
+/// belongs to. Held behind an [`Arc`] so a pool rebuild can cheaply hand each
+/// helper thread a clone.
+///
+/// Both vectors are one entry per worker and are indexed by worker id, worker 0
+/// being the per-`go` search coordinator.
+struct WorkerPlan {
+    cpus: Vec<usize>,
     system_nodes: Vec<NumaIndex>,
 }
 
-/// The worker → NUMA-node assignment for `requested` threads under `policy`.
-/// When binding is off the assignment is empty.
-fn compute_numa_binding(config: &NumaConfig, policy: &str, requested: usize) -> Vec<NumaIndex> {
-    let do_bind = match policy {
-        "none" => false,
-        "auto" => config.suggests_binding_threads(requested),
-        // "system", "hardware", or an explicit custom string.
-        _ => true,
-    };
-    if do_bind {
-        config.distribute_threads_among_numa_nodes(requested)
-    } else {
-        Vec::new()
+impl WorkerPlan {
+    /// The plan for `requested` workers over the compiled assignment.
+    ///
+    /// The assignment holds one CPU per configured worker. Asking for more than
+    /// that is only reachable through the measurement command that carries its
+    /// own worker count, and the extra workers wrap around onto the same CPUs —
+    /// oversubscribing the CPUs this binary owns rather than spilling onto ones
+    /// another binary was given.
+    fn of(cpus: &[usize], system_nodes: &[NumaIndex], requested: usize) -> Self {
+        let n = cpus.len().max(1);
+        let pick = |worker: usize| worker % n;
+        WorkerPlan {
+            cpus: (0..requested.max(1))
+                .map(|w| cpus.get(pick(w)).copied().unwrap_or(0))
+                .collect(),
+            system_nodes: (0..requested.max(1))
+                .map(|w| system_nodes.get(pick(w)).copied().unwrap_or(0))
+                .collect(),
+        }
+    }
+
+    /// A plan over the CPUs this process is actually allowed on, all of them on
+    /// node 0 — what a unit test spawning a pool needs, so its helper threads
+    /// pin themselves somewhere the test runner permits.
+    #[cfg(test)]
+    fn of_allowed_cpus(requested: usize) -> Self {
+        let cpus: Vec<usize> = yorkie_numa::startup_affinity().iter().copied().collect();
+        let nodes = vec![0; cpus.len().max(1)];
+        Self::of(&cpus, &nodes, requested)
+    }
+
+    /// The CPUs the plan uses, ascending and without repeats.
+    fn distinct_cpus(&self) -> BTreeSet<usize> {
+        self.cpus.iter().copied().collect()
+    }
+
+    /// The system NUMA nodes the plan's workers sit on, ascending and without
+    /// repeats.
+    fn distinct_system_nodes(&self) -> Vec<NumaIndex> {
+        let set: BTreeSet<NumaIndex> = self.system_nodes.iter().copied().collect();
+        set.into_iter().collect()
     }
 }
 
-/// Wrap a non-empty binding assignment into a shareable [`NumaBindPlan`]; an
-/// empty assignment yields `None`, and no thread binds.
+/// How the machine this process runs on differs from the one the binary was
+/// built for — one line, or `None` when they agree.
 ///
-/// `system_nodes` is the compiled layout's logical → *system* node map. The
-/// kernel's memory policy is indexed by system node while `bound` holds
-/// *logical* nodes that L3-aware bundling may have renumbered, so the plan
-/// carries the per-worker system nodes beside the logical ones, both the same
-/// length, and one worker id indexes both.
-fn bind_plan(
-    config: &NumaConfig,
-    bound: &[NumaIndex],
-    system_nodes: &[NumaIndex],
-) -> Option<Arc<NumaBindPlan>> {
-    if bound.is_empty() {
-        None
-    } else {
-        Some(Arc::new(NumaBindPlan {
-            config: config.clone(),
-            bound: bound.to_vec(),
-            system_nodes: worker_system_nodes(bound, system_nodes),
-        }))
-    }
-}
-
-/// How a machine whose layout is `live` differs from the `built` layout — one
-/// line, or `None` when they agree.
+/// Four ways to differ, in the order a reader wants them: a different number of
+/// nodes, a node holding different CPUs, a process denied a CPU a worker pins
+/// itself to, and a CPU that has moved to another node.
 ///
-/// Three ways to differ, in the order a reader wants them: a different number of
-/// nodes, a node holding different CPUs, and a process denied a CPU the compiled
-/// thread plan pins a worker to. The last is what a `taskset` or a `cpuset`
-/// around the engine can produce: the machine is right, but a worker would be
-/// pinned to a CPU this process is not allowed on, which the pin refuses at the
-/// point of no return — inside a spawned worker, mid-game. The question is
-/// therefore what `bound` assigns workers to: the CPUs of those nodes must be
-/// *allowed* by `affinity`, not equal to it. A wider affinity takes nothing
-/// away, since the engine narrows each worker itself; a `bound` that assigns
-/// nothing has no CPU to lose and skips the comparison entirely.
+/// The third is what a `taskset` or a `cpuset` around the engine can produce:
+/// the machine is right, but a worker would be pinned to a CPU this process is
+/// not allowed on, which the pin refuses at the point of no return — inside a
+/// spawned worker, mid-game. The question is inclusion, not equality: a wider
+/// affinity takes nothing away, since each worker narrows itself to its own CPU.
 ///
-/// The first two are asked of every build: they compare the machine with the
-/// layout the binary was built for, which confining the process does not change.
-fn numa_layout_difference(
+/// The fourth catches a machine that reports the same node count and CPU lists
+/// in a different order, which would leave every worker's memory placed on a
+/// node its CPU is not on.
+fn machine_refusal(
     live: &NumaLayout,
     affinity: &BTreeSet<usize>,
-    bound: &[NumaIndex],
-    built: &[&[usize]],
+    plan: &WorkerPlan,
+    built: &NumaLayout,
 ) -> Option<String> {
-    if live.nodes.len() != built.len() {
+    if live.nodes.len() != built.nodes.len() {
         return Some(format!(
             "this binary is built for {} NUMA node(s), this host has {}",
-            built.len(),
+            built.nodes.len(),
             live.nodes.len()
         ));
     }
-    for (n, (live_cpus, built_cpus)) in live.nodes.iter().zip(built).enumerate() {
-        if live_cpus.as_slice() != *built_cpus {
+    for (n, (live_cpus, built_cpus)) in live.nodes.iter().zip(&built.nodes).enumerate() {
+        if live_cpus != built_cpus {
             return Some(format!(
                 "node {n} holds CPUs {} on this host, {} in the layout this binary is built \
                  for",
@@ -2987,24 +2944,36 @@ fn numa_layout_difference(
             ));
         }
     }
-    let missing: BTreeSet<usize> = bound
-        .iter()
-        // A logical node outside the compiled layout cannot arise: `bound` is an
-        // assignment over that same layout's nodes.
-        .flat_map(|&logical| built[logical].iter().copied())
+    let missing: BTreeSet<usize> = plan
+        .distinct_cpus()
+        .into_iter()
         .filter(|cpu| !affinity.contains(cpu))
         .collect();
     if !missing.is_empty() {
         return Some(format!(
-            "this process may not run on CPUs {}, which the thread plan uses",
+            "this process may not run on CPUs {}, which its workers are pinned to",
             yorkie_numa::format_cpu_list(missing)
         ));
+    }
+    for (worker, (&cpu, &node)) in plan.cpus.iter().zip(&plan.system_nodes).enumerate() {
+        let live_node = live.system_node_of_cpu(cpu);
+        if live_node != Some(node) {
+            return Some(match live_node {
+                Some(live_node) => format!(
+                    "worker {worker} runs on CPU {cpu}, which is on node {live_node} on this \
+                     host and on node {node} in the layout this binary is built for"
+                ),
+                None => {
+                    format!("worker {worker} runs on CPU {cpu}, which no node of this host holds")
+                }
+            });
+        }
     }
     None
 }
 
 /// Where the shared transposition table's pages belong: the **system** NUMA
-/// nodes the compiled thread plan's workers run on, and nothing wider.
+/// nodes this binary's workers run on, and nothing wider.
 #[derive(Debug, PartialEq, Eq)]
 enum TablePlacement {
     /// Every worker sits on one node, so the whole table belongs on it.
@@ -3013,56 +2982,23 @@ enum TablePlacement {
     /// those: no node's memory controller carries the whole engine's probe
     /// traffic, and no page lands where no worker probes from.
     AcrossNodes(Vec<NumaIndex>),
-    /// Nothing pins a worker, so the engine sets no policy of its own and the
-    /// pages land wherever the process's policy puts them. A process confined
-    /// to one node — one of many single-thread engines sharing a machine — then
-    /// first-touches its table on that node, which is where its only worker
-    /// probes from.
-    ProcessDefault,
 }
 
-/// The placement a binding assignment implies, resolved through the compiled
-/// layout's logical → system node map. Ascending and without repeats.
+/// The placement a worker plan implies.
 ///
-/// A binary built for part of a machine — a `numa_policy` node string naming
-/// the CPUs of some of its nodes, or a thread count the binding fits on fewer
-/// nodes than the machine has — keeps its table on the part it uses, so every
-/// probe stays on a node a worker runs on. An empty assignment is the unbound
-/// case: no worker is pinned, so where the pages belong is not the engine's
-/// question to answer and the process's own policy answers it
-/// ([`TablePlacement::ProcessDefault`]).
+/// A binary built for part of a machine — a `cpu_assignment` naming CPUs of some
+/// of its nodes, or a thread count that fits on fewer nodes than the machine has
+/// — keeps its table on the part it uses, so every probe stays on a node a
+/// worker runs on.
 ///
-/// Reading the answer off the compiled constants keeps `isready` from asking
-/// the machine a second time.
-fn table_placement(bound: &[NumaIndex], system_nodes: &[NumaIndex]) -> TablePlacement {
-    if bound.is_empty() {
-        return TablePlacement::ProcessDefault;
-    }
-    let mut nodes = worker_system_nodes(bound, system_nodes);
-    nodes.sort_unstable();
-    nodes.dedup();
+/// Reading the answer off the compiled constants keeps `isready` from asking the
+/// machine a second time.
+fn table_placement(plan: &WorkerPlan) -> TablePlacement {
+    let nodes = plan.distinct_system_nodes();
     match nodes.as_slice() {
         [node] => TablePlacement::OnNode(*node),
         _ => TablePlacement::AcrossNodes(nodes),
     }
-}
-
-/// The *system* NUMA node of every worker in a binding assignment, read off the
-/// compiled layout's logical → system node map.
-fn worker_system_nodes(bound: &[NumaIndex], system_nodes: &[NumaIndex]) -> Vec<NumaIndex> {
-    bound
-        .iter()
-        .map(|&logical| {
-            // A logical node outside the compiled layout cannot arise: `bound`
-            // is an assignment over that same layout's nodes.
-            system_nodes[logical]
-        })
-        .collect()
-}
-
-/// Worker 0's system NUMA node under `plan`, or `None` when binding is inactive.
-fn coordinator_system_node(plan: Option<&Arc<NumaBindPlan>>) -> Option<NumaIndex> {
-    plan.and_then(|p| p.system_nodes.first().copied())
 }
 
 /// Move the coordinator's session-owned history tables onto worker 0's node.
@@ -3077,8 +3013,8 @@ fn coordinator_system_node(plan: Option<&Arc<NumaBindPlan>>) -> Option<NumaIndex
 ///
 /// Best-effort throughout, and run at pool-(re)build time only, outside any
 /// clock.
-fn place_coordinator_histories(histories: Option<&WorkerHistories>, node: Option<NumaIndex>) {
-    let (Some(histories), Some(node)) = (histories, node) else {
+fn place_coordinator_histories(histories: Option<&WorkerHistories>, node: NumaIndex) {
+    let Some(histories) = histories else {
         return;
     };
     for (addr, len) in histories.backing_regions() {
@@ -3086,97 +3022,55 @@ fn place_coordinator_histories(histories: Option<&WorkerHistories>, node: Option
     }
 }
 
-/// Build the per-worker handles to the node-shared correction / pawn tables,
-/// mirroring the reference per-node construction.
+/// Build the per-worker handles to the node-shared correction / pawn tables, one
+/// set per system NUMA node the plan's workers sit on.
 ///
-/// When `bound` is empty the reference pretends every thread is on node 0;
-/// otherwise it counts the assignment. When binding is active the construction
-/// runs *inside* a thread bound to that node so the pages first-touch there.
+/// Each node's set is allocated and filled *inside* a thread pinned to one of
+/// that node's worker CPUs, so the pages first-touch there.
 ///
-/// Returns one [`Arc`] per worker, each pointing at its node's table set, always
-/// `requested.max(1)` entries long.
-fn build_worker_shared(
-    config: &NumaConfig,
-    bound: &[NumaIndex],
-    requested: usize,
-) -> Vec<Arc<SharedHistories>> {
-    let requested = requested.max(1);
-    let counts = shared_node_counts(bound, requested);
-    // Binding active ⇒ allocate + fill each node's set on that node
-    // (first-touch); otherwise (single-node) build inline.
-    let binding_active = !bound.is_empty();
+/// Returns one [`Arc`] per worker, each pointing at its node's table set.
+fn build_worker_shared(plan: &WorkerPlan) -> Vec<Arc<SharedHistories>> {
+    let counts = shared_node_counts(&plan.system_nodes);
 
     let mut node_shared: std::collections::BTreeMap<NumaIndex, Arc<SharedHistories>> =
         std::collections::BTreeMap::new();
     for (&node, &count) in &counts {
         let thread_count = count.next_power_of_two();
-        let arc = if binding_active {
-            let mut built: Option<Arc<SharedHistories>> = None;
-            config.execute_on_numa_node(node, || {
-                built = Some(Arc::new(SharedHistories::new(thread_count)));
-            });
-            built.expect("execute_on_numa_node ran the closure")
-        } else {
-            Arc::new(SharedHistories::new(thread_count))
-        };
-        node_shared.insert(node, arc);
+        // A CPU of that node: the first worker the plan puts there.
+        let cpu = plan
+            .system_nodes
+            .iter()
+            .position(|&n| n == node)
+            .map(|worker| plan.cpus[worker])
+            .expect("every counted node holds at least one worker");
+        let mut built: Option<Arc<SharedHistories>> = None;
+        yorkie_numa::execute_on_cpu(cpu, || {
+            built = Some(Arc::new(SharedHistories::new(thread_count)));
+        });
+        node_shared.insert(node, built.expect("execute_on_cpu ran the closure"));
     }
 
-    worker_nodes(bound, requested)
-        .into_iter()
-        .map(|node| Arc::clone(&node_shared[&node]))
+    plan.system_nodes
+        .iter()
+        .map(|node| Arc::clone(&node_shared[node]))
         .collect()
 }
 
-/// The node → thread-count map for the shared-history construction: when
-/// `bound` is empty every thread is pretended to be on node 0
-/// (`counts[0] = requested`); otherwise the assignment is counted. Pure — no
-/// allocation or binding.
-fn shared_node_counts(
-    bound: &[NumaIndex],
-    requested: usize,
-) -> std::collections::BTreeMap<NumaIndex, usize> {
+/// The node → worker-count map the shared-history construction sizes each set
+/// from. Pure — no allocation and no pinning.
+fn shared_node_counts(worker_nodes: &[NumaIndex]) -> std::collections::BTreeMap<NumaIndex, usize> {
     let mut counts: std::collections::BTreeMap<NumaIndex, usize> =
         std::collections::BTreeMap::new();
-    if bound.is_empty() {
-        counts.insert(0, requested.max(1));
-    } else {
-        for &node in bound {
-            *counts.entry(node).or_insert(0) += 1;
-        }
+    for &node in worker_nodes {
+        *counts.entry(node).or_insert(0) += 1;
     }
     counts
 }
 
-/// The node each worker's shared table set belongs to: `bound[i]` when binding
-/// is active, else node 0 for every worker. Pure — no allocation or binding.
-/// Length is `requested.max(1)` (the pool size).
-fn worker_nodes(bound: &[NumaIndex], requested: usize) -> Vec<NumaIndex> {
-    if bound.is_empty() {
-        vec![0; requested.max(1)]
-    } else {
-        bound.to_vec()
-    }
-}
-
-/// The *system* NUMA nodes that need their own copy of the network: the
-/// distinct nodes the binding assignment's workers run on, in node order.
-///
-/// Empty when no worker is bound — a single-threaded build, or
-/// `numa_policy = "none"` — which is the case where one copy under the
-/// process's own memory policy is the right answer, and the operator confining
-/// the process is the one who chose where that is.
-///
-/// Pure, so the set a binding produces is unit-testable without a machine that
-/// has those nodes.
-fn network_regions(bound: &[NumaIndex], system_nodes: &[usize]) -> Vec<NumaIndex> {
-    if bound.is_empty() {
-        return Vec::new();
-    }
-    let mut nodes: Vec<NumaIndex> = worker_system_nodes(bound, system_nodes);
-    nodes.sort_unstable();
-    nodes.dedup();
-    nodes
+/// The *system* NUMA nodes that need their own copy of the network: the distinct
+/// nodes the plan's workers run on, ascending.
+fn network_regions(plan: &WorkerPlan) -> Vec<NumaIndex> {
+    plan.distinct_system_nodes()
 }
 
 /// Resolve the per-worker network handles for one pool configuration, factored
@@ -3219,69 +3113,20 @@ fn resolve_worker_networks<T>(
 
 // The thread-allocation diagnostic is emitted by the `verbose3` `bench`
 // command and nowhere else, since that is the only command that can change the
-// worker count; everything else about the layout is a compile-time constant.
-/// The `(bound_count, cpus_in_node)` pairs per node.
-///
-/// Empty when nothing is bound. Otherwise the pairs cover nodes
-/// `0..=highest_bound_node`, then — since at least one thread is bound —
-/// extend with `(0, cpus_in_node)` for the remaining nodes up to
-/// `num_numa_nodes`.
+// worker count; everything else about the assignment is a compile-time constant.
+/// `"Using N thread[s] on CPUs <list>"` — the pool size, and the CPUs its
+/// workers are pinned to.
 #[cfg(feature = "verbose3")]
-fn bound_thread_counts(cfg: &NumaConfig, bound: &[NumaIndex]) -> Vec<(usize, usize)> {
-    if bound.is_empty() {
-        return Vec::new();
-    }
-    let highest = bound.iter().copied().max().unwrap_or(0);
-    let mut counts = vec![0usize; highest + 1];
-    for &n in bound {
-        counts[n] += 1;
-    }
-    let mut ratios: Vec<(usize, usize)> = Vec::new();
-    for (n, &c) in counts.iter().enumerate() {
-        ratios.push((c, cfg.num_cpus_in_numa_node(n)));
-    }
-    // At least one thread is bound (checked above), so extend with the remaining
-    // nodes at zero bound threads.
-    for n in (highest + 1)..cfg.num_numa_nodes() {
-        ratios.push((0, cfg.num_cpus_in_numa_node(n)));
-    }
-    ratios
-}
-
-/// The `a/x:b/y:...` per-node `bound/total` string; empty when nothing is
-/// bound.
-#[cfg(feature = "verbose3")]
-fn thread_binding_information_as_string(cfg: &NumaConfig, bound: &[NumaIndex]) -> String {
-    bound_thread_counts(cfg, bound)
-        .iter()
-        .map(|(current, total)| format!("{current}/{total}"))
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
-/// `"Using N thread[s]"`, plus `" with NUMA node thread binding: a/x:b/y..."`
-/// when any thread is bound.
-#[cfg(feature = "verbose3")]
-fn thread_allocation_information_as_string(
-    threads_size: usize,
-    cfg: &NumaConfig,
-    bound: &[NumaIndex],
-) -> String {
-    let mut s = format!(
-        "Using {threads_size} {}",
+fn thread_allocation_information_as_string(threads_size: usize, plan: &WorkerPlan) -> String {
+    format!(
+        "Using {threads_size} {} on CPUs {}",
         if threads_size > 1 {
             "threads"
         } else {
             "thread"
-        }
-    );
-    let binding = thread_binding_information_as_string(cfg, bound);
-    if binding.is_empty() {
-        return s;
-    }
-    s.push_str(" with NUMA node thread binding: ");
-    s.push_str(&binding);
-    s
+        },
+        yorkie_numa::format_cpu_list(plan.distinct_cpus())
+    )
 }
 
 /// The bundle [`UsiDriver::handle_go`] hands its coordinator thread — grouped
@@ -3323,10 +3168,9 @@ struct CoordinatorJob<W: Write + Send + 'static> {
     helper_networks: Vec<Arc<Search>>,
     /// The worker count (main + helpers).
     n_threads: usize,
-    /// The active binding plan, or `None` when binding is inactive. When set,
-    /// the coordinator pins itself to worker 0's logical node and prefers that
-    /// worker's system node for memory at the start of this `go`.
-    numa_bind: Option<Arc<NumaBindPlan>>,
+    /// The active worker plan: the coordinator pins itself to worker 0's CPU and
+    /// prefers that CPU's node for memory at the start of this `go`.
+    worker_plan: Arc<WorkerPlan>,
     /// The loaded opening book to probe once, if any.
     book: Option<Arc<LoadedBook>>,
     /// The book-selection config snapshot for this `go`.
@@ -3431,7 +3275,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         helper_shared,
         helper_networks,
         n_threads,
-        numa_bind,
+        worker_plan,
         book,
         book_config,
         own_book,
@@ -3460,16 +3304,16 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     #[cfg(feature = "verbose2")]
     let multi_pv = multi_pv.max(1);
 
-    // Bind this coordinator to its assigned NUMA node before any search work,
-    // and make that node's memory its allocation preference, so everything this
-    // thread allocates from here on stays node-local instead of following the
+    // Pin this coordinator to its assigned CPU before any search work, and make
+    // that CPU's node the allocation preference, so everything this thread
+    // allocates from here on stays node-local instead of following the
     // launcher's process-wide interleave. Idempotent across the per-`go`
     // coordinator respawns. The bundle in `histories` is placed separately, at
     // pool (re)build time, because it was already faulted on the USI thread.
-    if let Some(plan) = &numa_bind {
-        plan.config
-            .bind_current_thread_with_local_memory(plan.bound[0], plan.system_nodes[0]);
-    }
+    yorkie_numa::pin_current_thread_to_cpu_with_local_memory(
+        worker_plan.cpus[0],
+        worker_plan.system_nodes[0],
+    );
 
     // One TT generation bump per `go`, on the main worker, BEFORE any helper
     // starts, so the observable single-thread sequence is the reference's:
@@ -3818,6 +3662,23 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
 mod tests {
     use super::*;
 
+    /// Serialises the tests that drive a session.
+    ///
+    /// The transposition table is one `static` per process, and every session
+    /// that reaches `usinewgame` empties the whole of it. Two such tests running
+    /// as threads of one binary would clear the table under each other. Under
+    /// `cargo nextest` each test is its own process and the lock is never
+    /// contended; under a plain `cargo test` it is what keeps them apart.
+    static TT_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Exclusive use of the process's transposition table, held until the
+    /// returned guard goes out of scope. A panicking test leaves the lock
+    /// poisoned; the next test wants the table, not the panic, and the session
+    /// it drives empties the table before searching anything.
+    fn serial_tt() -> std::sync::MutexGuard<'static, ()> {
+        TT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Drive a full canned session in-process and return everything written.
     ///
     /// The output sink is an `Arc<Mutex<Vec<u8>>>` shared with the driver (and,
@@ -3938,18 +3799,21 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn quit_returns_immediately() {
+        let _tt = serial_tt();
         assert_eq!(run_with("quit\n"), "");
     }
 
     #[cfg_attr(miri, ignore)]
     #[test]
     fn eof_returns_ok() {
+        let _tt = serial_tt();
         assert_eq!(run_with(""), "");
     }
 
     #[cfg_attr(miri, ignore)]
     #[test]
     fn isready_without_network_reports_load_failure() {
+        let _tt = serial_tt();
         // Nothing staged an evaluation file where this driver looks — beside
         // the running executable — so the load fails: the contract is an
         // `info string eval load failed:` notice and NO `readyok`. The process
@@ -4106,12 +3970,14 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn usinewgame_is_no_op() {
+        let _tt = serial_tt();
         assert_eq!(run_with("usinewgame\nquit\n"), "");
     }
 
     #[cfg_attr(miri, ignore)]
     #[test]
     fn unknown_command_echoes_back() {
+        let _tt = serial_tt();
         assert_eq!(
             run_with("frobnicate\nquit\n"),
             diag("unknown command: frobnicate")
@@ -4125,6 +3991,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn setoption_is_consumed_silently() {
+        let _tt = serial_tt();
         for line in [
             "setoption name USI_Hash value 256",
             "setoption name Nonexistent value foo",
@@ -4157,6 +4024,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_consumed_setoption_changes_nothing() {
+        let _tt = serial_tt();
         let with_setoption = run_with(
             "setoption name Threads value 1\n\
              setoption name USI_Hash value 1\n\
@@ -4171,12 +4039,14 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn position_startpos_silent() {
+        let _tt = serial_tt();
         assert_eq!(run_with("position startpos\nquit\n"), "");
     }
 
     #[cfg_attr(miri, ignore)]
     #[test]
     fn position_sfen_startpos_silent() {
+        let _tt = serial_tt();
         let sfen = yorkie_state::STARTPOS_SFEN;
         assert_eq!(run_with(&format!("position sfen {sfen}\nquit\n")), "");
     }
@@ -4184,12 +4054,14 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn position_startpos_moves_silent() {
+        let _tt = serial_tt();
         assert_eq!(run_with("position startpos moves 7g7f\nquit\n"), "");
     }
 
     #[cfg_attr(miri, ignore)]
     #[test]
     fn position_sfen_malformed_emits_info_string() {
+        let _tt = serial_tt();
         let out = run_with("position sfen not-a-board b - 1\nquit\n");
         if cfg!(feature = "verbose1") {
             assert!(
@@ -4207,6 +4079,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn position_with_illegal_move_emits_info_string() {
+        let _tt = serial_tt();
         // 1a1b would move a non-existent piece (square 1a empty at startpos).
         let out = run_with("position startpos moves 1a1b\nquit\n");
         if cfg!(feature = "verbose1") {
@@ -4222,6 +4095,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn position_with_pseudo_legal_but_illegal_move_emits_info_string() {
+        let _tt = serial_tt();
         // 1a1b' shape — pick a syntactically valid move that is not a legal
         // generated move from startpos. Pawn on 7g cannot jump to 5g.
         let out = run_with("position startpos moves 7g5g\nquit\n");
@@ -4238,6 +4112,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn position_parse_error_leaves_prior_state_intact() {
+        let _tt = serial_tt();
         // Apply a legal move; then send a malformed sfen; then `go`. The reply
         // must be a legal move from the *post-7g7f* position, not from startpos
         // — proving the malformed line did not clobber the driver's state.
@@ -4265,6 +4140,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn go_without_network_resigns_with_notice() {
+        let _tt = serial_tt();
         // No successful `isready`, so no network is loaded. `go` must not crash;
         // it emits the notice and `bestmove resign`. (The positive path — a
         // legal, search-chosen move — is covered in tests/eval_session.rs with a
@@ -4285,6 +4161,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn go_with_limit_subtokens_still_emits_one_bestmove() {
+        let _tt = serial_tt();
         // Whatever subset of GoLimits the host provides, the driver parses and
         // accepts them and still emits exactly one bestmove line (resign here,
         // as no network is loaded).
@@ -4302,6 +4179,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn go_with_gated_limit_subtokens_is_refused_and_starts_no_search() {
+        let _tt = serial_tt();
         let session = "go depth 8 wtime 60000 btime 60000 byoyomi 5000\nquit\n";
         // The refusal is what matters — no `bestmove`, so no search started. The
         // line that names it is `verbose1`.
@@ -4318,6 +4196,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn go_with_match_subtokens_still_emits_one_bestmove() {
+        let _tt = serial_tt();
         let session = "go wtime 60000 btime 60000 byoyomi 5000\nquit\n";
         let out = run_with(session);
         let bestmoves: Vec<&str> = out.lines().filter(|l| l.starts_with("bestmove ")).collect();
@@ -4330,6 +4209,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn bench_is_an_unknown_command_below_verbose3() {
+        let _tt = serial_tt();
         assert_eq!(
             run_with("bench 16 1 6 default depth\nquit\n"),
             diag("unknown command: bench 16 1 6 default depth")
@@ -4339,6 +4219,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn stop_is_silent() {
+        let _tt = serial_tt();
         assert_eq!(run_with("stop\nquit\n"), "");
         // `stop` with no network resolves the same as `go` alone: the no-network
         // notice plus a single `bestmove resign`, and nothing more.
@@ -4357,49 +4238,63 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_bench_thread_count_emits_the_allocation_line() {
+        let _tt = serial_tt();
         let out = run_with(
             "bench 1 1 1 current movetime\n\
              bench 1 4 1 current movetime\n\
              bench 1 2 1 current movetime\n\
              quit\n",
         );
-        // Prefix matches: on a machine whose layout suggests binding, the line
-        // carries a `with NUMA node thread binding: ...` suffix.
-        assert!(out.contains("info string Using 1 thread"), "{out}");
-        assert!(out.contains("info string Using 4 threads"), "{out}");
-        assert!(out.contains("info string Using 2 threads"), "{out}");
+        // Prefix matches: the CPU list the line ends with is the host's.
+        assert!(out.contains("info string Using 1 thread on CPUs "), "{out}");
+        assert!(
+            out.contains("info string Using 4 threads on CPUs "),
+            "{out}"
+        );
+        assert!(
+            out.contains("info string Using 2 threads on CPUs "),
+            "{out}"
+        );
     }
 
     // -- the compiled layout, and the machine it is held against ---------
 
-    /// A layout with `nodes` as its logical nodes, every one of them its own
-    /// system node.
+    /// A layout with `nodes` as its nodes, each carrying its own position as its
+    /// system node number.
     fn layout(nodes: &[&[usize]]) -> NumaLayout {
-        NumaLayout {
-            nodes: nodes.iter().map(|cpus| cpus.to_vec()).collect(),
-            system_nodes: (0..nodes.len()).collect(),
-            custom_affinity: false,
-        }
+        NumaLayout::from_const(nodes, &(0..nodes.len()).collect::<Vec<_>>())
     }
 
     fn affinity(cpus: &[usize]) -> BTreeSet<usize> {
         cpus.iter().copied().collect()
     }
 
+    /// A plan pinning one worker to each of `cpus`, on the node `built` puts it
+    /// on.
+    fn plan_over(cpus: &[usize], built: &NumaLayout) -> WorkerPlan {
+        let nodes: Vec<NumaIndex> = cpus
+            .iter()
+            .map(|&c| built.system_node_of_cpu(c).expect("a CPU of the layout"))
+            .collect();
+        WorkerPlan::of(cpus, &nodes, cpus.len())
+    }
+
     #[test]
     fn a_machine_matching_the_compiled_layout_is_no_difference() {
-        let built: &[&[usize]] = &[&[0, 1], &[2, 3]];
+        let built = layout(&[&[0, 1], &[2, 3]]);
+        let plan = plan_over(&[0, 2], &built);
         assert_eq!(
-            numa_layout_difference(&layout(built), &affinity(&[0, 1, 2, 3]), &[0, 1], built),
+            machine_refusal(&built, &affinity(&[0, 1, 2, 3]), &plan, &built),
             None
         );
     }
 
     #[test]
     fn a_machine_with_another_node_count_is_reported_with_both_counts() {
-        let built: &[&[usize]] = &[&[0, 1], &[2, 3]];
+        let built = layout(&[&[0, 1], &[2, 3]]);
+        let plan = plan_over(&[0, 2], &built);
         let live = layout(&[&[0, 1, 2, 3]]);
-        let msg = numa_layout_difference(&live, &affinity(&[0, 1, 2, 3]), &[0, 1], built)
+        let msg = machine_refusal(&live, &affinity(&[0, 1, 2, 3]), &plan, &built)
             .expect("one node is not two");
         assert!(msg.contains("built for 2 NUMA node(s)"), "message: {msg}");
         assert!(msg.contains("this host has 1"), "message: {msg}");
@@ -4407,9 +4302,10 @@ mod tests {
 
     #[test]
     fn a_node_holding_other_cpus_is_reported_with_both_cpu_lists() {
-        let built: &[&[usize]] = &[&[0, 1], &[2, 3]];
+        let built = layout(&[&[0, 1], &[2, 3]]);
+        let plan = plan_over(&[0, 2], &built);
         let live = layout(&[&[0, 1], &[2, 3, 4]]);
-        let msg = numa_layout_difference(&live, &affinity(&[0, 1, 2, 3, 4]), &[0, 1], built)
+        let msg = machine_refusal(&live, &affinity(&[0, 1, 2, 3, 4]), &plan, &built)
             .expect("node 1 grew a CPU");
         assert!(msg.contains("node 1"), "message: {msg}");
         assert!(msg.contains("2-4"), "message: {msg}");
@@ -4417,87 +4313,73 @@ mod tests {
     }
 
     #[test]
-    fn a_process_denied_a_cpu_the_plan_uses_is_refused_with_those_cpus() {
+    fn a_process_denied_a_cpu_a_worker_is_pinned_to_is_refused_with_those_cpus() {
         // The machine is the one the binary was built for; the *process* is not
-        // allowed on every CPU the plan pins a worker to — a `taskset` around
-        // the engine, whose workers would then pin themselves to CPUs they may
-        // not run on. Only the CPUs it is missing are named.
-        let built: &[&[usize]] = &[&[0, 1], &[2, 3]];
-        let msg = numa_layout_difference(&layout(built), &affinity(&[0, 1]), &[0, 1], built)
-            .expect("half the plan's CPUs are hidden");
+        // allowed on every CPU a worker pins itself to — a `taskset` around the
+        // engine, whose workers would then pin themselves to CPUs they may not
+        // run on. Only the CPUs it is missing are named.
+        let built = layout(&[&[0, 1], &[2, 3]]);
+        let plan = plan_over(&[0, 2, 3], &built);
+        let msg = machine_refusal(&built, &affinity(&[0, 1]), &plan, &built)
+            .expect("two of the plan's CPUs are hidden");
         assert!(msg.contains("may not run on CPUs 2-3"), "message: {msg}");
-        assert!(msg.contains("which the thread plan uses"), "message: {msg}");
+        assert!(
+            msg.contains("which its workers are pinned to"),
+            "message: {msg}"
+        );
 
-        let msg = numa_layout_difference(&layout(built), &affinity(&[0, 1, 2]), &[0, 1], built)
+        let msg = machine_refusal(&built, &affinity(&[0, 1, 2]), &plan, &built)
             .expect("one of the plan's CPUs is hidden");
         assert!(msg.contains("may not run on CPUs 3"), "message: {msg}");
     }
 
     #[test]
-    fn an_affinity_covering_the_plans_cpus_is_no_difference() {
+    fn an_affinity_covering_the_workers_cpus_is_no_difference() {
         // A binary built for part of the machine, started with no confinement:
-        // its plan uses node 0 and the process may run on everything. The CPUs
-        // beyond the plan take nothing away, since the worker narrows itself to
-        // the node it was assigned. An affinity holding exactly the plan's CPUs
-        // is equally fine.
-        let built: &[&[usize]] = &[&[0, 1], &[2, 3]];
+        // its workers sit on node 0 and the process may run on everything. The
+        // CPUs beyond them take nothing away, since each worker narrows itself
+        // to its own CPU. An affinity holding exactly those CPUs is equally
+        // fine.
+        let built = layout(&[&[0, 1], &[2, 3]]);
+        let plan = plan_over(&[0, 1], &built);
         assert_eq!(
-            numa_layout_difference(&layout(built), &affinity(&[0, 1, 2, 3]), &[0, 0], built),
+            machine_refusal(&built, &affinity(&[0, 1, 2, 3]), &plan, &built),
             None
         );
         assert_eq!(
-            numa_layout_difference(&layout(built), &affinity(&[0, 1]), &[0, 0], built),
+            machine_refusal(&built, &affinity(&[0, 1]), &plan, &built),
             None
         );
     }
 
     #[test]
-    fn a_confined_process_is_accepted_when_the_plan_pins_no_worker() {
-        // The build that binds nothing — one thread, or `numa_policy = "none"`
-        // — has no worker to pin, so the CPUs the process was denied are CPUs
-        // it was never going to use. An empty assignment is how the caller says
-        // so, and the machine comparisons are unaffected by it: a wrong machine
-        // is still refused, confined or not.
-        let built: &[&[usize]] = &[&[0, 1], &[2, 3]];
-        assert_eq!(
-            numa_layout_difference(&layout(built), &affinity(&[0]), &[], built),
-            None
-        );
-
-        let live = layout(&[&[0, 1, 2, 3]]);
-        let msg = numa_layout_difference(&live, &affinity(&[0]), &[], built)
-            .expect("one node is still not two nodes");
-        assert!(msg.contains("built for 2 NUMA node(s)"), "message: {msg}");
+    fn a_cpu_that_moved_node_is_refused_with_both_nodes() {
+        // Node count and CPU lists agree, but the two nodes have swapped their
+        // CPUs — every worker's memory would be placed on a node its CPU is not
+        // on, so the machine is not the one this binary was built for.
+        let built = layout(&[&[0, 1], &[2, 3]]);
+        let plan = plan_over(&[0, 2], &built);
+        let live = NumaLayout::from_const(&[&[0, 1], &[2, 3]], &[1, 0]);
+        let msg = machine_refusal(&live, &affinity(&[0, 1, 2, 3]), &plan, &built)
+            .expect("CPU 0 is on the other node now");
+        assert!(msg.contains("worker 0 runs on CPU 0"), "message: {msg}");
+        assert!(msg.contains("node 1 on this host"), "message: {msg}");
+        assert!(msg.contains("node 0 in the layout"), "message: {msg}");
     }
 
     #[cfg(feature = "verbose3")]
     #[test]
     fn info_strings_exact_formats() {
-        let cfg = NumaConfig::from_string("0-3,8:16-31").unwrap();
-
-        // No binding → bare `Using N thread[s]`, singular/plural.
+        // Singular and plural, and the CPU list in the shortened form.
+        let one = WorkerPlan::of(&[5], &[0], 1);
         assert_eq!(
-            thread_allocation_information_as_string(1, &cfg, &[]),
-            "Using 1 thread"
+            thread_allocation_information_as_string(1, &one),
+            "Using 1 thread on CPUs 5"
         );
+        let four = WorkerPlan::of(&[0, 1, 2, 8], &[0, 0, 0, 1], 4);
         assert_eq!(
-            thread_allocation_information_as_string(2, &cfg, &[]),
-            "Using 2 threads"
-        );
-
-        // Binding across two equal 2-CPU nodes → `a/x:b/y` suffix.
-        let two = NumaConfig::from_string("0-1:2-3").unwrap();
-        assert_eq!(
-            thread_allocation_information_as_string(2, &two, &[0, 1]),
-            "Using 2 threads with NUMA node thread binding: 1/2:1/2"
-        );
-
-        // Both workers bound to node 0 of three nodes → the trailing nodes are
-        // extended with `0/total`.
-        let three = NumaConfig::from_string("0-1:2-3:4-5").unwrap();
-        assert_eq!(
-            thread_allocation_information_as_string(2, &three, &[0, 0]),
-            "Using 2 threads with NUMA node thread binding: 2/2:0/2:0/2"
+            thread_allocation_information_as_string(4, &four),
+            "Using 4 threads on CPUs 0-2,8"
         );
     }
 
@@ -4537,37 +4419,33 @@ mod tests {
     // --- shared-history node mapping --------------------------------------
 
     #[test]
-    fn shared_node_counts_unbound_and_bound() {
-        // Unbound: every thread pretended on node 0, count == requested.
-        let c = shared_node_counts(&[], 5);
-        assert_eq!(c.len(), 1);
-        assert_eq!(c[&0], 5);
-
-        // Bound: per-node counts.
-        let c = shared_node_counts(&[0, 1, 0, 1, 0], 5);
+    fn shared_node_counts_are_the_workers_per_node() {
+        let c = shared_node_counts(&[0, 1, 0, 1, 0]);
         assert_eq!(c[&0], 3);
         assert_eq!(c[&1], 2);
+
+        // Every worker on one node: one set, sized for all of them.
+        let c = shared_node_counts(&[2, 2, 2]);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[&2], 3);
     }
 
-    #[test]
-    fn worker_nodes_selects_each_worker_node() {
-        // Unbound: every worker on node 0.
-        assert_eq!(worker_nodes(&[], 3), vec![0, 0, 0]);
-        // Bound: worker `i` → `bound[i]`.
-        assert_eq!(worker_nodes(&[1, 0, 1], 3), vec![1, 0, 1]);
+    /// A plan over the CPUs this process is allowed on, so the pin inside
+    /// `build_worker_shared` cannot hit a forbidden CPU.
+    fn allowed_plan(requested: usize) -> WorkerPlan {
+        WorkerPlan::of_allowed_cpus(requested)
     }
 
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn build_worker_shared_unbound_shares_one_set() {
-        let cfg = NumaConfig::from_string("0-3").unwrap();
-        let ws = build_worker_shared(&cfg, &[], 4);
+    fn build_worker_shared_shares_one_set_per_node() {
+        let ws = build_worker_shared(&allowed_plan(4));
         assert_eq!(ws.len(), 4, "one handle per worker");
-        // All workers on the single node share the SAME table set.
+        // The plan puts every worker on node 0, so all four share one set.
         for i in 1..4 {
             assert!(
                 Arc::ptr_eq(&ws[0], &ws[i]),
-                "unbound: every worker points at one shared set"
+                "workers on one node point at one shared set"
             );
         }
         // Sized to `next_power_of_two(pool size)`.
@@ -4576,124 +4454,67 @@ mod tests {
 
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn build_worker_shared_unbound_rounds_thread_count_up() {
-        let cfg = NumaConfig::from_string("0-3").unwrap();
-        // 3 workers → next_power_of_two(3) == 4 (matches the reference helper).
-        let ws = build_worker_shared(&cfg, &[], 3);
+    fn build_worker_shared_rounds_thread_count_up() {
+        // 3 workers → next_power_of_two(3) == 4.
+        let ws = build_worker_shared(&allowed_plan(3));
         assert_eq!(ws.len(), 3);
         assert_eq!(ws[0].thread_count(), 4);
         // Single worker → thread_count 1.
-        let ws1 = build_worker_shared(&cfg, &[], 1);
+        let ws1 = build_worker_shared(&allowed_plan(1));
         assert_eq!(ws1.len(), 1);
         assert_eq!(ws1[0].thread_count(), 1);
     }
 
     // --- NUMA memory placement --------------------------------------------
 
-    /// A NUMA node string that forces binding on any machine: a one-node
-    /// custom config over a single CPU the process is definitely allowed on.
-    /// `custom_affinity` short-circuits `suggests_binding_threads` to true, so
-    /// this turns the whole pin-and-place path on even where `auto` would never
-    /// bind — and picking the CPU from the live affinity keeps the fail-loud
-    /// `sched_setaffinity` inside it from ever seeing a forbidden CPU.
-    #[cfg(target_os = "linux")]
-    fn forced_binding_policy() -> String {
-        let cpu = yorkie_numa::startup_affinity()
-            .iter()
-            .next()
-            .copied()
-            .unwrap_or(0);
-        cpu.to_string()
-    }
-
-    #[cfg_attr(miri, ignore)]
     #[test]
-    fn bind_plan_is_absent_when_binding_is_inactive() {
-        // The single-node host case: no assignment, so no plan, so no thread
-        // ever pins itself and nothing touches a memory policy.
-        let cfg = NumaConfig::from_string("0-3").unwrap();
-        assert!(bind_plan(&cfg, &[], &[0]).is_none());
-        assert_eq!(coordinator_system_node(None), None);
+    fn a_plan_wraps_extra_workers_onto_the_assigned_cpus() {
+        // The assignment holds one CPU per configured worker; a measurement
+        // command asking for more wraps around rather than spilling onto CPUs
+        // this binary was not given.
+        let plan = WorkerPlan::of(&[4, 9], &[0, 1], 5);
+        assert_eq!(plan.cpus, vec![4, 9, 4, 9, 4]);
+        assert_eq!(plan.system_nodes, vec![0, 1, 0, 1, 0]);
+        assert_eq!(plan.distinct_cpus(), BTreeSet::from([4, 9]));
+        assert_eq!(plan.distinct_system_nodes(), vec![0, 1]);
     }
 
     #[test]
     fn table_placement_covers_the_nodes_the_workers_sit_on_and_no_others() {
-        // Every worker on one node: the whole table belongs on that node, and
-        // it is the node the layout maps the logical one to, not the logical
-        // one.
+        // Every worker on one node: the whole table belongs on that node, and it
+        // is the system node the layout names, not the position in the table.
         assert_eq!(
-            table_placement(&[0, 0, 0, 0], &[2]),
+            table_placement(&WorkerPlan::of(&[0, 1], &[2, 2], 2)),
             TablePlacement::OnNode(2)
         );
         // Two nodes under the workers: spread over exactly those two.
         assert_eq!(
-            table_placement(&[0, 1, 0, 1], &[0, 1]),
+            table_placement(&WorkerPlan::of(&[0, 4, 1, 5], &[0, 1, 0, 1], 4)),
             TablePlacement::AcrossNodes(vec![0, 1])
         );
-        // A four-node machine whose binding uses two of them: the other two
-        // hold no worker, so no page of the table may land on them.
+        // A four-node machine whose workers use two of them: the other two hold
+        // no worker, so no page of the table may land on them.
         assert_eq!(
-            table_placement(&[1, 3, 1], &[0, 1, 2, 3]),
+            table_placement(&WorkerPlan::of(&[0, 4, 8], &[1, 3, 1], 3)),
             TablePlacement::AcrossNodes(vec![1, 3])
         );
-        // No binding: nothing pins a worker, so the engine names no node set of
-        // its own and the process's policy places the pages — whatever the
-        // layout the binary was built for covers.
-        assert_eq!(
-            table_placement(&[], &[0, 1, 2, 3]),
-            TablePlacement::ProcessDefault
-        );
-        assert_eq!(table_placement(&[], &[0]), TablePlacement::ProcessDefault);
     }
 
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn bind_plan_carries_one_system_node_per_worker() {
-        // The plan's system-node vector is what both the pin site and the
-        // placement calls index with a worker id, so it is one entry per worker
-        // — the *logical* node each worker sits on, resolved through the
-        // layout's logical → system map, which L3 bundling makes a many-to-one.
-        let cfg = NumaConfig::from_string("0:1:2").unwrap();
-        let bound = vec![0, 1, 2, 0];
-        let plan =
-            bind_plan(&cfg, &bound, &[3, 3, 7]).expect("a non-empty assignment yields a plan");
-        assert_eq!(plan.bound, bound);
-        assert_eq!(
-            plan.system_nodes,
-            vec![3, 3, 7, 3],
-            "one system node per worker, through the layout's map"
-        );
-        assert_eq!(coordinator_system_node(Some(&plan)), Some(3));
-    }
-
-    /// With a NUMA layout that forces binding, every large-page block behind the
-    /// coordinator's history tables must be governed by an `MPOL_BIND` policy
-    /// naming worker 0's system node.
+    /// Every large-page block behind the coordinator's history tables must be
+    /// governed by an `MPOL_BIND` policy naming worker 0's system node.
     ///
     /// Still meaningful on a single-node host: the *placement* answer there is
     /// node 0 either way, but the *policy* over those pages is `MPOL_DEFAULT`
     /// until something binds it.
-    ///
-    /// The layout is injected rather than selected, since `numa_policy` is a
-    /// compile-time constant and no checked-in config would force binding on an
-    /// arbitrary host. Everything downstream of it is the production path.
     #[cfg(target_os = "linux")]
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn forced_binding_places_the_coordinator_histories_on_worker_zero_node() {
+    fn a_pool_rebuild_places_the_coordinator_histories_on_worker_zero_node() {
         let output = Arc::new(Mutex::new(Vec::<u8>::new()));
         let mut driver = UsiDriver::new(&b""[..], Arc::clone(&output));
-
-        // A custom node string always suggests binding, so this turns the
-        // binding on even on a single-node host. The node is the one CPU the
-        // process is certain to be allowed on, so the (fail-loud) pin the
-        // rebuild's helper threads perform cannot hit a forbidden CPU.
-        driver.numa_config = NumaConfig::from_string(&forced_binding_policy())
-            .expect("a one-CPU custom node string is a valid config");
         driver.rebuild_pool();
 
-        let node = coordinator_system_node(driver.numa_plan.as_ref())
-            .expect("a custom NumaPolicy binds, so a plan exists");
+        let node = driver.worker_plan.system_nodes[0];
         let regions = driver
             .histories
             .as_ref()
@@ -4807,9 +4628,8 @@ mod tests {
     // multi-node hardware.
 
     #[test]
-    fn every_worker_reads_the_one_instance_when_nothing_is_bound() {
-        // A single-node machine, a single-threaded build, or
-        // `numa_policy = "none"`: one instance, and every worker points at it.
+    fn every_worker_reads_the_one_instance_on_a_single_node_machine() {
+        // One shared mapping, and every worker points at it.
         let instances = vec![Arc::new(1000u32)];
         let workers = resolve_worker_networks(&instances, &BTreeMap::new(), &[], 3);
         assert_eq!(workers.len(), 3);
@@ -4832,9 +4652,9 @@ mod tests {
     }
 
     #[test]
-    fn two_logical_nodes_on_one_system_node_read_one_copy() {
-        // The copies are per system node, so workers on logical nodes that an
-        // L3-aware mapping split out of one system node share a copy.
+    fn two_workers_on_one_system_node_read_one_copy() {
+        // The copies are per system node, so two workers on different CPUs of
+        // one node share a copy.
         let instances = vec![Arc::new(10u32)];
         let by_node: BTreeMap<NumaIndex, usize> = [(0usize, 0usize)].into_iter().collect();
         let workers = resolve_worker_networks(&instances, &by_node, &[0, 0], 2);
@@ -4864,19 +4684,22 @@ mod tests {
     }
 
     #[test]
-    fn a_plan_that_binds_nothing_needs_no_per_node_region() {
-        assert!(network_regions(&[], &[0, 1]).is_empty());
-    }
-
-    #[test]
-    fn one_region_per_distinct_system_node_the_plan_uses() {
-        // Four logical nodes, two per system node — an L3-subdivided layout.
-        let system_nodes = [0usize, 0, 1, 1];
-        assert_eq!(network_regions(&[0, 1, 2, 3], &system_nodes), vec![0, 1]);
-        // A plan confined to one system node's logical nodes needs one region.
-        assert_eq!(network_regions(&[2, 3, 2], &system_nodes), vec![1]);
+    fn one_region_per_distinct_system_node_the_workers_use() {
+        // Four workers, two per system node.
+        assert_eq!(
+            network_regions(&WorkerPlan::of(&[0, 1, 8, 9], &[0, 0, 1, 1], 4)),
+            vec![0, 1]
+        );
+        // Workers confined to one node need one region.
+        assert_eq!(
+            network_regions(&WorkerPlan::of(&[8, 9, 10], &[1, 1, 1], 3)),
+            vec![1]
+        );
         // The set is in node order whatever order the workers landed in.
-        assert_eq!(network_regions(&[3, 0, 2, 1], &system_nodes), vec![0, 1]);
+        assert_eq!(
+            network_regions(&WorkerPlan::of(&[9, 0, 8, 1], &[1, 0, 1, 0], 4)),
+            vec![0, 1]
+        );
     }
 
     // -- Multiple Book name resolution ------------------------------------

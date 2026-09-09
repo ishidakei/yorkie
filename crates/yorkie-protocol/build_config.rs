@@ -70,12 +70,17 @@ enum Kind {
     /// `&'static str`, restricted to a fixed list — the corresponding USI combo
     /// option's choices.
     Choice(&'static [&'static str]),
-    /// The expected number of logical NUMA nodes: an integer, or the string
-    /// `"auto"` for whatever the building machine has. Either way the layout is
-    /// resolved from that machine and generated as constants; an integer also
-    /// has to equal what was resolved, so a binary meant for one machine cannot
-    /// be built on another by accident.
+    /// The expected number of NUMA nodes: an integer, or the string `"auto"`
+    /// for whatever the building machine has. Either way the layout is resolved
+    /// from that machine and generated as constants; an integer also has to
+    /// equal what was resolved, so a binary meant for one machine cannot be
+    /// built on another by accident.
     NodeCount,
+    /// Which logical CPU each worker is pinned to: the string `"auto"` for a
+    /// pick made from the CPUs no earlier build on the same machine has taken, or an
+    /// explicit CPU list. Either way the chosen CPUs are generated as constants
+    /// and recorded in the ledger.
+    CpuAssignment,
 }
 
 /// Every Cargo feature the schema conditions a constant on: the verbosity
@@ -103,16 +108,16 @@ enum Gating<'a> {
     Absent,
 }
 
-/// The logical NUMA layout of the machine a build ran on, as the resolver
-/// handed it back.
+/// The NUMA layout of the machine a build ran on, as the resolver handed it
+/// back.
 ///
 /// The count is what a pinned `numa_nodes` is checked against; the items are the
-/// generated constants describing the layout itself — the CPU list of every
-/// logical node and the system node each belongs to — which the engine builds
-/// its binding plan and its replica set from, without ever reading `/sys`.
+/// generated constants describing the layout itself — the CPU list of every node
+/// and the system node each one is — which the engine places its memory from,
+/// without ever reading `/sys`.
 #[allow(dead_code)]
 struct ResolvedLayout {
-    /// The number of logical NUMA nodes resolved.
+    /// The number of NUMA nodes resolved.
     nodes: usize,
     /// The generated items describing the layout, appended to the generated
     /// module after the node count itself.
@@ -122,13 +127,45 @@ struct ResolvedLayout {
 /// How a build script comes by the layout behind the `numa_nodes` key.
 #[allow(dead_code)]
 enum Layout<'a> {
-    /// Resolve it from the machine doing the building, under the config's own
-    /// `numa_policy`. The crate that compiles the layout in passes this.
-    Resolve(&'a dyn Fn(&str) -> Result<ResolvedLayout, String>),
+    /// Resolve it from the machine doing the building. The crate that compiles
+    /// the layout in passes this.
+    Resolve(&'a dyn Fn() -> Result<ResolvedLayout, String>),
     /// The crate compiles no layout in, so it neither resolves one nor
     /// generates the constants describing it. Such a crate reads no layout, and
     /// the crate that does is where a `numa_nodes` the machine does not satisfy
     /// is refused.
+    Absent,
+}
+
+/// What resolving `cpu_assignment` needs: the setting itself, the ledger it is
+/// taken against, and how many workers want a CPU.
+#[allow(dead_code)]
+struct AssignmentRequest<'a> {
+    /// The `cpu_assignment` value: `"auto"` or an explicit CPU list.
+    spec: &'a str,
+    /// The `cpu_ledger` value, as the config wrote it.
+    ledger: &'a str,
+    /// The `threads` value: how many CPUs the assignment must cover.
+    threads: i64,
+}
+
+/// The worker → CPU assignment a build resolved.
+#[allow(dead_code)]
+struct ResolvedAssignment {
+    /// The generated items naming the assigned CPUs and their system nodes,
+    /// appended to the generated module after the setting itself.
+    items: String,
+}
+
+/// How a build script comes by the assignment behind the `cpu_assignment` key.
+#[allow(dead_code)]
+enum Assignment<'a> {
+    /// Resolve it against the machine doing the building and its ledger. Only
+    /// the crate that compiles the assignment in passes this, so exactly one
+    /// build script per binary takes CPUs from the ledger.
+    Resolve(&'a dyn Fn(&AssignmentRequest) -> Result<ResolvedAssignment, String>),
+    /// The crate compiles no assignment in, so it neither takes CPUs nor
+    /// generates the constants naming them.
     Absent,
 }
 
@@ -240,6 +277,17 @@ const fn node_count(key: &'static str, usi: &'static str) -> Spec {
     }
 }
 
+/// The `cpu_assignment` key: which CPU each worker runs on (see
+/// [`Kind::CpuAssignment`]).
+const fn cpu_assignment(key: &'static str, usi: &'static str) -> Spec {
+    Spec {
+        key,
+        usi,
+        kind: Kind::CpuAssignment,
+        gate: None,
+    }
+}
+
 const fn boolean(key: &'static str, usi: &'static str) -> Spec {
     Spec {
         key,
@@ -292,10 +340,17 @@ const SCHEMA: &[Spec] = &[
     ),
     text("eval_dir", "EvalDir"),
     int("fv_scale", "FV_SCALE", 1, 128),
-    text("numa_policy", "NumaPolicy"),
+    cpu_assignment(
+        "cpu_assignment",
+        "(none: the logical CPU each worker thread is pinned to)",
+    ),
+    text(
+        "cpu_ledger",
+        "(none: the file recording which CPUs earlier builds on the same machine took)",
+    ),
     node_count(
         "numa_nodes",
-        "(none: the logical NUMA-node count the build host must have)",
+        "(none: the NUMA-node count the build host must have)",
     ),
     boolean("usi_ponder", "USI_Ponder"),
     boolean("stochastic_ponder", "Stochastic_Ponder"),
@@ -535,8 +590,9 @@ struct Generated {
 ///
 /// `label` names the file in messages, `source` is the path recorded in the
 /// generated header, and `name` is the config's identity (its file stem).
-/// `gating` says how this build treats the feature-gated keys, and `layout` how
-/// it comes by the machine's NUMA layout.
+/// `gating` says how this build treats the feature-gated keys, `layout` how it
+/// comes by the machine's NUMA layout, and `assignment` how it comes by the CPU
+/// each worker is pinned to.
 fn generate(
     entries: &BTreeMap<String, Entry>,
     label: &str,
@@ -544,6 +600,7 @@ fn generate(
     name: &str,
     gating: &Gating,
     layout: &Layout,
+    assignment: &Assignment,
 ) -> Result<Generated, String> {
     // Unknown keys first: a typo'd key would otherwise be reported as the schema
     // key it was meant to be, going missing.
@@ -673,24 +730,12 @@ fn generate(
                         ));
                     }
                 };
-                let Some(policy) = numa_policy_of(entries) else {
-                    return Err(at(
-                        label,
-                        entry.line,
-                        &format!(
-                            "`{}` is resolved under `numa_policy`, which this config does not \
-                             give as a string",
-                            spec.key
-                        ),
-                    ));
-                };
-                let resolved = resolve(policy).map_err(|e| {
+                let resolved = resolve().map_err(|e| {
                     at(
                         label,
                         entry.line,
                         &format!(
-                            "cannot resolve the NUMA layout of this host under \
-                             `numa_policy` = \"{policy}\": {e}\n       \
+                            "cannot resolve the NUMA layout of this host: {e}\n       \
                              the engine compiles the layout of the machine it is built on into \
                              the binary, so building it needs a Linux host whose sysfs reports \
                              one"
@@ -705,8 +750,8 @@ fn generate(
                         entry.line,
                         &format!(
                             "`{}` = {pinned} is not what this host has: it resolves to {} \
-                             logical NUMA node(s) under `numa_policy` = \"{policy}\" — build on a \
-                             machine with {pinned}, or set the key to \"auto\"",
+                             NUMA node(s) — build on a machine with {pinned}, or set the key to \
+                             \"auto\"",
                             spec.key, resolved.nodes
                         ),
                     ));
@@ -714,6 +759,57 @@ fn generate(
                 format!(
                     "pub const {const_name}: usize = {};\n{}",
                     resolved.nodes, resolved.items
+                )
+            }
+            (Kind::CpuAssignment, value) => {
+                let Assignment::Resolve(resolve) = assignment else {
+                    // This crate pins no worker, so it takes no CPU from the
+                    // ledger and generates no constant naming one.
+                    continue;
+                };
+                let Value::Str(spec_value) = value else {
+                    return Err(at(
+                        label,
+                        entry.line,
+                        &format!(
+                            "`{}` must be \"auto\" or a CPU list such as \"0,2,4-7\", got {}",
+                            spec.key,
+                            value.type_name()
+                        ),
+                    ));
+                };
+                let Some(Value::Str(ledger)) = entries.get("cpu_ledger").map(|e| &e.value) else {
+                    return Err(at(
+                        label,
+                        entry.line,
+                        &format!(
+                            "`{}` is taken against `cpu_ledger`, which this config does not give \
+                             as a string",
+                            spec.key
+                        ),
+                    ));
+                };
+                let Some(Value::Int(threads)) = entries.get("threads").map(|e| &e.value) else {
+                    return Err(at(
+                        label,
+                        entry.line,
+                        &format!(
+                            "`{}` covers one CPU per `threads`, which this config does not give \
+                             as an integer",
+                            spec.key
+                        ),
+                    ));
+                };
+                let resolved = resolve(&AssignmentRequest {
+                    spec: spec_value,
+                    ledger,
+                    threads: *threads,
+                })
+                .map_err(|e| at(label, entry.line, &e))?;
+                format!(
+                    "pub const {const_name}: &str = \"{}\";\n{}",
+                    escape(spec_value),
+                    resolved.items
                 )
             }
             (kind, value) => {
@@ -750,16 +846,7 @@ fn expected(kind: &Kind) -> &'static str {
         Kind::Bool => "a boolean",
         Kind::Text | Kind::Choice(_) => "a string",
         Kind::NodeCount => "an integer or \"auto\"",
-    }
-}
-
-/// The `numa_policy` value the layout is resolved under. `None` when the key is
-/// missing or is not a string, which the schema entry for `numa_policy` — read
-/// before this one — reports as the error it is.
-fn numa_policy_of(entries: &BTreeMap<String, Entry>) -> Option<&str> {
-    match entries.get("numa_policy").map(|e| &e.value) {
-        Some(Value::Str(s)) => Some(s.as_str()),
-        _ => None,
+        Kind::CpuAssignment => "\"auto\" or a CPU list",
     }
 }
 
@@ -776,9 +863,10 @@ fn compile_config(
     name: &str,
     gating: &Gating,
     layout: &Layout,
+    assignment: &Assignment,
 ) -> Result<Generated, String> {
     let entries = parse_config(contents, label)?;
-    generate(&entries, label, source, name, gating, layout)
+    generate(&entries, label, source, name, gating, layout, assignment)
 }
 
 // The config-path resolution is kept here, and kept pure — the caller reads the

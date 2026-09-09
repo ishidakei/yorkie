@@ -70,6 +70,7 @@ fn assert_legal_after(moves: &[&str], tok: &str) {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn go_ponder_holds_until_stop() {
+    let _tt = common::serial_tt();
     let h = start_ready();
     h.send("position startpos");
     h.send("go ponder btime 60000 wtime 60000");
@@ -99,6 +100,7 @@ fn go_ponder_holds_until_stop() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn ponderhit_continues_and_emits_one_bestmove() {
+    let _tt = common::serial_tt();
     let h = start_ready();
     h.send("position startpos");
     // A comfortable clock: the budget is not exhausted during the short ponder,
@@ -135,6 +137,7 @@ fn ponderhit_continues_and_emits_one_bestmove() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn stop_on_ponderhit_stops_promptly_after_a_late_ponderhit() {
+    let _tt = common::serial_tt();
     let h = start_ready();
     h.send("position startpos");
     // A tiny clock: the soft budget is exhausted almost immediately, arming
@@ -173,6 +176,7 @@ fn stop_on_ponderhit_stops_promptly_after_a_late_ponderhit() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn stochastic_ponder_reissues_on_the_current_position() {
+    let _tt = common::serial_tt();
     if !config::STOCHASTIC_PONDER {
         eprintln!("skipped: this build did not compile Stochastic_Ponder in");
         return;
@@ -208,6 +212,7 @@ fn stochastic_ponder_reissues_on_the_current_position() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn gameover_terminates_a_pondering_search() {
+    let _tt = common::serial_tt();
     let h = start_ready();
     h.send("position startpos");
     h.send("go ponder btime 60000 wtime 60000");

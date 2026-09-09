@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use yorkie_eval::network_file;
 use yorkie_protocol::UsiDriver;
@@ -57,6 +57,30 @@ pub fn evaluation_is_noise_free() -> bool {
     {
         true
     }
+}
+
+/// Serialises the tests that reach the transposition table.
+///
+/// The table is one `static` per process, and `usinewgame` — which every `go`
+/// session and every `bench` runs — empties the whole of it. Two tests driving
+/// sessions as threads of one binary would therefore clear and overwrite each
+/// other's entries, and what a search visits, and so how many nodes it reports,
+/// would depend on which other test was running beside it.
+///
+/// Under `cargo nextest` each test is its own process and the lock is never
+/// contended; under a plain `cargo test`, where one binary's tests are threads
+/// of one process, it is what makes a driven search reproducible.
+static TT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Exclusive use of the process's transposition table, held until the returned
+/// guard goes out of scope. A test that drives a session takes it as the first
+/// thing in its body, so the guard covers every search that body runs.
+///
+/// A panicking test leaves the lock poisoned; the next test wants the table,
+/// not the panic, and the session it drives empties the table before searching
+/// anything.
+pub fn serial_tt() -> MutexGuard<'static, ()> {
+    TT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The message [`evaluation_is_noise_free`]'s callers skip with.
@@ -133,6 +157,26 @@ fn write_synthetic_evaluation_file(path: &Path) {
         .expect("size the parameter region");
 }
 
+/// Whether the file at `path` is the synthetic network *this* build accepts:
+/// the full parameter region, and a header naming the same layout, source,
+/// target features and dimensions [`synthetic_header`] claims.
+///
+/// A header that cannot be read at all is not a match either, which covers both
+/// a file that is not there and one the reader refuses outright.
+fn staged_file_matches_this_build(path: &Path) -> bool {
+    let bytes = (network_file::DATA_OFFSET + network_file::DATA_BYTES) as u64;
+    if !std::fs::metadata(path).is_ok_and(|m| m.len() == bytes) {
+        return false;
+    }
+    let want = synthetic_header();
+    network_file::read_header(path).is_ok_and(|have| {
+        have.layout_version == want.layout_version
+            && have.source == want.source
+            && have.target_features == want.target_features
+            && have.dims == want.dims
+    })
+}
+
 /// Write a synthetic evaluation file into `dir` and return its path.
 pub fn write_synthetic_evaluation_file_in(dir: &Path) -> PathBuf {
     let path = dir.join(network_file::FILE_NAME);
@@ -187,16 +231,17 @@ static EVAL_ROOT: OnceLock<PathBuf> = OnceLock::new();
 /// caller names the same directory and writes the same file, the write is an
 /// atomic rename from a unique temporary, and a staged file is reused.
 ///
-/// The fixture root lives under `target/`, so the file is written once across
-/// runs and `cargo clean` takes it away.
+/// The fixture root lives under `target/`, so a file written by one run outlives
+/// it and is found by the next — including a run of a build that describes a
+/// different network, whose engine would refuse the file it finds. A staged file
+/// is therefore reused only when its header is the one this build expects; the
+/// size is the cheap part of that answer, not the whole of it.
 pub fn stage_configured_eval_dir() -> PathBuf {
     let root = fixture_root("synthetic");
     let eval_dir = root.join(yorkie_protocol::config::EVAL_DIR);
     std::fs::create_dir_all(&eval_dir).expect("create fixture eval dir");
     let file = eval_dir.join(network_file::FILE_NAME);
-    let expected = (network_file::DATA_OFFSET + network_file::DATA_BYTES) as u64;
-    let staged = std::fs::metadata(&file).is_ok_and(|m| m.len() == expected);
-    if !staged {
+    if !staged_file_matches_this_build(&file) {
         // Unique temporary + rename: a concurrent staging attempt from another
         // test in this process (or another test binary) either sees no file or
         // sees the complete one, never a half-written one.

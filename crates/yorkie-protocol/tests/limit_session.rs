@@ -117,6 +117,7 @@ fn go_and_wait(h: &StreamHarness, position: &str, go: &str, expect_bestmoves: us
 #[cfg_attr(miri, ignore)]
 #[test]
 fn depth_limit_caps_a_time_bounded_search_and_yields_to_an_explicit_depth() {
+    let _tt = common::serial_tt();
     let limit = config::DEPTH_LIMIT;
     if limit == 0 {
         eprintln!("skipped: this build compiled in no DepthLimit");
@@ -178,6 +179,7 @@ fn depth_limit_caps_a_time_bounded_search_and_yields_to_an_explicit_depth() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn nodes_limit_matches_the_same_go_nodes() {
+    let _tt = common::serial_tt();
     let limit = config::NODES_LIMIT;
     if limit == 0 {
         eprintln!("skipped: this build compiled in no NodesLimit");
@@ -216,6 +218,7 @@ fn nodes_limit_matches_the_same_go_nodes() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn max_moves_to_draw_adjudicates_a_draw_past_the_horizon() {
+    let _tt = common::serial_tt();
     // A mate-in-1 position at game ply 100. Unlimited, the search finds the
     // mate; with a horizon below the game ply every node adjudicates a draw
     // before the mate is seen, so the score collapses to a draw-band `cp` value.
@@ -261,6 +264,7 @@ fn max_moves_to_draw_adjudicates_a_draw_past_the_horizon() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn gameover_releases_infinite_search_and_a_fresh_go_works() {
+    let _tt = common::serial_tt();
     // `go infinite` then `gameover lose` releases the bestmove exactly as `stop`
     // would; afterwards `usinewgame` + a fresh `go` works normally.
     let h = start_ready();
@@ -307,6 +311,7 @@ fn gameover_releases_infinite_search_and_a_fresh_go_works() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn gameover_result_token_is_optional_and_ignored() {
+    let _tt = common::serial_tt();
     // A bare `gameover` (no win/lose/draw token) is accepted and releases the
     // held reply just like `gameover lose` / `stop`.
     let h = start_ready();

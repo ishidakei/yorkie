@@ -70,6 +70,7 @@ fn store_at(sfen: &str, rest: &str) -> String {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn store_then_probe_returns_the_same_entry() {
+    let _tt = common::serial_tt();
     let got = tt_session(&[
         "tt store startpos move 7g7f value 100 depth 12 bound exact eval 50 pv",
         "tt probe startpos",
@@ -89,6 +90,7 @@ fn store_then_probe_returns_the_same_entry() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn omitting_pv_stores_a_non_pv_entry() {
+    let _tt = common::serial_tt();
     let got = tt_session(&[
         "tt store startpos move 2g2f value 0 depth 3 bound lower eval 0",
         "tt probe startpos",
@@ -116,6 +118,7 @@ fn omitting_pv_stores_a_non_pv_entry() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn centipawn_round_trip_quantises_to_the_usi_pawn_scale() {
+    let _tt = common::serial_tt();
     // 101 cp → 101*90/100 = 90 internal → 100*90/90 = 100 cp.
     // 109 cp →  98 internal → 108 cp. 5 cp → 4 internal → 4 cp.
     for (given, expected) in [(100, 100), (101, 100), (109, 108), (5, 4), (-101, -100)] {
@@ -143,6 +146,7 @@ fn centipawn_round_trip_quantises_to_the_usi_pawn_scale() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn the_path_dependence_mark_round_trips_through_store_and_probe() {
+    let _tt = common::serial_tt();
     let child = sfen_after(&["7g7f"]);
     let got = tt_session(&[
         "tt store startpos move 2g2f value 0 depth 3 bound lower eval 0 pathdep 1",
@@ -172,6 +176,7 @@ fn the_path_dependence_mark_round_trips_through_store_and_probe() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_store_without_the_clause_leaves_the_entry_unmarked() {
+    let _tt = common::serial_tt();
     let got = tt_session(&[
         "tt store startpos move 2g2f value 0 depth 3 bound exact eval 0 pathdep 1",
         "tt probe startpos",
@@ -192,6 +197,7 @@ fn a_store_without_the_clause_leaves_the_entry_unmarked() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn one_positions_mark_does_not_disturb_anothers() {
+    let _tt = common::serial_tt();
     let marked = sfen_after(&["7g7f"]);
     let unmarked = sfen_after(&["2g2f"]);
     let got = tt_session(&[
@@ -218,6 +224,7 @@ fn one_positions_mark_does_not_disturb_anothers() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn mate_scores_round_trip_through_store_and_probe() {
+    let _tt = common::serial_tt();
     let got = tt_session(&[
         "tt store startpos move 7g7f value mate 5 depth 30 bound exact eval 0 pv",
         "tt probe startpos",
@@ -252,6 +259,7 @@ fn mate_scores_round_trip_through_store_and_probe() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn children_report_values_relative_to_the_named_position() {
+    let _tt = common::serial_tt();
     let child = sfen_after(&["7g7f"]);
     let got = tt_session(&[
         &store_at(
@@ -281,6 +289,7 @@ fn children_report_values_relative_to_the_named_position() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn children_do_not_shift_non_mate_values() {
+    let _tt = common::serial_tt();
     let child = sfen_after(&["2g2f"]);
     let got = tt_session(&[
         &store_at(&child, "move 8c8d value 90 depth 7 bound upper eval -90"),
@@ -305,6 +314,7 @@ fn children_do_not_shift_non_mate_values() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn children_lists_only_seeded_children() {
+    let _tt = common::serial_tt();
     let seeded = ["7g7f", "2g2f", "6i7h"];
     // A fourth legal move deliberately left unseeded.
     let unseeded = "1g1f";
@@ -352,6 +362,7 @@ fn children_lists_only_seeded_children() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn children_of_an_untouched_position_lists_nothing() {
+    let _tt = common::serial_tt();
     let got = tt_session(&["tt children startpos"]);
     assert_eq!(got, vec!["children end 0".to_string()]);
 }
@@ -359,6 +370,7 @@ fn children_of_an_untouched_position_lists_nothing() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn probe_of_an_untouched_position_is_a_miss() {
+    let _tt = common::serial_tt();
     let got = tt_session(&["tt probe startpos"]);
     assert_eq!(got, vec!["probe miss".to_string()]);
 }
@@ -368,6 +380,7 @@ fn probe_of_an_untouched_position_is_a_miss() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn malformed_input_yields_one_error_line_each() {
+    let _tt = common::serial_tt();
     let cases: &[&str] = &[
         // Subcommand.
         "tt",
@@ -410,6 +423,7 @@ fn malformed_input_yields_one_error_line_each() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_position_without_kings_is_rejected() {
+    let _tt = common::serial_tt();
     let got = tt_session(&["tt probe sfen 9/9/9/9/9/9/9/9/9 b - 1"]);
     assert_eq!(got.len(), 1);
     assert!(got[0].contains("no king"), "got {got:?}");
@@ -422,6 +436,7 @@ fn a_position_without_kings_is_rejected() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn the_table_answers_before_any_isready() {
+    let _tt = common::serial_tt();
     let got = tt_session_bare(&["usinewgame", "tt probe startpos"]);
     assert_eq!(got, vec!["probe miss".to_string()]);
 
@@ -442,6 +457,7 @@ fn the_table_answers_before_any_isready() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_rejected_store_leaves_the_existing_entry_intact() {
+    let _tt = common::serial_tt();
     let got = tt_session(&[
         "tt store startpos move 7g7f value 100 depth 12 bound exact eval 50 pv",
         "tt store startpos move 7g7e value 999 depth 12 bound exact eval 0",
@@ -465,6 +481,7 @@ fn a_rejected_store_leaves_the_existing_entry_intact() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_declined_write_is_reported_not_silently_dropped() {
+    let _tt = common::serial_tt();
     let got = tt_session(&[
         "tt store startpos move 7g7f value 100 depth 40 bound exact eval 0 pv",
         "tt store startpos move 2g2f value 200 depth 1 bound lower eval 0",
@@ -506,6 +523,7 @@ fn ready_harness() -> StreamHarness {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_running_search_refuses_the_tt_commands() {
+    let _tt = common::serial_tt();
     let h = ready_harness();
 
     h.send("position startpos");
@@ -533,6 +551,7 @@ fn a_running_search_refuses_the_tt_commands() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_finished_search_does_not_block_the_tt_commands() {
+    let _tt = common::serial_tt();
     let h = ready_harness();
 
     h.send("position startpos");
@@ -558,6 +577,7 @@ fn a_finished_search_does_not_block_the_tt_commands() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn usinewgame_clears_stored_entries() {
+    let _tt = common::serial_tt();
     let got = tt_session(&[
         "tt store startpos move 7g7f value 100 depth 12 bound exact eval 0",
         "usinewgame",
@@ -578,6 +598,7 @@ fn usinewgame_clears_stored_entries() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn the_tt_commands_round_trip_through_the_wide_table() {
+    let _tt = common::serial_tt();
     // Twelve distinct legal first moves, hence twelve distinct child positions
     // and twelve distinct 64-bit keys.
     const CHILDREN: [&str; 12] = [

@@ -43,6 +43,7 @@ fn bestmove_indices(out: &str) -> Vec<usize> {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn every_reply_reports_the_allocations_of_its_own_interval() {
+    let _tt = common::serial_tt();
     stage_configured_eval_dir();
     let out = drive(
         "usi\n\
@@ -85,6 +86,7 @@ fn every_reply_reports_the_allocations_of_its_own_interval() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_reply_that_starts_no_search_still_reports_its_interval() {
+    let _tt = common::serial_tt();
     // No network staged for this session — the working directory is wherever the
     // previous test left it, so this asserts only the shape a `bestmove` line
     // comes in, not which move it is.

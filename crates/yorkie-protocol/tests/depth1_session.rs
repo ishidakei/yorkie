@@ -63,6 +63,7 @@ fn field_after<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn depth1_session_matches_reference_startpos_fixture() {
+    let _tt = common::serial_tt();
     // The fixture's node count was captured on one worker; helpers sharing the
     // TT move it, so the comparison only means anything under the test config.
     common::require_test_config();

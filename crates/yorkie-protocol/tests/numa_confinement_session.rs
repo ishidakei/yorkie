@@ -1,13 +1,13 @@
 //! Starting a session as a process confined to part of the machine.
 //!
-//! A `taskset` or a cgroup cpuset around the engine hides CPUs from the process,
-//! and what that costs depends on the compiled thread plan. A plan that pins
-//! workers to nodes loses the CPUs it was going to pin them to, so `isready`
-//! names the difference and withholds `readyok`. A plan that pins nothing — a
-//! single worker, or `numa_policy = "none"` — loses nothing, so the session
-//! readies as usual and the transposition table keeps the process's own memory
-//! policy. The second is what a set of single-thread engines pinned to
-//! individual CPUs of one many-core machine relies on.
+//! A `taskset` or a cgroup cpuset around the engine hides CPUs from the process.
+//! Every worker of every build pins itself to one logical CPU chosen when the
+//! binary was built, so a confinement that hides one of those CPUs takes a
+//! worker's seat away — `isready` names the difference and withholds `readyok`
+//! rather than letting the pin fail mid-game inside a spawned worker. A
+//! confinement that leaves them alone costs nothing, and the session readies as
+//! usual: that is what a set of engines pinned to individual CPUs of one
+//! many-core machine relies on.
 //!
 //! The confinement is presented to the driver rather than imposed on the test
 //! process, which shares its CPUs with the rest of the suite.
@@ -19,18 +19,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use common::stage_configured_eval_dir;
-use yorkie_numa::NumaConfig;
 use yorkie_protocol::{UsiDriver, config};
 
-/// Whether this build's compiled thread plan pins a worker, which is what
-/// decides whether hiding CPUs from the process takes anything away from it.
-fn compiled_plan_binds() -> bool {
-    let cfg = NumaConfig::from_const(config::NUMA_NODE_CPUS, config::NUMA_CUSTOM_AFFINITY);
-    match config::NUMA_POLICY {
-        "none" => false,
-        "auto" => cfg.suggests_binding_threads(config::THREADS as usize),
-        _ => true,
-    }
+/// The CPUs this build's workers are pinned to.
+fn worker_cpus() -> BTreeSet<usize> {
+    config::WORKER_CPUS.iter().copied().collect()
 }
 
 /// Every CPU the compiled layout holds.
@@ -52,48 +45,65 @@ fn drive_confined(input: &str, cpus: BTreeSet<usize>, eval_root: PathBuf) -> Str
     String::from_utf8(output.lock().expect("output lock").clone()).expect("utf-8")
 }
 
-#[cfg_attr(miri, ignore)]
-#[test]
-fn a_confined_start_is_refused_only_where_the_plan_pins_a_worker() {
-    let all = compiled_cpus();
-    let narrowed: BTreeSet<usize> = all.iter().copied().take(1).collect();
-    if narrowed.len() == all.len() {
-        // A one-CPU layout cannot be narrowed, so there is no confinement to
-        // present. Nothing is skipped anywhere else.
-        eprintln!("skipped: the compiled layout holds a single CPU");
-        return;
-    }
-
-    let staged = stage_configured_eval_dir();
-    let eval_root = staged
+/// The directory the staged network sits under, which the driver reads
+/// `eval_dir` against.
+fn staged_eval_root() -> PathBuf {
+    stage_configured_eval_dir()
         .parent()
         .and_then(std::path::Path::parent)
         .expect("the staged network sits under <root>/<eval_dir>")
-        .to_path_buf();
-    let out = drive_confined("isready\nquit\n", narrowed, eval_root);
+        .to_path_buf()
+}
 
-    if compiled_plan_binds() {
-        assert!(
-            out.contains("info string NUMA layout mismatch:"),
-            "a plan that pins workers must refuse a process denied their CPUs, got: {out:?}"
-        );
-        assert!(
-            !out.contains("readyok"),
-            "readyok must not follow a refused layout: {out:?}"
-        );
-    } else {
-        assert!(
-            !out.contains("NUMA layout mismatch"),
-            "a plan that pins nothing loses nothing to a confined start, got: {out:?}"
-        );
-        assert!(
-            out.contains("readyok"),
-            "the confined session must ready, got: {out:?}"
-        );
-        assert!(
-            out.contains("info string transposition table: ")
-                && out.contains("; process default policy;"),
-            "with no worker pinned the table takes the process's own policy, got: {out:?}"
-        );
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_start_denied_a_workers_cpu_is_refused() {
+    let _tt = common::serial_tt();
+    let workers = worker_cpus();
+    let allowed: BTreeSet<usize> = compiled_cpus().difference(&workers).copied().collect();
+    if allowed.is_empty() {
+        // The workers cover every CPU the machine has, so there is no
+        // confinement left to present that still names a real CPU.
+        eprintln!("skipped: this build's workers cover every CPU of the machine");
+        return;
     }
+
+    let out = drive_confined("isready\nquit\n", allowed, staged_eval_root());
+    assert!(
+        out.contains("info string NUMA layout mismatch:"),
+        "a process denied a worker's CPU must be refused, got: {out:?}"
+    );
+    assert!(
+        out.contains("which its workers are pinned to"),
+        "the refusal must say what the missing CPUs are for, got: {out:?}"
+    );
+    assert!(
+        !out.contains("readyok"),
+        "readyok must not follow a refused layout: {out:?}"
+    );
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_start_confined_to_exactly_the_workers_cpus_readies() {
+    let _tt = common::serial_tt();
+    // The narrowest confinement that still leaves every worker its seat: nothing
+    // beyond the assignment is needed, since each worker narrows itself to one
+    // CPU anyway.
+    let out = drive_confined("isready\nquit\n", worker_cpus(), staged_eval_root());
+    assert!(
+        !out.contains("NUMA layout mismatch"),
+        "an affinity covering every worker's CPU takes nothing away, got: {out:?}"
+    );
+    assert!(
+        out.contains("readyok"),
+        "the confined session must ready, got: {out:?}"
+    );
+    assert!(
+        out.contains(&format!(
+            "info string workers on CPUs {}",
+            yorkie_numa::format_cpu_list(worker_cpus())
+        )),
+        "the session names the CPUs it plays on, got: {out:?}"
+    );
 }
