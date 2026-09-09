@@ -16,10 +16,10 @@ publish = false
 # build host.
 mimalloc = "0.1"
 
-# Unix-only: `madvise(MADV_HUGEPAGE)` over the transposition-table allocation,
-# mirroring the reference's `aligned_large_pages_alloc`. The call is Linux-gated
-# in code; the dependency is `cfg(unix)`-gated so non-Unix targets never pull it
-# in.
+# Unix-only: `madvise(MADV_HUGEPAGE)` over a large-page block and over the
+# transposition table's `static`, mirroring the reference's
+# `aligned_large_pages_alloc`. The call is Linux-gated in code; the dependency is
+# `cfg(unix)`-gated so non-Unix targets never pull it in.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

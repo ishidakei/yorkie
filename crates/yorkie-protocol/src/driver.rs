@@ -86,12 +86,11 @@ macro_rules! diag {
 pub const ENGINE_NAME: &str = "Yorkie 3.1.0";
 pub const ENGINE_AUTHOR: &str = "Kei Ishida <ishida.kei@gmail.com>";
 
-// The transposition table is sized from the `usi_hash` config constant (the
-// reference's `USI_Hash` option — the depth-1 fixture capture condition): the
-// first successful `isready` sizes it if still unsized, and nothing resizes it
-// thereafter, because nothing can change the constant. The `verbose3` `bench`
-// command is the one exception: it carries its own table size as a command
-// argument. See [`UsiDriver::resize_tt_to_hash_config`].
+// The transposition table is a `static` sized from the `usi_hash` config
+// constant (the reference's `USI_Hash` option — the depth-1 fixture capture
+// condition) when the binary is built, so no command and no reply can change
+// how big it is. What `isready` still decides is where its pages live; see
+// [`UsiDriver::place_transposition_table`].
 
 /// The largest iterative-deepening depth a `go` ever requests. `run_root`'s own
 /// `rootDepth + 1 < MAX_PLY` guard (`MAX_PLY == 246`) is the real ceiling; this
@@ -303,14 +302,17 @@ pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
     /// The loaded network holder, present only after a successful `isready`.
     /// `go` before this is set replies `bestmove resign`.
     eval: Option<LoadedEval>,
-    /// The shared transposition table the root search runs against.
+    /// The shared transposition table the root search runs against: the one
+    /// `static`, whose size this binary was built with.
     ///
-    /// Sized from the `usi_hash` config constant the first time `isready`
-    /// succeeds, cleared on `usinewgame`, and advanced per `go` by the search
-    /// itself — the driver never bumps the generation. `resize` / `clear` reach
-    /// the table via [`Arc::get_mut`], which succeeds only once every worker
-    /// clone has been dropped.
-    tt: Arc<TranspositionTable>,
+    /// Cleared on `usinewgame` and advanced per `go` by the search itself — the
+    /// driver never bumps the generation. Every worker holds this same
+    /// reference, so there is nothing to hand out and nothing to reclaim.
+    tt: &'static TranspositionTable,
+    /// Whether `isready` has placed the table's pages ([`Self::place_transposition_table`]).
+    /// Once per session: the policy and the huge-page hint are properties of the
+    /// address range, and repeating them would say the same thing again.
+    tt_placed: bool,
     /// Game-scoped worker histories. `None` only while a worker
     /// holds them mid-search.
     histories: Option<WorkerHistories>,
@@ -439,7 +441,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             settings,
             pos: Position::startpos(),
             eval: None,
-            tt: Arc::new(TranspositionTable::new()),
+            tt: TranspositionTable::shared(),
+            tt_placed: false,
             histories,
             book: None,
             book_signature: None,
@@ -569,9 +572,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// If a search worker is running, request its stop and join it, reclaiming
     /// the session-owned histories. Idempotent: a no-op when idle.
     ///
-    /// Joining also drops the worker's `Arc` clone of the transposition table,
-    /// so afterwards the driver holds the sole reference and `Arc::get_mut`
-    /// succeeds.
+    /// Joining is also what leaves this thread alone with the shared
+    /// transposition table, which is what a `usinewgame` clear wants.
     fn finish_search_join(&mut self) {
         if let Some(active) = self.search.take() {
             active.stop.store(true, Ordering::Relaxed);
@@ -598,21 +600,63 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         }
     }
 
-    /// Resize the shared transposition table to `mb` MiB — the reference's
-    /// `set_tt_size`.
+    /// Place the shared transposition table's pages, once per session.
     ///
-    /// The caller must have run [`Self::finish_search_join`] first so the driver
-    /// holds the sole [`Arc`] and [`Arc::get_mut`] succeeds.
-    fn resize_tt(&mut self, mb: usize) {
-        Arc::get_mut(&mut self.tt)
-            .expect("no search worker holds the TT during a table resize")
-            .resize(mb.max(1));
-    }
+    /// The table is a `static` whose size the build fixed; what is left to
+    /// decide is where its pages come from, and both halves are asked for
+    /// before anything faults one in:
+    ///
+    /// 1. A memory policy naming exactly the system NUMA nodes the compiled
+    ///    thread plan's workers run on ([`table_placement`]): `MPOL_INTERLEAVE`
+    ///    over the set when they span several, so no node's memory controller
+    ///    carries the whole engine's probe traffic, and a preference for the one
+    ///    node when they share it. The policy goes on first, because it decides
+    ///    where the *first touch* of every page lands.
+    /// 2. `madvise(MADV_HUGEPAGE)`, so the region a huge-page boundary starts is
+    ///    actually backed by huge pages.
+    ///
+    /// Both are best-effort. A kernel without `CONFIG_NUMA`, a seccomp filter or
+    /// a restricted cgroup refuses one or both, and the table then keeps the
+    /// process default policy and ordinary pages — slower, never wrong. The
+    /// outcome is reported rather than assumed, since a tournament host silently
+    /// falling back is exactly what an operator wants to see before the game and
+    /// not after it — so the line is an initialisation-phase `info string`,
+    /// present in every build like the rest of them. It names the size and the
+    /// nodes but not the address, which differs from run to run and would make
+    /// every transcript differ with it.
+    fn place_transposition_table(&mut self) -> io::Result<()> {
+        if self.tt_placed {
+            return Ok(());
+        }
+        self.tt_placed = true;
 
-    /// Size the shared transposition table from the `usi_hash` config constant.
-    fn resize_tt_to_hash_config(&mut self) {
-        let mb = self.settings.usi_hash().max(1) as usize;
-        self.resize_tt(mb);
+        // The span handed to the kernel is the whole `static`, alignment tail
+        // included; the size reported is the clusters, which is what the
+        // `usi_hash` setting asked for.
+        let (addr, span) = self.tt.backing_region();
+        let (placed, tried) =
+            match table_placement(&self.numa_bound, self.settings.numa_system_nodes()) {
+                TablePlacement::OnNode(node) => (
+                    mempolicy::prefer_region_on_node(addr, span, node),
+                    format!("preferred on node {node}"),
+                ),
+                TablePlacement::AcrossNodes(nodes) => (
+                    mempolicy::interleave_region_over_nodes(addr, span, &nodes),
+                    format!(
+                        "interleave on nodes {}",
+                        yorkie_numa::format_cpu_list(nodes.iter().copied())
+                    ),
+                ),
+            };
+        let huge = yorkie_storage::advise_huge_pages(addr, span);
+
+        let outcome = |accepted: bool| if accepted { "applied" } else { "refused" };
+        self.info_string(&format!(
+            "transposition table: {} MiB; {tried} {}; huge pages {}",
+            yorkie_storage::TABLE_BYTES / (1024 * 1024),
+            outcome(placed),
+            outcome(huge),
+        ))
     }
 
     /// Recompute the worker → NUMA-node binding for the current pool size and
@@ -923,6 +967,11 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         if let Some(reason) = self.numa_layout_refusal() {
             return Ok(IsreadyOutcome::LayoutMismatch(reason));
         }
+        // The machine is the one the binary was built for, so the thread plan's
+        // nodes are the ones the table belongs on. Done before anything else
+        // here, so the policy is in force before the first page of it is
+        // touched.
+        self.place_transposition_table()?;
         // Load / reload the opening book (the reference does this in isready).
         self.reload_book()?;
         let path = self.nn_bin_path();
@@ -941,15 +990,6 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 // load carries none, so a correct `nn.bin` emits nothing new.
                 for warning in &warnings {
                     self.info_string(warning)?;
-                }
-                // Size the transposition table from the `usi_hash` config
-                // constant the first time a network loads. `resize` is a no-op
-                // once the cluster count matches, so a later reload never
-                // reallocates it. The `finish_search_join` above dropped any
-                // worker's `Arc` clone, so `get_mut` holds the sole reference
-                // here (the exclusivity contract on `TranspositionTable`).
-                if self.tt.cluster_count() == 0 {
-                    self.resize_tt_to_hash_config();
                 }
                 self.eval = Some(LoadedEval {
                     path,
@@ -1044,12 +1084,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // `go` bumps it again via `run_root`.
         self.finish_search_join();
         self.pos = Position::startpos();
-        // The join above dropped any worker's `Arc` clone, so this holds the
-        // sole reference; `get_mut` therefore succeeds (the exclusivity contract
-        // on `TranspositionTable`).
-        Arc::get_mut(&mut self.tt)
-            .expect("no search worker holds the TT during usinewgame")
-            .clear();
+        // The join above left this thread as the only one touching the table,
+        // so the clear races nothing.
+        self.tt.clear();
         // Fresh per-worker tables. The shared correction / pawn handle is swapped
         // to the freshly (re)built node table set by `rebuild_pool` below, so a
         // cheap clone of the current handle here avoids a throwaway allocation.
@@ -1448,10 +1485,11 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         let helper_networks: Vec<Arc<Search>> =
             self.worker_networks[1..].iter().map(Arc::clone).collect();
 
-        // Hand the coordinator a cheap `Arc` clone of the shared table; the main
-        // histories are still lent take-and-return and reclaimed
-        // on join. Helper histories live in the pool threads.
-        let tt = Arc::clone(&self.tt);
+        // The shared table is a `static`, so the coordinator gets the same
+        // reference and nothing is handed over; the main histories are still
+        // lent take-and-return and reclaimed on join. Helper histories live in
+        // the pool threads.
+        let tt = self.tt;
         let histories = self
             .histories
             .take()
@@ -1618,13 +1656,13 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             Err(e) => return diag!(self, "bench: {}", e),
         };
 
-        // The two values the reference replays as `setoption` lines. The pool
-        // rebuild reports itself exactly as the reference `Threads` on_change
-        // callback does.
+        // The thread count is the one value the reference replays as a
+        // `setoption` line that still means something here — the table's size
+        // is the build's, not the command's. The pool rebuild reports itself
+        // exactly as the reference `Threads` on_change callback does.
         self.pool_threads = config.threads.max(1) as usize;
         self.rebuild_pool();
         self.emit_thread_allocation_information()?;
-        self.resize_tt(config.tt_mb.max(1) as usize);
 
         // The `ucinewgame` (`search_clear`) the reference runs once before the
         // positions: clears the TT, resets histories, and rebuilds the pool — the
@@ -1747,11 +1785,11 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 
     /// Dispatch one `tt …` line.
     ///
-    /// Refuses while a search is in flight and before the table has been
-    /// allocated; both are one `info string tt error: …` line, never a panic. A
-    /// worker that has already replied but not yet been joined is reclaimed
-    /// first rather than refused, so the natural `go … → bestmove → tt probe`
-    /// sequence works.
+    /// Refuses while a search is in flight — one `info string tt error: …` line,
+    /// never a panic. A worker that has already replied but not yet been joined
+    /// is reclaimed first rather than refused, so the natural
+    /// `go … → bestmove → tt probe` sequence works. The table itself is always
+    /// there to read: it is a `static`, empty rather than absent before a game.
     ///
     /// "Already replied" is [`ActiveSearch::bestmove_sent`], not
     /// `JoinHandle::is_finished`: the coordinator writes `bestmove` and *then*
@@ -1772,14 +1810,6 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             Ok(command) => command,
             Err(e) => return self.tt_error(&e.to_string()),
         };
-
-        // The table is unsized until a successful `isready` (or a `bench`, which
-        // carries its own size); probing it would panic, so this is a checked
-        // error.
-        if self.tt.cluster_count() == 0 {
-            return self
-                .tt_error("transposition table not allocated; run `isready` or `bench` first");
-        }
 
         match command {
             TtCommand::Store(args) => self.tt_store(&args),
@@ -2442,15 +2472,17 @@ fn emit_book_hit<W: Write>(
 }
 
 /// Everything one helper needs to run its own iterative deepening for a single
-/// `go`. All heavy state is shared behind [`Arc`]: the network, the
-/// transposition table, the stop flag, and the per-worker node counters. The
-/// position and the root-move list are cheap per-helper copies (the reference
-/// `start_thinking` copies the root-move list to every worker).
+/// `go`. The heavy state is shared: the network, the stop flag and the
+/// per-worker node counters behind [`Arc`], the transposition table as the
+/// `static` every worker points at. The position and the root-move list are
+/// cheap per-helper copies (the reference `start_thinking` copies the root-move
+/// list to every worker).
 struct HelperJob {
     /// The loaded network holder; the helper borrows `search.network()`.
     search: Arc<Search>,
-    /// The shared transposition table.
-    tt: Arc<TranspositionTable>,
+    /// The shared transposition table — the one `static`, so this is a
+    /// reference rather than a handle the helper has to release.
+    tt: &'static TranspositionTable,
     /// The root position.
     pos: Position,
     /// This helper's own copy of the root-move list.
@@ -2603,7 +2635,7 @@ fn helper_loop(slot: Arc<HelperSlot>) {
             histories.unwrap_or_else(|| WorkerHistories::with_shared(Arc::clone(&job.shared)));
         let (result, reclaimed) = {
             let net = job.search.network();
-            let mut qs = QSearch::with_histories(net, &job.tt, histories_in);
+            let mut qs = QSearch::with_histories(net, job.tt, histories_in);
             qs.set_control(SearchControl {
                 stop: Some(Arc::clone(&job.stop)),
                 // Helpers never run `check_time` (only the main worker ponders), so
@@ -2638,16 +2670,12 @@ fn helper_loop(slot: Arc<HelperSlot>) {
         };
         histories = Some(reclaimed);
 
-        // Release every shared-`Arc` clone this helper holds — the transposition
-        // table above all — BEFORE publishing `Finished`. `finish_search_join`
-        // joins only the coordinator thread, yet `isready` / `usinewgame` then
-        // call `Arc::get_mut(&mut self.tt)`, which succeeds only once every
-        // re-parking helper has dropped its clone too. Dropping at the loop-body
-        // end instead would leave a window in which an oversubscribed helper is
-        // descheduled, the coordinator's `collect()` returns, and `get_mut`
-        // panics. Dropping here, before the `Finished` store that `collect()`
-        // synchronizes on, makes the release happen-before the reclaim.
-        drop(job.tt);
+        // Release every shared-`Arc` clone this helper holds BEFORE publishing
+        // `Finished`, so a reclaim that follows the coordinator's `collect()`
+        // finds nothing still held by a helper that has been descheduled
+        // mid-teardown. Dropping here, before the `Finished` store that
+        // `collect()` synchronizes on, makes the release happen-before the
+        // reclaim.
         drop(job.search);
         drop(job.stop);
         #[cfg(feature = "verbose2")]
@@ -2869,6 +2897,44 @@ fn numa_layout_difference(
         ));
     }
     None
+}
+
+/// Where the shared transposition table's pages belong: the **system** NUMA
+/// nodes the compiled thread plan's workers run on, and nothing wider.
+#[derive(Debug, PartialEq, Eq)]
+enum TablePlacement {
+    /// Every worker sits on one node, so the whole table belongs on it.
+    OnNode(NumaIndex),
+    /// The workers span several nodes, so the table is spread over exactly
+    /// those: no node's memory controller carries the whole engine's probe
+    /// traffic, and no page lands where no worker probes from.
+    AcrossNodes(Vec<NumaIndex>),
+}
+
+/// The placement a binding assignment implies, resolved through the compiled
+/// layout's logical → system node map. Ascending and without repeats.
+///
+/// A binary built for part of a machine — a `numa_policy` node string naming
+/// the CPUs of some of its nodes, or a thread count the binding fits on fewer
+/// nodes than the machine has — keeps its table on the part it uses, so every
+/// probe stays on a node a worker runs on. An empty assignment is the unbound
+/// case: no worker is pinned, so any CPU the layout names can issue a probe and
+/// every node it covers is in the set.
+///
+/// Reading the answer off the compiled constants keeps `isready` from asking
+/// the machine a second time.
+fn table_placement(bound: &[NumaIndex], system_nodes: &[NumaIndex]) -> TablePlacement {
+    let mut nodes = if bound.is_empty() {
+        system_nodes.to_vec()
+    } else {
+        worker_system_nodes(bound, system_nodes)
+    };
+    nodes.sort_unstable();
+    nodes.dedup();
+    match nodes.as_slice() {
+        [node] => TablePlacement::OnNode(*node),
+        _ => TablePlacement::AcrossNodes(nodes),
+    }
 }
 
 /// The *system* NUMA node of every worker in a binding assignment, read off the
@@ -3097,7 +3163,7 @@ fn thread_allocation_information_as_string(
 /// into one struct so [`run_coordinated`] stays a single-argument call.
 struct CoordinatorJob<W: Write + Send + 'static> {
     search: Arc<Search>,
-    tt: Arc<TranspositionTable>,
+    tt: &'static TranspositionTable,
     pos: Position,
     /// The iterative-deepening ceiling for this `go`, below the search's own
     /// maximum. `go depth` and the `DepthLimit` key, its only two sources, are
@@ -3400,7 +3466,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         slot.assign(HelperJob {
             // Worker `h + 1`'s own system node's network replica.
             search: Arc::clone(&helper_networks[h]),
-            tt: Arc::clone(&tt),
+            tt,
             pos: pos.clone(),
             root_moves: root_moves.clone(),
             #[cfg(feature = "verbose2")]
@@ -3431,7 +3497,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     // the root is single-line and the emission sites are not compiled at all, so
     // the search of the first line is identical in all three build shapes.
     let net = search.network();
-    let mut qs = QSearch::with_histories(net, &tt, histories);
+    let mut qs = QSearch::with_histories(net, tt, histories);
     qs.set_control(control);
     #[cfg(feature = "verbose2")]
     qs.set_node_tally(Arc::clone(&node_slots), 0);
@@ -4379,6 +4445,35 @@ mod tests {
         let cfg = NumaConfig::from_string("0-3").unwrap();
         assert!(bind_plan(&cfg, &[], &[0]).is_none());
         assert_eq!(coordinator_system_node(None), None);
+    }
+
+    #[test]
+    fn table_placement_covers_the_nodes_the_workers_sit_on_and_no_others() {
+        // Every worker on one node: the whole table belongs on that node, and
+        // it is the node the layout maps the logical one to, not the logical
+        // one.
+        assert_eq!(
+            table_placement(&[0, 0, 0, 0], &[2]),
+            TablePlacement::OnNode(2)
+        );
+        // Two nodes under the workers: spread over exactly those two.
+        assert_eq!(
+            table_placement(&[0, 1, 0, 1], &[0, 1]),
+            TablePlacement::AcrossNodes(vec![0, 1])
+        );
+        // A four-node machine whose binding uses two of them: the other two
+        // hold no worker, so no page of the table may land on them.
+        assert_eq!(
+            table_placement(&[1, 3, 1], &[0, 1, 2, 3]),
+            TablePlacement::AcrossNodes(vec![1, 3])
+        );
+        // No binding: nothing pins a worker, so every node the layout covers
+        // can issue a probe.
+        assert_eq!(
+            table_placement(&[], &[0, 1, 2, 3]),
+            TablePlacement::AcrossNodes(vec![0, 1, 2, 3])
+        );
+        assert_eq!(table_placement(&[], &[0]), TablePlacement::OnNode(0));
     }
 
     #[cfg_attr(miri, ignore)]

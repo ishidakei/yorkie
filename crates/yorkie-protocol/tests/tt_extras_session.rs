@@ -6,9 +6,10 @@
 //! The complementary "command absent" assertion lives in `src/parser.rs`,
 //! compiled only without it.
 //!
-//! No network is needed for most of them: `bench` carries its own table size as
-//! a command argument, so it allocates a table on its own and, finding no
-//! network loaded, resigns each position immediately.
+//! No network is needed for most of them: the table is a `static` that is there
+//! from process start, and the `bench` line each session opens with empties it
+//! (its `usinewgame`) before, finding no network loaded, resigning each position
+//! immediately.
 
 #![cfg(feature = "verbose3")]
 
@@ -19,8 +20,8 @@ use yorkie_state::{format_sfen, parse_sfen, parse_usi_move};
 
 const STARTPOS: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
 
-/// Run `script` against a driver whose table is already sized, and return every
-/// `tt …` reply with the `info string ` prefix stripped.
+/// Run `script` against a driver whose table has just been emptied, and return
+/// every `tt …` reply with the `info string ` prefix stripped.
 fn tt_session(script: &[&str]) -> Vec<String> {
     let mut input = String::from("bench 1 1 1 current movetime\n");
     for line in script {
@@ -31,9 +32,10 @@ fn tt_session(script: &[&str]) -> Vec<String> {
     replies(&drive(&input))
 }
 
-/// Like [`tt_session`] but WITHOUT the `bench` line, so the table is still
-/// unsized (the state right after process start, before `isready`).
-fn tt_session_unsized(script: &[&str]) -> Vec<String> {
+/// Like [`tt_session`] but WITHOUT the `bench` line, so nothing but the script
+/// itself has touched the engine — the state right after process start, before
+/// any `isready`.
+fn tt_session_bare(script: &[&str]) -> Vec<String> {
     let mut input = String::new();
     for line in script {
         input.push_str(line);
@@ -413,23 +415,27 @@ fn a_position_without_kings_is_rejected() {
     assert!(got[0].contains("no king"), "got {got:?}");
 }
 
-/// Before `isready` (or an explicit `USI_Hash`) the table has zero clusters, and
-/// probing it would panic. Every subcommand must report that instead.
+/// The table is a `static`, so it exists — empty — from process start: every
+/// subcommand answers before any `isready` or `bench`, rather than reporting a
+/// table that is not there. The leading `usinewgame` empties whatever an earlier
+/// session in this process left behind.
 #[cfg_attr(miri, ignore)]
 #[test]
-fn an_unallocated_table_is_a_clear_error() {
-    for case in [
-        "tt probe startpos",
-        "tt children startpos",
+fn the_table_answers_before_any_isready() {
+    let got = tt_session_bare(&["usinewgame", "tt probe startpos"]);
+    assert_eq!(got, vec!["probe miss".to_string()]);
+
+    let got = tt_session_bare(&["usinewgame", "tt children startpos"]);
+    assert_eq!(got, vec!["children end 0".to_string()]);
+
+    let got = tt_session_bare(&[
+        "usinewgame",
         "tt store startpos move 7g7f value 0 depth 1 bound exact eval 0",
-    ] {
-        let got = tt_session_unsized(&[case]);
-        assert_eq!(got.len(), 1, "`{case}` → {got:?}");
-        assert!(
-            got[0].contains("not allocated"),
-            "`{case}` must report the unsized table; got {got:?}"
-        );
-    }
+        "tt probe startpos",
+    ]);
+    assert_eq!(got.len(), 2, "got {got:?}");
+    assert_eq!(got[0], "store ok");
+    assert!(got[1].starts_with("probe hit "), "got {got:?}");
 }
 
 /// A malformed line must never disturb an entry that is already there.

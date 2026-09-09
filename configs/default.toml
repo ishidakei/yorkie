@@ -24,8 +24,10 @@
 # Engine core
 # ---------------------------------------------------------------------------
 
-# Transposition-table size in MiB (USI option `USI_Hash`). Sized once, when a
-# network first loads.
+# Transposition-table size in MiB (USI option `USI_Hash`). The table is a
+# `static` array of this size in the binary's BSS, so the value is an array
+# length: nothing allocates it, nothing can resize it, and a build carries
+# exactly the table it will play with.
 usi_hash = 1024
 
 # Worker-pool size (`Threads`).

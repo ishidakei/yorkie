@@ -27,10 +27,17 @@ use yorkie_search::{QSearch, RootKind, RootOutcome, Search};
 use yorkie_state::{Move, Position, format_usi_move, parse_sfen, parse_usi_move};
 use yorkie_storage::TranspositionTable;
 
-/// The compiled-in `USI_Hash` in MiB — the size the driver allocates on the
-/// first successful `isready`, reproduced here so the direct `run_root` call
-/// searches under identical TT conditions.
-const HASH_MB: usize = config::USI_HASH as usize;
+/// The one transposition table, emptied — what a driver session and a direct
+/// `run_root` each need to start from if their results are to be compared.
+///
+/// The table is a `static`, so the direct search below and the session that
+/// follows it use the very same one; only clearing between them makes the two
+/// searches comparable.
+fn cleared_tt() -> &'static TranspositionTable {
+    let tt = TranspositionTable::shared();
+    tt.clear();
+    tt
+}
 
 /// The USI-string form of a `run_root` outcome's bestmove (the synthetic
 /// positions never hit the declaration-win exit, but the mapping is exhaustive).
@@ -75,16 +82,16 @@ fn synthetic_network_session_matches_direct_search_choice() {
     let path = stage_configured_eval_dir();
 
     // Independent, direct depth-1 root-search choice for the same network +
-    // startpos, under the same TT sizing the driver uses. Scoped so the network
-    // and 1024 MiB table free before the driver session allocates its own.
+    // startpos, on the same table the session will use. Scoped so the network
+    // frees before the driver session loads its own.
     let startpos = parse_sfen(yorkie_state::STARTPOS_SFEN).expect("startpos SFEN");
     let expected_usi = {
         let search = Search::from_network_file(&path).expect("synthetic network loads");
-        let mut tt = TranspositionTable::new();
-        tt.resize(HASH_MB);
-        let outcome = QSearch::new(search.network(), &tt).run_root(&startpos, 1);
+        let outcome = QSearch::new(search.network(), cleared_tt()).run_root(&startpos, 1);
         bestmove_usi(&outcome)
     };
+    // The session below starts from an empty table, as this search just did.
+    cleared_tt();
 
     // Full session, with a repeat `isready` to exercise idempotent reload.
     let out = drive(
@@ -189,18 +196,19 @@ fn synthetic_network_reuse_reset_and_mate_resign() {
     let startpos = parse_sfen(yorkie_state::STARTPOS_SFEN).expect("startpos");
 
     // Independent depth-1 root-search choices, reproducing the session's TT
-    // lifecycle: one 1024 MiB table for `go` #1 (post-7g7f), then `usinewgame`
-    // (tt.clear) before `go` #2 (startpos). Scoped so it frees before the driver
-    // allocates its own table.
+    // lifecycle: an empty table for `go` #1 (post-7g7f), then `usinewgame`
+    // (tt.clear) before `go` #2 (startpos). Scoped so the network frees before
+    // the driver loads its own.
     let (expected_after_7g7f, expected_startpos) = {
         let search = Search::from_network_file(&nn_bin).expect("synthetic network loads");
-        let mut tt = TranspositionTable::new();
-        tt.resize(HASH_MB);
-        let e1 = bestmove_usi(&QSearch::new(search.network(), &tt).run_root(&post_7g7f, 1));
+        let tt = cleared_tt();
+        let e1 = bestmove_usi(&QSearch::new(search.network(), tt).run_root(&post_7g7f, 1));
         tt.clear(); // usinewgame equivalent.
-        let e2 = bestmove_usi(&QSearch::new(search.network(), &tt).run_root(&startpos, 1));
+        let e2 = bestmove_usi(&QSearch::new(search.network(), tt).run_root(&startpos, 1));
         (e1, e2)
     };
+    // The session below starts from an empty table, as the first search did.
+    cleared_tt();
 
     // A mate for the side to move (White): no legal move → search resigns.
     let mate = "4k4/4G4/3S5/9/9/9/9/9/4K4 w - 1";

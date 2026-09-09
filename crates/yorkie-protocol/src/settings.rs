@@ -7,7 +7,11 @@
 //!
 //! The accessors stay because the driver reads settings by name, and keeping the
 //! name → constant mapping in one file is what makes "which constant does
-//! `USI_Hash` mean" answerable in one place.
+//! `MultiPV` mean" answerable in one place.
+//!
+//! One setting has no accessor here: `usi_hash`. The transposition table is a
+//! `static` whose length is that value, so the storage crate compiles the
+//! constant in for itself and no run-time reader of it exists.
 //!
 //! Eight book settings come in two halves, four belonging to the V1 book profile
 //! and four to V2. The config schema is one fixed key set, so both halves are
@@ -112,8 +116,6 @@ macro_rules! text_accessors {
 }
 
 spin_accessors! {
-    /// Transposition-table size in MiB (`USI_Hash`).
-    usi_hash => USI_HASH;
     /// Principal variations reported per search (`MultiPV`). Read only where a
     /// second PV line can be reported, which is where the search `info` lines
     /// are; without that feature the root is single-line and the constant does

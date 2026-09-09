@@ -15,10 +15,10 @@
 # Engine core
 # ---------------------------------------------------------------------------
 
-# TEST VALUE: the play value is 1024. Every session test that reaches `readyok`
-# allocates this table for real, and nothing can shrink it at run time, so a
-# play-sized value here would have the suite allocate a gibibyte per test
-# process.
+# TEST VALUE: the play value is 1024. The table is a `static` array of this
+# size, so the value is an array length the compiler has to lay out and every
+# `usinewgame` has to walk: a play-sized value here would spend minutes of
+# build time on the initializer and clear a gibibyte per test process.
 usi_hash = 16
 
 # TEST VALUE: the play value is 4. The session tests pin a deterministic

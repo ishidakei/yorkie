@@ -13,7 +13,17 @@
 //! cascades through PVS re-search bounds into the node count.
 //!
 //! Captured with Threads=1, no book, `usinewgame`, USI_Hash 1024 MiB and
-//! FV_SCALE 16, reproduced here. Skipped with a notice when `nn.bin` is absent.
+//! FV_SCALE 16. Everything but the hash size is reproduced here: the table is
+//! the `static` this build compiled in — 16 MiB under the test config — and the
+//! fixture comes out the same on it. Skipped with a notice when `nn.bin` is
+//! absent.
+//!
+//! Not compiled under `tt-entry16`. What that layout promises is exact position
+//! identity, not the reference's search: it fits two entries in a cluster
+//! instead of three, which changes which position a full cluster keeps, and the
+//! fixture is the reference's numbers.
+
+#![cfg(not(feature = "tt-entry16"))]
 
 use std::path::PathBuf;
 
@@ -28,8 +38,6 @@ const VALUE_MATE: i32 = 32000;
 const VALUE_TB_WIN_IN_MAX_PLY: i32 = VALUE_MATE - 246;
 /// `Eval::PawnValue` (`NormalizeToPawnValue`).
 const PAWN_VALUE: i32 = 90;
-/// Engine default `USI_Hash` in MiB.
-const HASH_MB: usize = 1024;
 
 #[derive(Debug, Deserialize)]
 struct FixtureJson {
@@ -120,8 +128,8 @@ fn depth2_startpos_7g7f_matches_reference() {
     }
 
     let net = yorkie_eval::load_network(&path).expect("real nn.bin should load and validate");
-    let mut tt = TranspositionTable::new();
-    tt.resize(HASH_MB);
+    // usinewgame: the shared table, emptied.
+    let tt = TranspositionTable::shared();
     tt.clear();
 
     let json = load_fixture("startpos-7g7f.json");
@@ -129,7 +137,7 @@ fn depth2_startpos_7g7f_matches_reference() {
     let pos = setup(&json);
 
     let outcome = {
-        let mut search = QSearch::new(&net, &tt);
+        let mut search = QSearch::new(&net, tt);
         search.run_root(&pos, json.depth)
     };
 

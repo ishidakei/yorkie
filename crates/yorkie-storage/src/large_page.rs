@@ -1,11 +1,13 @@
 //! Shared huge-page-backed allocator, a port of the reference's
 //! `aligned_large_pages_alloc` / `make_unique_large_page`.
 //!
-//! The transposition table, the history tables and the loaded NNUE parameters
-//! all allocate through here, so the huge-page policy lives in one place: base
-//! alignment [`LARGE_PAGE_ALIGN`], the byte size rounded **up** to a whole
-//! multiple of it, zero-initialised, and — on Linux — `MADV_HUGEPAGE`-hinted
-//! best-effort across the whole rounded region.
+//! The history tables and the loaded NNUE parameters allocate through here, so
+//! the huge-page policy lives in one place: base alignment
+//! [`LARGE_PAGE_ALIGN`], the byte size rounded **up** to a whole multiple of it,
+//! zero-initialised, and — on Linux — `MADV_HUGEPAGE`-hinted best-effort across
+//! the whole rounded region. [`advise_huge_pages`] is that last step on its own,
+//! for a region this module did not allocate: the transposition table's
+//! `static`, which the linker placed.
 //!
 //! [`LargePageArray<T>`] and [`LargePageBox<T>`] are the `Box<[T]>` and `Box<T>`
 //! analogues on top of it. Both construct their storage zeroed, so the element
@@ -76,24 +78,47 @@ pub(crate) fn alloc_zeroed_large(min_bytes: usize) -> (NonNull<u8>, Layout) {
         None => handle_alloc_error(layout),
     };
 
-    // miri rejects `madvise` with any advice beyond MADV_NORMAL / RANDOM /
-    // SEQUENTIAL / WILLNEED, which would abort every miri test that allocates
-    // here. The hint has no observable effect on the returned block, so
-    // dropping it under miri still leaves the allocation, the aliasing and the
-    // drop path covered.
-    #[cfg(all(target_os = "linux", not(miri)))]
-    {
-        // SAFETY: `ptr` and `size` describe the live allocation just returned,
-        // and `madvise` only adjusts kernel paging policy for that range — it
-        // neither reads nor writes the memory and cannot invalidate it. The
-        // return value is discarded because the hint is best-effort, as the
-        // reference discards it too.
-        unsafe {
-            libc::madvise(ptr.as_ptr() as *mut libc::c_void, size, libc::MADV_HUGEPAGE);
-        }
-    }
+    // Best-effort, as the reference's is: a refused hint leaves the block
+    // exactly as it was.
+    advise_huge_pages(ptr.as_ptr() as usize, size);
 
     (ptr, layout)
+}
+
+/// Ask the kernel to back the byte range `[addr, addr + len)` with transparent
+/// huge pages (`madvise(MADV_HUGEPAGE)`).
+///
+/// The hint every block this module hands out carries, and the one a caller
+/// applies to a region it did not allocate here — the transposition table's
+/// `static`, whose address the linker fixed. `addr` must be page-aligned, which
+/// both of those are, being [`LARGE_PAGE_ALIGN`]-aligned.
+///
+/// Returns whether the kernel accepted it. `false` — off Linux, or where the
+/// kernel was built or configured without transparent huge pages — leaves the
+/// range with whatever backing it had, which costs TLB misses and nothing else.
+///
+/// No memory is read or written: the range is handed to the kernel as a
+/// descriptor, which is why this is safe despite taking a raw address.
+pub fn advise_huge_pages(addr: usize, len: usize) -> bool {
+    // miri rejects `madvise` with any advice beyond MADV_NORMAL / RANDOM /
+    // SEQUENTIAL / WILLNEED, which would abort every miri test that allocates
+    // here. The hint has no observable effect on the range, so dropping it
+    // under miri still leaves the allocation, the aliasing and the drop path
+    // covered.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    {
+        // SAFETY: `madvise` only adjusts kernel paging policy for the range —
+        // it neither reads nor writes the memory and cannot invalidate it, so
+        // an address it rejects (unmapped, unaligned) is an error return rather
+        // than an unsound access.
+        let rc = unsafe { libc::madvise(addr as *mut libc::c_void, len, libc::MADV_HUGEPAGE) };
+        rc == 0
+    }
+    #[cfg(not(all(target_os = "linux", not(miri))))]
+    {
+        let _ = (addr, len);
+        false
+    }
 }
 
 /// Free a block returned by [`alloc_zeroed_large`].

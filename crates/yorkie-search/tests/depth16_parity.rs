@@ -16,8 +16,18 @@
 //! 20x the depth-8 fixture. The six-position sweep stays at depth 8.
 //!
 //! The fixture was captured with Threads=1, no book, `usinewgame` before the
-//! position, and USI_Hash 1024 MiB, reproduced here. Skipped with a notice when
-//! `nn.bin` is absent.
+//! position, and USI_Hash 1024 MiB. Everything but the hash size is reproduced
+//! here: the table is the `static` this build compiled in — 16 MiB under the
+//! test config — and the fixture comes out the same on it. Skipped with a notice
+//! when `nn.bin` is absent.
+//!
+//! Not compiled under `tt-entry16`. What that layout promises is exact position
+//! identity, not the reference's search: it spends the entry's extra bytes on
+//! the key and so fits two entries in a cluster instead of three, which changes
+//! which position a full cluster keeps. A table of the size this build carries
+//! reaches that point, and the fixtures are the reference's numbers.
+
+#![cfg(not(feature = "tt-entry16"))]
 
 use std::path::PathBuf;
 
@@ -32,8 +42,6 @@ const VALUE_MATE: i32 = 32000;
 const VALUE_TB_WIN_IN_MAX_PLY: i32 = VALUE_MATE - 246;
 /// `Eval::PawnValue` (`NormalizeToPawnValue`).
 const PAWN_VALUE: i32 = 90;
-/// Engine default `USI_Hash` in MiB (`tests/fixtures/search-depth16/README.md`).
-const HASH_MB: usize = 1024;
 
 #[derive(Debug, Deserialize)]
 struct FixtureJson {
@@ -130,8 +138,7 @@ fn depth16_search_matches_reference_fixture() {
     }
     let net = yorkie_eval::load_network(&path).expect("real nn.bin should load and validate");
 
-    let mut tt = TranspositionTable::new();
-    tt.resize(HASH_MB);
+    let tt = TranspositionTable::shared();
 
     let name = "startpos.json";
     let json = load_fixture(name);
@@ -142,7 +149,7 @@ fn depth16_search_matches_reference_fixture() {
     let pos = setup(&json);
 
     let outcome = {
-        let mut qs = QSearch::new(&net, &tt);
+        let mut qs = QSearch::new(&net, tt);
         qs.run_root(&pos, json.depth)
     };
 

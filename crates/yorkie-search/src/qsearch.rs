@@ -350,13 +350,11 @@ pub struct TimeControl {
 /// deepening, [`Self::search`] the interior body, and [`Self::qsearch`] the leaf
 /// they recurse into.
 ///
-/// The transposition table must be sized before [`QSearch::run`]; probing an
-/// unsized table panics.
 pub struct QSearch<'a> {
     net: &'a NnueNetwork,
-    /// The shared transposition table, borrowed `&self`: the table
-    /// lives behind an `Arc` in the driver and every probe / write goes through
-    /// its atomics, so the driver can hand each worker a cheap `Arc` clone.
+    /// The shared transposition table, borrowed `&self`: it is one `static`
+    /// whose size the build fixed, and every probe / write goes through its
+    /// atomics, so each worker holds this same reference.
     tt: &'a TranspositionTable,
 
     /// `nodes` counter — bumped once per `do_move`. A search input in every
@@ -948,9 +946,7 @@ impl<'a> QSearch<'a> {
     }
 
     /// Consume the driver and return its history tables so the session can carry
-    /// them into the next `go`. Consuming `self` also ends the
-    /// mutable borrow of the transposition table, freeing the caller to reclaim
-    /// it too.
+    /// them into the next `go`.
     pub fn into_histories(self) -> WorkerHistories {
         self.histories
     }
@@ -3840,10 +3836,38 @@ mod tests {
         parse_sfen(sfen).expect("valid SFEN")
     }
 
-    fn fresh_tt() -> TranspositionTable {
-        let mut t = TranspositionTable::new();
-        t.resize(1); // 1 MiB is plenty for these tiny trees.
-        t
+    /// Serialises the tests that use the transposition table.
+    ///
+    /// There is one table in the process — a `static` — so two tests running as
+    /// threads of one binary would clear and overwrite each other's entries.
+    /// Under `cargo nextest` each test is its own process and the lock is never
+    /// contended; under a plain `cargo test` it is what makes these tests
+    /// deterministic.
+    static TT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Exclusive use of the emptied table, released when the test's binding
+    /// goes out of scope. Derefs to the table, so a caller writes `&tt` where a
+    /// `&TranspositionTable` is wanted.
+    struct TtHandle {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        tt: &'static TranspositionTable,
+    }
+
+    impl std::ops::Deref for TtHandle {
+        type Target = TranspositionTable;
+
+        fn deref(&self) -> &TranspositionTable {
+            self.tt
+        }
+    }
+
+    fn fresh_tt() -> TtHandle {
+        // A panicking test leaves the lock poisoned; the next test wants the
+        // table, not the panic, and clears it before reading anything.
+        let guard = TT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tt = TranspositionTable::shared();
+        tt.clear();
+        TtHandle { _guard: guard, tt }
     }
 
     fn legal_moves(p: &Position) -> Vec<Move> {
@@ -3861,7 +3885,7 @@ mod tests {
 
     #[allow(clippy::too_many_arguments)]
     fn prewrite(
-        table: &mut TranspositionTable,
+        table: &TranspositionTable,
         p: &Position,
         value: Value,
         pv: bool,
@@ -3888,7 +3912,7 @@ mod tests {
         );
     }
 
-    fn probe_root(table: &mut TranspositionTable, p: &Position) -> (bool, TTData) {
+    fn probe_root(table: &TranspositionTable, p: &Position) -> (bool, TTData) {
         let (f, d, _w) = table.probe(p.key(), p.side_to_move().index() as u8);
         (f, d)
     }
@@ -4054,7 +4078,7 @@ mod tests {
     #[test]
     fn stand_pat_cutoff_adjusts_and_writes_unsearched_lower_bound() {
         let net = zero_net();
-        let mut table = fresh_tt();
+        let table = fresh_tt();
         let p = pos(TWO_KINGS);
         assert!(!p.in_check());
 
@@ -4066,7 +4090,7 @@ mod tests {
         assert_eq!(out.value, -2);
         assert_eq!(out.nodes, 0, "stand pat returns before any do_move");
 
-        let (found, data) = probe_root(&mut table, &p);
+        let (found, data) = probe_root(&table, &p);
         assert!(found);
         assert_eq!(data.depth, DEPTH_UNSEARCHED);
         assert_eq!(data.bound, Bound::Lower);
@@ -4352,17 +4376,8 @@ mod tests {
         // loop. A non-checking capture would be futility-pruned at this alpha;
         // the givesCheck exemption is what lets the capture through.
         let net = zero_net();
-        let mut table = fresh_tt();
-        prewrite(
-            &mut table,
-            &p,
-            0,
-            false,
-            Bound::None,
-            DEPTH_UNSEARCHED,
-            0,
-            0,
-        );
+        let table = fresh_tt();
+        prewrite(&table, &p, 0, false, Bound::None, DEPTH_UNSEARCHED, 0, 0);
         let out = {
             let mut q = QSearch::new(&net, &table);
             q.run(&mut p.clone(), 418, 419, false, true)
@@ -4391,10 +4406,10 @@ mod tests {
         assert!(legal_moves(&p).contains(&quiet_check));
 
         let net = zero_net();
-        let mut table = fresh_tt();
+        let table = fresh_tt();
         // Store the quiet check as the TT move (non-cutoff entry).
         prewrite(
-            &mut table,
+            &table,
             &p,
             0,
             false,
@@ -4446,7 +4461,7 @@ mod tests {
         assert!(p.mate_1ply().is_some());
 
         let net = zero_net();
-        let mut table = fresh_tt();
+        let table = fresh_tt();
         let out = {
             let mut q = QSearch::new(&net, &table);
             q.run(&mut p.clone(), -VALUE_INFINITE, VALUE_INFINITE, true, true)
@@ -4454,7 +4469,7 @@ mod tests {
         assert_eq!(out.value, mate_in(1)); // mate_in(ss->ply + 1) at ply 0
         assert_eq!(out.nodes, 0, "the mate is found before any do_move");
 
-        let (found, data) = probe_root(&mut table, &p);
+        let (found, data) = probe_root(&table, &p);
         assert!(found);
         assert_eq!(data.bound, Bound::Exact);
         assert_eq!(data.depth, DEPTH_QS);
@@ -4545,7 +4560,7 @@ mod tests {
 
         /// [`prewrite`] with the entry's path-dependence mark.
         fn prewrite_marked(
-            table: &mut TranspositionTable,
+            table: &TranspositionTable,
             p: &Position,
             value: Value,
             bound: Bound,
@@ -4563,7 +4578,7 @@ mod tests {
         /// Seed every child of `p` with the same entry, so which evasion the
         /// MovePicker happens to yield first does not decide the outcome.
         fn seed_every_child(
-            table: &mut TranspositionTable,
+            table: &TranspositionTable,
             p: &Position,
             value: Value,
             bound: Bound,
@@ -4633,14 +4648,14 @@ mod tests {
         #[test]
         fn a_marked_child_that_moves_the_window_marks_the_node() {
             let net = zero_net();
-            let mut table = fresh_tt();
+            let table = fresh_tt();
             let p = pos(IN_CHECK_WITH_EVASIONS);
             assert!(p.in_check(), "the fixture must be in check");
             assert!(!legal_moves(&p).is_empty(), "and must have an evasion");
 
             // Each child cuts off on an upper bound of -500, so the node sees
             // +500 — above its beta of 1.
-            seed_every_child(&mut table, &p, -500, Bound::Upper, true);
+            seed_every_child(&table, &p, -500, Bound::Upper, true);
 
             let (value, marked) = {
                 let mut q = QSearch::new(&net, &table);
@@ -4650,7 +4665,7 @@ mod tests {
             assert!(value > 0, "the node fails high on the marked child");
             assert!(marked, "and returns a marked value");
 
-            let (found, data) = probe_root(&mut table, &p);
+            let (found, data) = probe_root(&table, &p);
             assert!(found);
             assert!(data.path_dep, "the stored entry carries the node's mark");
         }
@@ -4661,12 +4676,12 @@ mod tests {
         #[test]
         fn a_marked_child_at_or_below_alpha_leaves_the_node_unmarked() {
             let net = zero_net();
-            let mut table = fresh_tt();
+            let table = fresh_tt();
             let p = pos(IN_CHECK_WITH_EVASIONS);
 
             // Each child cuts off on a lower bound of +500, so the node sees
             // -500 — never above its alpha of 0.
-            seed_every_child(&mut table, &p, 500, Bound::Lower, true);
+            seed_every_child(&table, &p, 500, Bound::Lower, true);
 
             let (value, marked) = {
                 let mut q = QSearch::new(&net, &table);
@@ -4676,7 +4691,7 @@ mod tests {
             assert!(value < 0, "every child fails low");
             assert!(!marked, "so no child's mark reaches the node");
 
-            let (found, data) = probe_root(&mut table, &p);
+            let (found, data) = probe_root(&table, &p);
             assert!(found);
             assert!(!data.path_dep);
         }
@@ -4688,11 +4703,11 @@ mod tests {
     #[test]
     fn read_tt_false_ignores_a_cutoff_entry() {
         let net = zero_net();
-        let mut table = fresh_tt();
+        let table = fresh_tt();
         let p = pos(TWO_KINGS);
         // A lower-bound entry at DEPTH_QS with value 500 >= beta triggers the
         // non-PV early cutoff when ReadTT is honoured.
-        prewrite(&mut table, &p, 500, false, Bound::Lower, DEPTH_QS, 0, 0);
+        prewrite(&table, &p, 500, false, Bound::Lower, DEPTH_QS, 0, 0);
 
         let with_tt = {
             let mut q = QSearch::new(&net, &table);
@@ -5042,19 +5057,20 @@ mod tests {
         // eval == 0, depth 1 ⇒ razoring fires when alpha - 502 - 306 > 0, i.e.
         // alpha > 808. It returns qsearch<NonPV>, which for two bare kings makes
         // no do_move.
-        let fired_tt = fresh_tt();
+        let tt = fresh_tt();
         let fired_nodes = {
-            let mut q = QSearch::new(&net, &fired_tt);
+            let mut q = QSearch::new(&net, &tt);
             q.run_search(&mut pos(TWO_KINGS), 809, 810, 1, false, false);
             q.nodes
         };
         assert_eq!(fired_nodes, 0, "razoring returns qsearch with no do_move");
 
         // At the boundary (alpha 808 ⇒ 0 < 0 is false) razoring does not fire and
-        // the move loop searches the king moves.
-        let not_tt = fresh_tt();
+        // the move loop searches the king moves. The same table, emptied: the
+        // second half must start where the first did.
+        tt.clear();
         let not_nodes = {
-            let mut q = QSearch::new(&net, &not_tt);
+            let mut q = QSearch::new(&net, &tt);
             q.run_search(&mut pos(TWO_KINGS), 808, 809, 1, false, false);
             q.nodes
         };
@@ -5079,9 +5095,10 @@ mod tests {
         assert_eq!(n, 0, "futility returns before any do_move");
 
         // beta == -35: eval - margin (-36) < beta, so futility does not fire.
-        let tt2 = fresh_tt();
+        // The same table, emptied.
+        tt.clear();
         let n2 = {
-            let mut q = QSearch::new(&net, &tt2);
+            let mut q = QSearch::new(&net, &tt);
             q.run_search(&mut pos(TWO_KINGS), -36, -35, 1, false, false);
             q.nodes
         };
@@ -5104,9 +5121,9 @@ mod tests {
 
         // depth 1, improving false ⇒ null fires when 0 >= beta + 378 - 16, i.e.
         // beta <= -362. R = 7, depth-R < 0 ⇒ the child is qsearch (no do_move).
-        let mut tt = fresh_tt();
+        let tt = fresh_tt();
         prewrite(
-            &mut tt,
+            &tt,
             &p,
             VALUE_NONE,
             false,
@@ -5124,9 +5141,10 @@ mod tests {
         assert_eq!(n, 0, "null move + qsearch make no counted do_move");
 
         // beta == -361: 0 >= -361 - 16 + 378 == 1 is false ⇒ null does not fire.
-        let mut tt2 = fresh_tt();
+        // The same table, emptied and re-seeded.
+        tt.clear();
         prewrite(
-            &mut tt2,
+            &tt,
             &p,
             VALUE_NONE,
             false,
@@ -5136,7 +5154,7 @@ mod tests {
             VALUE_NONE,
         );
         let n2 = {
-            let mut q = QSearch::new(&net, &tt2);
+            let mut q = QSearch::new(&net, &tt);
             q.run_search(&mut p.clone(), -362, -361, 1, true, false);
             q.nodes
         };
@@ -5155,9 +5173,9 @@ mod tests {
         assert!(!p.in_check());
         assert_eq!(captures(&p).len(), 1, "exactly one capture");
 
-        let mut tt = fresh_tt();
+        let tt = fresh_tt();
         prewrite(
-            &mut tt,
+            &tt,
             &p,
             VALUE_NONE,
             true, // is_pv ⇒ ss->ttPv true
@@ -5250,7 +5268,7 @@ mod tests {
         for depth in [1, 2] {
             let orig = pos(SFEN);
             let mut work = orig.clone();
-            let mut tt = fresh_tt();
+            let tt = fresh_tt();
             let (v, nodes) = {
                 let mut q = QSearch::new(&net, &tt);
                 let v = q.run_search(
@@ -5269,7 +5287,7 @@ mod tests {
             );
             assert!(nodes > 0, "depth {depth}: interior body must search moves");
             assert_eq!(work, orig, "depth {depth}: the position stack must balance");
-            let (found, _data) = probe_root(&mut tt, &orig);
+            let (found, _data) = probe_root(&tt, &orig);
             assert!(found, "depth {depth}: the root node writes a TT entry");
         }
     }

@@ -10,14 +10,18 @@
 //!
 //! The three-layer policy this module makes possible:
 //!
-//! 1. **Process default — untouched**, so the TT keeps interleaving and the USI
-//!    thread keeps the launcher's policy.
+//! 1. **Process default — untouched**, so the USI thread keeps the launcher's
+//!    policy, and the one region every worker shares says for itself where it
+//!    wants to live: the shared transposition table asks for the nodes its
+//!    workers run on, [`interleave_region_over_nodes`] when they span several
+//!    and [`prefer_region_on_node`] when they share one, whatever the launch
+//!    line was.
 //! 2. **Explicit per-region placement** — [`migrate_region_to_node`], for a
 //!    block another thread already allocated *and faulted*, so first-touch is no
 //!    longer available as a lever.
 //! 3. **Worker-scope preference** — [`set_current_thread_preferred_node`], set
 //!    by a worker right after it pins itself. Being per-thread, it can never
-//!    disturb the TT's interleave or another thread's placement.
+//!    disturb the table's interleave or another thread's placement.
 //!
 //! The kernel's nodemask is indexed by **system** NUMA node, while a
 //! [`NumaIndex`] is a *logical* node that L3-aware bundling can renumber, so
@@ -96,12 +100,24 @@ pub struct MemPolicy {
 /// Returns `None` for an index past [`MAX_NODE_INDEX`], which the kernel would
 /// reject anyway.
 pub(crate) fn node_mask(node: NumaIndex) -> Option<(Vec<usize>, usize)> {
-    if node > MAX_NODE_INDEX {
+    nodes_mask(&[node])
+}
+
+/// [`node_mask`] for a set: the mask naming every node in `nodes`, and the
+/// `maxnode` that goes with it.
+///
+/// Returns `None` for an empty set — a policy over no node is one the kernel
+/// rejects — or for any index past [`MAX_NODE_INDEX`].
+pub(crate) fn nodes_mask(nodes: &[NumaIndex]) -> Option<(Vec<usize>, usize)> {
+    let &highest = nodes.iter().max()?;
+    if highest > MAX_NODE_INDEX {
         return None;
     }
-    let words = node / MASK_WORD_BITS + 1;
+    let words = highest / MASK_WORD_BITS + 1;
     let mut mask = vec![0usize; words];
-    mask[node / MASK_WORD_BITS] = 1usize << (node % MASK_WORD_BITS);
+    for &node in nodes {
+        mask[node / MASK_WORD_BITS] |= 1usize << (node % MASK_WORD_BITS);
+    }
     Some((mask, words * MASK_WORD_BITS + 1))
 }
 
@@ -201,7 +217,64 @@ pub fn migrate_region_to_node(addr: usize, len: usize, system_node: NumaIndex) -
     let Some((start, span)) = page_span(page_size(), addr, len) else {
         return false;
     };
-    sys_mbind(start, span, &mask, maxnode)
+    sys_mbind(start, span, MODE_BIND, &mask, maxnode)
+}
+
+/// Make the byte range `[addr, addr + len)` prefer `system_node`, migrating
+/// pages that are already faulted somewhere else
+/// (`mbind(MPOL_PREFERRED, {system_node}, MPOL_MF_MOVE)`).
+///
+/// The one-node counterpart of [`interleave_region_over_nodes`], for a region
+/// every reader of which sits on the same node. A *preference* rather than the
+/// bind [`migrate_region_to_node`] installs, because this is the path the
+/// shared transposition table takes and the table can be a large fraction of a
+/// node's memory: under `MPOL_BIND` a table that does not fit its node has
+/// nowhere to fault and takes the process down mid-search, while a preference
+/// spills onto the nearest node that has room — slower, never wrong, and the
+/// same non-fatal behaviour `MPOL_INTERLEAVE` has when one of its nodes fills
+/// up.
+///
+/// The range is widened to whole pages ([`page_span`]). `system_node` is a
+/// **system** NUMA node index. Returns whether the kernel accepted the call;
+/// `false` leaves the range under whatever policy already governed it.
+///
+/// No memory is read or written here: the address is handed to the kernel as a
+/// range descriptor, which is why this is safe despite taking a raw address.
+pub fn prefer_region_on_node(addr: usize, len: usize, system_node: NumaIndex) -> bool {
+    let Some((mask, maxnode)) = node_mask(system_node) else {
+        return false;
+    };
+    let Some((start, span)) = page_span(page_size(), addr, len) else {
+        return false;
+    };
+    sys_mbind(start, span, MODE_PREFERRED, &mask, maxnode)
+}
+
+/// Spread the byte range `[addr, addr + len)` evenly over `system_nodes`,
+/// migrating pages that are already faulted somewhere else
+/// (`mbind(MPOL_INTERLEAVE, system_nodes, MPOL_MF_MOVE)`).
+///
+/// What a region every worker reads uniformly wants, the transposition table
+/// being the one that matters: no node owns it, so no node's memory controller
+/// carries the whole engine's probe traffic. It is what
+/// `numactl --interleave=all` installs process-wide, applied to one range
+/// instead, so nothing else in the process inherits it.
+///
+/// The range is widened to whole pages ([`page_span`]); the caller's range is
+/// already 2 MiB-aligned and -sized. `system_nodes` are **system** NUMA node
+/// indices, in any order. Returns whether the kernel accepted the call; `false`
+/// leaves the range under whatever policy already governed it.
+///
+/// No memory is read or written here: the address is handed to the kernel as a
+/// range descriptor, which is why this is safe despite taking a raw address.
+pub fn interleave_region_over_nodes(addr: usize, len: usize, system_nodes: &[NumaIndex]) -> bool {
+    let Some((mask, maxnode)) = nodes_mask(system_nodes) else {
+        return false;
+    };
+    let Some((start, span)) = page_span(page_size(), addr, len) else {
+        return false;
+    };
+    sys_mbind(start, span, MODE_INTERLEAVE, &mask, maxnode)
 }
 
 /// The calling thread's own memory policy (`get_mempolicy(…, NULL, 0)`) — the
@@ -242,9 +315,9 @@ fn sys_set_preferred(_mask: &[usize], _maxnode: usize) -> bool {
     false
 }
 
-/// `mbind(start, span, MPOL_BIND, mask, maxnode, MPOL_MF_MOVE)`.
+/// `mbind(start, span, mode, mask, maxnode, MPOL_MF_MOVE)`.
 #[cfg(all(target_os = "linux", not(miri)))]
-fn sys_mbind(start: usize, span: usize, mask: &[usize], maxnode: usize) -> bool {
+fn sys_mbind(start: usize, span: usize, mode: i32, mask: &[usize], maxnode: usize) -> bool {
     // SAFETY: the syscall takes (addr, len, mode, nodemask, maxnode, flags).
     // `mask` is a live buffer the kernel only reads. `start`/`span` describe a
     // page-aligned range that the kernel validates against this process's
@@ -257,7 +330,7 @@ fn sys_mbind(start: usize, span: usize, mask: &[usize], maxnode: usize) -> bool 
             libc::SYS_mbind,
             start as *const libc::c_void,
             span as libc::c_ulong,
-            libc::MPOL_BIND as libc::c_long,
+            mode as libc::c_long,
             mask.as_ptr(),
             maxnode as libc::c_ulong,
             MPOL_MF_MOVE,
@@ -268,7 +341,7 @@ fn sys_mbind(start: usize, span: usize, mask: &[usize], maxnode: usize) -> bool 
 
 /// Off Linux (and under miri) there is no placement to change.
 #[cfg(not(all(target_os = "linux", not(miri))))]
-fn sys_mbind(_start: usize, _span: usize, _mask: &[usize], _maxnode: usize) -> bool {
+fn sys_mbind(_start: usize, _span: usize, _mode: i32, _mask: &[usize], _maxnode: usize) -> bool {
     false
 }
 
@@ -367,6 +440,26 @@ mod tests {
     }
 
     #[test]
+    fn nodes_mask_names_every_node_it_is_given() {
+        let w = MASK_WORD_BITS;
+        let (mask, maxnode) = nodes_mask(&[0, 3, w + 1]).expect("in-range nodes");
+        assert_eq!(nodes_from_mask(&mask), vec![0, 3, w + 1]);
+        // The mask is as wide as the highest node needs, and no wider.
+        assert_eq!(mask.len(), 2);
+        assert_eq!(maxnode, 2 * w + 1);
+
+        // Order and repetition do not change the set.
+        let (unordered, _) = nodes_mask(&[w + 1, 0, 3, 0]).expect("in-range nodes");
+        assert_eq!(unordered, mask);
+    }
+
+    #[test]
+    fn nodes_mask_rejects_an_empty_or_out_of_range_set() {
+        assert!(nodes_mask(&[]).is_none());
+        assert!(nodes_mask(&[0, MAX_NODE_INDEX + 1]).is_none());
+    }
+
+    #[test]
     fn nodes_from_mask_decodes_several_bits_in_order() {
         let w = MASK_WORD_BITS;
         let mask = vec![0b1001usize, 0b10usize];
@@ -429,6 +522,15 @@ mod tests {
         assert!(!migrate_region_to_node(0x1000, 0, 0));
         assert!(!migrate_region_to_node(0x1000, 4096, MAX_NODE_INDEX + 1));
         assert!(!set_current_thread_preferred_node(MAX_NODE_INDEX + 1));
+        assert!(!interleave_region_over_nodes(0x1000, 4096, &[]));
+        assert!(!interleave_region_over_nodes(0x1000, 0, &[0]));
+        assert!(!interleave_region_over_nodes(
+            0x1000,
+            4096,
+            &[MAX_NODE_INDEX + 1]
+        ));
+        assert!(!prefer_region_on_node(0x1000, 0, 0));
+        assert!(!prefer_region_on_node(0x1000, 4096, MAX_NODE_INDEX + 1));
     }
 
     // -- live syscalls (best-effort; assert nothing changed when refused) --
@@ -504,6 +606,86 @@ mod tests {
         // their contents.
         assert_eq!(bytes[0], 0xAB);
         assert_eq!(bytes[2 * page - 1], 0xCD);
+
+        // SAFETY: `ptr` / `layout` are exactly what `alloc_zeroed` returned, and
+        // the block is freed once.
+        unsafe { std::alloc::dealloc(ptr, layout) };
+    }
+
+    /// The interleave the shared table asks for, over the one node every host
+    /// has. A single-node host reports `MPOL_INTERLEAVE` over node 0, which is
+    /// the same placement it had and still a real read-back of the call.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn interleaving_a_region_installs_an_interleave_policy_over_it() {
+        let page = page_size();
+        let layout = std::alloc::Layout::from_size_align(2 * page, page).expect("valid layout");
+        // SAFETY: `layout` has non-zero size; the block is freed exactly once
+        // below and is never aliased.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!ptr.is_null(), "the allocation must succeed");
+        // SAFETY: `ptr` addresses `2 * page` live, initialised bytes, and this is
+        // the only reference to them.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, 2 * page) };
+        bytes[0] = 0xAB;
+
+        let addr = ptr as usize;
+        let before = policy_at_address(addr);
+        if interleave_region_over_nodes(addr, 2 * page, &[0]) {
+            let after = policy_at_address(addr).expect("get_mempolicy over a mapped address");
+            assert_eq!(after.mode, MODE_INTERLEAVE);
+            assert_eq!(after.nodes, vec![0]);
+        } else {
+            assert_eq!(
+                policy_at_address(addr),
+                before,
+                "a refused mbind must not change the range's policy"
+            );
+        }
+        assert_eq!(
+            bytes[0], 0xAB,
+            "mbind moves pages, it does not rewrite them"
+        );
+
+        // SAFETY: `ptr` / `layout` are exactly what `alloc_zeroed` returned, and
+        // the block is freed once.
+        unsafe { std::alloc::dealloc(ptr, layout) };
+    }
+
+    /// The one-node placement the shared table asks for when every worker sits
+    /// on the same node. Node 0 exists on every host, so the read-back is real
+    /// even where there is nothing else to prefer.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn preferring_a_node_for_a_region_installs_a_preferred_policy_over_it() {
+        let page = page_size();
+        let layout = std::alloc::Layout::from_size_align(2 * page, page).expect("valid layout");
+        // SAFETY: `layout` has non-zero size; the block is freed exactly once
+        // below and is never aliased.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!ptr.is_null(), "the allocation must succeed");
+        // SAFETY: `ptr` addresses `2 * page` live, initialised bytes, and this is
+        // the only reference to them.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, 2 * page) };
+        bytes[0] = 0xAB;
+
+        let addr = ptr as usize;
+        let before = policy_at_address(addr);
+        if prefer_region_on_node(addr, 2 * page, 0) {
+            let after = policy_at_address(addr).expect("get_mempolicy over a mapped address");
+            assert_eq!(after.mode, MODE_PREFERRED);
+            assert_eq!(after.nodes, vec![0]);
+        } else {
+            assert_eq!(
+                policy_at_address(addr),
+                before,
+                "a refused mbind must not change the range's policy"
+            );
+        }
+        assert_eq!(
+            bytes[0], 0xAB,
+            "mbind moves pages, it does not rewrite them"
+        );
 
         // SAFETY: `ptr` / `layout` are exactly what `alloc_zeroed` returned, and
         // the block is freed once.

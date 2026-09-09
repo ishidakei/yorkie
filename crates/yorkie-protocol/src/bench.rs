@@ -15,6 +15,12 @@
 //! `fenFile=default`, `limitType=movetime` — its *code*, not the stale comment
 //! example beside it, is the ground truth. This port mirrors them exactly.
 //!
+//! `ttSizeMB` is checked and then dropped: the transposition table is a `static`
+//! whose size the build fixed, so no command can change it, and a bench
+//! measures whatever size the binary was built with. The argument keeps its
+//! place because the grammar is positional — `bench 16 1 6 default depth` names
+//! its thread count by being fourth from the end.
+//!
 //! The reference's `limitType` also accepts `perft` and `eval`. `perft` needs a
 //! `go perft` path this crate does not own and `eval` needs `trace_eval`, so
 //! both parse to a loud [`BenchParseError`] rather than panicking.
@@ -60,8 +66,6 @@ impl std::fmt::Display for BenchParseError {
 /// limit for every position, and the position list to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BenchConfig {
-    /// The `USI_Hash` value (MiB) to `setoption`.
-    pub tt_mb: i64,
     /// The `Threads` value to `setoption`.
     pub threads: i64,
     /// The per-position search limit, applied to every position exactly as a
@@ -93,7 +97,10 @@ pub fn parse_bench(tokens: &[String], current_sfen: &str) -> Result<BenchConfig,
     let fen_source = arg(3, DEFAULT_FEN_SOURCE);
     let limit_type = arg(4, DEFAULT_LIMIT_TYPE);
 
-    let tt_mb: i64 = tt_arg
+    // Parsed for its shape and then dropped: nothing can resize the table, but
+    // a garbage argument still has to fail loudly rather than shift the
+    // positional arguments behind it.
+    let _tt_mb: i64 = tt_arg
         .parse()
         .map_err(|_| BenchParseError(format!("invalid ttSizeMB `{tt_arg}`")))?;
     let threads: i64 = threads_arg
@@ -142,7 +149,6 @@ pub fn parse_bench(tokens: &[String], current_sfen: &str) -> Result<BenchConfig,
     };
 
     Ok(BenchConfig {
-        tt_mb,
         threads,
         limits,
         fens,
@@ -163,7 +169,6 @@ mod tests {
     #[test]
     fn defaults_when_no_args() {
         let cfg = parse_bench(&[], "startsfen").expect("defaults parse");
-        assert_eq!(cfg.tt_mb, 1024);
         assert_eq!(cfg.threads, 1);
         // Default limit type is movetime 15000 (yaneuraou's one-minute bench).
         assert_eq!(cfg.limits.movetime, Some(15000));
@@ -176,7 +181,6 @@ mod tests {
     fn depth_limit_type() {
         let tokens = ["16", "1", "6", "default", "depth"].map(String::from);
         let cfg = parse_bench(&tokens, "x").expect("parse");
-        assert_eq!(cfg.tt_mb, 16);
         assert_eq!(cfg.limits.depth, Some(6));
         assert_eq!(cfg.limits.movetime, None);
     }

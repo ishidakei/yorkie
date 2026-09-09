@@ -7,8 +7,17 @@
 //! different score and a flipped bestmove.
 //!
 //! The fixtures were captured with Threads=1, no book, `usinewgame` before each
-//! position, USI_Hash 1024 MiB and FV_SCALE 16, reproduced here. Skipped with a
-//! notice when `nn.bin` is absent.
+//! position, USI_Hash 1024 MiB and FV_SCALE 16. Everything but the hash size is
+//! reproduced here: the table is the `static` this build compiled in — 16 MiB
+//! under the test config — and these fixtures come out the same on it. Skipped
+//! with a notice when `nn.bin` is absent.
+//!
+//! Not compiled under `tt-entry16`. What that layout promises is exact position
+//! identity, not the reference's search: it fits two entries in a cluster
+//! instead of three, which changes which position a full cluster keeps, and the
+//! fixtures are the reference's numbers.
+
+#![cfg(not(feature = "tt-entry16"))]
 
 use std::path::PathBuf;
 
@@ -23,8 +32,6 @@ const VALUE_MATE: i32 = 32000;
 const VALUE_TB_WIN_IN_MAX_PLY: i32 = VALUE_MATE - 246;
 /// `Eval::PawnValue` (`NormalizeToPawnValue`).
 const PAWN_VALUE: i32 = 90;
-/// Engine default `USI_Hash` in MiB (`tests/fixtures/search-depth1/README.md`).
-const HASH_MB: usize = 1024;
 
 const FIXTURES: &[&str] = &[
     "startpos.json",
@@ -116,7 +123,7 @@ fn format_score(v: i32) -> ScoreJson {
     }
 }
 
-fn assert_fixture(name: &str, net: &yorkie_eval::NnueNetwork, tt: &mut TranspositionTable) {
+fn assert_fixture(name: &str, net: &yorkie_eval::NnueNetwork, tt: &TranspositionTable) {
     let fixture = load_fixture(name);
     assert_eq!(fixture.depth, 1, "{name}: depth-1 fixtures only");
 
@@ -181,11 +188,10 @@ fn depth1_search_matches_reference_fixtures() {
 
     let net = yorkie_eval::load_network(&path).expect("real nn.bin should load and validate");
 
-    // One 1024 MiB table, cleared per fixture (the usinewgame equivalent).
-    let mut tt = TranspositionTable::new();
-    tt.resize(HASH_MB);
+    // The one shared table, cleared per fixture (the usinewgame equivalent).
+    let tt = TranspositionTable::shared();
 
     for name in FIXTURES {
-        assert_fixture(name, &net, &mut tt);
+        assert_fixture(name, &net, tt);
     }
 }

@@ -73,13 +73,35 @@ fn search_output_is_bestmove_only_below_verbose2() {
         );
     } else {
         // The whole claim of the default build, in one assertion: a search that
-        // ran, produced a move, and printed not one `info` line — search info
-        // and diagnostics alike. A clean load emits no initialisation-phase
-        // line either, so the expected count really is zero.
+        // ran, produced a move, and printed not one `info` line about itself.
+        // Two lines in this session are not about the search, and each is
+        // counted on its own:
         //
-        // `verbose1` adds exactly one line to this session, and it is not about
-        // the search: the per-reply statistics line before the `bestmove`,
-        // which reports what the process allocated.
+        //   - `isready` reports where it placed the transposition table. An
+        //     initialisation-phase line, so it is here in every build.
+        //   - `verbose1` adds the per-reply statistics line before the
+        //     `bestmove`, which reports what the process allocated.
+        let placement: Vec<&&str> = infos
+            .iter()
+            .filter(|l| l.starts_with("info string transposition table: "))
+            .collect();
+        assert_eq!(
+            placement.len(),
+            1,
+            "`isready` reports the table's placement in every build, \
+             got {infos:?} in:\n{out}"
+        );
+        // The line names the node set it asked for, which is the set the
+        // compiled thread plan's workers run on: one node the table prefers, or
+        // the several it is interleaved over. Which of the two this host gets
+        // depends on the layout the binary was built for, so the assertion
+        // accepts either shape and insists that one of them is named.
+        assert!(
+            placement[0].contains("; preferred on node ")
+                || placement[0].contains("; interleave on nodes "),
+            "the placement line names the nodes it tried, got {:?} in:\n{out}",
+            placement[0]
+        );
         let stats: Vec<&&str> = infos
             .iter()
             .filter(|l| l.starts_with("info string stats "))
@@ -92,7 +114,7 @@ fn search_output_is_bestmove_only_below_verbose2() {
         );
         assert_eq!(
             infos.len(),
-            stats.len(),
+            placement.len() + stats.len(),
             "a build without `verbose2` must emit no info line about the \
              search itself, got {infos:?} in:\n{out}"
         );
