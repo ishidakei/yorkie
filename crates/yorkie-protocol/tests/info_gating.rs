@@ -91,15 +91,18 @@ fn search_output_is_bestmove_only_below_verbose2() {
             "`isready` reports the table's placement in every build, \
              got {infos:?} in:\n{out}"
         );
-        // The line names the node set it asked for, which is the set the
-        // compiled thread plan's workers run on: one node the table prefers, or
-        // the several it is interleaved over. Which of the two this host gets
-        // depends on the layout the binary was built for, so the assertion
-        // accepts either shape and insists that one of them is named.
+        // The line says what the table's pages were given: the node set the
+        // compiled thread plan's workers run on, as one node the table prefers
+        // or the several it is interleaved over, or the process's own policy
+        // where that plan pins no worker and the engine sets none. Which of the
+        // three this build gets depends on its thread count and the layout it
+        // was built for, so the assertion accepts any of them and insists that
+        // one is named.
         assert!(
             placement[0].contains("; preferred on node ")
-                || placement[0].contains("; interleave on nodes "),
-            "the placement line names the nodes it tried, got {:?} in:\n{out}",
+                || placement[0].contains("; interleave on nodes ")
+                || placement[0].contains("; process default policy;"),
+            "the placement line says what the pages were given, got {:?} in:\n{out}",
             placement[0]
         );
         let stats: Vec<&&str> = infos

@@ -399,6 +399,12 @@ pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
     /// — `/sys`, overridable via [`Self::with_sysfs_root`] so a test can hold
     /// the binary against a machine other than the one it is running on.
     sysfs_root: PathBuf,
+    /// The CPUs this process may run on, captured at startup and held against
+    /// the CPUs the compiled thread plan pins workers to by the `isready` check
+    /// — which asks nothing of a build that pins none. Overridable via
+    /// [`Self::with_startup_affinity`] so a test can present a confined process
+    /// without confining the test process itself.
+    startup_affinity: BTreeSet<usize>,
 }
 
 impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
@@ -466,6 +472,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             worker_networks: Vec::new(),
             keep_alive_poll: KEEP_ALIVE_POLL_INTERVAL,
             sysfs_root: PathBuf::from(SYSFS_ROOT),
+            startup_affinity: yorkie_numa::startup_affinity().clone(),
         }
     }
 
@@ -483,6 +490,14 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// it.
     pub fn with_sysfs_root(mut self, root: PathBuf) -> Self {
         self.sysfs_root = root;
+        self
+    }
+
+    /// Override the CPU set the `isready` layout check takes for this process's
+    /// startup affinity, so a test can drive a session as a confined process
+    /// while the test process itself stays where it is.
+    pub fn with_startup_affinity(mut self, cpus: BTreeSet<usize>) -> Self {
+        self.startup_affinity = cpus;
         self
     }
 
@@ -611,7 +626,10 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     ///    over the set when they span several, so no node's memory controller
     ///    carries the whole engine's probe traffic, and a preference for the one
     ///    node when they share it. The policy goes on first, because it decides
-    ///    where the *first touch* of every page lands.
+    ///    where the *first touch* of every page lands. A plan that pins no
+    ///    worker gets no policy at all: the process's own is the better answer
+    ///    there, since it is the one an operator confining the process to a node
+    ///    already gave.
     /// 2. `madvise(MADV_HUGEPAGE)`, so the region a huge-page boundary starts is
     ///    actually backed by huge pages.
     ///
@@ -634,27 +652,24 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // included; the size reported is the clusters, which is what the
         // `usi_hash` setting asked for.
         let (addr, span) = self.tt.backing_region();
-        let (placed, tried) =
-            match table_placement(&self.numa_bound, self.settings.numa_system_nodes()) {
-                TablePlacement::OnNode(node) => (
-                    mempolicy::prefer_region_on_node(addr, span, node),
-                    format!("preferred on node {node}"),
-                ),
-                TablePlacement::AcrossNodes(nodes) => (
-                    mempolicy::interleave_region_over_nodes(addr, span, &nodes),
-                    format!(
-                        "interleave on nodes {}",
-                        yorkie_numa::format_cpu_list(nodes.iter().copied())
-                    ),
-                ),
-            };
+        let outcome = |accepted: bool| if accepted { "applied" } else { "refused" };
+        let placement = match table_placement(&self.numa_bound, self.settings.numa_system_nodes()) {
+            TablePlacement::OnNode(node) => format!(
+                "preferred on node {node} {}",
+                outcome(mempolicy::prefer_region_on_node(addr, span, node))
+            ),
+            TablePlacement::AcrossNodes(nodes) => format!(
+                "interleave on nodes {} {}",
+                yorkie_numa::format_cpu_list(nodes.iter().copied()),
+                outcome(mempolicy::interleave_region_over_nodes(addr, span, &nodes))
+            ),
+            TablePlacement::ProcessDefault => "process default policy".to_string(),
+        };
         let huge = yorkie_storage::advise_huge_pages(addr, span);
 
-        let outcome = |accepted: bool| if accepted { "applied" } else { "refused" };
         self.info_string(&format!(
-            "transposition table: {} MiB; {tried} {}; huge pages {}",
+            "transposition table: {} MiB; {placement}; huge pages {}",
             yorkie_storage::TABLE_BYTES / (1024 * 1024),
-            outcome(placed),
             outcome(huge),
         ))
     }
@@ -1028,7 +1043,14 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         };
         numa_layout_difference(
             &live,
-            yorkie_numa::startup_affinity(),
+            &self.startup_affinity,
+            // What a confined process hides is a CPU some worker was going to
+            // pin itself to, so the question is only asked of a build whose
+            // compiled plan pins one, and only of the CPUs that plan uses. A
+            // build that binds nothing — a single thread, or
+            // `numa_policy = "none"` — has no such CPU, and starting it under a
+            // `taskset` or in a cpuset takes nothing away from it.
+            &self.numa_bound,
             self.settings.numa_node_cpus(),
         )
     }
@@ -2856,19 +2878,26 @@ fn bind_plan(
     }
 }
 
-/// How a machine whose layout is `live`, and on which this process may run on
-/// `affinity`, differs from the `built` layout — one line, or `None` when they
-/// agree.
+/// How a machine whose layout is `live` differs from the `built` layout — one
+/// line, or `None` when they agree.
 ///
 /// Three ways to differ, in the order a reader wants them: a different number of
-/// nodes, a node holding different CPUs, and a process that cannot use the CPUs
-/// the layout names. The last is what a `taskset` or a `cpuset` around the
-/// engine produces: the machine is right, but the workers would be pinned to
-/// CPUs this process is not allowed on, which the pin refuses at the point of no
-/// return — inside a spawned worker, mid-game.
+/// nodes, a node holding different CPUs, and a process denied a CPU the compiled
+/// thread plan pins a worker to. The last is what a `taskset` or a `cpuset`
+/// around the engine can produce: the machine is right, but a worker would be
+/// pinned to a CPU this process is not allowed on, which the pin refuses at the
+/// point of no return — inside a spawned worker, mid-game. The question is
+/// therefore what `bound` assigns workers to: the CPUs of those nodes must be
+/// *allowed* by `affinity`, not equal to it. A wider affinity takes nothing
+/// away, since the engine narrows each worker itself; a `bound` that assigns
+/// nothing has no CPU to lose and skips the comparison entirely.
+///
+/// The first two are asked of every build: they compare the machine with the
+/// layout the binary was built for, which confining the process does not change.
 fn numa_layout_difference(
     live: &NumaLayout,
     affinity: &BTreeSet<usize>,
+    bound: &[NumaIndex],
     built: &[&[usize]],
 ) -> Option<String> {
     if live.nodes.len() != built.len() {
@@ -2888,12 +2917,17 @@ fn numa_layout_difference(
             ));
         }
     }
-    let all: BTreeSet<usize> = built.iter().flat_map(|cpus| cpus.iter().copied()).collect();
-    if *affinity != all {
+    let missing: BTreeSet<usize> = bound
+        .iter()
+        // A logical node outside the compiled layout cannot arise: `bound` is an
+        // assignment over that same layout's nodes.
+        .flat_map(|&logical| built[logical].iter().copied())
+        .filter(|cpu| !affinity.contains(cpu))
+        .collect();
+    if !missing.is_empty() {
         return Some(format!(
-            "this process may run on CPUs {}, the layout this binary is built for holds {}",
-            yorkie_numa::format_cpu_list(affinity.iter().copied()),
-            yorkie_numa::format_cpu_list(all)
+            "this process may not run on CPUs {}, which the thread plan uses",
+            yorkie_numa::format_cpu_list(missing)
         ));
     }
     None
@@ -2909,6 +2943,12 @@ enum TablePlacement {
     /// those: no node's memory controller carries the whole engine's probe
     /// traffic, and no page lands where no worker probes from.
     AcrossNodes(Vec<NumaIndex>),
+    /// Nothing pins a worker, so the engine sets no policy of its own and the
+    /// pages land wherever the process's policy puts them. A process confined
+    /// to one node — one of many single-thread engines sharing a machine — then
+    /// first-touches its table on that node, which is where its only worker
+    /// probes from.
+    ProcessDefault,
 }
 
 /// The placement a binding assignment implies, resolved through the compiled
@@ -2918,17 +2958,17 @@ enum TablePlacement {
 /// the CPUs of some of its nodes, or a thread count the binding fits on fewer
 /// nodes than the machine has — keeps its table on the part it uses, so every
 /// probe stays on a node a worker runs on. An empty assignment is the unbound
-/// case: no worker is pinned, so any CPU the layout names can issue a probe and
-/// every node it covers is in the set.
+/// case: no worker is pinned, so where the pages belong is not the engine's
+/// question to answer and the process's own policy answers it
+/// ([`TablePlacement::ProcessDefault`]).
 ///
 /// Reading the answer off the compiled constants keeps `isready` from asking
 /// the machine a second time.
 fn table_placement(bound: &[NumaIndex], system_nodes: &[NumaIndex]) -> TablePlacement {
-    let mut nodes = if bound.is_empty() {
-        system_nodes.to_vec()
-    } else {
-        worker_system_nodes(bound, system_nodes)
-    };
+    if bound.is_empty() {
+        return TablePlacement::ProcessDefault;
+    }
+    let mut nodes = worker_system_nodes(bound, system_nodes);
     nodes.sort_unstable();
     nodes.dedup();
     match nodes.as_slice() {
@@ -4263,7 +4303,7 @@ mod tests {
     fn a_machine_matching_the_compiled_layout_is_no_difference() {
         let built: &[&[usize]] = &[&[0, 1], &[2, 3]];
         assert_eq!(
-            numa_layout_difference(&layout(built), &affinity(&[0, 1, 2, 3]), built),
+            numa_layout_difference(&layout(built), &affinity(&[0, 1, 2, 3]), &[0, 1], built),
             None
         );
     }
@@ -4272,7 +4312,7 @@ mod tests {
     fn a_machine_with_another_node_count_is_reported_with_both_counts() {
         let built: &[&[usize]] = &[&[0, 1], &[2, 3]];
         let live = layout(&[&[0, 1, 2, 3]]);
-        let msg = numa_layout_difference(&live, &affinity(&[0, 1, 2, 3]), built)
+        let msg = numa_layout_difference(&live, &affinity(&[0, 1, 2, 3]), &[0, 1], built)
             .expect("one node is not two");
         assert!(msg.contains("built for 2 NUMA node(s)"), "message: {msg}");
         assert!(msg.contains("this host has 1"), "message: {msg}");
@@ -4282,7 +4322,7 @@ mod tests {
     fn a_node_holding_other_cpus_is_reported_with_both_cpu_lists() {
         let built: &[&[usize]] = &[&[0, 1], &[2, 3]];
         let live = layout(&[&[0, 1], &[2, 3, 4]]);
-        let msg = numa_layout_difference(&live, &affinity(&[0, 1, 2, 3, 4]), built)
+        let msg = numa_layout_difference(&live, &affinity(&[0, 1, 2, 3, 4]), &[0, 1], built)
             .expect("node 1 grew a CPU");
         assert!(msg.contains("node 1"), "message: {msg}");
         assert!(msg.contains("2-4"), "message: {msg}");
@@ -4290,15 +4330,57 @@ mod tests {
     }
 
     #[test]
-    fn a_process_confined_to_part_of_the_machine_is_refused() {
+    fn a_process_denied_a_cpu_the_plan_uses_is_refused_with_those_cpus() {
         // The machine is the one the binary was built for; the *process* is not
-        // allowed on all of it — a `taskset` around the engine, whose workers
-        // would then pin themselves to CPUs they may not run on.
+        // allowed on every CPU the plan pins a worker to — a `taskset` around
+        // the engine, whose workers would then pin themselves to CPUs they may
+        // not run on. Only the CPUs it is missing are named.
         let built: &[&[usize]] = &[&[0, 1], &[2, 3]];
-        let msg = numa_layout_difference(&layout(built), &affinity(&[0, 1]), built)
-            .expect("half the machine is not the machine");
-        assert!(msg.contains("may run on CPUs 0-1"), "message: {msg}");
-        assert!(msg.contains("holds 0-3"), "message: {msg}");
+        let msg = numa_layout_difference(&layout(built), &affinity(&[0, 1]), &[0, 1], built)
+            .expect("half the plan's CPUs are hidden");
+        assert!(msg.contains("may not run on CPUs 2-3"), "message: {msg}");
+        assert!(msg.contains("which the thread plan uses"), "message: {msg}");
+
+        let msg = numa_layout_difference(&layout(built), &affinity(&[0, 1, 2]), &[0, 1], built)
+            .expect("one of the plan's CPUs is hidden");
+        assert!(msg.contains("may not run on CPUs 3"), "message: {msg}");
+    }
+
+    #[test]
+    fn an_affinity_covering_the_plans_cpus_is_no_difference() {
+        // A binary built for part of the machine, started with no confinement:
+        // its plan uses node 0 and the process may run on everything. The CPUs
+        // beyond the plan take nothing away, since the worker narrows itself to
+        // the node it was assigned. An affinity holding exactly the plan's CPUs
+        // is equally fine.
+        let built: &[&[usize]] = &[&[0, 1], &[2, 3]];
+        assert_eq!(
+            numa_layout_difference(&layout(built), &affinity(&[0, 1, 2, 3]), &[0, 0], built),
+            None
+        );
+        assert_eq!(
+            numa_layout_difference(&layout(built), &affinity(&[0, 1]), &[0, 0], built),
+            None
+        );
+    }
+
+    #[test]
+    fn a_confined_process_is_accepted_when_the_plan_pins_no_worker() {
+        // The build that binds nothing — one thread, or `numa_policy = "none"`
+        // — has no worker to pin, so the CPUs the process was denied are CPUs
+        // it was never going to use. An empty assignment is how the caller says
+        // so, and the machine comparisons are unaffected by it: a wrong machine
+        // is still refused, confined or not.
+        let built: &[&[usize]] = &[&[0, 1], &[2, 3]];
+        assert_eq!(
+            numa_layout_difference(&layout(built), &affinity(&[0]), &[], built),
+            None
+        );
+
+        let live = layout(&[&[0, 1, 2, 3]]);
+        let msg = numa_layout_difference(&live, &affinity(&[0]), &[], built)
+            .expect("one node is still not two nodes");
+        assert!(msg.contains("built for 2 NUMA node(s)"), "message: {msg}");
     }
 
     #[cfg(feature = "verbose3")]
@@ -4467,13 +4549,14 @@ mod tests {
             table_placement(&[1, 3, 1], &[0, 1, 2, 3]),
             TablePlacement::AcrossNodes(vec![1, 3])
         );
-        // No binding: nothing pins a worker, so every node the layout covers
-        // can issue a probe.
+        // No binding: nothing pins a worker, so the engine names no node set of
+        // its own and the process's policy places the pages — whatever the
+        // layout the binary was built for covers.
         assert_eq!(
             table_placement(&[], &[0, 1, 2, 3]),
-            TablePlacement::AcrossNodes(vec![0, 1, 2, 3])
+            TablePlacement::ProcessDefault
         );
-        assert_eq!(table_placement(&[], &[0]), TablePlacement::OnNode(0));
+        assert_eq!(table_placement(&[], &[0]), TablePlacement::ProcessDefault);
     }
 
     #[cfg_attr(miri, ignore)]
