@@ -11,16 +11,15 @@
 //! `report_active_backend` prints which. The kernels' bit-equality with each
 //! other is pinned by the in-crate backend tests.
 //!
-//! The network file is staged locally and never committed, so when it is absent
-//! the property body is a no-op and the test passes.
-
-use std::path::PathBuf;
+//! The network read is the one the engine plays with — the file the build laid
+//! out for the kernels. A checkout with no network staged has none, and the
+//! property body is a no-op and the test passes.
 
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseResult;
-use yorkie_eval::{
-    Accumulator, NnueNetwork, active_backend, evaluate, evaluate_with, load_network,
-};
+use yorkie_eval::{Accumulator, NnueNetwork, active_backend, evaluate, evaluate_with};
+
+mod common;
 use yorkie_state::{Color, Move, Position, Undo, format_usi_move, parse_sfen};
 
 /// Roots the random lines start from, covering the opening, check-evasion,
@@ -38,28 +37,11 @@ const ROOT_SFENS: &[&str] = &[
 /// evaluations, so this stays short.
 const MAX_PLIES: usize = 12;
 
-fn workspace_relative(rel: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(rel)
-}
-
-fn nn_bin_path() -> PathBuf {
-    workspace_relative("eval/nn.bin")
-}
-
 thread_local! {
-    /// The network, loaded at most once per test thread. Proptest runs every
-    /// case of a property on the same thread, so re-loading a 113 MB file per
-    /// case would dominate the runtime.
-    static NETWORK: Option<NnueNetwork> = {
-        let path = nn_bin_path();
-        if path.exists() {
-            Some(load_network(&path).expect("real nn.bin should load and validate"))
-        } else {
-            None
-        }
-    };
+    /// The network, opened at most once per test thread. Proptest runs every
+    /// case of a property on the same thread, and opening the file per case
+    /// would dominate the runtime.
+    static NETWORK: Option<NnueNetwork> = common::engine_network();
 }
 
 /// A root index plus a line of legal-move selectors; each selector picks

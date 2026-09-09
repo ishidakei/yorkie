@@ -11,7 +11,9 @@
 
 use std::path::PathBuf;
 
-use yorkie_eval::{Accumulator, NnueNetwork, evaluate, evaluate_with, load_network};
+use yorkie_eval::{Accumulator, NnueNetwork, evaluate, evaluate_with};
+
+mod common;
 use yorkie_state::{Color, Move, Position, Undo, format_usi_move, parse_sfen, parse_usi_move};
 
 /// The six eval-fixture SFENs the playout driver seeds from.
@@ -28,10 +30,6 @@ fn workspace_relative(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join(rel)
-}
-
-fn nn_bin_path() -> PathBuf {
-    workspace_relative("eval/nn.bin")
 }
 
 /// Refresh a fresh accumulator from `pos`.
@@ -93,15 +91,9 @@ fn retreat(net: &NnueNetwork, pos: &mut Position, frame: Frame, parent: &Accumul
 #[cfg_attr(miri, ignore)]
 #[test]
 fn incremental_accumulator_matches_refresh_on_fixture_lines() {
-    let nn_bin = nn_bin_path();
-    if !nn_bin.exists() {
-        eprintln!(
-            "skipping incremental_accumulator_matches_refresh_on_fixture_lines: {} is not present (obtained out-of-band)",
-            nn_bin.display()
-        );
+    let Some(net) = common::engine_network() else {
         return;
-    }
-    let net = load_network(&nn_bin).expect("real nn.bin should load and validate");
+    };
 
     let dir = workspace_relative("tests/fixtures/eval");
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -183,15 +175,9 @@ impl Rng {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn incremental_accumulator_matches_refresh_on_random_playouts() {
-    let nn_bin = nn_bin_path();
-    if !nn_bin.exists() {
-        eprintln!(
-            "skipping incremental_accumulator_matches_refresh_on_random_playouts: {} is not present (obtained out-of-band)",
-            nn_bin.display()
-        );
+    let Some(net) = common::engine_network() else {
         return;
-    }
-    let net = load_network(&nn_bin).expect("real nn.bin should load and validate");
+    };
 
     const MIN_PLIES: usize = 30;
 

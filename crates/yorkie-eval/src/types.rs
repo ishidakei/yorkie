@@ -1,4 +1,9 @@
-//! Dimensions, shared network types, and the loader error type for SFNN-1536.
+//! The loaded network and the loader error type for SFNN-1536.
+//!
+//! The dimensions and the byte layout the parameters sit in are the shared
+//! definition the build script writes the evaluation file from; what this
+//! module adds is the typed views the kernels read through, and the memory
+//! those views point into.
 //!
 //! The prose here follows the reference's naming: the **FT layer** is the
 //! feature transformer, and **L1 / L2 / L3** are the dense layers after it. The
@@ -7,116 +12,20 @@
 
 use std::fmt;
 
-use yorkie_storage::{ArenaLayout, ArenaSlice, LargePageArena, Section};
+use yorkie_storage::{ArenaSlice, MappedRegion};
 
-pub const HIDDEN_SIZE: usize = 1_536;
-pub const NUM_FEATURES: usize = 73_305;
-pub const LAYER_STACKS: usize = 9;
+#[cfg(any(test, feature = "source-network"))]
+use yorkie_storage::LargePageArray;
 
-// `fc_0`'s 16th output feeds only the post-`fc_2` shortcut; the first 15 feed
-// both activations.
-pub const HIDDEN1_DIMS: usize = 15;
-pub const HIDDEN2_DIMS: usize = 32;
-
-pub const FC_0_OUTPUT_DIMS: usize = HIDDEN1_DIMS + 1;
-pub const FC_0_INPUT_DIMS: usize = HIDDEN_SIZE;
-pub const FC_0_PADDED_INPUT_DIMS: usize = HIDDEN_SIZE;
-
-pub const FC_1_OUTPUT_DIMS: usize = HIDDEN2_DIMS;
-pub const FC_1_INPUT_DIMS: usize = HIDDEN1_DIMS * 2;
-pub const FC_1_PADDED_INPUT_DIMS: usize = 32;
-
-pub const FC_2_OUTPUT_DIMS: usize = 1;
-pub const FC_2_INPUT_DIMS: usize = HIDDEN2_DIMS;
-pub const FC_2_PADDED_INPUT_DIMS: usize = 32;
-
-#[derive(Clone, Debug)]
-pub struct NetHeader {
-    pub version: u32,
-    pub hash: u32,
-    pub arch_id: String,
-}
-
-/// The dimensions of one SFNN network, driving both the arena layout and the
-/// loader's read sizes.
-#[derive(Clone, Copy, Debug)]
-pub struct NetDims {
-    pub hidden_size: usize,
-    pub num_features: usize,
-    pub layer_stacks: usize,
-    pub fc_0_output: usize,
-    pub fc_0_padded_input: usize,
-    pub fc_1_output: usize,
-    pub fc_1_padded_input: usize,
-    pub fc_2_output: usize,
-    pub fc_2_padded_input: usize,
-}
-
-impl NetDims {
-    /// The shipped SFNN-1536 dimensions.
-    pub const STANDARD: NetDims = NetDims {
-        hidden_size: HIDDEN_SIZE,
-        num_features: NUM_FEATURES,
-        layer_stacks: LAYER_STACKS,
-        fc_0_output: FC_0_OUTPUT_DIMS,
-        fc_0_padded_input: FC_0_PADDED_INPUT_DIMS,
-        fc_1_output: FC_1_OUTPUT_DIMS,
-        fc_1_padded_input: FC_1_PADDED_INPUT_DIMS,
-        fc_2_output: FC_2_OUTPUT_DIMS,
-        fc_2_padded_input: FC_2_PADDED_INPUT_DIMS,
-    };
-}
-
-/// The arena [`Section`]s of one layer stack's six FC arrays.
-#[derive(Clone, Copy, Debug)]
-struct StackSections {
-    fc_0_biases: Section<i32>,
-    fc_0_weights: Section<i8>,
-    fc_1_biases: Section<i32>,
-    fc_1_weights: Section<i8>,
-    fc_2_biases: Section<i32>,
-    fc_2_weights: Section<i8>,
-}
-
-/// The full arena layout of one network. Recorded once, so a NUMA replica can
-/// be rebuilt into a fresh arena without re-deriving anything.
-#[derive(Clone, Debug)]
-struct NetLayout {
-    ft_biases: Section<i16>,
-    ft_weights: Section<i16>,
-    stacks: Vec<StackSections>,
-    total_bytes: usize,
-}
-
-impl NetLayout {
-    /// Pack every parameter array into one 64-byte-aligned layout, in file order
-    /// (ft_biases, ft_weights, then each stack's fc arrays).
-    fn compute(dims: &NetDims) -> Self {
-        let mut l = ArenaLayout::new();
-        let ft_biases = l.reserve::<i16>(dims.hidden_size);
-        let ft_weights = l.reserve::<i16>(dims.hidden_size * dims.num_features);
-        let mut stacks = Vec::with_capacity(dims.layer_stacks);
-        for _ in 0..dims.layer_stacks {
-            stacks.push(StackSections {
-                fc_0_biases: l.reserve::<i32>(dims.fc_0_output),
-                fc_0_weights: l.reserve::<i8>(dims.fc_0_output * dims.fc_0_padded_input),
-                fc_1_biases: l.reserve::<i32>(dims.fc_1_output),
-                fc_1_weights: l.reserve::<i8>(dims.fc_1_output * dims.fc_1_padded_input),
-                fc_2_biases: l.reserve::<i32>(dims.fc_2_output),
-                fc_2_weights: l.reserve::<i8>(dims.fc_2_output * dims.fc_2_padded_input),
-            });
-        }
-        Self {
-            ft_biases,
-            ft_weights,
-            stacks,
-            total_bytes: l.total_bytes(),
-        }
-    }
-}
+pub use crate::nnue_layout::{
+    FC_0_INPUT_DIMS, FC_0_OUTPUT_DIMS, FC_0_PADDED_INPUT_DIMS, FC_1_INPUT_DIMS, FC_1_OUTPUT_DIMS,
+    FC_1_PADDED_INPUT_DIMS, FC_2_INPUT_DIMS, FC_2_OUTPUT_DIMS, FC_2_PADDED_INPUT_DIMS, HIDDEN_SIZE,
+    HIDDEN1_DIMS, HIDDEN2_DIMS, LAYER_STACKS, NUM_FEATURES, NetDims, NetHeader,
+};
+use crate::nnue_layout::{Span, StackSpans, net_spans};
 
 /// One layer stack's parameter arrays, each a 64-byte-aligned view into the
-/// network's single arena.
+/// network's one region of memory.
 #[derive(Debug)]
 pub struct NetworkStack {
     pub fc_0_biases: ArenaSlice<i32>,
@@ -127,96 +36,161 @@ pub struct NetworkStack {
     pub fc_2_weights: ArenaSlice<i8>,
 }
 
-impl NetworkStack {
-    /// Build the six views for stack `sections` against `arena`.
-    fn from_sections(arena: &LargePageArena, sections: &StackSections) -> Self {
-        Self {
-            fc_0_biases: arena.view(sections.fc_0_biases),
-            fc_0_weights: arena.view(sections.fc_0_weights),
-            fc_1_biases: arena.view(sections.fc_1_biases),
-            fc_1_weights: arena.view(sections.fc_1_weights),
-            fc_2_biases: arena.view(sections.fc_2_biases),
-            fc_2_weights: arena.view(sections.fc_2_weights),
+/// The memory a network's parameters live in, kept alongside the views so it
+/// outlives them.
+pub(crate) enum Backing {
+    /// The evaluation file's own pages, mapped read-only and shared with every
+    /// process that maps them.
+    Mapped(MappedRegion),
+    /// A region this binary declares, one per NUMA node whose workers read it.
+    /// It is `static`, so there is nothing to keep alive here.
+    Region,
+    /// A block on the heap, for the tooling that builds a network in memory
+    /// rather than reading one the build laid out.
+    #[cfg(any(test, feature = "source-network"))]
+    Owned(LargePageArray<u8>),
+}
+
+impl fmt::Debug for Backing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Backing::Mapped(region) => write!(f, "Mapped({region:?})"),
+            Backing::Region => f.write_str("Region"),
+            #[cfg(any(test, feature = "source-network"))]
+            Backing::Owned(bytes) => write!(f, "Owned({} bytes)", bytes.len()),
         }
     }
 }
 
 /// A loaded SFNN network.
 ///
-/// Every parameter array lives in **one** large-page allocation, as the
-/// reference's does. The public parameter fields are 64-byte-aligned
-/// [`ArenaSlice`] views into it, which the AVX-512 kernels require.
-#[derive(Debug)]
+/// Every parameter array is a 64-byte-aligned [`ArenaSlice`] view into **one**
+/// contiguous region, which is what the AVX-512 kernels require and what lets
+/// the whole network be a single mapping or a single copy.
+///
+/// The views are read-only by contract: the region behind a mapped network is
+/// mapped without write permission, so taking a `&mut` to one would fault.
+/// Nothing does — a network is reached through a shared reference from the
+/// moment it exists.
 pub struct NnueNetwork {
     pub header: NetHeader,
-    /// The single backing allocation, kept so a NUMA replica can copy the whole
-    /// buffer in one shot. Never mutated after the build.
-    arena: LargePageArena,
-    /// The section table, replayed to rebuild views for a replica.
-    layout: NetLayout,
+    /// The memory the views point into, dropped after them (views carry no drop
+    /// glue, so field order cannot produce a use-after-free).
+    backing: Backing,
+    /// The address and byte length of the parameters, for a caller placing
+    /// them.
+    region: (usize, usize),
     pub ft_biases: ArenaSlice<i16>,
     pub ft_weights: ArenaSlice<i16>,
     pub stacks: Vec<NetworkStack>,
+    /// The SHA-256 of the network file this one's parameters came from; all
+    /// zero when they were not read from one.
     pub sha256: [u8; 32],
 }
 
+/// The parameters themselves are a few hundred mebibytes, so what a network
+/// shows of itself is what it is, not what it holds.
+impl fmt::Debug for NnueNetwork {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NnueNetwork")
+            .field("header", &self.header)
+            .field("backing", &self.backing)
+            .field("stacks", &self.stacks.len())
+            .finish()
+    }
+}
+
 impl NnueNetwork {
-    /// Assemble a network from a filled `arena` and its `layout`, building every
-    /// view without copying any data.
-    fn from_arena(
+    /// Build the views of a network whose parameters are already laid out at
+    /// `base`.
+    ///
+    /// # Safety
+    /// `base` must address at least `data_bytes(dims)` initialised bytes,
+    /// aligned to a 64-byte boundary, laid out as the shared layout describes,
+    /// and they must live as long as `backing` keeps them — which is for the
+    /// life of the returned network.
+    pub(crate) unsafe fn over(
         header: NetHeader,
-        arena: LargePageArena,
-        layout: NetLayout,
         sha256: [u8; 32],
+        dims: &NetDims,
+        base: *mut u8,
+        backing: Backing,
     ) -> Self {
-        let ft_biases = arena.view(layout.ft_biases);
-        let ft_weights = arena.view(layout.ft_weights);
-        let stacks = layout
-            .stacks
-            .iter()
-            .map(|s| NetworkStack::from_sections(&arena, s))
-            .collect();
-        Self {
-            header,
-            arena,
-            layout,
-            ft_biases,
-            ft_weights,
-            stacks,
-            sha256,
+        let spans = net_spans(dims);
+        // SAFETY: every span lies inside the region the caller vouched for, and
+        // each starts on a 64-byte boundary, so each view is aligned and
+        // in-bounds; the spans are disjoint, so no two views alias.
+        unsafe {
+            Self {
+                header,
+                backing,
+                region: (base as usize, spans.total_bytes),
+                ft_biases: view(base, spans.ft_biases),
+                ft_weights: view(base, spans.ft_weights),
+                stacks: spans.stacks.iter().map(|s| stack_views(base, s)).collect(),
+                sha256,
+            }
         }
     }
 
-    /// A deep copy of the whole network into a freshly allocated arena,
-    /// byte-identical to `self`.
+    /// The `(address, byte length)` of the parameters, for a caller placing
+    /// them: a huge-page hint over the region, or a memory policy over its
+    /// pages.
     ///
-    /// The copy runs on the calling thread, so running it inside a
-    /// NUMA-node-bound thread first-touches every page on that node — the
-    /// in-process analogue of the reference's
-    /// `LazyNumaReplicatedSystemWide<Networks>`, without its shared-memory
-    /// layer, which a single-process engine does not need.
-    pub fn replicate(&self) -> Self {
-        let arena = self.arena.clone_backing();
-        Self::from_arena(self.header.clone(), arena, self.layout.clone(), self.sha256)
-    }
-
-    /// The number of large-page allocations backing this network, always one,
-    /// and the reserved byte size.
-    pub fn allocation_disclosure(&self) -> (usize, usize) {
-        (1, self.arena.reserved_bytes())
+    /// The address is a `usize` because the consumer hands it to the kernel as
+    /// a range descriptor and never dereferences it. It is on a huge-page
+    /// boundary however the parameters were read.
+    pub fn parameter_region(&self) -> (usize, usize) {
+        self.region
     }
 }
 
-/// In-place builder for a [`NnueNetwork`]: allocate the arena up front, fill
-/// each parameter array through a mutable view of it, then
-/// [`build`](Self::build).
+/// One typed view of `span` inside the region at `base`.
+///
+/// # Safety
+/// As [`NnueNetwork::over`], for this one span.
+unsafe fn view<T>(base: *mut u8, span: Span) -> ArenaSlice<T> {
+    // SAFETY: the caller vouches for the region; `span.offset` is 64-byte
+    // aligned, hence aligned for `T`.
+    unsafe { ArenaSlice::from_raw(base.add(span.offset) as *mut T, span.count) }
+}
+
+/// The six views of one layer stack.
+///
+/// # Safety
+/// As [`NnueNetwork::over`], for this stack's spans.
+unsafe fn stack_views(base: *mut u8, spans: &StackSpans) -> NetworkStack {
+    // SAFETY: as `view`, for each of the stack's disjoint spans.
+    unsafe {
+        NetworkStack {
+            fc_0_biases: view(base, spans.fc_0_biases),
+            fc_0_weights: view(base, spans.fc_0_weights),
+            fc_1_biases: view(base, spans.fc_1_biases),
+            fc_1_weights: view(base, spans.fc_1_weights),
+            fc_2_biases: view(base, spans.fc_2_biases),
+            fc_2_weights: view(base, spans.fc_2_weights),
+        }
+    }
+}
+
+/// In-place builder for a [`NnueNetwork`] in this process's own memory:
+/// allocate the region up front, fill each parameter array through a mutable
+/// view of it, then [`build`](Self::build).
+///
+/// The engine never builds a network this way — it reads one the build already
+/// laid out — so this is compiled only into the tooling that needs a network in
+/// memory: a synthetic one a test writes parameter by parameter, and the source
+/// file's own reader.
+#[cfg(any(test, feature = "source-network"))]
 pub struct NnueNetworkBuilder {
     header: NetHeader,
     sha256: [u8; 32],
-    arena: LargePageArena,
-    layout: NetLayout,
+    dims: NetDims,
+    spans: crate::nnue_layout::NetSpans,
+    bytes: LargePageArray<u8>,
 }
 
+#[cfg(any(test, feature = "source-network"))]
 impl NnueNetworkBuilder {
     /// A zeroed builder for the shipped SFNN-1536 dimensions.
     pub fn new(header: NetHeader, sha256: [u8; 32]) -> Self {
@@ -225,64 +199,113 @@ impl NnueNetworkBuilder {
 
     /// A zeroed builder for arbitrary `dims`.
     pub fn with_dims(header: NetHeader, sha256: [u8; 32], dims: &NetDims) -> Self {
-        let layout = NetLayout::compute(dims);
-        let arena = LargePageArena::with_capacity(layout.total_bytes);
+        let spans = net_spans(dims);
         Self {
             header,
             sha256,
-            arena,
-            layout,
+            dims: *dims,
+            bytes: LargePageArray::<u8>::zeroed(spans.total_bytes.max(1)),
+            spans,
         }
     }
 
     /// Mutable view of `ft_biases` (`hidden_size` i16).
     pub fn ft_biases_mut(&mut self) -> &mut [i16] {
-        self.arena.slice_mut(self.layout.ft_biases)
+        let span = self.spans.ft_biases;
+        self.slice_mut(span)
     }
 
     /// Mutable view of `ft_weights` (`hidden_size * num_features` i16).
     pub fn ft_weights_mut(&mut self) -> &mut [i16] {
-        self.arena.slice_mut(self.layout.ft_weights)
+        let span = self.spans.ft_weights;
+        self.slice_mut(span)
     }
 
     /// Mutable view of stack `i`'s `fc_0_biases`.
     pub fn fc_0_biases_mut(&mut self, i: usize) -> &mut [i32] {
-        self.arena.slice_mut(self.layout.stacks[i].fc_0_biases)
+        let span = self.spans.stacks[i].fc_0_biases;
+        self.slice_mut(span)
     }
     /// Mutable view of stack `i`'s `fc_0_weights`.
     pub fn fc_0_weights_mut(&mut self, i: usize) -> &mut [i8] {
-        self.arena.slice_mut(self.layout.stacks[i].fc_0_weights)
+        let span = self.spans.stacks[i].fc_0_weights;
+        self.slice_mut(span)
     }
     /// Mutable view of stack `i`'s `fc_1_biases`.
     pub fn fc_1_biases_mut(&mut self, i: usize) -> &mut [i32] {
-        self.arena.slice_mut(self.layout.stacks[i].fc_1_biases)
+        let span = self.spans.stacks[i].fc_1_biases;
+        self.slice_mut(span)
     }
     /// Mutable view of stack `i`'s `fc_1_weights`.
     pub fn fc_1_weights_mut(&mut self, i: usize) -> &mut [i8] {
-        self.arena.slice_mut(self.layout.stacks[i].fc_1_weights)
+        let span = self.spans.stacks[i].fc_1_weights;
+        self.slice_mut(span)
     }
     /// Mutable view of stack `i`'s `fc_2_biases`.
     pub fn fc_2_biases_mut(&mut self, i: usize) -> &mut [i32] {
-        self.arena.slice_mut(self.layout.stacks[i].fc_2_biases)
+        let span = self.spans.stacks[i].fc_2_biases;
+        self.slice_mut(span)
     }
     /// Mutable view of stack `i`'s `fc_2_weights`.
     pub fn fc_2_weights_mut(&mut self, i: usize) -> &mut [i8] {
-        self.arena.slice_mut(self.layout.stacks[i].fc_2_weights)
+        let span = self.spans.stacks[i].fc_2_weights;
+        self.slice_mut(span)
     }
 
     /// Number of layer stacks the layout carries.
     pub fn layer_stacks(&self) -> usize {
-        self.layout.stacks.len()
+        self.spans.stacks.len()
     }
 
-    /// Finish: consume the filled arena and produce the network (no copy).
+    /// The raw parameter bytes being filled, in the layout the kernels read
+    /// them — what the source file's reader hands out so the same bytes can be
+    /// held against the file the build wrote.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.spans.total_bytes]
+    }
+
+    /// Overwrite the whole parameter region with `bytes`, which must be the
+    /// region's exact size.
+    pub fn fill(&mut self, bytes: &[u8]) {
+        assert_eq!(
+            bytes.len(),
+            self.spans.total_bytes,
+            "the parameter region's size is fixed by the dimensions",
+        );
+        self.bytes[..bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// Finish: consume the filled region and produce the network (no copy).
     pub fn build(self) -> NnueNetwork {
-        NnueNetwork::from_arena(self.header, self.arena, self.layout, self.sha256)
+        let base = self.bytes.as_ptr() as *mut u8;
+        // SAFETY: the block holds `total_bytes` zeroed — hence initialised —
+        // bytes on a large-page boundary, so every span is aligned and
+        // in-bounds, and it moves into the network as the backing, which keeps
+        // it alive for exactly as long as the views.
+        unsafe {
+            NnueNetwork::over(
+                self.header,
+                self.sha256,
+                &self.dims,
+                base,
+                Backing::Owned(self.bytes),
+            )
+        }
+    }
+
+    /// A typed mutable view of `span` in the block being filled.
+    fn slice_mut<T>(&mut self, span: Span) -> &mut [T] {
+        let bytes = &mut self.bytes[span.offset..span.offset + span.count * size_of::<T>()];
+        // SAFETY: the span starts on a 64-byte boundary inside the block, so
+        // the pointer is aligned for `T`, and it covers exactly `span.count`
+        // elements of zeroed — hence valid — bytes. The borrow is tied to
+        // `&mut self`, so no other view of the block is live.
+        unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut T, span.count) }
     }
 }
 
-/// Errors returned by the network-file loader. Every variant carries a
-/// human-readable reason; the loader never panics on malformed input.
+/// Errors returned when the engine's network cannot be read. Every variant
+/// carries a human-readable reason; nothing here panics on a malformed file.
 #[derive(Debug)]
 pub enum NnueError {
     Io {
@@ -294,6 +317,10 @@ pub enum NnueError {
         got: usize,
     },
     InvalidFormat {
+        reason: String,
+    },
+    /// The evaluation file is not the one this binary was built to read.
+    Mismatch {
         reason: String,
     },
     NotLoaded,
@@ -312,9 +339,13 @@ impl fmt::Display for NnueError {
             NnueError::InvalidFormat { reason } => {
                 write!(f, "NNUE file is malformed: {reason}")
             }
+            NnueError::Mismatch { reason } => write!(
+                f,
+                "the evaluation file is not the one this build reads: {reason}"
+            ),
             NnueError::NotLoaded => write!(
                 f,
-                "no NNUE network loaded; point the EvalDir USI option at a directory containing nn.bin"
+                "no NNUE network loaded; the engine reads one from the evaluation directory beside it"
             ),
         }
     }
@@ -332,10 +363,10 @@ impl std::error::Error for NnueError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem::size_of;
+    use crate::nnue_layout::{DATA_BYTES, SECTION_ALIGN, data_bytes};
 
-    /// A small but multi-stack synthetic net for the arena-layout tests: two
-    /// stacks and a tiny feature transformer, standard FC shapes.
+    /// A small but multi-stack synthetic net for the layout tests: two stacks
+    /// and a tiny feature transformer, standard FC shapes.
     fn small_net() -> NnueNetwork {
         let dims = NetDims {
             layer_stacks: 2,
@@ -371,12 +402,16 @@ mod tests {
     fn every_sub_array_is_64_byte_aligned() {
         let net = small_net();
         for (addr, _) in sub_arrays(&net) {
-            assert_eq!(addr % 64, 0, "sub-array at {addr:#x} is not 64-aligned");
+            assert_eq!(
+                addr % SECTION_ALIGN,
+                0,
+                "sub-array at {addr:#x} is not 64-aligned"
+            );
         }
     }
 
     #[test]
-    fn sub_arrays_are_disjoint_and_inside_one_arena() {
+    fn sub_arrays_are_disjoint_and_inside_one_region() {
         let net = small_net();
         let mut spans = sub_arrays(&net);
         spans.sort_by_key(|&(addr, _)| addr);
@@ -389,15 +424,15 @@ mod tests {
                 "sub-arrays overlap: [{start_a:#x}, +{len_a}) then {start_b:#x}",
             );
         }
-        // The whole spread fits inside the single reserved arena.
+        // The whole spread fits inside the one region the dimensions size.
+        let dims = NetDims {
+            layer_stacks: 2,
+            num_features: 3,
+            ..NetDims::STANDARD
+        };
         let (first, _) = *spans.first().unwrap();
         let (last, last_len) = *spans.last().unwrap();
-        let (allocs, reserved) = net.allocation_disclosure();
-        assert_eq!(allocs, 1, "exactly one large-page allocation per net");
-        assert!(
-            (last + last_len) - first <= reserved,
-            "sub-array span exceeds the reserved arena",
-        );
+        assert!((last + last_len) - first <= data_bytes(&dims));
     }
 
     #[test]
@@ -430,45 +465,8 @@ mod tests {
     }
 
     #[test]
-    fn replicate_is_byte_equal_and_allocation_distinct() {
-        let dims = NetDims {
-            layer_stacks: 2,
-            num_features: 3,
-            ..NetDims::STANDARD
-        };
-        let mut b = NnueNetworkBuilder::with_dims(
-            NetHeader {
-                version: 0,
-                hash: 0,
-                arch_id: "rep".to_string(),
-            },
-            [0xCD; 32],
-            &dims,
-        );
-        for (i, s) in b.ft_weights_mut().iter_mut().enumerate() {
-            *s = (i as i16) % 61 - 30;
-        }
-        b.fc_1_weights_mut(1)[7] = 42;
-        let net = b.build();
-        let copy = net.replicate();
-
-        assert_eq!(&*copy.ft_biases, &*net.ft_biases);
-        assert_eq!(&*copy.ft_weights, &*net.ft_weights);
-        for (a, b) in copy.stacks.iter().zip(net.stacks.iter()) {
-            assert_eq!(&*a.fc_0_weights, &*b.fc_0_weights);
-            assert_eq!(&*a.fc_1_weights, &*b.fc_1_weights);
-            assert_eq!(&*a.fc_2_biases, &*b.fc_2_biases);
-        }
-        // Distinct allocation: no view aliases the source arena.
-        assert_ne!(copy.ft_weights.as_ptr(), net.ft_weights.as_ptr());
-        assert_ne!(
-            copy.stacks[1].fc_1_weights.as_ptr(),
-            net.stacks[1].fc_1_weights.as_ptr(),
-        );
-        assert_eq!(net.allocation_disclosure().0, 1);
-        assert_eq!(copy.allocation_disclosure().0, 1);
-        // Sanity that the arrays are non-trivial and the type sizes are as assumed.
-        assert_eq!(size_of::<i16>(), 2);
+    fn the_regions_size_matches_the_layout_walk() {
+        assert_eq!(DATA_BYTES, net_spans(&NetDims::STANDARD).total_bytes);
     }
 
     #[test]
@@ -511,8 +509,8 @@ mod tests {
     fn not_loaded_has_human_readable_message() {
         let msg = format!("{}", NnueError::NotLoaded);
         assert!(!msg.is_empty());
-        assert!(msg.contains("EvalDir"));
-        assert!(msg.contains("nn.bin"));
+        assert!(msg.contains("no NNUE network loaded"));
+        assert!(msg.contains("evaluation directory"));
     }
 
     #[test]
@@ -524,5 +522,16 @@ mod tests {
             }
         );
         assert!(msg.contains("bad magic"));
+    }
+
+    #[test]
+    fn a_mismatch_names_what_differs() {
+        let msg = format!(
+            "{}",
+            NnueError::Mismatch {
+                reason: "made from no network file".to_string()
+            }
+        );
+        assert!(msg.contains("made from no network file"), "got: {msg}");
     }
 }

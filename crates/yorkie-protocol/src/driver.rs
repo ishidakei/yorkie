@@ -9,6 +9,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use yorkie_eval::{NnueError, network_file};
 use yorkie_numa::{NumaConfig, NumaIndex, NumaLayout, mempolicy};
 use yorkie_search::{
     BookConfig, BookHit, EnteringKingConfig, EnteringKingRule, PonderSignal, Prng, QSearch,
@@ -111,8 +112,9 @@ const KEEP_ALIVE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How many polls elapse between bare keep-alive newlines: `50 * 100ms = 5s`
 /// (reference: `if (++count >= 50 /* 5秒 */)`). A GUI (Shogidokoro / ShogiGUI)
 /// reads the periodic empty line as a sign the engine is alive and does not
-/// time out while a big `USI_Hash` allocation and the ~215 MiB `nn.bin` load
-/// run between `isready` and `readyok`.
+/// time out while the book load, the table's placement and the evaluation
+/// network's — a copy of a few hundred mebibytes per node, where the machine
+/// calls for copies — run between `isready` and `readyok`.
 const KEEP_ALIVE_TICKS_PER_NEWLINE: u32 = 50;
 
 /// The evaluation-noise seed a `bench` runs under. What the command reports is a
@@ -179,30 +181,28 @@ pub(crate) fn format_score(v: Value) -> String {
     out
 }
 
-/// A loaded evaluation network paired with the `nn.bin` path it came from.
+/// The evaluation network in the memory it was read into, paired with the file
+/// path it came from.
 ///
-/// The path is retained so `isready` is idempotent: a repeat with the same
-/// `<EvalDir>/nn.bin` reuses the already-loaded [`Search`] instead of parsing
-/// the file again.
+/// The path is retained so `isready` is idempotent: a repeat reuses what is
+/// already there instead of reading the file again.
 ///
-/// When NUMA thread binding is active *and*
-/// [`requires_memory_replication`](NumaConfig::requires_memory_replication),
-/// the single shared network is replaced by one on-node copy per *system* NUMA
-/// node touched by the binding assignment. The granularity is the system node,
-/// not the possibly L3-bundled logical node, so logical nodes that share a
-/// system node share one copy.
+/// How many instances there are is the machine's answer, decided when the
+/// binary was built. On a single-node machine there is one, mapped from the
+/// file and shared by every worker — and by every other engine process on the
+/// machine, the pages being the page cache's. On a multi-node machine there is
+/// one copy per *system* NUMA node the thread plan's workers run on, each in
+/// memory belonging to that node. The granularity is the system node, not the
+/// possibly L3-bundled logical node, so logical nodes that share a system node
+/// share one copy.
 struct LoadedEval {
     path: PathBuf,
-    /// The instance the file was loaded into (the reference's replication
-    /// `source`). Handed to every worker directly when replication is inactive;
-    /// the clone source for the on-node replicas when it is active.
-    source: Arc<Search>,
-    /// System-node → on-node replica. Empty when replication is inactive.
-    /// Rebuilt from `source` on every pool rebuild and every reload
-    /// ([`UsiDriver::rebuild_networks`]); stale entries drop with their [`Arc`]s
-    /// once the previous searches have finished (the `finish_search_join`
-    /// discipline).
-    replicas: BTreeMap<NumaIndex, Arc<Search>>,
+    /// The network instances, in the order they were placed.
+    instances: Vec<Arc<Search>>,
+    /// System node → the instance its workers read. Empty when there is one
+    /// instance for everything, which is every single-node machine and any plan
+    /// that binds no worker.
+    by_node: BTreeMap<NumaIndex, usize>,
 }
 
 /// The result of the heavy `isready` initialisation, produced inside the
@@ -391,6 +391,10 @@ pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
     /// otherwise its length equals the pool size, so `[0]` is the coordinator's
     /// and `[1..]` the helpers'.
     worker_networks: Vec<Arc<Search>>,
+    /// The directory a relative `eval_dir` resolves against — the running
+    /// executable's own, overridable via [`Self::with_eval_root`] so a test can
+    /// present a directory of its own rather than the one it runs from.
+    eval_root: PathBuf,
     /// Poll interval of the `isready` keep-alive helper thread ([`KeepAlive`]),
     /// overridable via [`Self::with_keep_alive_poll`] so a test can drive the
     /// mechanism with a short interval.
@@ -470,6 +474,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             worker_shared,
             // No network loaded yet; populated by the first `isready`.
             worker_networks: Vec::new(),
+            eval_root: network_file::executable_directory(),
             keep_alive_poll: KEEP_ALIVE_POLL_INTERVAL,
             sysfs_root: PathBuf::from(SYSFS_ROOT),
             startup_affinity: yorkie_numa::startup_affinity().clone(),
@@ -482,6 +487,19 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// the whole cadence.
     pub fn with_keep_alive_poll(mut self, poll: Duration) -> Self {
         self.keep_alive_poll = poll;
+        self
+    }
+
+    /// Override the directory a relative `eval_dir` resolves against.
+    ///
+    /// An engine finds its evaluation file beside itself, which is the one
+    /// place a session cannot move: `eval_dir` is compiled in, and no build has
+    /// an option surface to point it elsewhere. A test that has to drive a
+    /// session against a network of its own — a synthetic one, or none at all —
+    /// names the directory here, the same way it names a machine through
+    /// [`Self::with_sysfs_root`].
+    pub fn with_eval_root(mut self, root: PathBuf) -> Self {
+        self.eval_root = root;
         self
     }
 
@@ -715,64 +733,32 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         self.rebuild_networks();
     }
 
-    /// Ensure a network replica exists for every *system* NUMA node the current
-    /// binding assignment touches, and resolve the per-worker
-    /// [`Self::worker_networks`] handles.
+    /// Resolve the per-worker [`Self::worker_networks`] handles for the current
+    /// pool size and binding assignment: each worker gets the instance its own
+    /// *system* NUMA node's memory holds.
     ///
-    /// Forced at configuration time so no replication ever runs on the search
-    /// path. When no network is loaded, or replication is not required, the one
-    /// loaded instance is shared by every worker. Otherwise one copy is built
-    /// per distinct system node, cloned inside a thread bound to that node so
-    /// its pages first-touch there. Existing replicas are reused — every
-    /// instance is byte-identical — so a pool rebuild that leaves the layout
-    /// unchanged performs no cloning.
+    /// Done at configuration time, so nothing about which network a worker
+    /// reads is decided on the search path. Nothing is copied here: the
+    /// instances were placed when the file was read, and this only hands out
+    /// [`Arc`]s to them.
     fn rebuild_networks(&mut self) {
         let requested = self.pool.size().max(1);
-        let replication_active =
-            !self.numa_bound.is_empty() && self.numa_config.requires_memory_replication();
-
-        // Resolve the per-worker system node and a representative logical node per
-        // distinct system node while `self.eval` is not yet borrowed (these read
-        // `numa_bound`). `sys_nodes[i]` is worker `i`'s system node — the
-        // reference's `get_discriminator` per worker; the representative logical
-        // node is the lowest-indexed worker's logical node on that system node
-        // (stable, and any logical node on the system node first-touches the
-        // copy's pages there).
-        let (sys_nodes, rep_logical) = if replication_active {
-            let sys = worker_system_nodes(&self.numa_bound, self.settings.numa_system_nodes());
-            let mut rep: BTreeMap<NumaIndex, NumaIndex> = BTreeMap::new();
-            for (&s, &logical) in sys.iter().zip(self.numa_bound.iter()) {
-                rep.entry(s).or_insert(logical);
-            }
-            (sys, rep)
+        // Worker `i`'s system node — the reference's `get_discriminator` per
+        // worker. Read before `self.eval` is borrowed.
+        let sys_nodes = if self.numa_bound.is_empty() {
+            Vec::new()
         } else {
-            (Vec::new(), BTreeMap::new())
+            worker_system_nodes(&self.numa_bound, self.settings.numa_system_nodes())
         };
 
-        let config = &self.numa_config;
-        let Some(eval) = self.eval.as_mut() else {
+        let Some(eval) = self.eval.as_ref() else {
             // No network loaded; `go` before an `isready` resigns anyway.
             self.worker_networks = Vec::new();
             return;
         };
 
-        self.worker_networks = resolve_worker_networks(
-            &eval.source,
-            &mut eval.replicas,
-            &sys_nodes,
-            &rep_logical,
-            requested,
-            replication_active,
-            // Clone the source on-node so the copy's pages first-touch the target
-            // system node (via a thread bound to one of its logical nodes).
-            |logical, src| {
-                let mut built: Option<Arc<Search>> = None;
-                config.execute_on_numa_node(logical, || {
-                    built = Some(Arc::new(src.replicate()));
-                });
-                built.expect("execute_on_numa_node ran the closure")
-            },
-        );
+        self.worker_networks =
+            resolve_worker_networks(&eval.instances, &eval.by_node, &sys_nodes, requested);
     }
 
     /// Emit each non-blank line of `text` as `info string <line>` through the
@@ -810,15 +796,6 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         f.id_name(ENGINE_NAME)?;
         f.id_author(ENGINE_AUTHOR)?;
         f.usiok()
-    }
-
-    /// The `<EvalDir>/nn.bin` path the network is loaded from.
-    ///
-    /// `EvalDir` is a data path opened as-is via `std::fs`: no shell, no
-    /// metacharacter interpretation, no symlink policy beyond what the OS
-    /// `open` does.
-    fn nn_bin_path(&self) -> PathBuf {
-        Path::new(self.settings.eval_dir()).join("nn.bin")
     }
 
     /// The absolute path a `<BookDir>/<BookFile>` pair resolves to.
@@ -960,8 +937,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             IsreadyOutcome::LoadFailed(reason) => {
                 // Contract: on a load failure, emit
                 // `info string eval load failed: <reason>` and do NOT emit
-                // `readyok`. A previously-loaded network (if any) is left
-                // untouched so a bad reload does not drop a working net.
+                // `readyok`. There is no working network to lose here: one
+                // already read is reused by the idempotent path above, so the
+                // only session that reaches this had none to begin with.
                 self.info_string(&format!("eval load failed: {reason}"))
             }
             IsreadyOutcome::LayoutMismatch(reason) => {
@@ -989,40 +967,132 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         self.place_transposition_table()?;
         // Load / reload the opening book (the reference does this in isready).
         self.reload_book()?;
-        let path = self.nn_bin_path();
+        let path = self.evaluation_file_path();
 
-        // Idempotent: a repeat `isready` with the same path reuses the loaded
-        // network — no reparse, no reallocation.
+        // Idempotent: a repeat `isready` reuses what is already in memory — no
+        // second read of the file, and on a multi-node machine no second copy
+        // into the regions the first one is being read from.
         if self.eval.as_ref().is_some_and(|e| e.path == path) {
             return Ok(IsreadyOutcome::Ready);
         }
 
-        match Search::from_network_file_with_warnings(&path) {
-            Ok((search, warnings)) => {
-                // Surface the loader's non-fatal warnings (hash mismatches) as
-                // `info string` lines before `readyok`, mirroring the reference
-                // `LoadAndShare` / `Detail::ReadParameters` diagnostics. A clean
-                // load carries none, so a correct `nn.bin` emits nothing new.
+        match self.place_evaluation_network(&path) {
+            Ok((eval, warnings, placement)) => {
+                // Surface the complaints the conversion had about the source
+                // network (hash mismatches) as `info string` lines before
+                // `readyok`, mirroring the reference `LoadAndShare` /
+                // `Detail::ReadParameters` diagnostics. A clean network carries
+                // none, so a correct one emits nothing new.
                 for warning in &warnings {
                     self.info_string(warning)?;
                 }
-                self.eval = Some(LoadedEval {
-                    path,
-                    source: Arc::new(search),
-                    // Rebuilt from the fresh source just below; a reload starts
-                    // with no replicas so the stale set (built from the previous
-                    // network) is dropped.
-                    replicas: BTreeMap::new(),
-                });
-                // Force replication now (the reference forces
-                // `ensure_network_replicated` after a network reload), so a
-                // replica exists for every bound system node before the next
-                // `go` and none is built on the search path.
+                self.info_string(&placement)?;
+                self.eval = Some(eval);
+                // Resolve the per-worker handles now, so the next `go` finds
+                // every worker already pointed at the instance its node holds.
                 self.rebuild_networks();
                 Ok(IsreadyOutcome::Ready)
             }
             Err(e) => Ok(IsreadyOutcome::LoadFailed(e.to_string())),
         }
+    }
+
+    /// The evaluation file the engine plays with: `eval_dir` — absolute as it
+    /// stands, relative resolved against the running executable's own directory
+    /// — and the file's name.
+    ///
+    /// `eval_dir` is a data path opened as-is via `std::fs`: no shell, no
+    /// metacharacter interpretation, no symlink policy beyond what the OS
+    /// `open` does.
+    fn evaluation_file_path(&self) -> PathBuf {
+        network_file::network_path(&self.eval_root)
+    }
+
+    /// Read the evaluation file into the memory the machine calls for, and
+    /// report where it went.
+    ///
+    /// One mapping on a single-node machine; one copy per system NUMA node the
+    /// thread plan's workers run on otherwise, each region placed on its node
+    /// *before* the copy so every page's first touch lands there, and hinted
+    /// for huge pages either way. Every placement call is best-effort: a kernel
+    /// without `CONFIG_NUMA`, a seccomp filter or a restricted cgroup refuses
+    /// one, and the network then keeps the process's own policy and ordinary
+    /// pages — slower, never wrong. The line says which, in every build, since
+    /// a tournament host silently falling back is what an operator wants to see
+    /// before the game rather than after it.
+    fn place_evaluation_network(
+        &mut self,
+        path: &Path,
+    ) -> Result<(LoadedEval, Vec<String>, String), NnueError> {
+        // Nothing may still be reading the regions when they are filled: on a
+        // multi-node machine they are the process's only storage for the
+        // network. Any search has been joined by the caller, so dropping these
+        // handles drops the last references.
+        self.worker_networks = Vec::new();
+        self.eval = None;
+
+        let outcome = |accepted: bool| if accepted { "applied" } else { "refused" };
+        let mut instances = Vec::new();
+        let mut by_node = BTreeMap::new();
+        let mut warnings = Vec::new();
+
+        let placement = if network_file::SHARED_MAPPING {
+            let (search, w) = Search::map_evaluation_file(path)?;
+            let (addr, span) = search.network().parameter_region();
+            let huge = yorkie_storage::advise_huge_pages(addr, span);
+            warnings = w;
+            instances.push(Arc::new(search));
+            format!("one shared mapping; huge pages {}", outcome(huge))
+        } else {
+            let nodes = network_regions(&self.numa_bound, self.settings.numa_system_nodes());
+            let mut reported = Vec::new();
+            // A plan that binds no worker gets one region under the process's
+            // own policy, which is the policy an operator confining the process
+            // already chose.
+            let slots: Vec<Option<NumaIndex>> = if nodes.is_empty() {
+                vec![None]
+            } else {
+                nodes.iter().copied().map(Some).collect()
+            };
+            for (slot, node) in slots.iter().enumerate() {
+                let (addr, span) = network_file::region_backing(slot);
+                let placed = match node {
+                    Some(node) => format!(
+                        "node {node} {}",
+                        outcome(mempolicy::migrate_region_to_node(addr, span, *node))
+                    ),
+                    None => "the process default policy".to_string(),
+                };
+                let huge = yorkie_storage::advise_huge_pages(addr, span);
+                // SAFETY: every handle to a network over these regions was
+                // dropped above, and a search that could have held one was
+                // joined before this `isready` reached here, so nothing is
+                // reading the region being filled.
+                let (search, w) = unsafe { Search::load_evaluation_file_into_region(slot, path)? };
+                if let Some(node) = node {
+                    by_node.insert(*node, slot);
+                }
+                // Every region reads the same file, so its complaints are the
+                // same each time; they are worth reporting once.
+                warnings = w;
+                instances.push(Arc::new(search));
+                reported.push(format!("{placed}, huge pages {}", outcome(huge)));
+            }
+            format!("one copy on {}", reported.join("; "))
+        };
+
+        Ok((
+            LoadedEval {
+                path: path.to_path_buf(),
+                instances,
+                by_node,
+            },
+            warnings,
+            format!(
+                "evaluation network: {} MiB; {placement}",
+                network_file::DATA_BYTES / (1024 * 1024),
+            ),
+        ))
     }
 
     /// How the machine this process runs on differs from the one the binary was
@@ -3089,46 +3159,61 @@ fn worker_nodes(bound: &[NumaIndex], requested: usize) -> Vec<NumaIndex> {
     }
 }
 
+/// The *system* NUMA nodes that need their own copy of the network: the
+/// distinct nodes the binding assignment's workers run on, in node order.
+///
+/// Empty when no worker is bound — a single-threaded build, or
+/// `numa_policy = "none"` — which is the case where one copy under the
+/// process's own memory policy is the right answer, and the operator confining
+/// the process is the one who chose where that is.
+///
+/// Pure, so the set a binding produces is unit-testable without a machine that
+/// has those nodes.
+fn network_regions(bound: &[NumaIndex], system_nodes: &[usize]) -> Vec<NumaIndex> {
+    if bound.is_empty() {
+        return Vec::new();
+    }
+    let mut nodes: Vec<NumaIndex> = worker_system_nodes(bound, system_nodes);
+    nodes.sort_unstable();
+    nodes.dedup();
+    nodes
+}
+
 /// Resolve the per-worker network handles for one pool configuration, factored
 /// out of [`UsiDriver::rebuild_networks`] so it is unit-testable without a
 /// loaded network or a live `/sys` tree.
 ///
-/// `sys_nodes[i]` is worker `i`'s *system* NUMA node; `rep_logical` maps each
-/// distinct system node to a representative logical node to clone on. When
-/// `replication_active` is false the one `source` instance is shared by every
-/// worker and `clone_on_node` is never called. Reuse of an existing replica is
-/// sound because every instance is byte-identical, so a rebuild that leaves the
-/// layout unchanged clones nothing.
+/// `sys_nodes[i]` is worker `i`'s *system* NUMA node, and `by_node` maps a
+/// system node to the instance its memory holds. An empty `sys_nodes` or an
+/// empty `by_node` means one instance serves every worker.
+///
+/// A worker whose node no instance was placed for reads the first instance
+/// instead: the parameters are identical, so the only cost is that its reads
+/// cross to another node. That is reachable only where the worker count grew
+/// after the network was placed, which is the measurement command's doing. The
+/// result is always `requested` handles long, which is what the per-worker
+/// indexing everywhere else assumes.
 ///
 /// Generic over the payload so tests can drive it with a trivial stand-in.
 fn resolve_worker_networks<T>(
-    source: &Arc<T>,
-    replicas: &mut BTreeMap<NumaIndex, Arc<T>>,
+    instances: &[Arc<T>],
+    by_node: &BTreeMap<NumaIndex, usize>,
     sys_nodes: &[NumaIndex],
-    rep_logical: &BTreeMap<NumaIndex, NumaIndex>,
     requested: usize,
-    replication_active: bool,
-    mut clone_on_node: impl FnMut(NumaIndex, &Arc<T>) -> Arc<T>,
 ) -> Vec<Arc<T>> {
-    if !replication_active {
-        // Drop any replicas left over from a previous binding so their memory
-        // frees, and share the one loaded instance with every worker.
-        replicas.clear();
-        return vec![Arc::clone(source); requested.max(1)];
-    }
-
-    // Drop replicas for system nodes no longer in play, then build the missing
-    // ones from the source.
-    replicas.retain(|sys, _| rep_logical.contains_key(sys));
-    for (&sys, &logical) in rep_logical {
-        replicas
-            .entry(sys)
-            .or_insert_with(|| clone_on_node(logical, source));
-    }
-
-    sys_nodes
-        .iter()
-        .map(|sys| Arc::clone(&replicas[sys]))
+    let first = match instances.first() {
+        Some(first) => first,
+        None => return Vec::new(),
+    };
+    (0..requested.max(1))
+        .map(|worker| {
+            let index = sys_nodes
+                .get(worker)
+                .and_then(|sys| by_node.get(sys))
+                .copied()
+                .unwrap_or(0);
+            Arc::clone(instances.get(index).unwrap_or(first))
+        })
         .collect()
 }
 
@@ -3865,9 +3950,10 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn isready_without_network_reports_load_failure() {
-        // Default EvalDir is `eval`; `eval/nn.bin` is absent in the test CWD, so
-        // the load fails: the contract is an `info string eval load failed:`
-        // notice and NO `readyok`. The process stays alive (the `quit` returns).
+        // Nothing staged an evaluation file where this driver looks — beside
+        // the running executable — so the load fails: the contract is an
+        // `info string eval load failed:` notice and NO `readyok`. The process
+        // stays alive (the `quit` returns).
         let out = run_with("isready\nquit\n");
         assert!(
             out.contains("info string eval load failed:"),
@@ -4182,7 +4268,8 @@ mod tests {
         // No successful `isready`, so no network is loaded. `go` must not crash;
         // it emits the notice and `bestmove resign`. (The positive path — a
         // legal, search-chosen move — is covered in tests/eval_session.rs with a
-        // synthetic network, and in tests/real_network_selfplay against nn.bin.)
+        // synthetic network, and in tests/real_network_selfplay against the
+        // network the build laid out.)
         let out = run_with("go\nquit\n");
         if cfg!(feature = "verbose1") {
             assert!(
@@ -4715,243 +4802,81 @@ mod tests {
         assert_eq!(driver.last_game_ply, 3);
     }
 
-    // These exercise the Arc bookkeeping of `resolve_worker_networks` with a
+    // These exercise the per-worker handle resolution and the region set with a
     // trivial stand-in payload, so they need neither a loaded network nor
     // multi-node hardware.
 
-    /// A `clone_on_node` stand-in that records each `(system, logical)` build and
-    /// hands back a fresh `Arc` with a distinct value, so replicas are never
-    /// accidentally `ptr_eq` to the source or to each other.
-    fn counting_cloner<'a>(
-        calls: &'a std::cell::RefCell<Vec<(NumaIndex, NumaIndex)>>,
-        next: &'a std::cell::Cell<u32>,
-    ) -> impl FnMut(NumaIndex, &Arc<u32>) -> Arc<u32> + 'a {
-        move |logical, src| {
-            // Records the representative logical node the copy is built on.
-            calls.borrow_mut().push((**src as NumaIndex, logical));
-            let v = next.get();
-            next.set(v + 1);
-            Arc::new(v)
-        }
-    }
-
     #[test]
-    fn resolve_networks_inactive_shares_source_and_builds_nothing() {
-        // requires_memory_replication() == false (or binding inactive): every
-        // worker gets the one loaded instance, no replica is built, and any stale
-        // replicas are dropped.
-        let source = Arc::new(1000u32);
-        let mut replicas: BTreeMap<NumaIndex, Arc<u32>> = BTreeMap::new();
-        replicas.insert(9, Arc::new(7)); // a stale leftover
-        let calls = std::cell::RefCell::new(Vec::new());
-        let next = std::cell::Cell::new(0);
-
-        let workers = resolve_worker_networks(
-            &source,
-            &mut replicas,
-            &[],
-            &BTreeMap::new(),
-            3,
-            false,
-            counting_cloner(&calls, &next),
-        );
-
+    fn every_worker_reads_the_one_instance_when_nothing_is_bound() {
+        // A single-node machine, a single-threaded build, or
+        // `numa_policy = "none"`: one instance, and every worker points at it.
+        let instances = vec![Arc::new(1000u32)];
+        let workers = resolve_worker_networks(&instances, &BTreeMap::new(), &[], 3);
         assert_eq!(workers.len(), 3);
         for w in &workers {
-            assert!(
-                Arc::ptr_eq(w, &source),
-                "unbound worker must share the base"
-            );
+            assert!(Arc::ptr_eq(w, &instances[0]));
         }
-        assert!(replicas.is_empty(), "stale replicas dropped");
-        assert!(calls.borrow().is_empty(), "no on-node clone when inactive");
     }
 
     #[test]
-    fn resolve_networks_shares_one_copy_within_a_system_node() {
-        // Two logical nodes that map to ONE system node share a single replica
-        // (ptr_eq), built exactly once.
-        let source = Arc::new(1u32);
-        let mut replicas = BTreeMap::new();
-        let calls = std::cell::RefCell::new(Vec::new());
-        let next = std::cell::Cell::new(0);
-        // Workers 0,1 on logical nodes 0,1 — both on system node 0.
-        let sys_nodes = [0usize, 0];
-        let rep_logical: BTreeMap<NumaIndex, NumaIndex> = [(0usize, 0usize)].into_iter().collect();
-
-        let workers = resolve_worker_networks(
-            &source,
-            &mut replicas,
-            &sys_nodes,
-            &rep_logical,
-            2,
-            true,
-            counting_cloner(&calls, &next),
-        );
-
-        assert_eq!(workers.len(), 2);
-        assert!(
-            Arc::ptr_eq(&workers[0], &workers[1]),
-            "same system node → one shared copy"
-        );
-        assert!(
-            !Arc::ptr_eq(&workers[0], &source),
-            "replica is a fresh copy"
-        );
-        assert_eq!(replicas.len(), 1);
-        assert_eq!(calls.borrow().len(), 1, "exactly one on-node clone");
-    }
-
-    #[test]
-    fn resolve_networks_distinct_copies_across_system_nodes() {
-        // Two system nodes get two distinct replicas.
-        let source = Arc::new(1u32);
-        let mut replicas = BTreeMap::new();
-        let calls = std::cell::RefCell::new(Vec::new());
-        let next = std::cell::Cell::new(0);
-        let sys_nodes = [0usize, 1];
-        let rep_logical: BTreeMap<NumaIndex, NumaIndex> =
-            [(0usize, 0usize), (1, 1)].into_iter().collect();
-
-        let workers = resolve_worker_networks(
-            &source,
-            &mut replicas,
-            &sys_nodes,
-            &rep_logical,
-            2,
-            true,
-            counting_cloner(&calls, &next),
-        );
-
-        assert!(
-            !Arc::ptr_eq(&workers[0], &workers[1]),
-            "distinct system nodes → distinct copies"
-        );
-        assert!(!Arc::ptr_eq(&workers[0], &source));
-        assert!(!Arc::ptr_eq(&workers[1], &source));
-        assert_eq!(replicas.len(), 2);
-        assert_eq!(calls.borrow().len(), 2);
-    }
-
-    #[test]
-    fn resolve_networks_reuses_unchanged_layout_without_recloning() {
-        // A second rebuild with the same layout reuses the existing replicas: no
-        // fresh clone, and the Arc identities are preserved (the reference
-        // rebuilds byte-identical copies; the port keeps them, a documented
-        // optimisation — see `resolve_worker_networks`).
-        let source = Arc::new(1u32);
-        let mut replicas = BTreeMap::new();
-        let calls = std::cell::RefCell::new(Vec::new());
-        let next = std::cell::Cell::new(0);
-        let sys_nodes = [0usize, 1];
-        let rep_logical: BTreeMap<NumaIndex, NumaIndex> =
-            [(0usize, 0usize), (1, 1)].into_iter().collect();
-
-        let first = resolve_worker_networks(
-            &source,
-            &mut replicas,
-            &sys_nodes,
-            &rep_logical,
-            2,
-            true,
-            counting_cloner(&calls, &next),
-        );
-        assert_eq!(calls.borrow().len(), 2);
-
-        let second = resolve_worker_networks(
-            &source,
-            &mut replicas,
-            &sys_nodes,
-            &rep_logical,
-            2,
-            true,
-            counting_cloner(&calls, &next),
-        );
-        assert_eq!(calls.borrow().len(), 2, "no new clone on unchanged layout");
-        assert!(Arc::ptr_eq(&first[0], &second[0]));
-        assert!(Arc::ptr_eq(&first[1], &second[1]));
-    }
-
-    #[test]
-    fn resolve_networks_drops_stale_replicas_when_a_system_node_leaves() {
-        // First a two-system-node layout, then one where only system node 0
-        // remains: node 1's replica is dropped from the set.
-        let source = Arc::new(1u32);
-        let mut replicas = BTreeMap::new();
-        let calls = std::cell::RefCell::new(Vec::new());
-        let next = std::cell::Cell::new(0);
-
-        let _ = resolve_worker_networks(
-            &source,
-            &mut replicas,
-            &[0usize, 1],
-            &[(0usize, 0usize), (1, 1)].into_iter().collect(),
-            2,
-            true,
-            counting_cloner(&calls, &next),
-        );
-        assert_eq!(replicas.len(), 2);
-        let node0_before = Arc::clone(&replicas[&0]);
-
-        let workers = resolve_worker_networks(
-            &source,
-            &mut replicas,
-            &[0usize],
-            &[(0usize, 0usize)].into_iter().collect(),
-            1,
-            true,
-            counting_cloner(&calls, &next),
-        );
-        assert_eq!(replicas.len(), 1, "system node 1's replica dropped");
-        assert!(replicas.contains_key(&0));
-        assert!(
-            Arc::ptr_eq(&workers[0], &node0_before),
-            "the surviving replica is reused, not rebuilt"
+    fn each_worker_reads_the_instance_its_system_node_holds() {
+        // Four workers over two system nodes, alternating: each gets its own
+        // node's copy, and nothing is cloned to arrange it.
+        let instances = vec![Arc::new(10u32), Arc::new(20u32)];
+        let by_node: BTreeMap<NumaIndex, usize> = [(0usize, 0usize), (1, 1)].into_iter().collect();
+        let workers = resolve_worker_networks(&instances, &by_node, &[0, 1, 0, 1], 4);
+        assert_eq!(
+            workers.iter().map(|w| **w).collect::<Vec<u32>>(),
+            vec![10, 20, 10, 20]
         );
     }
 
     #[test]
-    fn resolve_networks_reload_from_new_source_replaces_the_set() {
-        // A reload clears `replicas` (as `isready` does) before resolving, so the
-        // new set is built fresh from the new source and shares nothing with the
-        // old copies.
-        let source_a = Arc::new(1u32);
-        let mut replicas = BTreeMap::new();
-        let calls = std::cell::RefCell::new(Vec::new());
-        let next = std::cell::Cell::new(0);
-        let sys_nodes = [0usize, 1];
-        let rep_logical: BTreeMap<NumaIndex, NumaIndex> =
-            [(0usize, 0usize), (1, 1)].into_iter().collect();
+    fn two_logical_nodes_on_one_system_node_read_one_copy() {
+        // The copies are per system node, so workers on logical nodes that an
+        // L3-aware mapping split out of one system node share a copy.
+        let instances = vec![Arc::new(10u32)];
+        let by_node: BTreeMap<NumaIndex, usize> = [(0usize, 0usize)].into_iter().collect();
+        let workers = resolve_worker_networks(&instances, &by_node, &[0, 0], 2);
+        assert!(Arc::ptr_eq(&workers[0], &workers[1]));
+    }
 
-        let old = resolve_worker_networks(
-            &source_a,
-            &mut replicas,
-            &sys_nodes,
-            &rep_logical,
-            2,
-            true,
-            counting_cloner(&calls, &next),
+    #[test]
+    fn a_worker_on_a_node_with_no_copy_reads_the_first_one() {
+        // The worker count grew past the plan the network was placed for, so a
+        // worker's node has no copy of its own: it reads another node's, which
+        // holds the same parameters.
+        let instances = vec![Arc::new(10u32), Arc::new(20u32)];
+        let by_node: BTreeMap<NumaIndex, usize> = [(0usize, 0usize), (1, 1)].into_iter().collect();
+        let workers = resolve_worker_networks(&instances, &by_node, &[1, 7], 2);
+        assert_eq!(
+            workers.iter().map(|w| **w).collect::<Vec<u32>>(),
+            vec![20, 10]
         );
+    }
 
-        // Reload: the driver installs a new `LoadedEval` with an empty replica map.
-        let source_b = Arc::new(2u32);
-        let mut fresh_replicas = BTreeMap::new();
-        let new = resolve_worker_networks(
-            &source_b,
-            &mut fresh_replicas,
-            &sys_nodes,
-            &rep_logical,
-            2,
-            true,
-            counting_cloner(&calls, &next),
-        );
+    #[test]
+    fn no_instance_means_no_worker_handles() {
+        // Before an `isready` has read the file there is nothing to hand out,
+        // and a `go` in that state resigns.
+        let none: Vec<Arc<u32>> = Vec::new();
+        assert!(resolve_worker_networks(&none, &BTreeMap::new(), &[0], 2).is_empty());
+    }
 
-        for old_w in &old {
-            for new_w in &new {
-                assert!(!Arc::ptr_eq(old_w, new_w), "old copies are not reused");
-            }
-        }
-        assert_eq!(fresh_replicas.len(), 2);
+    #[test]
+    fn a_plan_that_binds_nothing_needs_no_per_node_region() {
+        assert!(network_regions(&[], &[0, 1]).is_empty());
+    }
+
+    #[test]
+    fn one_region_per_distinct_system_node_the_plan_uses() {
+        // Four logical nodes, two per system node — an L3-subdivided layout.
+        let system_nodes = [0usize, 0, 1, 1];
+        assert_eq!(network_regions(&[0, 1, 2, 3], &system_nodes), vec![0, 1]);
+        // A plan confined to one system node's logical nodes needs one region.
+        assert_eq!(network_regions(&[2, 3, 2], &system_nodes), vec![1]);
+        // The set is in node order whatever order the workers landed in.
+        assert_eq!(network_regions(&[3, 0, 2, 1], &system_nodes), vec![0, 1]);
     }
 
     // -- Multiple Book name resolution ------------------------------------

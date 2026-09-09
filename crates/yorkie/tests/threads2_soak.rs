@@ -30,7 +30,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{engine_cwd_with_eval_dir, eval_dir};
+use common::{engine_cwd, engine_has_network, engine_network_path};
 use yorkie_state::{Move, Position, parse_usi_move};
 
 /// Default soak duration when `SOAK_SECS` is unset (~10 minutes).
@@ -138,11 +138,11 @@ fn threads2_self_play_soak_stays_legal_and_stable() {
         );
         return;
     }
-    let dir = eval_dir();
-    if !dir.join("nn.bin").exists() {
+    if !engine_has_network() {
         eprintln!(
-            "skipping threads2_self_play_soak_stays_legal_and_stable: {} is not present (obtained out-of-band)",
-            dir.join("nn.bin").display()
+            "skipping threads2_self_play_soak_stays_legal_and_stable: {} is not present \
+             (this build had no network to convert; it is obtained out-of-band)",
+            engine_network_path().display()
         );
         return;
     }
@@ -153,7 +153,7 @@ fn threads2_self_play_soak_stays_legal_and_stable() {
         .unwrap_or(DEFAULT_SOAK_SECS);
     let deadline = Instant::now() + Duration::from_secs(soak_secs);
 
-    let cwd = engine_cwd_with_eval_dir(&dir);
+    let cwd = engine_cwd();
     let mut sess = Session::start(&cwd).expect("engine session");
 
     send(&mut sess.stdin, "usi");

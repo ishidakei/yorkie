@@ -253,6 +253,24 @@ pub struct ArenaSlice<T> {
     _marker: PhantomData<T>,
 }
 
+impl<T> ArenaSlice<T> {
+    /// A view of the `len` elements of `T` at `ptr`, for a region this module
+    /// did not carve: a mapped file, or a `static` the linker placed.
+    ///
+    /// # Safety
+    /// `ptr` must be non-null, aligned for `T`, and address `len` contiguous
+    /// initialised `T` that outlive the view; and nothing else may hold a `&mut`
+    /// to them. The view hands out `&mut [T]` through [`DerefMut`], so a caller
+    /// that builds one over read-only memory must never take that borrow.
+    pub unsafe fn from_raw(ptr: *mut T, len: usize) -> Self {
+        ArenaSlice {
+            ptr: NonNull::new(ptr).expect("an arena view's base is non-null"),
+            len,
+            _marker: PhantomData,
+        }
+    }
+}
+
 // SAFETY: an `ArenaSlice<T>` is a view of `[T]` whose backing the same owner
 // keeps alive; it behaves like `&[T]` / `&mut [T]`, so it is `Send`/`Sync`
 // exactly when `T` is. The owner gives each view a disjoint section, so no

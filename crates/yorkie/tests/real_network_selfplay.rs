@@ -20,7 +20,7 @@ mod common;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use common::{engine_cwd_with_eval_dir, eval_dir};
+use common::{engine_cwd, engine_has_network, engine_network_path};
 use yorkie_state::{Move, Position, parse_usi_move};
 
 const MAX_PLIES: usize = 40;
@@ -56,18 +56,18 @@ fn legal_moves(p: &Position) -> Vec<Move> {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn real_network_self_play_stays_legal_and_exits_cleanly() {
-    let dir = eval_dir();
-    if !dir.join("nn.bin").exists() {
+    if !engine_has_network() {
         eprintln!(
-            "skipping real_network_self_play_stays_legal_and_exits_cleanly: {} is not present (obtained out-of-band)",
-            dir.join("nn.bin").display()
+            "skipping real_network_self_play_stays_legal_and_exits_cleanly: {} is not \
+             present (this build had no network to convert; it is obtained out-of-band)",
+            engine_network_path().display()
         );
         return;
     }
 
     let exe = env!("CARGO_BIN_EXE_yorkie");
     let mut child: Child = Command::new(exe)
-        .current_dir(engine_cwd_with_eval_dir(&dir))
+        .current_dir(engine_cwd())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

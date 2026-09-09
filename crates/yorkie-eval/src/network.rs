@@ -230,43 +230,6 @@ mod tests {
     }
 
     #[test]
-    fn replicate_is_byte_identical_deep_copy() {
-        // A per-NUMA-node replica must be byte-for-byte identical to its source
-        // in a freshly allocated arena, so the two evaluate alike while living
-        // on different nodes.
-        let dims = NetDims {
-            layer_stacks: 1,
-            num_features: 1,
-            hidden_size: 5,
-            ..NetDims::STANDARD
-        };
-        let mut builder = NnueNetworkBuilder::with_dims(synthetic_header(), [0xAB; 32], &dims);
-        builder.fc_0_biases_mut(0)[0] = 123;
-        builder.fc_0_weights_mut(0)[1] = -7;
-        builder.fc_1_biases_mut(0)[2] = 55;
-        builder.fc_2_weights_mut(0)[0] = 9;
-        builder.ft_biases_mut()[0] = 4242;
-        builder
-            .ft_weights_mut()
-            .copy_from_slice(&[1i16, 2, 3, -4, 5]);
-        let net = builder.build();
-
-        let copy = net.replicate();
-
-        assert_eq!(&*copy.ft_biases, &*net.ft_biases);
-        assert_eq!(&*copy.ft_weights, &*net.ft_weights);
-        assert_eq!(copy.sha256, net.sha256);
-        assert_eq!(copy.header.arch_id, net.header.arch_id);
-        assert_eq!(copy.stacks.len(), net.stacks.len());
-        assert_eq!(&*copy.stacks[0].fc_0_biases, &*net.stacks[0].fc_0_biases);
-        assert_eq!(&*copy.stacks[0].fc_0_weights, &*net.stacks[0].fc_0_weights);
-        assert_eq!(&*copy.stacks[0].fc_2_weights, &*net.stacks[0].fc_2_weights);
-        assert_ne!(copy.ft_weights.as_ptr(), net.ft_weights.as_ptr());
-        assert_eq!(net.allocation_disclosure().0, 1);
-        assert_eq!(copy.allocation_disclosure().0, 1);
-    }
-
-    #[test]
     fn zero_network_evaluates_to_zero() {
         // `per_layer_flow` ignores the feature transformer.
         let net = zero_net_1stack();

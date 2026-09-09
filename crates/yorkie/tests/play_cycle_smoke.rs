@@ -6,6 +6,8 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+mod common;
+
 fn is_well_formed_usi_move(s: &str) -> bool {
     if s == "resign" {
         return true;
@@ -69,28 +71,41 @@ fn multi_cycle_play_via_spawned_binary() {
 
     let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
     assert!(stdout.contains("usiok\n"), "missing usiok in:\n{stdout}");
-    // No EvalDir set → default `eval/nn.bin` is absent in the spawned binary's
-    // CWD → load fails, no readyok, and each `go` resigns. This confirms the
-    // main ↔ UsiDriver wiring survives an unloaded network end-to-end; the
-    // positive multi-cycle play path lives in engine/tests/real_network_selfplay.
-    assert!(
-        stdout.contains("info string eval load failed:"),
-        "missing eval-load-failure notice in:\n{stdout}"
-    );
-    assert!(
-        !stdout.contains("readyok"),
-        "unexpected readyok in:\n{stdout}"
-    );
 
+    // The move itself, without the `ponder <move>` a real search appends.
     let bestmoves: Vec<&str> = stdout
         .lines()
         .filter_map(|l| l.strip_prefix("bestmove "))
+        .map(|l| l.split_whitespace().next().unwrap_or(l))
         .collect();
-    assert_eq!(
-        bestmoves,
-        vec!["resign", "resign"],
-        "expected two resign bestmoves in:\n{stdout}"
-    );
+    if common::engine_has_network() {
+        // The engine reads the evaluation file beside the binary, so both `go`s
+        // are real searches and answer with a move of their own.
+        assert!(stdout.contains("readyok"), "missing readyok in:\n{stdout}");
+        assert_eq!(
+            bestmoves.len(),
+            2,
+            "expected one bestmove per cycle in:\n{stdout}"
+        );
+    } else {
+        // A build that had no network to convert wrote no evaluation file, so
+        // the load fails, `readyok` is withheld, and each `go` resigns. The
+        // wiring this proves — `main` ↔ `UsiDriver`, end to end — is the same
+        // either way.
+        assert!(
+            stdout.contains("info string eval load failed:"),
+            "missing eval-load-failure notice in:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("readyok"),
+            "unexpected readyok in:\n{stdout}"
+        );
+        assert_eq!(
+            bestmoves,
+            vec!["resign", "resign"],
+            "expected two resign bestmoves in:\n{stdout}"
+        );
+    }
     for m in &bestmoves {
         assert!(
             is_well_formed_usi_move(m),

@@ -196,8 +196,6 @@ check_accessors! {
 }
 
 text_accessors! {
-    /// Directory holding `nn.bin` (`EvalDir`).
-    eval_dir => EVAL_DIR;
     /// Book file name, `no_book` for bookless (`BookFile`).
     book_file => BOOK_FILE;
     /// Book directory (`BookDir`).

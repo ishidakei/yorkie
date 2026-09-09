@@ -23,13 +23,8 @@ mod common;
 
 use std::path::PathBuf;
 
-use common::stage_eval_dir_link;
+use common::stage_engine_eval_root;
 use serde::Deserialize;
-use yorkie_protocol::UsiDriver;
-
-fn eval_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../eval")
-}
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -51,14 +46,6 @@ struct ScoreJson {
     cp: Option<i32>,
     #[serde(default)]
     mate: Option<i32>,
-}
-
-fn drive(input: &str) -> String {
-    let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let driver = UsiDriver::new(input.as_bytes(), std::sync::Arc::clone(&output));
-    driver.run().expect("driver run");
-    let bytes = output.lock().expect("output lock").clone();
-    String::from_utf8(bytes).expect("utf-8")
 }
 
 /// Extract the value following `key` in a whitespace-tokenised `info` line, e.g.
@@ -93,11 +80,11 @@ fn depth1_session_matches_reference_startpos_fixture() {
         return;
     }
 
-    let dir = eval_dir();
-    if !dir.join("nn.bin").exists() {
+    // The engine's own network — the file this build laid out for the kernels.
+    if !stage_engine_eval_root() {
         eprintln!(
-            "skipping depth1_session_matches_reference_startpos_fixture: {} is not present (obtained out-of-band)",
-            dir.join("nn.bin").display()
+            "skipping depth1_session_matches_reference_startpos_fixture: this build \
+             had no network to convert (it is obtained out-of-band)"
         );
         return;
     }
@@ -105,8 +92,7 @@ fn depth1_session_matches_reference_startpos_fixture() {
     let raw = std::fs::read_to_string(fixture_path()).expect("read startpos fixture");
     let fixture: Fixture = serde_json::from_str(&raw).expect("parse startpos fixture");
 
-    stage_eval_dir_link(&dir);
-    let out = drive(
+    let out = common::drive(
         "usi\n\
          isready\n\
          position startpos\n\

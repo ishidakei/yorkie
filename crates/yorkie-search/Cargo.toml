@@ -16,6 +16,11 @@ yorkie-storage = { path = "../yorkie-storage" }
 serde = { version = "~1.0", features = ["derive"] }
 serde_json = "~1.0"
 
+# The tests stand a network up in memory rather than reading the one the build
+# laid out, which is what the Evaluation layer's builder is for. It is off in
+# the build that plays, so the tests ask for it here.
+yorkie-eval = { path = "../yorkie-eval", features = ["source-network"] }
+
 # Re-exported from the Storage layer so this crate's code and tests can `cfg` on
 # it: the wide TT changes which probes hit, so the reference-captured parity
 # gates cannot hold and are compiled out under it. Off by default.

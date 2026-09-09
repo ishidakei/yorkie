@@ -11,9 +11,7 @@
 
 use std::path::Path;
 
-use yorkie_eval::{
-    Accumulator, NnueError, NnueNetwork, evaluate_with, load_network, load_network_with_warnings,
-};
+use yorkie_eval::{Accumulator, NnueError, NnueNetwork, evaluate_with, network_file};
 use yorkie_state::{Move, Position};
 
 pub mod book;
@@ -121,33 +119,37 @@ impl Search {
         Self { net }
     }
 
-    /// Load and validate the network at `path`, then wrap it.
+    /// Open the evaluation file at `path` as one mapping, shared by everything
+    /// that reads it, and wrap the network it holds.
     ///
-    /// Non-fatal warnings are discarded; use
-    /// [`Search::from_network_file_with_warnings`] to surface them.
-    pub fn from_network_file(path: &Path) -> Result<Self, NnueError> {
-        Ok(Self::new(load_network(path)?))
+    /// Also returns the complaints the conversion had about the source network
+    /// (hash mismatches), which the driver emits as `info string` lines before
+    /// `readyok`. An empty vector means the file was made from a clean source.
+    pub fn map_evaluation_file(path: &Path) -> Result<(Self, Vec<String>), NnueError> {
+        let (net, warnings) = network_file::open_shared(path)?;
+        Ok((Self::new(net), warnings))
     }
 
-    /// Like [`Search::from_network_file`], but also returns the loader's
-    /// non-fatal warning bodies (hash mismatches) so the driver can emit them as
-    /// `info string` lines before `readyok`. An empty vector means a clean load.
-    pub fn from_network_file_with_warnings(path: &Path) -> Result<(Self, Vec<String>), NnueError> {
-        let (net, warnings) = load_network_with_warnings(path)?;
+    /// Copy the evaluation file at `path` into on-node region `slot` and wrap
+    /// the network it holds, so the workers on that node read parameters their
+    /// own node's memory holds.
+    ///
+    /// # Safety
+    /// No search built over `slot` may still be alive: the region is the
+    /// process's only storage for that copy, so filling it again while
+    /// something reads it would change parameters underneath a search.
+    pub unsafe fn load_evaluation_file_into_region(
+        slot: usize,
+        path: &Path,
+    ) -> Result<(Self, Vec<String>), NnueError> {
+        // SAFETY: forwarded to the caller, who owns the same obligation.
+        let (net, warnings) = unsafe { network_file::load_into_region(slot, path)? };
         Ok((Self::new(net), warnings))
     }
 
     /// The network this search evaluates with.
     pub fn network(&self) -> &NnueNetwork {
         &self.net
-    }
-
-    /// A deep copy of this search with freshly allocated network storage.
-    ///
-    /// The driver runs this inside a NUMA-node-bound thread so the copy's pages
-    /// land on that node. The replica evaluates identically to `self`.
-    pub fn replicate(&self) -> Self {
-        Self::new(self.net.replicate())
     }
 
     /// Greedy 1-ply move choice.

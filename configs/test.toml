@@ -27,6 +27,7 @@ usi_hash = 16
 threads = 1
 
 multi_pv = 1
+original_eval_dir = "eval"
 eval_dir = "eval"
 fv_scale = 16
 numa_policy = "auto"

@@ -286,6 +286,10 @@ const SCHEMA: &[Spec] = &[
         "a build that prints no search `info` line has no way to report a second principal \
          variation, so its root search is single-line",
     ),
+    text(
+        "original_eval_dir",
+        "(none: the directory the network a build converts is read from)",
+    ),
     text("eval_dir", "EvalDir"),
     int("fv_scale", "FV_SCALE", 1, 128),
     text("numa_policy", "NumaPolicy"),

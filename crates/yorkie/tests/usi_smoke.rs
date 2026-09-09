@@ -5,6 +5,8 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+mod common;
+
 /// Spawn the engine binary, feed it `input`, and return its stdout. Fails the
 /// test if it exits non-zero.
 fn spawn_and_drive(input: &[u8]) -> String {
@@ -30,10 +32,10 @@ fn spawn_and_drive(input: &[u8]) -> String {
     String::from_utf8(out.stdout).expect("utf-8 stdout")
 }
 
-/// The shared part of the contract: identity, `usiok`, and an
-/// `isready` that reports a load failure (no `eval/nn.bin` in the spawned
-/// binary's CWD) rather than answering `readyok`. The positive isready path is
-/// covered by `tests/real_network_selfplay` against the real network.
+/// The shared part of the contract: identity, `usiok`, and an `isready` that
+/// answers `readyok` when the evaluation file beside the binary is there — and
+/// reports the failure, without `readyok`, when a build that had no network to
+/// convert left none.
 fn assert_common_handshake(stdout: &str) {
     assert!(stdout.contains("id name "), "missing id name in:\n{stdout}");
     assert!(
@@ -41,14 +43,25 @@ fn assert_common_handshake(stdout: &str) {
         "missing id author in:\n{stdout}"
     );
     assert!(stdout.contains("usiok\n"), "missing usiok in:\n{stdout}");
-    assert!(
-        stdout.contains("info string eval load failed:"),
-        "missing eval-load-failure notice in:\n{stdout}"
-    );
-    assert!(
-        !stdout.contains("readyok"),
-        "readyok must not appear on a failed load in:\n{stdout}"
-    );
+    if common::engine_has_network() {
+        assert!(
+            stdout.contains("readyok"),
+            "the network beside the binary must load in:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("eval load failed"),
+            "unexpected load failure in:\n{stdout}"
+        );
+    } else {
+        assert!(
+            stdout.contains("info string eval load failed:"),
+            "missing eval-load-failure notice in:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("readyok"),
+            "readyok must not appear on a failed load in:\n{stdout}"
+        );
+    }
 }
 
 /// The binary as it is actually shipped: no options advertised, and a

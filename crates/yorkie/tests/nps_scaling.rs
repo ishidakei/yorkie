@@ -30,7 +30,7 @@ mod common;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use common::{engine_cwd_with_eval_dir, eval_dir};
+use common::{engine_cwd, engine_has_network, engine_network_path};
 
 const MOVETIME_MS: u64 = 5000;
 /// The table size the bench runs allocate, in MiB.
@@ -105,10 +105,9 @@ fn median3(mut v: [u64; RUNS]) -> u64 {
 }
 
 fn start_engine() -> (Child, ChildStdin, BufReader<ChildStdout>) {
-    let dir = eval_dir();
     let exe = env!("CARGO_BIN_EXE_yorkie");
     let mut child: Child = Command::new(exe)
-        .current_dir(engine_cwd_with_eval_dir(&dir))
+        .current_dir(engine_cwd())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -131,11 +130,11 @@ fn start_engine() -> (Child, ChildStdin, BufReader<ChildStdout>) {
 #[test]
 #[ignore = "spawns the engine and searches about 90 s; run explicitly"]
 fn nps_threads1_vs_threads2() {
-    let dir = eval_dir();
-    if !dir.join("nn.bin").exists() {
+    if !engine_has_network() {
         eprintln!(
-            "skipping nps_threads1_vs_threads2: {} is not present (obtained out-of-band)",
-            dir.join("nn.bin").display()
+            "skipping nps_threads1_vs_threads2: {} is not present (this build had no \
+             network to convert; it is obtained out-of-band)",
+            engine_network_path().display()
         );
         return;
     }

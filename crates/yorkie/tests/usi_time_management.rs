@@ -6,7 +6,8 @@
 //! the time-managed forms (`go infinite` + `stop`, `go movetime`, a Fischer
 //! mini-game) must each terminate promptly with exactly one `bestmove`.
 //!
-//! The whole file is skipped with a notice when `nn.bin` is absent.
+//! The whole file is skipped with a notice when this build had no network to
+//! convert, and so wrote no evaluation file for the engine to read.
 //!
 //! Gated on `verbose2`: the session drives analysis-only `go` clauses, every
 //! assertion reads the search `info depth …` line (its `nodes` and `score`
@@ -22,7 +23,7 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{engine_cwd_with_eval_dir, eval_dir};
+use common::{engine_cwd, engine_has_network, engine_network_path};
 use serde::Deserialize;
 
 fn fixtures_dir() -> PathBuf {
@@ -63,23 +64,22 @@ struct Engine {
 }
 
 impl Engine {
-    /// Spawn the engine in a working directory whose `EvalDir` links to the
-    /// staged network, and complete the `usi` / `isready` handshake. Returns
-    /// `None` (with a printed notice) when the network is absent, so callers can
-    /// skip.
+    /// Spawn the engine and complete the `usi` / `isready` handshake. Returns
+    /// `None` (with a printed notice) when this build had no network to convert,
+    /// so callers can skip.
     fn start() -> Option<Self> {
-        let dir = eval_dir();
-        if !dir.join("nn.bin").exists() {
+        if !engine_has_network() {
             eprintln!(
-                "skipping usi_time_management: {} is not present (obtained out-of-band)",
-                dir.join("nn.bin").display()
+                "skipping usi_time_management: {} is not present (this build had no \
+                 network to convert; it is obtained out-of-band)",
+                engine_network_path().display()
             );
             return None;
         }
 
         let exe = env!("CARGO_BIN_EXE_yorkie");
         let mut child = Command::new(exe)
-            .current_dir(engine_cwd_with_eval_dir(&dir))
+            .current_dir(engine_cwd())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

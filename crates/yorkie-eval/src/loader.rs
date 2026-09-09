@@ -1,34 +1,21 @@
-//! SFNN-1536 network-file (`nn.bin`) parsing and validation.
+//! Reading a source network file (`nn.bin`) into a network in this process's
+//! own memory.
 //!
-//! The format is ported from `ReadHeader` / `ReadParameters`. Which failures
-//! are fatal follows the reference:
+//! The engine never does this: its parameters are laid out for the kernels
+//! ahead of time and read in place. What needs it is the tooling that holds the
+//! two against each other — a parity run reads the same source file the build
+//! converted and evaluates with it — so the reader is compiled in only where
+//! that is asked for.
 //!
-//! - The **version word** is a hard failure on mismatch: the file is a
-//!   different serialization format, so parsing cannot continue.
-//! - The **file-level, feature-transformer and layer-stack hashes** are only
-//!   warnings; the load continues and the parameters are read as usual. They
-//!   are topology-derived, but the reference tolerates old files, so this does
-//!   too, surfacing the warnings during `isready`.
-//! - The **architecture string** is read but never compared. It appears only
-//!   inside the file-hash warning, rendered lossily so non-UTF-8 bytes never
-//!   fail the load.
-//! - **Structural failures stay hard**: a short read, a bad LEB128 magic, an
-//!   out-of-range value, or trailing bytes after the last stack.
+//! The file format, its validation and the transformation into the kernels'
+//! layout are the definition the build script converts with, so this reader and
+//! that conversion cannot produce different parameters.
 
 use std::path::Path;
 
-use crate::types::{NetDims, NetHeader, NnueError, NnueNetwork, NnueNetworkBuilder};
-
-const NNUE_VERSION: u32 = 0x7AF3_2F16;
-const NNUE_HASH_VALUE: u32 = 0x3C20_3B32;
-const FT_HASH: u32 = 0x5F13_4AB8;
-const NET_HASH: u32 = 0x6333_718A;
-const ARCH_STRING: &str = "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm(Friend)[73305->1536x2],Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-15](ClippedReLU[15](AffineTransform[15<-3072](InputSlice[3072(0:3072)]))))){LayerStack=9}";
-const LEB128_MAGIC: &[u8; 17] = b"COMPRESSED_LEB128";
-
-/// Warning body emitted when a feature-transformer or layer-stack hash does not
-/// match — the reference's `Detail::ReadParameters` text, spacing and all.
-const SECTION_HASH_WARNING: &str = "Warning : nn.bin hash mismatch.";
+use crate::nnue_layout::{NetDims, NetHeader};
+use crate::nnue_source::{convert, sha256};
+use crate::types::{NnueError, NnueNetwork, NnueNetworkBuilder};
 
 /// Reads and validates the SFNN-1536 network file at `path`, discarding any
 /// non-fatal warnings. Use [`load_network_with_warnings`] to surface them.
@@ -44,414 +31,45 @@ pub fn load_network_with_warnings(path: &Path) -> Result<(NnueNetwork, Vec<Strin
         path: path.display().to_string(),
         source: e,
     })?;
-    let sha256 = sha256::digest(&bytes);
-    parse_from_bytes(&bytes, &NetDims::STANDARD, sha256)
+    let digest = sha256(&bytes);
+    network_from_bytes(&bytes, &NetDims::STANDARD, digest)
 }
 
-fn parse_from_bytes(
+/// The network `bytes` describe, in a freshly allocated block.
+fn network_from_bytes(
     bytes: &[u8],
     dims: &NetDims,
     sha256: [u8; 32],
 ) -> Result<(NnueNetwork, Vec<String>), NnueError> {
-    let mut warnings = Vec::new();
-    let mut reader = ByteReader::new(bytes);
-    let header = read_header(&mut reader, &mut warnings)?;
-    // The builder allocates one arena up front and hands out mutable views, so
-    // the ~215 MiB `ft_weights` decodes straight into its final home.
-    let mut builder = NnueNetworkBuilder::with_dims(header, sha256, dims);
-
-    let ft_hash = reader.read_u32_le()?;
-    if ft_hash != FT_HASH {
-        warnings.push(SECTION_HASH_WARNING.to_string());
-    }
-    read_leb128_i16_into(&mut reader, builder.ft_biases_mut())?;
-    scale_ft_i16_x2_in_place(builder.ft_biases_mut())?;
-    read_leb128_i16_into(&mut reader, builder.ft_weights_mut())?;
-    scale_ft_i16_x2_in_place(builder.ft_weights_mut())?;
-    for i in 0..dims.layer_stacks {
-        read_network_block(&mut reader, &mut builder, i, &mut warnings)?;
-    }
-    reader.assert_eof()?;
-    Ok((builder.build(), warnings))
+    let converted = convert(bytes, dims).map_err(|reason| NnueError::InvalidFormat { reason })?;
+    let mut builder = NnueNetworkBuilder::with_dims(converted.net.clone(), sha256, dims);
+    builder.fill(&converted.data);
+    Ok((builder.build(), converted.warnings))
 }
 
-fn read_header(
-    reader: &mut ByteReader,
-    warnings: &mut Vec<String>,
-) -> Result<NetHeader, NnueError> {
-    let version = reader.read_u32_le()?;
-    if version != NNUE_VERSION {
-        // The reference's `ReadHeader` message shape, exactly.
-        return Err(NnueError::InvalidFormat {
-            reason: format!(
-                "NNUE header version mismatch: expected {} got {}",
-                NNUE_VERSION, version
-            ),
-        });
-    }
-    let hash = reader.read_u32_le()?;
-    let arch_size = reader.read_u32_le()?;
-    // `read_slice` bounds the length against the file, so a short file fails
-    // structurally rather than here.
-    let arch_bytes = reader.read_slice(arch_size as usize)?;
-    let arch_id = String::from_utf8_lossy(arch_bytes).into_owned();
-    // The message names both the in-file and the expected architecture string.
-    if hash != NNUE_HASH_VALUE {
-        warnings.push(format!(
-            "Warning: NNUE hash mismatch: expected {} got {} arch_in_file={} arch_expected={}",
-            NNUE_HASH_VALUE, hash, arch_id, ARCH_STRING
-        ));
-    }
-    Ok(NetHeader {
-        version,
-        hash,
-        arch_id,
-    })
+/// The parameters `bytes` lay out, as the kernels read them — the same region
+/// the build script writes into the evaluation file.
+pub fn parameter_bytes(bytes: &[u8], dims: &NetDims) -> Result<Vec<u8>, NnueError> {
+    convert(bytes, dims)
+        .map(|converted| converted.data)
+        .map_err(|reason| NnueError::InvalidFormat { reason })
 }
 
-/// Decode one signed-LEB128 block into `out`, whose length is the value count.
-fn read_leb128_i16_into(reader: &mut ByteReader, out: &mut [i16]) -> Result<(), NnueError> {
-    let count = out.len();
-    let magic = reader.read_slice(LEB128_MAGIC.len())?;
-    if magic != LEB128_MAGIC {
-        return Err(NnueError::InvalidFormat {
-            reason: format!(
-                "expected LEB128 magic {:?}, got {:?}",
-                std::str::from_utf8(LEB128_MAGIC).unwrap_or("<non-utf8>"),
-                String::from_utf8_lossy(magic),
-            ),
-        });
-    }
-    let bytes_left = reader.read_u32_le()? as usize;
-    // Worst-case signed LEB128 for an `i16` is 3 bytes, which bounds the
-    // allocation against bad input.
-    let upper_bound = count.saturating_mul(3);
-    if bytes_left > upper_bound {
-        return Err(NnueError::InvalidFormat {
-            reason: format!(
-                "LEB128 bytes_left {} exceeds upper bound {} for {} i16 values",
-                bytes_left, upper_bound, count
-            ),
-        });
-    }
-    let payload = reader.read_slice(bytes_left)?;
-    let mut pos = 0usize;
-    for slot in out.iter_mut() {
-        let v = read_signed_leb128(payload, &mut pos)?;
-        if !(i16::MIN as i64..=i16::MAX as i64).contains(&v) {
-            return Err(NnueError::InvalidFormat {
-                reason: format!("LEB128 value {} out of i16 range", v),
-            });
-        }
-        *slot = v as i16;
-    }
-    if pos != payload.len() {
-        return Err(NnueError::InvalidFormat {
-            reason: format!(
-                "LEB128 block has {} unused bytes after {} values",
-                payload.len() - pos,
-                count
-            ),
-        });
-    }
-    Ok(())
-}
-
-fn scale_ft_i16_x2_in_place(values: &mut [i16]) -> Result<(), NnueError> {
-    for slot in values.iter_mut() {
-        let scaled = (*slot as i32) * 2;
-        if !(i16::MIN as i32..=i16::MAX as i32).contains(&scaled) {
-            return Err(NnueError::InvalidFormat {
-                reason: format!(
-                    "feature-transformer value {} out of range: ×2 scale overflows i16 (pre-scale bound is [-16_384, 16_383])",
-                    slot
-                ),
-            });
-        }
-        *slot = scaled as i16;
-    }
-    Ok(())
-}
-
-fn read_signed_leb128(bytes: &[u8], pos: &mut usize) -> Result<i64, NnueError> {
-    let mut result: i64 = 0;
-    let mut shift: u32 = 0;
-    loop {
-        if *pos >= bytes.len() {
-            return Err(NnueError::InvalidFormat {
-                reason: "LEB128 value truncated".to_string(),
-            });
-        }
-        let byte = bytes[*pos];
-        *pos += 1;
-        if shift >= 64 {
-            return Err(NnueError::InvalidFormat {
-                reason: "LEB128 value exceeds 64 bits".to_string(),
-            });
-        }
-        result |= ((byte & 0x7F) as i64).wrapping_shl(shift);
-        shift += 7;
-        if byte & 0x80 == 0 {
-            if shift < 64 && (byte & 0x40) != 0 {
-                result |= (-1i64).wrapping_shl(shift);
-            }
-            return Ok(result);
-        }
-    }
-}
-
-fn read_network_block(
-    reader: &mut ByteReader,
-    builder: &mut NnueNetworkBuilder,
-    stack: usize,
-    warnings: &mut Vec<String>,
-) -> Result<(), NnueError> {
-    let net_hash = reader.read_u32_le()?;
-    if net_hash != NET_HASH {
-        warnings.push(SECTION_HASH_WARNING.to_string());
-    }
-    // In the file's `fc_0`, `fc_1`, `fc_2` order.
-    read_i32_into(reader, builder.fc_0_biases_mut(stack))?;
-    read_i8_into(reader, builder.fc_0_weights_mut(stack))?;
-    read_i32_into(reader, builder.fc_1_biases_mut(stack))?;
-    read_i8_into(reader, builder.fc_1_weights_mut(stack))?;
-    read_i32_into(reader, builder.fc_2_biases_mut(stack))?;
-    read_i8_into(reader, builder.fc_2_weights_mut(stack))?;
-    Ok(())
-}
-
-fn read_i32_into(reader: &mut ByteReader, out: &mut [i32]) -> Result<(), NnueError> {
-    let bytes = reader.read_slice(out.len() * 4)?;
-    for (i, slot) in out.iter_mut().enumerate() {
-        let chunk = &bytes[i * 4..i * 4 + 4];
-        *slot = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-    }
-    Ok(())
-}
-
-fn read_i8_into(reader: &mut ByteReader, out: &mut [i8]) -> Result<(), NnueError> {
-    let bytes = reader.read_slice(out.len())?;
-    for (i, slot) in out.iter_mut().enumerate() {
-        *slot = bytes[i] as i8;
-    }
-    Ok(())
-}
-
-struct ByteReader<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> ByteReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, pos: 0 }
-    }
-
-    fn read_slice(&mut self, n: usize) -> Result<&'a [u8], NnueError> {
-        let end = self
-            .pos
-            .checked_add(n)
-            .ok_or_else(|| NnueError::InvalidFormat {
-                reason: "read offset overflows usize".to_string(),
-            })?;
-        if end > self.bytes.len() {
-            return Err(NnueError::SizeMismatch {
-                expected: end,
-                got: self.bytes.len(),
-            });
-        }
-        let s = &self.bytes[self.pos..end];
-        self.pos = end;
-        Ok(s)
-    }
-
-    fn read_u32_le(&mut self) -> Result<u32, NnueError> {
-        let s = self.read_slice(4)?;
-        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-    }
-
-    fn assert_eof(&self) -> Result<(), NnueError> {
-        if self.pos != self.bytes.len() {
-            Err(NnueError::SizeMismatch {
-                expected: self.pos,
-                got: self.bytes.len(),
-            })
-        } else {
-            Ok(())
-        }
-    }
-}
-
-mod sha256 {
-    const K: [u32; 64] = [
-        0x428a_2f98,
-        0x7137_4491,
-        0xb5c0_fbcf,
-        0xe9b5_dba5,
-        0x3956_c25b,
-        0x59f1_11f1,
-        0x923f_82a4,
-        0xab1c_5ed5,
-        0xd807_aa98,
-        0x1283_5b01,
-        0x2431_85be,
-        0x550c_7dc3,
-        0x72be_5d74,
-        0x80de_b1fe,
-        0x9bdc_06a7,
-        0xc19b_f174,
-        0xe49b_69c1,
-        0xefbe_4786,
-        0x0fc1_9dc6,
-        0x240c_a1cc,
-        0x2de9_2c6f,
-        0x4a74_84aa,
-        0x5cb0_a9dc,
-        0x76f9_88da,
-        0x983e_5152,
-        0xa831_c66d,
-        0xb003_27c8,
-        0xbf59_7fc7,
-        0xc6e0_0bf3,
-        0xd5a7_9147,
-        0x06ca_6351,
-        0x1429_2967,
-        0x27b7_0a85,
-        0x2e1b_2138,
-        0x4d2c_6dfc,
-        0x5338_0d13,
-        0x650a_7354,
-        0x766a_0abb,
-        0x81c2_c92e,
-        0x9272_2c85,
-        0xa2bf_e8a1,
-        0xa81a_664b,
-        0xc24b_8b70,
-        0xc76c_51a3,
-        0xd192_e819,
-        0xd699_0624,
-        0xf40e_3585,
-        0x106a_a070,
-        0x19a4_c116,
-        0x1e37_6c08,
-        0x2748_774c,
-        0x34b0_bcb5,
-        0x391c_0cb3,
-        0x4ed8_aa4a,
-        0x5b9c_ca4f,
-        0x682e_6ff3,
-        0x748f_82ee,
-        0x78a5_636f,
-        0x84c8_7814,
-        0x8cc7_0208,
-        0x90be_fffa,
-        0xa450_6ceb,
-        0xbef9_a3f7,
-        0xc671_78f2,
-    ];
-
-    const INIT: [u32; 8] = [
-        0x6a09_e667,
-        0xbb67_ae85,
-        0x3c6e_f372,
-        0xa54f_f53a,
-        0x510e_527f,
-        0x9b05_688c,
-        0x1f83_d9ab,
-        0x5be0_cd19,
-    ];
-
-    pub fn digest(data: &[u8]) -> [u8; 32] {
-        let mut h = INIT;
-        let bit_len: u64 = (data.len() as u64).wrapping_mul(8);
-
-        let full_blocks = data.len() / 64;
-        for i in 0..full_blocks {
-            let mut block = [0u8; 64];
-            block.copy_from_slice(&data[i * 64..(i + 1) * 64]);
-            compress(&mut h, &block);
-        }
-
-        let remainder = &data[full_blocks * 64..];
-        let mut tail = [0u8; 128];
-        tail[..remainder.len()].copy_from_slice(remainder);
-        tail[remainder.len()] = 0x80;
-        if remainder.len() < 56 {
-            tail[56..64].copy_from_slice(&bit_len.to_be_bytes());
-            let mut block = [0u8; 64];
-            block.copy_from_slice(&tail[..64]);
-            compress(&mut h, &block);
-        } else {
-            tail[120..128].copy_from_slice(&bit_len.to_be_bytes());
-            let mut b1 = [0u8; 64];
-            b1.copy_from_slice(&tail[..64]);
-            compress(&mut h, &b1);
-            let mut b2 = [0u8; 64];
-            b2.copy_from_slice(&tail[64..128]);
-            compress(&mut h, &b2);
-        }
-
-        let mut out = [0u8; 32];
-        for (i, word) in h.iter().enumerate() {
-            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
-        }
-        out
-    }
-
-    fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
-        let mut w = [0u32; 64];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([
-                block[i * 4],
-                block[i * 4 + 1],
-                block[i * 4 + 2],
-                block[i * 4 + 3],
-            ]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
-        for i in 0..64 {
-            let big_s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ (!e & g);
-            let temp1 = hh
-                .wrapping_add(big_s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let big_s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = big_s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
-    }
+/// The identity fields of the network file `bytes`, without laying its
+/// parameters out.
+pub fn source_header(bytes: &[u8], dims: &NetDims) -> Result<NetHeader, NnueError> {
+    convert(bytes, dims)
+        .map(|converted| converted.net)
+        .map_err(|reason| NnueError::InvalidFormat { reason })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nnue_source::{
+        ARCH_STRING, FT_HASH, LEB128_MAGIC, NET_HASH, NNUE_HASH_VALUE, NNUE_VERSION,
+        SECTION_HASH_WARNING,
+    };
 
     const TEST_DIMS: NetDims = NetDims {
         hidden_size: 4,
@@ -568,7 +186,7 @@ mod tests {
     fn valid_header_round_trips() {
         let bytes = build_valid_bytes(&TEST_DIMS, ARCH_STRING);
         let (net, warnings) =
-            parse_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).expect("should parse");
+            network_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).expect("should parse");
         assert!(
             warnings.is_empty(),
             "clean file must not warn: {warnings:?}"
@@ -608,7 +226,7 @@ mod tests {
         // different one loads cleanly.
         let bytes = build_valid_bytes(&TEST_DIMS, "SFNNwoP1024");
         let (net, warnings) =
-            parse_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).expect("should parse");
+            network_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).expect("should parse");
         assert!(
             warnings.is_empty(),
             "arch difference must not warn: {warnings:?}"
@@ -622,7 +240,7 @@ mod tests {
         // Raw, non-UTF-8 arch bytes are rendered lossily and never rejected.
         let bytes = build_valid_bytes_arch(&TEST_DIMS, &[0xFF, 0xFE, 0x00, 0x80]);
         let (net, warnings) =
-            parse_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).expect("should parse");
+            network_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).expect("should parse");
         assert!(
             warnings.is_empty(),
             "arch bytes must not warn: {warnings:?}"
@@ -639,24 +257,27 @@ mod tests {
     fn short_read_is_rejected() {
         let bytes = build_valid_bytes(&TEST_DIMS, ARCH_STRING);
         let truncated = &bytes[..bytes.len() - 5];
-        let err = parse_from_bytes(truncated, &TEST_DIMS, [0u8; 32]).unwrap_err();
-        assert!(
-            matches!(err, NnueError::SizeMismatch { .. }),
-            "expected SizeMismatch, got {:?}",
-            err
-        );
+        let err = network_from_bytes(truncated, &TEST_DIMS, [0u8; 32]).unwrap_err();
+        match err {
+            NnueError::InvalidFormat { reason } => assert!(
+                reason.contains("unexpected size"),
+                "expected a size complaint, got: {reason}"
+            ),
+            other => panic!("expected InvalidFormat, got {other:?}"),
+        }
     }
 
     #[test]
     fn oversize_trailer_is_rejected() {
         let mut bytes = build_valid_bytes(&TEST_DIMS, ARCH_STRING);
         bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
-        let err = parse_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).unwrap_err();
+        let err = network_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).unwrap_err();
         match err {
-            NnueError::SizeMismatch { expected, got } => {
-                assert_eq!(got, expected + 3);
-            }
-            other => panic!("expected SizeMismatch, got {:?}", other),
+            NnueError::InvalidFormat { reason } => assert!(
+                reason.contains("unexpected size"),
+                "expected a size complaint, got: {reason}"
+            ),
+            other => panic!("expected InvalidFormat, got {other:?}"),
         }
     }
 
@@ -664,7 +285,7 @@ mod tests {
     fn wrong_version_is_hard_rejected_with_reference_message() {
         let mut bytes = build_valid_bytes(&TEST_DIMS, ARCH_STRING);
         bytes[..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
-        let err = parse_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).unwrap_err();
+        let err = network_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).unwrap_err();
         match err {
             NnueError::InvalidFormat { reason } => {
                 assert!(
@@ -673,7 +294,7 @@ mod tests {
                     "expected the reference version-mismatch message shape, got: {reason}"
                 );
             }
-            other => panic!("expected InvalidFormat, got {:?}", other),
+            other => panic!("expected InvalidFormat, got {other:?}"),
         }
     }
 
@@ -682,7 +303,8 @@ mod tests {
         let mut bytes = build_valid_bytes(&TEST_DIMS, ARCH_STRING);
         // The top-level hash sits right after the 4-byte version.
         bytes[4..8].copy_from_slice(&0x1234_5678u32.to_le_bytes());
-        let (net, warnings) = parse_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).expect("should load");
+        let (net, warnings) =
+            network_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).expect("should load");
         // Exactly one warning: the file-level hash mismatch, naming both arches.
         assert_eq!(
             warnings.len(),
@@ -711,7 +333,8 @@ mod tests {
         // ft_hash follows version(4) + hash(4) + arch_size(4) + arch bytes.
         let ft_hash_pos = 12 + ARCH_STRING.len();
         bytes[ft_hash_pos..ft_hash_pos + 4].copy_from_slice(&0x0BAD_F00Du32.to_le_bytes());
-        let (net, warnings) = parse_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).expect("should load");
+        let (net, warnings) =
+            network_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).expect("should load");
         assert_eq!(warnings, vec![SECTION_HASH_WARNING.to_string()]);
         assert_eq!(net.stacks.len(), TEST_DIMS.layer_stacks);
     }
@@ -726,7 +349,8 @@ mod tests {
             LEB128_MAGIC.len() + 4 + TEST_DIMS.hidden_size * TEST_DIMS.num_features;
         let net_hash_pos = 12 + ARCH_STRING.len() + 4 + ft_bias_block + ft_weight_block;
         bytes[net_hash_pos..net_hash_pos + 4].copy_from_slice(&0x0BAD_CAFEu32.to_le_bytes());
-        let (net, warnings) = parse_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).expect("should load");
+        let (net, warnings) =
+            network_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).expect("should load");
         assert_eq!(warnings, vec![SECTION_HASH_WARNING.to_string()]);
         assert_eq!(net.stacks.len(), TEST_DIMS.layer_stacks);
     }
@@ -736,11 +360,10 @@ mod tests {
         let mut bytes = build_valid_bytes(&TEST_DIMS, ARCH_STRING);
         let magic_start = 12 + ARCH_STRING.len() + 4;
         bytes[magic_start] = b'X';
-        let err = parse_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).unwrap_err();
+        let err = network_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).unwrap_err();
         assert!(
             matches!(err, NnueError::InvalidFormat { .. }),
-            "expected InvalidFormat, got {:?}",
-            err
+            "expected InvalidFormat, got {err:?}"
         );
     }
 
@@ -755,7 +378,7 @@ mod tests {
 
         let bytes = build_bytes_with_ft(&SCALE_DIMS, ARCH_STRING, &biases, &weights);
         let (net, _warnings) =
-            parse_from_bytes(&bytes, &SCALE_DIMS, [0u8; 32]).expect("should parse");
+            network_from_bytes(&bytes, &SCALE_DIMS, [0u8; 32]).expect("should parse");
 
         let expected_row: [i16; 5] = [0, 2, -2, 32_766, -32_768];
         assert_eq!(&*net.ft_biases, &expected_row[..]);
@@ -771,60 +394,45 @@ mod tests {
         let weights = vec![0i16; SCALE_DIMS.hidden_size * SCALE_DIMS.num_features];
 
         let bytes = build_bytes_with_ft(&SCALE_DIMS, ARCH_STRING, &biases, &weights);
-        let err = parse_from_bytes(&bytes, &SCALE_DIMS, [0u8; 32]).unwrap_err();
+        let err = network_from_bytes(&bytes, &SCALE_DIMS, [0u8; 32]).unwrap_err();
 
         match err {
             NnueError::InvalidFormat { reason } => {
                 assert!(
                     reason.contains("16384"),
-                    "expected message to name the offending value, got: {}",
-                    reason
+                    "expected message to name the offending value, got: {reason}"
                 );
                 assert!(
                     reason.contains("out of range") || reason.contains("overflow"),
-                    "expected message to mention overflow / out-of-range, got: {}",
-                    reason
+                    "expected message to mention overflow / out-of-range, got: {reason}"
                 );
             }
-            other => panic!("expected InvalidFormat, got {:?}", other),
+            other => panic!("expected InvalidFormat, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn leb128_decoder_handles_boundary_values() {
-        // signed-LEB128 stream: { -1, 0, 1, 127, -128 }
-        let payload = [0x7F, 0x00, 0x01, 0xFF, 0x00, 0x80, 0x7F];
-        let mut pos = 0usize;
-        let mut decoded = Vec::new();
-        for _ in 0..5 {
-            decoded.push(read_signed_leb128(&payload, &mut pos).unwrap());
-        }
-        assert_eq!(decoded, vec![-1, 0, 1, 127, -128]);
-        assert_eq!(pos, payload.len());
     }
 
     #[test]
     fn sha256_matches_nist_empty_vector() {
-        let digest = sha256::digest(b"");
-        let expected =
-            hex_decode("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-        assert_eq!(digest, expected);
+        assert_eq!(
+            sha256(b""),
+            hex_decode("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
     }
 
     #[test]
     fn sha256_matches_nist_abc_vector() {
-        let digest = sha256::digest(b"abc");
-        let expected =
-            hex_decode("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-        assert_eq!(digest, expected);
+        assert_eq!(
+            sha256(b"abc"),
+            hex_decode("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
     }
 
     #[test]
     fn sha256_matches_nist_long_vector() {
-        let digest = sha256::digest(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
-        let expected =
-            hex_decode("248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
-        assert_eq!(digest, expected);
+        assert_eq!(
+            sha256(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            hex_decode("248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+        );
     }
 
     fn hex_decode(s: &str) -> [u8; 32] {

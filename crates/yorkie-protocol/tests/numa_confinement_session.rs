@@ -15,6 +15,7 @@
 mod common;
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use common::stage_configured_eval_dir;
@@ -40,10 +41,13 @@ fn compiled_cpus() -> BTreeSet<usize> {
         .collect()
 }
 
-/// Drive a session as a process allowed on `cpus` alone.
-fn drive_confined(input: &str, cpus: BTreeSet<usize>) -> String {
+/// Drive a session as a process allowed on `cpus` alone, against the network
+/// `eval_root` holds.
+fn drive_confined(input: &str, cpus: BTreeSet<usize>, eval_root: PathBuf) -> String {
     let output = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let driver = UsiDriver::new(input.as_bytes(), Arc::clone(&output)).with_startup_affinity(cpus);
+    let driver = UsiDriver::new(input.as_bytes(), Arc::clone(&output))
+        .with_startup_affinity(cpus)
+        .with_eval_root(eval_root);
     driver.run().expect("driver run");
     String::from_utf8(output.lock().expect("output lock").clone()).expect("utf-8")
 }
@@ -60,8 +64,13 @@ fn a_confined_start_is_refused_only_where_the_plan_pins_a_worker() {
         return;
     }
 
-    stage_configured_eval_dir();
-    let out = drive_confined("isready\nquit\n", narrowed);
+    let staged = stage_configured_eval_dir();
+    let eval_root = staged
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("the staged network sits under <root>/<eval_dir>")
+        .to_path_buf();
+    let out = drive_confined("isready\nquit\n", narrowed, eval_root);
 
     if compiled_plan_binds() {
         assert!(

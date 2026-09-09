@@ -1,10 +1,10 @@
 //! Shared helpers for the tests that spawn the built `yorkie` binary.
 //!
-//! `EvalDir` is a compile-time constant — no build has a runtime option surface,
-//! so a test cannot tell a spawned engine where its network is. It chooses the
-//! engine's *working directory* instead: a fixture root under the workspace
-//! `target/` directory whose `<EvalDir>` entry links to the real network
-//! directory, which is exactly where the engine's relative `EvalDir` resolves.
+//! A spawned engine reads the evaluation file the build laid out for it, beside
+//! the binary, and no build has a runtime option surface to point it anywhere
+//! else. So there is nothing for a test to stage: what it can ask is whether
+//! that file is there at all, which it is exactly when a network was staged
+//! when this build ran.
 
 #![allow(dead_code)]
 
@@ -30,40 +30,41 @@ pub fn require_test_config() {
     assert_eq!(config::PV_INTERVAL, 0, "{WRONG_CONFIG}");
 }
 
-/// Where the real (never-committed) SFNN-1536 network is staged.
-pub fn eval_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../eval")
+/// The evaluation file a spawned engine reads: the compiled-in `eval_dir`,
+/// resolved against the binary's own directory.
+pub fn engine_network_path() -> PathBuf {
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_yorkie"));
+    let dir = exe
+        .parent()
+        .expect("the engine binary lives under <target>/<profile>");
+    yorkie_eval::network_file::network_path(dir)
 }
 
-/// A working directory for a spawned engine whose compiled-in `EvalDir` resolves
-/// to `src`. Idempotent and safe to call concurrently: every caller names the
-/// same root and wants the same link target.
-pub fn engine_cwd_with_eval_dir(src: &Path) -> PathBuf {
-    let root = fixture_root();
-    std::fs::create_dir_all(&root).expect("create fixture root");
-    let link = root.join(yorkie_protocol::config::EVAL_DIR);
-    let src = src.canonicalize().expect("real eval dir resolves");
-    if std::fs::read_link(&link).ok().as_deref() != Some(src.as_path()) {
-        // Losing the race against another test binary is fine: the winner made
-        // the same link.
-        let _ = std::os::unix::fs::symlink(&src, &link);
-    }
-    assert_eq!(
-        std::fs::read_link(&link).ok().as_deref(),
-        Some(src.as_path()),
-        "the fixture root's EvalDir must link to the network directory"
-    );
-    root
+/// Whether this build had a network to convert, and so whether a spawned engine
+/// can answer `readyok`.
+///
+/// The network is staged out-of-band and never committed, so a fresh checkout
+/// has none; a test that needs one reports that and passes.
+pub fn engine_has_network() -> bool {
+    engine_network_path().is_file()
 }
 
-/// `<workspace target>/yorkie-engine-cwd`, derived from the test executable's own
-/// path (`<target>/<profile>/deps/<name>-<hash>`) so it follows
-/// `CARGO_TARGET_DIR` wherever it points.
-fn fixture_root() -> PathBuf {
+/// A scratch working directory for a spawned engine, under the workspace
+/// `target/` directory. Derived from the test executable's own path
+/// (`<target>/<profile>/deps/<name>-<hash>`) so it follows `CARGO_TARGET_DIR`
+/// wherever it points.
+///
+/// Where the engine reads its network from no longer depends on this — it reads
+/// what sits beside the binary — so this is only for the tests that watch what
+/// the engine does, or does not do, with the files in its working directory.
+pub fn engine_cwd() -> PathBuf {
     let exe = std::env::current_exe().expect("test executable path");
-    exe.parent()
+    let root = exe
+        .parent()
         .and_then(Path::parent)
         .and_then(Path::parent)
         .expect("test executable lives under <target>/<profile>/deps")
-        .join("yorkie-engine-cwd")
+        .join("yorkie-engine-cwd");
+    std::fs::create_dir_all(&root).expect("create the engine working directory");
+    root
 }

@@ -4,12 +4,15 @@
 //! prefix, evaluates with the real network, and asserts **exact** equality with
 //! the recorded value.
 //!
-//! The network file is staged locally and never committed, so when it is absent
-//! the test prints a notice and passes.
+//! The network read is the one the engine plays with — the file the build laid
+//! out for the kernels. A checkout with no network staged has none, and the
+//! test prints a notice and passes.
 
 use std::path::{Path, PathBuf};
 
-use yorkie_eval::{Backend, NnueNetwork, active_backend, evaluate, load_network};
+use yorkie_eval::{Backend, active_backend, evaluate};
+
+mod common;
 use yorkie_state::{Position, parse_sfen, parse_usi_move};
 
 /// Exact match: a single point of divergence is a failure, not a warning.
@@ -19,10 +22,6 @@ fn workspace_relative(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join(rel)
-}
-
-fn nn_bin_path() -> PathBuf {
-    workspace_relative("eval/nn.bin")
 }
 
 fn fixtures_dir() -> PathBuf {
@@ -148,16 +147,9 @@ fn assert_simd_path_selected() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn eval_fixtures_match_reference_exactly() {
-    let nn_bin = nn_bin_path();
-    if !nn_bin.exists() {
-        eprintln!(
-            "skipping eval_fixtures_match_reference_exactly: {} is not present (obtained out-of-band)",
-            nn_bin.display()
-        );
+    let Some(net) = common::engine_network() else {
         return;
-    }
-
-    let net: NnueNetwork = load_network(&nn_bin).expect("real nn.bin should load and validate");
+    };
 
     // Without this the suite could silently exercise only the scalar path.
     assert_simd_path_selected();

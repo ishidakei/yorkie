@@ -38,7 +38,15 @@ threads = 4
 # without it the root search is single-line and only `1` builds.
 multi_pv = 1
 
-# Directory holding `nn.bin` (`EvalDir`).
+# Directory holding the source network `nn.bin`, which the build reads once and
+# converts into the file the engine plays with. Relative paths are taken from
+# the repository root. Nothing at run time opens this directory.
+original_eval_dir = "eval"
+
+# Directory the engine reads its evaluation file from (`EvalDir`), and the
+# directory the build writes that file into. Relative paths are taken from the
+# directory the engine binary sits in, so moving the binary somewhere else means
+# taking this directory along with it.
 eval_dir = "eval"
 
 # NNUE fixed-point output scale (`FV_SCALE`).

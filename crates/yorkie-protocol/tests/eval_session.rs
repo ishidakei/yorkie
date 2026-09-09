@@ -1,10 +1,10 @@
 //! Driver-level session tests against a **synthetic** SFNN-1536 network.
 //!
-//! These are hermetic: they build a byte-for-byte valid `nn.bin` at the location
-//! this build's compiled-in `EvalDir` names and drive a full session in-process,
-//! so they run everywhere, not just where the real network is staged. `EvalDir`
-//! cannot be pointed anywhere at run time, so the staging works the other way
-//! round — see [`common::stage_configured_eval_dir`].
+//! These are hermetic: they write an evaluation file this build accepts into a
+//! directory of their own and drive a full session in-process against it, so
+//! they run everywhere, not just where the real network is staged. `eval_dir`
+//! cannot be pointed anywhere at run time, so what a test chooses is the
+//! directory it resolves against — see [`common::stage_configured_eval_dir`].
 //!
 //! The synthetic network is all zeros, so every position evaluates to the same
 //! constant and the chosen move is fully deterministic. That lets the tests
@@ -21,7 +21,7 @@
 
 mod common;
 
-use common::{NOISY_EVALUATION, evaluation_is_noise_free, stage_configured_eval_dir};
+use common::{NOISY_EVALUATION, drive, evaluation_is_noise_free, stage_configured_eval_dir};
 use yorkie_protocol::{UsiDriver, config};
 use yorkie_search::{QSearch, RootKind, RootOutcome, Search};
 use yorkie_state::{Move, Position, format_usi_move, parse_sfen, parse_usi_move};
@@ -47,14 +47,6 @@ fn bestmove_usi(outcome: &RootOutcome) -> String {
         RootKind::DeclarationWin => "win".to_string(),
         RootKind::Normal => format_usi_move(outcome.best_move),
     }
-}
-
-fn drive(input: &str) -> String {
-    let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let driver = UsiDriver::new(input.as_bytes(), std::sync::Arc::clone(&output));
-    driver.run().expect("driver run");
-    let bytes = output.lock().expect("output lock").clone();
-    String::from_utf8(bytes).expect("utf-8")
 }
 
 fn legal_moves(p: &Position) -> Vec<Move> {
@@ -86,7 +78,8 @@ fn synthetic_network_session_matches_direct_search_choice() {
     // frees before the driver session loads its own.
     let startpos = parse_sfen(yorkie_state::STARTPOS_SFEN).expect("startpos SFEN");
     let expected_usi = {
-        let search = Search::from_network_file(&path).expect("synthetic network loads");
+        let (search, _warnings) =
+            Search::map_evaluation_file(&path).expect("the synthetic network opens");
         let outcome = QSearch::new(search.network(), cleared_tt()).run_root(&startpos, 1);
         bestmove_usi(&outcome)
     };
@@ -139,13 +132,20 @@ fn synthetic_network_session_matches_direct_search_choice() {
 #[test]
 fn isready_keep_alive_emits_bare_newline_during_heavy_load() {
     // With a very short injected poll interval, the real heavy work here — the
-    // `nn.bin` load and the TT sizing — spans many keep-alive ticks and reliably
+    // evaluation file's opening and the book load — spans many keep-alive ticks
+    // and reliably
     // emits at least one bare newline before `readyok`.
-    stage_configured_eval_dir();
+    let staged = stage_configured_eval_dir();
+    let eval_root = staged
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("the staged network sits under <root>/<eval_dir>")
+        .to_path_buf();
 
     let input = "usi\nisready\nquit\n".to_string();
     let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
     let driver = UsiDriver::new(input.as_bytes(), std::sync::Arc::clone(&output))
+        .with_eval_root(eval_root)
         .with_keep_alive_poll(std::time::Duration::from_micros(100));
     driver.run().expect("driver run");
     let out = String::from_utf8(output.lock().expect("output lock").clone()).expect("utf-8");
@@ -186,7 +186,7 @@ fn synthetic_network_reuse_reset_and_mate_resign() {
         eprintln!("{NOISY_EVALUATION}");
         return;
     }
-    let nn_bin = stage_configured_eval_dir();
+    let file = stage_configured_eval_dir();
 
     // A single load (one `isready`) serves all three `go`s below: this pins that
     // the loaded network is reused across positions without reloading.
@@ -200,7 +200,8 @@ fn synthetic_network_reuse_reset_and_mate_resign() {
     // (tt.clear) before `go` #2 (startpos). Scoped so the network frees before
     // the driver loads its own.
     let (expected_after_7g7f, expected_startpos) = {
-        let search = Search::from_network_file(&nn_bin).expect("synthetic network loads");
+        let (search, _warnings) =
+            Search::map_evaluation_file(&file).expect("the synthetic network opens");
         let tt = cleared_tt();
         let e1 = bestmove_usi(&QSearch::new(search.network(), tt).run_root(&post_7g7f, 1));
         tt.clear(); // usinewgame equivalent.

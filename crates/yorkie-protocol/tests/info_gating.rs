@@ -77,19 +77,23 @@ fn search_output_is_bestmove_only_below_verbose2() {
         // Two lines in this session are not about the search, and each is
         // counted on its own:
         //
-        //   - `isready` reports where it placed the transposition table. An
-        //     initialisation-phase line, so it is here in every build.
+        //   - `isready` reports where it placed the transposition table, and
+        //     where it put the evaluation network. Initialisation-phase lines,
+        //     so both are here in every build.
         //   - `verbose1` adds the per-reply statistics line before the
         //     `bestmove`, which reports what the process allocated.
         let placement: Vec<&&str> = infos
             .iter()
-            .filter(|l| l.starts_with("info string transposition table: "))
+            .filter(|l| {
+                l.starts_with("info string transposition table: ")
+                    || l.starts_with("info string evaluation network: ")
+            })
             .collect();
         assert_eq!(
             placement.len(),
-            1,
-            "`isready` reports the table's placement in every build, \
-             got {infos:?} in:\n{out}"
+            2,
+            "`isready` reports the table's and the network's placement in every \
+             build, got {infos:?} in:\n{out}"
         );
         // The line says what the table's pages were given: the node set the
         // compiled thread plan's workers run on, as one node the table prefers
@@ -104,6 +108,15 @@ fn search_output_is_bestmove_only_below_verbose2() {
                 || placement[0].contains("; process default policy;"),
             "the placement line says what the pages were given, got {:?} in:\n{out}",
             placement[0]
+        );
+        // The network's line says the same about its own memory: the one
+        // mapping every reader on a single-node machine shares, or the copy per
+        // node the workers read it from.
+        assert!(
+            placement[1].contains("; one shared mapping;")
+                || placement[1].contains("; one copy on "),
+            "the network line says where the parameters went, got {:?} in:\n{out}",
+            placement[1]
         );
         let stats: Vec<&&str> = infos
             .iter()

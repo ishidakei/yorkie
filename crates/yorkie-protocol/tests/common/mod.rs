@@ -1,18 +1,25 @@
-//! Shared harness for driver-level session tests: a synthetic (all-zero,
-//! format-valid) `nn.bin` builder, a temp-dir guard, an all-at-once `drive`,
-//! a `.ybb` writer, and a streaming input harness for async-hold tests.
+//! Shared harness for driver-level session tests: a synthetic (all-zero)
+//! evaluation file, a temp-dir guard, an all-at-once `drive`, a `.ybb` writer,
+//! and a streaming input harness for async-hold tests.
 //!
-//! The synthetic-network builder mirrors `yorkie-eval/src/loader.rs`, the format
-//! ground truth, and `yorkie-eval/src/types.rs`, the dimensions.
+//! The engine reads its parameters from an evaluation file the build laid out
+//! for the kernels, beside the binary. A test that wants a network of its own
+//! writes one — the header the engine checks, then an all-zero parameter region
+//! — and points the driver at the directory holding it. Nothing checks the
+//! parameters against the header, which is what makes a zero-weight network
+//! possible at all: it evaluates every position to the same value, which is
+//! what a session test pinning a transcript wants.
 
 #![allow(dead_code)]
 
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
+use yorkie_eval::network_file;
 use yorkie_protocol::UsiDriver;
 use yorkie_state::{Move, Position, parse_sfen, parse_usi_move, sfen_pack};
 
@@ -56,23 +63,14 @@ pub fn evaluation_is_noise_free() -> bool {
 pub const NOISY_EVALUATION: &str =
     "skipped: this build's per-game evaluation noise makes two games incomparable";
 
-// --- SFNN-1536 file-format constants (mirror yorkie-eval/src/loader.rs).
-const NNUE_VERSION: u32 = 0x7AF3_2F16;
-const NNUE_HASH_VALUE: u32 = 0x3C20_3B32;
-const FT_HASH: u32 = 0x5F13_4AB8;
-const NET_HASH: u32 = 0x6333_718A;
-const LEB128_MAGIC: &[u8; 17] = b"COMPRESSED_LEB128";
+/// The architecture string a clean network file carries — the one the source
+/// reader renders into its hash-mismatch warning, and the one this harness's
+/// synthetic header claims so no such warning is produced.
 const ARCH_STRING: &str = "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm(Friend)[73305->1536x2],Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-15](ClippedReLU[15](AffineTransform[15<-3072](InputSlice[3072(0:3072)]))))){LayerStack=9}";
 
-const HIDDEN_SIZE: usize = 1_536;
-const NUM_FEATURES: usize = 73_305;
-const LAYER_STACKS: usize = 9;
-const FC_0_OUTPUT: usize = 16;
-const FC_0_PADDED_INPUT: usize = 1_536;
-const FC_1_OUTPUT: usize = 32;
-const FC_1_PADDED_INPUT: usize = 32;
-const FC_2_OUTPUT: usize = 1;
-const FC_2_PADDED_INPUT: usize = 32;
+/// The source network file's version word and hash for a clean file.
+const NNUE_VERSION: u32 = 0x7AF3_2F16;
+const NNUE_HASH_VALUE: u32 = 0x3C20_3B32;
 
 /// A temp directory removed on drop.
 pub struct TempDir {
@@ -103,41 +101,42 @@ impl Drop for TempDir {
     }
 }
 
-fn build_zero_network_bytes() -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&NNUE_VERSION.to_le_bytes());
-    out.extend_from_slice(&NNUE_HASH_VALUE.to_le_bytes());
-    out.extend_from_slice(&(ARCH_STRING.len() as u32).to_le_bytes());
-    out.extend_from_slice(ARCH_STRING.as_bytes());
-    out.extend_from_slice(&FT_HASH.to_le_bytes());
-    append_zero_leb128_block(&mut out, HIDDEN_SIZE);
-    append_zero_leb128_block(&mut out, HIDDEN_SIZE * NUM_FEATURES);
-    for _ in 0..LAYER_STACKS {
-        out.extend_from_slice(&NET_HASH.to_le_bytes());
-        append_zeros(&mut out, FC_0_OUTPUT * 4);
-        append_zeros(&mut out, FC_0_OUTPUT * FC_0_PADDED_INPUT);
-        append_zeros(&mut out, FC_1_OUTPUT * 4);
-        append_zeros(&mut out, FC_1_OUTPUT * FC_1_PADDED_INPUT);
-        append_zeros(&mut out, FC_2_OUTPUT * 4);
-        append_zeros(&mut out, FC_2_OUTPUT * FC_2_PADDED_INPUT);
+/// The header of an evaluation file this build accepts: the layout, the source
+/// and the target features it was made for, all as compiled in.
+fn synthetic_header() -> network_file::Header {
+    network_file::Header {
+        layout_version: network_file::LAYOUT_VERSION,
+        source: network_file::SOURCE,
+        target_features: network_file::TARGET_FEATURES.to_string(),
+        dims: network_file::NetDims::STANDARD,
+        data_bytes: network_file::DATA_BYTES as u64,
+        net: yorkie_eval::NetHeader {
+            version: NNUE_VERSION,
+            hash: NNUE_HASH_VALUE,
+            arch_id: ARCH_STRING.to_string(),
+        },
+        warnings: Vec::new(),
     }
-    out
 }
 
-fn append_zero_leb128_block(out: &mut Vec<u8>, count: usize) {
-    out.extend_from_slice(LEB128_MAGIC);
-    out.extend_from_slice(&(count as u32).to_le_bytes());
-    out.resize(out.len() + count, 0);
+/// Write an evaluation file with all-zero parameters at `path`.
+///
+/// The parameter region is a hole rather than a few hundred mebibytes of
+/// written zeros: the file system reads a hole back as zeros, which is exactly
+/// the network wanted.
+fn write_synthetic_evaluation_file(path: &Path) {
+    use std::io::Write as _;
+    let encoded = synthetic_header().encode();
+    let mut file = std::fs::File::create(path).expect("create the evaluation file");
+    file.write_all(&encoded).expect("write the header");
+    file.set_len((network_file::DATA_OFFSET + network_file::DATA_BYTES) as u64)
+        .expect("size the parameter region");
 }
 
-fn append_zeros(out: &mut Vec<u8>, n: usize) {
-    out.resize(out.len() + n, 0);
-}
-
-/// Write a synthetic `nn.bin` into `dir` and return its path.
-pub fn write_synthetic_nn_bin(dir: &Path) -> PathBuf {
-    let path = dir.join("nn.bin");
-    std::fs::write(&path, build_zero_network_bytes()).expect("write nn.bin");
+/// Write a synthetic evaluation file into `dir` and return its path.
+pub fn write_synthetic_evaluation_file_in(dir: &Path) -> PathBuf {
+    let path = dir.join(network_file::FILE_NAME);
+    write_synthetic_evaluation_file(&path);
     path
 }
 
@@ -149,8 +148,9 @@ pub fn write_synthetic_nn_bin(dir: &Path) -> PathBuf {
 /// [`drive_with_seed`].
 pub fn drive(input: &str) -> String {
     let output = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let driver = UsiDriver::new(input.as_bytes(), Arc::clone(&output));
-    driver.run().expect("driver run");
+    driver(input.as_bytes(), Arc::clone(&output), None)
+        .run()
+        .expect("driver run");
     let bytes = output.lock().expect("output lock").clone();
     String::from_utf8(bytes).expect("utf-8")
 }
@@ -163,72 +163,95 @@ pub const TEST_BOOK_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 /// selection (and `rtime`) is reproducible.
 pub fn drive_with_seed(input: &str, book_seed: u64) -> String {
     let output = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let driver = UsiDriver::with_book_seed(input.as_bytes(), Arc::clone(&output), book_seed);
-    driver.run().expect("driver run");
+    driver(input.as_bytes(), Arc::clone(&output), Some(book_seed))
+        .run()
+        .expect("driver run");
     let bytes = output.lock().expect("output lock").clone();
     String::from_utf8(bytes).expect("utf-8")
 }
 
-/// Put the synthetic network where this build will look for it, and return its
-/// path.
+/// The directory every driver this harness builds resolves `eval_dir` against,
+/// once a test has staged a network. Unset until then, which is the state the
+/// tests that need the engine to find *no* network rely on.
+static EVAL_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Put a synthetic network where a driver this harness builds will look for it,
+/// and return its path.
 ///
-/// `EvalDir` is a compile-time constant, so a test cannot point the engine at a
-/// temp directory; it points the *process* at one instead, making a fixture root
-/// the working directory so a relative `EvalDir` resolves inside it.
+/// `eval_dir` is a compile-time constant and no build has an option surface, so
+/// what a test chooses is the directory that constant resolves against — the
+/// running executable's own directory in the engine, and whatever a test names
+/// here in a session it drives itself.
 ///
 /// Safe to call from every test in a binary and from several at once: every
-/// caller names the same directory and writes the same bytes, the write is an
-/// atomic rename from a unique temporary, and a staged file is reused. Tests
-/// that need the engine to find *no* network simply never call this.
+/// caller names the same directory and writes the same file, the write is an
+/// atomic rename from a unique temporary, and a staged file is reused.
 ///
-/// The fixture root lives under `target/` so the large all-zero network is
-/// written once across runs, and `cargo clean` takes it away.
+/// The fixture root lives under `target/`, so the file is written once across
+/// runs and `cargo clean` takes it away.
 pub fn stage_configured_eval_dir() -> PathBuf {
     let root = fixture_root("synthetic");
     let eval_dir = root.join(yorkie_protocol::config::EVAL_DIR);
     std::fs::create_dir_all(&eval_dir).expect("create fixture eval dir");
-    let nn_bin = eval_dir.join("nn.bin");
-    let bytes = build_zero_network_bytes();
-    let staged = std::fs::metadata(&nn_bin).is_ok_and(|m| m.len() == bytes.len() as u64);
+    let file = eval_dir.join(network_file::FILE_NAME);
+    let expected = (network_file::DATA_OFFSET + network_file::DATA_BYTES) as u64;
+    let staged = std::fs::metadata(&file).is_ok_and(|m| m.len() == expected);
     if !staged {
         // Unique temporary + rename: a concurrent staging attempt from another
         // test in this process (or another test binary) either sees no file or
         // sees the complete one, never a half-written one.
         static CTR: AtomicU32 = AtomicU32::new(0);
         let tmp = eval_dir.join(format!(
-            "nn.bin.{}.{}",
+            "{}.{}.{}",
+            network_file::FILE_NAME,
             std::process::id(),
             CTR.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::write(&tmp, &bytes).expect("write synthetic nn.bin");
-        std::fs::rename(&tmp, &nn_bin).expect("publish synthetic nn.bin");
+        write_synthetic_evaluation_file(&tmp);
+        std::fs::rename(&tmp, &file).expect("publish the synthetic evaluation file");
     }
-    std::env::set_current_dir(&root).expect("enter the fixture root");
-    nn_bin
+    let _ = EVAL_ROOT.set(root);
+    file
 }
 
-/// Point the compiled-in `EvalDir` at an existing network directory, the same
-/// way [`stage_configured_eval_dir`] points it at the synthetic one: enter a
-/// fixture root whose `<EvalDir>` entry is a symlink to `src`.
+/// Point the drivers this harness builds at the evaluation file the build
+/// itself wrote — the network the engine plays with — and report whether there
+/// is one.
 ///
-/// For the tests that need the real `nn.bin`, which is staged outside the
-/// build tree and is too large to copy per run.
-pub fn stage_eval_dir_link(src: &Path) {
-    let root = fixture_root("linked");
-    std::fs::create_dir_all(&root).expect("create fixture root");
-    let link = root.join(yorkie_protocol::config::EVAL_DIR);
-    let src = src.canonicalize().expect("real eval dir resolves");
-    // Link only when it does not already name `src`; concurrent callers in other
-    // test binaries all want the same target, so losing the race is harmless.
-    if std::fs::read_link(&link).ok().as_deref() != Some(src.as_path()) {
-        let _ = std::os::unix::fs::symlink(&src, &link);
+/// For the tests that need the real network, which is staged outside the build
+/// tree and never committed.
+pub fn stage_engine_eval_root() -> bool {
+    let root = engine_eval_root();
+    let present = network_file::network_path(&root).is_file();
+    let _ = EVAL_ROOT.set(root);
+    present
+}
+
+/// The directory holding the binaries this build produced, which is where the
+/// build wrote the evaluation file: the test executable's parent's parent
+/// (`<target>/<profile>/deps/<name>-<hash>`).
+pub fn engine_eval_root() -> PathBuf {
+    let exe = std::env::current_exe().expect("test executable path");
+    exe.parent()
+        .and_then(Path::parent)
+        .expect("a test executable lives under <target>/<profile>/deps")
+        .to_path_buf()
+}
+
+/// Build a driver over `reader`, pointed at whatever network this test staged.
+fn driver<R: BufRead>(
+    reader: R,
+    output: Arc<Mutex<Vec<u8>>>,
+    book_seed: Option<u64>,
+) -> UsiDriver<R, Vec<u8>> {
+    let driver = match book_seed {
+        Some(seed) => UsiDriver::with_book_seed(reader, output, seed),
+        None => UsiDriver::new(reader, output),
+    };
+    match EVAL_ROOT.get() {
+        Some(root) => driver.with_eval_root(root.clone()),
+        None => driver,
     }
-    assert_eq!(
-        std::fs::read_link(&link).ok().as_deref(),
-        Some(src.as_path()),
-        "the fixture root's EvalDir must link to the real network directory"
-    );
-    std::env::set_current_dir(&root).expect("enter the fixture root");
 }
 
 /// A fixture root under the workspace `target/` directory, one per `tag`.
@@ -424,12 +447,7 @@ impl StreamHarness {
                 pos: 0,
                 done: false,
             });
-            match book_seed {
-                Some(seed) => UsiDriver::with_book_seed(reader, out2, seed)
-                    .run()
-                    .expect("driver run"),
-                None => UsiDriver::new(reader, out2).run().expect("driver run"),
-            }
+            driver(reader, out2, book_seed).run().expect("driver run");
         });
         StreamHarness {
             tx,

@@ -54,7 +54,9 @@ fn startpos_choice_is_legal_deterministic_and_matches_full_refresh() {
         return;
     }
 
-    let search = Search::from_network_file(&path).expect("real nn.bin should load and validate");
+    let search = Search::new(
+        yorkie_eval::load_network(&path).expect("real nn.bin should load and validate"),
+    );
     let p = parse_sfen(STARTPOS).expect("valid startpos SFEN");
 
     let a = search.go(&p, &SearchLimits::default(), &mut NullInfoSink);

@@ -21,6 +21,7 @@ threads = 1
 # DIFFERENCE: 1 in test.toml. Three ranked PVs per iteration. `MultiPV` is
 # honoured with `verbose2`, so this file builds only with that feature.
 multi_pv = 3
+original_eval_dir = "eval"
 eval_dir = "eval"
 fv_scale = 16
 numa_policy = "auto"

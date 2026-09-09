@@ -9,9 +9,24 @@ publish = false
 yorkie-state = { path = "../yorkie-state" }
 yorkie-storage = { path = "../yorkie-storage" }
 
+# The build script converts the network into the layout the kernels read, and
+# needs the node count of the machine it runs on to size the memory the engine
+# reads it back from.
+[build-dependencies]
+yorkie-numa = { path = "../yorkie-numa" }
+
 [dev-dependencies]
 proptest = "~1.11"
 serde_json = "~1.0"
+
+[features]
+# Compile in the reader for the source network file (`nn.bin`). The engine
+# never reads one: its network is the kernel-layout file the build wrote, which
+# is why this is off in the build that plays. What needs it is the tooling that
+# holds the two against each other — the parity tests, which read the source
+# file the build converted and check the conversion — and the tests that build
+# a network in memory.
+source-network = []
 
 [lints]
 workspace = true

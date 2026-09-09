@@ -1,30 +1,19 @@
-//! Integration test: load the real SFNN-1536 `nn.bin` when it is present.
+//! Integration test: the evaluation file this build wrote holds a whole
+//! SFNN-1536 network, laid out the way the kernels read it.
 //!
-//! The network file is staged locally and never committed, so when it is absent
-//! the test prints a notice and passes.
+//! A checkout with no network staged has no such file, so the test prints a
+//! notice and passes.
 
-use std::path::PathBuf;
+use yorkie_eval::{HIDDEN_SIZE, LAYER_STACKS, NUM_FEATURES};
 
-use yorkie_eval::{HIDDEN_SIZE, LAYER_STACKS, NUM_FEATURES, load_network};
-
-/// Resolves the staged network path relative to the workspace root.
-fn nn_bin_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../eval/nn.bin")
-}
+mod common;
 
 #[cfg_attr(miri, ignore)]
 #[test]
-fn loads_real_network_if_present() {
-    let path = nn_bin_path();
-    if !path.exists() {
-        eprintln!(
-            "skipping loads_real_network_if_present: {} is not present (obtained out-of-band)",
-            path.display()
-        );
+fn the_evaluation_file_this_build_wrote_holds_the_whole_network() {
+    let Some(net) = common::engine_network() else {
         return;
-    }
-
-    let net = load_network(&path).expect("real nn.bin should load and validate");
+    };
 
     assert_eq!(net.stacks.len(), LAYER_STACKS, "layer-stack count");
     assert_eq!(net.ft_biases.len(), HIDDEN_SIZE, "ft bias count");

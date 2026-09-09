@@ -7,6 +7,11 @@ publish = false
 # Protocol layer: may import Search, Storage and State, never Evaluation
 # directly.
 [dependencies]
+# The Evaluation layer, for the evaluation file itself: where it is, how big the
+# memory holding it is, and which of the two ways of holding it the host the
+# build ran on calls for. The searching it feeds is reached through the Search
+# layer.
+yorkie-eval = { path = "../yorkie-eval" }
 yorkie-numa = { path = "../yorkie-numa" }
 yorkie-search = { path = "../yorkie-search" }
 yorkie-state = { path = "../yorkie-state" }

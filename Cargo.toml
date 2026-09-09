@@ -18,6 +18,15 @@ version = "3.1.0"
 [workspace.lints.clippy]
 mod_module_files = "warn"
 
+# Build scripts are optimised in every profile. One of them decodes the whole
+# network and lays it out for the kernels, which is a few hundred megabytes of
+# arithmetic: unoptimised, that turns a build into a coffee break, and the code
+# doing it ships in nothing.
+[profile.dev.build-override]
+opt-level = 2
+[profile.release.build-override]
+opt-level = 2
+
 # Fat LTO and a single codegen unit trade link time for run-time speed.
 # `panic = "abort"` matches the reference build, which is compiled
 # `-fno-exceptions -fno-rtti`: it strips unwind edges, cleanup landing pads and
