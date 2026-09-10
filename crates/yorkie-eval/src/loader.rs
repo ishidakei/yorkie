@@ -66,6 +66,7 @@ pub fn source_header(bytes: &[u8], dims: &NetDims) -> Result<NetHeader, NnueErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nnue_layout::LAYER_STACKS;
     use crate::nnue_source::{
         ARCH_STRING, FT_HASH, LEB128_MAGIC, NET_HASH, NNUE_HASH_VALUE, NNUE_VERSION,
         SECTION_HASH_WARNING,
@@ -74,7 +75,7 @@ mod tests {
     const TEST_DIMS: NetDims = NetDims {
         hidden_size: 4,
         num_features: 2,
-        layer_stacks: 1,
+        layer_stacks: LAYER_STACKS,
         fc_0_output: 2,
         fc_0_padded_input: 4,
         fc_1_output: 2,
@@ -173,7 +174,7 @@ mod tests {
     const SCALE_DIMS: NetDims = NetDims {
         hidden_size: 5,
         num_features: 2,
-        layer_stacks: 1,
+        layer_stacks: LAYER_STACKS,
         fc_0_output: 2,
         fc_0_padded_input: 5,
         fc_1_output: 2,
@@ -342,7 +343,7 @@ mod tests {
     #[test]
     fn wrong_net_hash_loads_with_section_warning() {
         let mut bytes = build_valid_bytes(&TEST_DIMS, ARCH_STRING);
-        // The single layer stack's `net_hash` is the last word before its
+        // The first layer stack's `net_hash` is the last word before its
         // parameter blocks.
         let ft_bias_block = LEB128_MAGIC.len() + 4 + TEST_DIMS.hidden_size;
         let ft_weight_block =

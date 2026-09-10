@@ -297,12 +297,11 @@ mod tests {
         NnueNetwork, NnueNetworkBuilder,
     };
 
-    /// A single-stack network (standard FC dims, tiny FT) whose lone stack the
-    /// caller fills through `fill`; returned by value so its arena outlives the
-    /// borrowed `&net.stacks[0]`.
+    /// A network (standard FC dims, tiny FT) whose first stack the caller fills
+    /// through `fill`; returned by value so its arena outlives the borrowed
+    /// `&net.stacks[0]`.
     fn stack_net(fill: impl FnOnce(&mut NnueNetworkBuilder)) -> NnueNetwork {
         let dims = NetDims {
-            layer_stacks: 1,
             num_features: 1,
             ..NetDims::STANDARD
         };

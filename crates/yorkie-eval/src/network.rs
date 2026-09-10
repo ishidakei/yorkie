@@ -213,26 +213,25 @@ mod tests {
         }
     }
 
-    /// A single-stack builder with the standard FC dims but a one-feature
-    /// transformer, so the FC forward pass runs without a 215 MiB allocation.
-    fn builder_1stack_std() -> NnueNetworkBuilder {
+    /// A builder with the standard FC dims but a one-feature transformer, so
+    /// the FC forward pass runs without a 215 MiB allocation.
+    fn builder_tiny_ft() -> NnueNetworkBuilder {
         let dims = NetDims {
-            layer_stacks: 1,
             num_features: 1,
             ..NetDims::STANDARD
         };
         NnueNetworkBuilder::with_dims(synthetic_header(), [0u8; 32], &dims)
     }
 
-    /// A single-stack, all-zero network with the standard FC dims (tiny FT).
-    fn zero_net_1stack() -> NnueNetwork {
-        builder_1stack_std().build()
+    /// An all-zero network with the standard FC dims (tiny FT).
+    fn zero_net_tiny_ft() -> NnueNetwork {
+        builder_tiny_ft().build()
     }
 
     #[test]
     fn zero_network_evaluates_to_zero() {
         // `per_layer_flow` ignores the feature transformer.
-        let net = zero_net_1stack();
+        let net = zero_net_tiny_ft();
         let transformed = [0u8; FC_0_INPUT_DIMS];
         assert_eq!(per_layer_flow(&transformed, &net.stacks[0]), 0);
     }
@@ -244,7 +243,7 @@ mod tests {
         // fc_0_out[15]=100+4*39=256. ac_0[0]=167>>6=2, ac_sqr_0 all 0.
         // fc_1_in[15]=2 -> fc_1_out[0]=30+7*2=44; ac_1[0]=44>>6=0.
         // fc_2_out[0]=1000+256=1256.
-        let mut b = builder_1stack_std();
+        let mut b = builder_tiny_ft();
         b.fc_0_biases_mut(0)[0] = 50;
         b.fc_0_weights_mut(0)[0] = 3;
         b.fc_0_biases_mut(0)[HIDDEN1_DIMS] = 100;
@@ -268,7 +267,7 @@ mod tests {
         // On a VNNI build this pits the fused chain against the unfused one; on
         // any other build the two are the same code, and the check merely keeps
         // the unfused form exercised.
-        let mut b = builder_1stack_std();
+        let mut b = builder_tiny_ft();
         for (i, w) in b.fc_0_weights_mut(0).iter_mut().enumerate() {
             *w = ((i as i32 * 7) % 61 - 30) as i8;
         }

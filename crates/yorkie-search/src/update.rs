@@ -154,7 +154,7 @@ impl WorkerHistories {
         regions.extend(self.main.backing_region());
         regions.extend(self.low_ply.backing_region());
         regions.extend(self.capture.backing_region());
-        regions.extend(self.continuation.backing_region());
+        regions.push(self.continuation.backing_region());
         regions.push(self.continuation_correction.backing_region());
         regions
     }
@@ -498,13 +498,7 @@ mod tests {
             .map(|&(_, len)| len)
             .max()
             .expect("non-empty");
-        assert_eq!(
-            biggest,
-            h.continuation
-                .backing_region()
-                .expect("the continuation table owns a block")
-                .1
-        );
+        assert_eq!(biggest, h.continuation.backing_region().1);
     }
 
     // ---- gravity primitive ------------------------------------------------

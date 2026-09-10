@@ -22,7 +22,7 @@
 use std::sync::atomic::{AtomicI16, Ordering};
 
 use yorkie_state::{Color, Move, Piece, Square};
-use yorkie_storage::{LargePageArray, LargePageBox};
+use yorkie_storage::{LargePageArray, LargePageBox, Zeroable};
 
 /// Number of low-ply planes the reference keeps (`LOW_PLY_HISTORY_SIZE`):
 /// `lowPlyHistory` is indexed by `ply` for `ply < 5`.
@@ -199,17 +199,27 @@ impl ButterflyHistory {
     }
 }
 
+/// Entries in one continuation plane (`[pc][to]`).
+const PLANE_LEN: usize = PIECE_NB * SQ_NB;
+
 /// `PieceToHistory[pc][to]` — one continuation-history plane. The qsearch
 /// evasion quiet score reads only `continuationHistory[0]`, i.e. one such
 /// plane.
+///
+/// The entries are inline, so a plane held inside a larger table is part of
+/// that table's block and an entry is one address computation away from it.
 pub struct PieceToHistory {
-    table: Box<[i16]>,
+    table: [i16; PLANE_LEN],
 }
+
+// SAFETY: an all-zero `[i16; PLANE_LEN]` is the zero-filled plane, a valid
+// value, and the plane needs no drop glue.
+unsafe impl Zeroable for PieceToHistory {}
 
 impl Default for PieceToHistory {
     fn default() -> Self {
         Self {
-            table: vec![0i16; PIECE_NB * SQ_NB].into_boxed_slice(),
+            table: [0i16; PLANE_LEN],
         }
     }
 }
@@ -223,13 +233,7 @@ impl PieceToHistory {
     /// Overwrite every entry with `v` — the reference fills each
     /// `continuationHistory` plane with `-523`.
     pub fn fill(&mut self, v: i16) {
-        self.table.iter_mut().for_each(|e| *e = v);
-    }
-
-    /// Overwrite this plane's entries from `src` (a `PIECE_NB * SQ_NB` slice, the
-    /// plane layout). Used by [`ContinuationHistory::clone_plane`].
-    fn copy_from_slice(&mut self, src: &[i16]) {
-        self.table.copy_from_slice(src);
+        self.table.fill(v);
     }
 
     fn index(pc: Piece, to: Square) -> usize {
@@ -549,20 +553,20 @@ impl ContinuationCorrectionHistory {
 /// the update primitives write the current move's `[pc][to]` within it.
 pub struct ContinuationHistory {
     /// Layout: `[plane][inner_pc][inner_to]`, `plane` from [`Self::plane_index`].
-    table: LargePageArray<i16>,
+    /// The planes are inline, so their length is part of the type and an entry's
+    /// address is one computation from the block's base.
+    table: LargePageBox<[PieceToHistory; ContinuationHistory::NUM_PLANES]>,
 }
 
 impl Default for ContinuationHistory {
     fn default() -> Self {
         Self {
-            table: LargePageArray::zeroed(Self::NUM_PLANES * Self::PLANE_LEN),
+            table: LargePageBox::zeroed(),
         }
     }
 }
 
 impl ContinuationHistory {
-    /// Entries per plane (`PIECE_NB * SQ_NB`).
-    const PLANE_LEN: usize = PIECE_NB * SQ_NB;
     /// Plane count: `[in_check][capture][pc][to]` == `2 * 2 * PIECE_NB * SQ_NB`.
     const NUM_PLANES: usize = 2 * 2 * PIECE_NB * SQ_NB;
 
@@ -574,15 +578,16 @@ impl ContinuationHistory {
     /// The `(address, byte length)` of this table's large-page block — see
     /// [`WorkerHistories::backing_regions`](crate::WorkerHistories::backing_regions).
     /// This is the big one: ~54 MiB, more than three quarters of a worker's
-    /// private footprint.
-    pub fn backing_region(&self) -> Option<(usize, usize)> {
+    /// private footprint. A [`LargePageBox`] always owns a block, so this is
+    /// never `None`.
+    pub fn backing_region(&self) -> (usize, usize) {
         self.table.backing_region()
     }
 
     /// Overwrite every entry with `v` — the reference fills each continuation
     /// plane with `-523`.
     pub fn fill(&mut self, v: i16) {
-        self.table.iter_mut().for_each(|e| *e = v);
+        self.table.iter_mut().for_each(|plane| plane.fill(v));
     }
 
     /// The plane index selected by `(in_check, capture, pc, to)` — the plane a
@@ -593,29 +598,21 @@ impl ContinuationHistory {
         ((ic * 2 + cap) * PIECE_NB + piece_code(pc)) * SQ_NB + to.index() as usize
     }
 
-    fn cell(plane: usize, pc: Piece, to: Square) -> usize {
-        plane * Self::PLANE_LEN + piece_code(pc) * SQ_NB + to.index() as usize
-    }
-
     /// The inner `[pc][to]` value in `plane`.
     pub fn get_at(&self, plane: usize, pc: Piece, to: Square) -> i32 {
-        self.table[Self::cell(plane, pc, to)] as i32
+        self.table[plane].get(pc, to)
     }
 
     /// Gravity-update the inner `[pc][to]` entry in `plane` (`D = 30000`).
     pub fn update_at(&mut self, plane: usize, pc: Piece, to: Square, bonus: i32) {
-        let i = Self::cell(plane, pc, to);
-        self.table[i] = apply_gravity(self.table[i], bonus, CONTINUATION_HISTORY_D);
+        self.table[plane].update(pc, to, bonus);
     }
 
-    /// Copy `plane` out into a standalone [`PieceToHistory`], so a search that
-    /// keeps its continuation table in this multi-plane form can hand the
-    /// picker the six planes its `contHist` array names.
-    pub fn clone_plane(&self, plane: usize) -> PieceToHistory {
-        let mut out = PieceToHistory::new();
-        let base = plane * Self::PLANE_LEN;
-        out.copy_from_slice(&self.table[base..base + Self::PLANE_LEN]);
-        out
+    /// Borrow `plane` whole, so a search that keeps its continuation table in
+    /// this multi-plane form can hand the picker the six planes its `contHist`
+    /// array names.
+    pub fn plane(&self, plane: usize) -> &PieceToHistory {
+        &self.table[plane]
     }
 }
 
@@ -639,6 +636,47 @@ impl TtMoveHistory {
     /// Gravity-update the entry (`D = 8192`).
     pub fn update(&mut self, bonus: i32) {
         self.entry = apply_gravity(self.entry, bonus, TT_MOVE_HISTORY_D);
+    }
+}
+
+#[cfg(test)]
+mod plane_tests {
+    use super::*;
+    use yorkie_state::PieceKind;
+
+    fn bp() -> Piece {
+        Piece::new(PieceKind::Pawn, Color::Black)
+    }
+    fn to() -> Square {
+        Square::new(4, 3).unwrap()
+    }
+
+    /// A borrowed plane is part of the table's own block, so a continuation
+    /// lookup is an offset into it and never a pointer load of its own.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn every_plane_lies_inside_the_tables_block() {
+        let hist = ContinuationHistory::new();
+        let (base, len) = hist.backing_region();
+        for plane in [0, 1, ContinuationHistory::NUM_PLANES - 1] {
+            let at = hist.plane(plane) as *const PieceToHistory as usize;
+            assert!(
+                at >= base && at + size_of::<PieceToHistory>() <= base + len,
+                "plane {plane} at {at:#x} is outside the block [{base:#x}, +{len})",
+            );
+        }
+    }
+
+    /// A borrowed plane reads what the table reads at the same cell.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_borrowed_plane_reads_what_the_table_reads() {
+        let mut hist = ContinuationHistory::new();
+        hist.fill(-523);
+        hist.update_at(7, bp(), to(), 4_000);
+        assert_eq!(hist.plane(7).get(bp(), to()), hist.get_at(7, bp(), to()));
+        assert_ne!(hist.plane(7).get(bp(), to()), -523);
+        assert_eq!(hist.plane(8).get(bp(), to()), -523);
     }
 }
 

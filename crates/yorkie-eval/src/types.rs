@@ -82,7 +82,9 @@ pub struct NnueNetwork {
     region: (usize, usize),
     pub ft_biases: ArenaSlice<i16>,
     pub ft_weights: ArenaSlice<i16>,
-    pub stacks: Vec<NetworkStack>,
+    /// The layer stacks, inline: an evaluation reaches its bucket's stack at a
+    /// fixed offset from the network rather than through a pointer of its own.
+    pub stacks: [NetworkStack; LAYER_STACKS],
     /// The SHA-256 of the network file this one's parameters came from; all
     /// zero when they were not read from one.
     pub sha256: [u8; 32],
@@ -104,6 +106,9 @@ impl NnueNetwork {
     /// Build the views of a network whose parameters are already laid out at
     /// `base`.
     ///
+    /// The stack count is part of the type, so `dims` has to name
+    /// [`LAYER_STACKS`] of them.
+    ///
     /// # Safety
     /// `base` must address at least `data_bytes(dims)` initialised bytes,
     /// aligned to a 64-byte boundary, laid out as the shared layout describes,
@@ -116,10 +121,16 @@ impl NnueNetwork {
         base: *mut u8,
         backing: Backing,
     ) -> Self {
+        assert_eq!(
+            dims.layer_stacks, LAYER_STACKS,
+            "a network in memory carries exactly {LAYER_STACKS} layer stacks",
+        );
         let spans = net_spans(dims);
         // SAFETY: every span lies inside the region the caller vouched for, and
         // each starts on a 64-byte boundary, so each view is aligned and
         // in-bounds; the spans are disjoint, so no two views alias.
+        let stacks = std::array::from_fn(|i| unsafe { stack_views(base, &spans.stacks[i]) });
+        // SAFETY: as the stacks above, for the two feature-transformer spans.
         unsafe {
             Self {
                 header,
@@ -127,7 +138,7 @@ impl NnueNetwork {
                 region: (base as usize, spans.total_bytes),
                 ft_biases: view(base, spans.ft_biases),
                 ft_weights: view(base, spans.ft_weights),
-                stacks: spans.stacks.iter().map(|s| stack_views(base, s)).collect(),
+                stacks,
                 sha256,
             }
         }
@@ -365,11 +376,10 @@ mod tests {
     use super::*;
     use crate::nnue_layout::{DATA_BYTES, SECTION_ALIGN, data_bytes};
 
-    /// A small but multi-stack synthetic net for the layout tests: two stacks
-    /// and a tiny feature transformer, standard FC shapes.
+    /// A small synthetic net for the layout tests: a tiny feature transformer,
+    /// standard FC shapes and stack count.
     fn small_net() -> NnueNetwork {
         let dims = NetDims {
-            layer_stacks: 2,
             num_features: 3,
             ..NetDims::STANDARD
         };
@@ -426,7 +436,6 @@ mod tests {
         }
         // The whole spread fits inside the one region the dimensions size.
         let dims = NetDims {
-            layer_stacks: 2,
             num_features: 3,
             ..NetDims::STANDARD
         };
@@ -438,7 +447,6 @@ mod tests {
     #[test]
     fn builder_fills_are_visible_through_the_views() {
         let dims = NetDims {
-            layer_stacks: 2,
             num_features: 3,
             ..NetDims::STANDARD
         };
@@ -462,6 +470,19 @@ mod tests {
         assert_eq!(net.stacks[0].fc_2_weights[1], -5);
         assert_eq!(net.header.version, 1);
         assert_eq!(net.sha256, [7u8; 32]);
+    }
+
+    #[test]
+    fn every_stack_sits_inside_the_network_itself() {
+        let net = small_net();
+        let base = &net as *const NnueNetwork as usize;
+        for stack in &net.stacks {
+            let at = stack as *const NetworkStack as usize;
+            assert!(
+                at >= base && at + size_of::<NetworkStack>() <= base + size_of::<NnueNetwork>(),
+                "a stack must be reachable at an offset from the network, not through a pointer",
+            );
+        }
     }
 
     #[test]
