@@ -3,11 +3,12 @@
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
 
 /// `position` command's first argument: either the implicit start position or
-/// an explicit four-token SFEN string preserved verbatim for re-parsing.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PositionSfen {
+/// an explicit SFEN, whose four fields — board, side to move, hands, ply — are
+/// borrowed from the command line rather than copied out of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PositionSfen<'a> {
     StartPos,
-    Sfen(String),
+    Sfen([&'a str; 4]),
 }
 
 /// All USI `go` sub-tokens captured verbatim, including the ones the driver does
@@ -65,7 +66,7 @@ pub const MATE_UNLIMITED_MS: u64 = i32::MAX as u64;
 pub const EXTRA_GO_CLAUSES: [&str; 6] = ["depth", "nodes", "mate", "movetime", "infinite", "rtime"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Command {
+pub enum Command<'a> {
     Usi,
     IsReady,
     SetOption {
@@ -74,8 +75,12 @@ pub enum Command {
     },
     UsiNewGame,
     Position {
-        sfen: PositionSfen,
-        moves: Vec<String>,
+        sfen: PositionSfen<'a>,
+        /// The move tokens as they arrived, still one whitespace-separated run
+        /// of the command line: the game path splits them where it replays
+        /// them, so no move is ever copied out of the line. Empty when the
+        /// command carried none.
+        moves: &'a str,
     },
     Go(GoLimits),
     /// A `go` line carrying one of the [`EXTRA_GO_CLAUSES`], parsed by a build
@@ -123,12 +128,12 @@ pub enum Command {
 /// [`Command::Unknown`] for `line`, carrying the text only where a build can
 /// print it.
 #[cfg(feature = "verbose1")]
-fn unknown(line: &str) -> Command {
+fn unknown(line: &str) -> Command<'static> {
     Command::Unknown(line.to_string())
 }
 
 #[cfg(not(feature = "verbose1"))]
-fn unknown(_line: &str) -> Command {
+fn unknown(_line: &str) -> Command<'static> {
     Command::Unknown
 }
 
@@ -136,16 +141,26 @@ fn unknown(_line: &str) -> Command {
 /// re-joined line. The join exists only for the report, so a build that cannot
 /// print one does not perform it.
 #[cfg(feature = "verbose1")]
-fn unknown_setoption(tokens: &[&str]) -> Command {
+fn unknown_setoption(tokens: &[&str]) -> Command<'static> {
     Command::Unknown(format!("setoption {}", tokens.join(" ")))
 }
 
 #[cfg(not(feature = "verbose1"))]
-fn unknown_setoption(_tokens: &[&str]) -> Command {
+fn unknown_setoption(_tokens: &[&str]) -> Command<'static> {
     Command::Unknown
 }
 
-pub fn parse_line(input: &str) -> Command {
+/// Split off the leading token: what precedes the first run of whitespace, and
+/// what follows that run. Both halves are empty once nothing is left, and the
+/// tail keeps its own inner spacing, so a caller can hand it on whole.
+fn split_token(s: &str) -> (&str, &str) {
+    match s.find(char::is_whitespace) {
+        Some(i) => (&s[..i], s[i..].trim_start()),
+        None => (s, ""),
+    }
+}
+
+pub fn parse_line(input: &str) -> Command<'_> {
     if input.len() > MAX_LINE_BYTES {
         return Command::TooLong;
     }
@@ -153,16 +168,16 @@ pub fn parse_line(input: &str) -> Command {
     if trimmed.is_empty() {
         return unknown("");
     }
-    let mut parts = trimmed.split_whitespace();
-    let head = parts.next().unwrap_or("");
+    let (head, rest) = split_token(trimmed);
+    let parts = rest.split_whitespace();
     match head {
         "usi" => Command::Usi,
         "isready" => Command::IsReady,
         "usinewgame" => Command::UsiNewGame,
         "quit" => Command::Quit,
         "setoption" => parse_setoption(parts),
-        "position" => parse_position(trimmed, parts),
-        "go" => parse_go(trimmed, parts),
+        "position" => parse_position(trimmed, rest),
+        "go" => parse_go(trimmed, rest),
         "stop" => Command::Stop,
         // `gameover [result]`: the trailing win/lose/draw token is optional and
         // ignored — the command is handled identically to `stop`.
@@ -184,45 +199,49 @@ pub fn parse_line(input: &str) -> Command {
     }
 }
 
-fn parse_position<'a>(line: &str, parts: impl Iterator<Item = &'a str>) -> Command {
-    let tokens: Vec<&str> = parts.collect();
-    let Some((&kind, rest)) = tokens.split_first() else {
-        return unknown(line);
-    };
+fn parse_position<'a>(line: &'a str, args: &'a str) -> Command<'a> {
+    let (kind, rest) = split_token(args);
     let (sfen, after_sfen) = match kind {
         "startpos" => (PositionSfen::StartPos, rest),
         "sfen" => {
-            // The four SFEN tokens are: board, side-to-move, hands, ply. We pass
-            // the joined string to `yorkie_state::parse_sfen` in the driver and
-            // surface any per-field error from there.
-            if rest.len() < 4 {
+            // The four SFEN fields are: board, side-to-move, hands, ply. The
+            // driver hands them to `yorkie_state::parse_sfen` and surfaces any
+            // per-field error from there.
+            let (board, rest) = split_token(rest);
+            let (side_to_move, rest) = split_token(rest);
+            let (hands, rest) = split_token(rest);
+            let (ply, rest) = split_token(rest);
+            if ply.is_empty() {
                 return unknown(line);
             }
-            let sfen_str = rest[..4].join(" ");
-            (PositionSfen::Sfen(sfen_str), &rest[4..])
+            (PositionSfen::Sfen([board, side_to_move, hands, ply]), rest)
         }
         _ => return unknown(line),
     };
-    let moves = match after_sfen {
-        [] => Vec::new(),
-        ["moves", rest @ ..] => rest.iter().map(|s| (*s).to_string()).collect(),
-        _ => return unknown(line),
-    };
+    if after_sfen.is_empty() {
+        return Command::Position { sfen, moves: "" };
+    }
+    let (keyword, moves) = split_token(after_sfen);
+    if keyword != "moves" {
+        return unknown(line);
+    }
     Command::Position { sfen, moves }
 }
 
-/// The `u64` value of the clause whose keyword sits at `tokens[i]`, or `None`
-/// when it is missing or malformed.
-fn u64_arg(tokens: &[&str], i: usize) -> Option<u64> {
-    tokens.get(i + 1)?.parse::<u64>().ok()
+/// The `u64` the clause's value token spells, or `None` when it is missing or
+/// malformed.
+fn u64_arg(value: &str) -> Option<u64> {
+    value.parse::<u64>().ok()
 }
 
-fn parse_go<'a>(line: &str, parts: impl Iterator<Item = &'a str>) -> Command {
-    let tokens: Vec<&str> = parts.collect();
+fn parse_go<'a>(line: &'a str, args: &'a str) -> Command<'a> {
     let mut limits = GoLimits::default();
-    let mut i = 0;
-    while i < tokens.len() {
-        let key = tokens[i];
+    let mut rest = args;
+    while !rest.is_empty() {
+        let (key, after_key) = split_token(rest);
+        // The clause's value, for the arms that take one: empty where the line
+        // ends after the keyword, which every one of them rejects.
+        let (value, after_value) = split_token(after_key);
         // `verbose2` gate. Checked before the clause is interpreted, so a
         // gated clause is reported by name whatever follows it (including a
         // missing or malformed value, which would otherwise be `Unknown`). The
@@ -237,48 +256,45 @@ fn parse_go<'a>(line: &str, parts: impl Iterator<Item = &'a str>) -> Command {
             #[cfg(feature = "verbose2")]
             "infinite" => {
                 limits.infinite = true;
-                i += 1;
+                rest = after_key;
             }
             "ponder" => {
                 limits.ponder = true;
-                i += 1;
+                rest = after_key;
             }
             // `go mate [ms|infinite]`: the token after `mate` is a millisecond
             // time budget; `infinite`, or nothing following, means unlimited.
             // Anything else that is not a valid `u64` is an error (the
             // reference's `stoi` would throw).
             #[cfg(feature = "verbose2")]
-            "mate" => match tokens.get(i + 1) {
-                None => {
+            "mate" => match value {
+                "" => {
                     limits.mate = Some(MATE_UNLIMITED_MS);
-                    i += 1;
+                    rest = after_key;
                 }
-                Some(&"infinite") => {
+                "infinite" => {
                     limits.mate = Some(MATE_UNLIMITED_MS);
-                    i += 2;
+                    rest = after_value;
                 }
-                Some(value) => {
+                _ => {
                     let Ok(v) = value.parse::<u64>() else {
                         return unknown(line);
                     };
                     limits.mate = Some(v);
-                    i += 2;
+                    rest = after_value;
                 }
             },
             #[cfg(feature = "verbose2")]
             "depth" => {
-                let Some(value) = tokens.get(i + 1) else {
-                    return unknown(line);
-                };
                 let Ok(v) = value.parse::<u32>() else {
                     return unknown(line);
                 };
                 limits.depth = Some(v);
-                i += 2;
+                rest = after_value;
             }
             #[cfg(feature = "verbose2")]
             "nodes" | "movetime" | "rtime" => {
-                let Some(v) = u64_arg(&tokens, i) else {
+                let Some(v) = u64_arg(value) else {
                     return unknown(line);
                 };
                 match key {
@@ -286,10 +302,10 @@ fn parse_go<'a>(line: &str, parts: impl Iterator<Item = &'a str>) -> Command {
                     "movetime" => limits.movetime = Some(v),
                     _ => limits.rtime = Some(v),
                 }
-                i += 2;
+                rest = after_value;
             }
             "wtime" | "btime" | "winc" | "binc" | "byoyomi" => {
-                let Some(v) = u64_arg(&tokens, i) else {
+                let Some(v) = u64_arg(value) else {
                     return unknown(line);
                 };
                 match key {
@@ -300,7 +316,7 @@ fn parse_go<'a>(line: &str, parts: impl Iterator<Item = &'a str>) -> Command {
                     "byoyomi" => limits.byoyomi = Some(v),
                     _ => unreachable!("matched key {key} but no branch"),
                 }
-                i += 2;
+                rest = after_value;
             }
             _ => return unknown(line),
         }
@@ -308,7 +324,7 @@ fn parse_go<'a>(line: &str, parts: impl Iterator<Item = &'a str>) -> Command {
     Command::Go(limits)
 }
 
-fn parse_setoption<'a>(parts: impl Iterator<Item = &'a str>) -> Command {
+fn parse_setoption<'a>(parts: impl Iterator<Item = &'a str>) -> Command<'static> {
     // USI: setoption name <NAME> [value <VALUE...>]
     // Per the protocol, NAME is a single token (option names contain no spaces),
     // and everything after `value` is the value (joined back with single spaces).
@@ -419,13 +435,22 @@ mod tests {
         );
     }
 
+    /// The board / side-to-move / hands / ply fields of the initial position,
+    /// as the four the `sfen` form is split into.
+    const STARTPOS_FIELDS: [&str; 4] = [
+        "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL",
+        "b",
+        "-",
+        "1",
+    ];
+
     #[test]
     fn parses_position_startpos() {
         assert_eq!(
             parse_line("position startpos"),
             Command::Position {
                 sfen: PositionSfen::StartPos,
-                moves: Vec::new(),
+                moves: "",
             }
         );
     }
@@ -436,31 +461,52 @@ mod tests {
             parse_line("position startpos moves 7g7f 8c8d"),
             Command::Position {
                 sfen: PositionSfen::StartPos,
-                moves: vec!["7g7f".to_string(), "8c8d".to_string()],
+                moves: "7g7f 8c8d",
+            }
+        );
+    }
+
+    /// The move tokens are handed on as the one run of line they arrived as,
+    /// whatever spacing separated them, and a trailing `moves` with nothing
+    /// after it is the same command as none at all.
+    #[test]
+    fn position_moves_are_the_line_run_whatever_its_spacing() {
+        assert_eq!(
+            parse_line("position   startpos   moves   7g7f\t8c8d  "),
+            Command::Position {
+                sfen: PositionSfen::StartPos,
+                moves: "7g7f\t8c8d",
+            }
+        );
+        assert_eq!(
+            parse_line("position startpos moves"),
+            Command::Position {
+                sfen: PositionSfen::StartPos,
+                moves: "",
             }
         );
     }
 
     #[test]
     fn parses_position_sfen_no_moves() {
-        let sfen = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
+        let sfen = STARTPOS_FIELDS.join(" ");
         assert_eq!(
             parse_line(&format!("position sfen {sfen}")),
             Command::Position {
-                sfen: PositionSfen::Sfen(sfen.to_string()),
-                moves: Vec::new(),
+                sfen: PositionSfen::Sfen(STARTPOS_FIELDS),
+                moves: "",
             }
         );
     }
 
     #[test]
     fn parses_position_sfen_with_moves() {
-        let sfen = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
+        let sfen = STARTPOS_FIELDS.join(" ");
         assert_eq!(
             parse_line(&format!("position sfen {sfen} moves 7g7f")),
             Command::Position {
-                sfen: PositionSfen::Sfen(sfen.to_string()),
-                moves: vec!["7g7f".to_string()],
+                sfen: PositionSfen::Sfen(STARTPOS_FIELDS),
+                moves: "7g7f",
             }
         );
     }

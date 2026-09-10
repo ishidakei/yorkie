@@ -1379,13 +1379,22 @@ impl Position {
     /// rather than the move illegal, and the search scores it. Uchifuzume and
     /// nifu are excluded at drop generation instead.
     pub fn generate_legal_all(&self, out: &mut Vec<Move>) {
-        let mut buf: Vec<ExtMove> = Vec::with_capacity(64);
+        let mut pseudo: Vec<ExtMove> = Vec::with_capacity(64);
+        self.generate_legal_all_with(&mut pseudo, out);
+    }
+
+    /// [`Position::generate_legal_all`] filtering through the caller's `pseudo`
+    /// buffer, which it empties first: a caller generating position after
+    /// position — replaying a game, walking a move list — takes the buffer once
+    /// instead of once per position.
+    pub fn generate_legal_all_with(&self, pseudo: &mut Vec<ExtMove>, out: &mut Vec<Move>) {
+        pseudo.clear();
         if self.in_check() {
-            self.generate_evasions::<true>(&mut buf);
+            self.generate_evasions::<true>(pseudo);
         } else {
-            self.generate_non_evasions::<true>(&mut buf);
+            self.generate_non_evasions::<true>(pseudo);
         }
-        for em in buf {
+        for em in pseudo.iter() {
             if self.is_legal(em.mv) {
                 out.push(em.mv);
             }

@@ -28,5 +28,5 @@ pub use piece::{Piece, PieceKind};
 pub use position::{Position, RepetitionState, Undo};
 pub use search_movegen::{CheckSquares, ExtMove};
 pub use see::piece_value;
-pub use sfen::{STARTPOS_SFEN, SfenError, format_sfen, parse_sfen};
+pub use sfen::{STARTPOS_SFEN, SfenError, format_sfen, parse_sfen, parse_sfen_into};
 pub use square::Square;

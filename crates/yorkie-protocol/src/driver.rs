@@ -23,7 +23,14 @@ use yorkie_search::{PvBound, PvInfo, PvOutputConfig, PvSink};
 // The per-game evaluation-noise seed: drawn here, read only by the search.
 #[cfg(feature = "random")]
 use yorkie_search::new_game_seed;
-use yorkie_state::{Move, Position, format_usi_move, parse_sfen, parse_usi_move};
+use yorkie_state::{
+    ExtMove, Move, Position, SfenError, format_usi_move, parse_sfen_into, parse_usi_move,
+};
+// A whole SFEN string is parsed only by the `verbose3` commands that carry one
+// as an argument; the `position` command's own is read field by field, into the
+// position the driver already holds.
+#[cfg(feature = "verbose3")]
+use yorkie_state::parse_sfen;
 use yorkie_storage::{Book, TranspositionTable, Value};
 #[cfg(feature = "verbose3")]
 use yorkie_storage::{TTData, VALUE_NONE};
@@ -103,6 +110,91 @@ const SEARCH_MAX_DEPTH: i32 = 245;
 /// reads it: `isready`'s, which holds the machine against the layout this binary
 /// was built for.
 const SYSFS_ROOT: &str = "/sys";
+
+/// Moves one `position` command may carry. A shogi game reaches its result in a
+/// few hundred plies — a build that sets a draw ply cap stops one far sooner —
+/// so the bound is out of a game's reach, and a command that exceeds it is
+/// refused rather than allowed to grow the buffer that holds it.
+const MAX_POSITION_MOVES: usize = 1024;
+
+/// Room the retained SFEN buffer starts with: enough for the longest SFEN a
+/// board can spell — every square occupied by a promoted piece, both hands
+/// full, a five-digit ply — so a game's `position` commands are written into
+/// the buffer already there.
+const SFEN_CAPACITY: usize = 256;
+
+/// Legal moves the widest shogi position offers, which is what the replay's
+/// legality buffer is built to hold (the reference's `MAX_MOVES`).
+const MAX_LEGAL_MOVES: usize = 600;
+
+/// A `position` command in the form the driver replays it from: where the game
+/// starts, and the moves that reached the position it names, already parsed and
+/// verified legal in sequence.
+///
+/// Both buffers are filled in place and never handed back to the allocator, so
+/// a game's worth of `position` commands reaches it only for the first one.
+struct RetainedPosition {
+    /// The command named `startpos` rather than an explicit SFEN, in which case
+    /// [`Self::sfen`] is empty.
+    startpos: bool,
+    /// The four SFEN fields joined by single spaces — the form
+    /// [`parse_sfen_into`] reads.
+    sfen: String,
+    /// The moves in the order they were applied.
+    moves: Vec<Move>,
+}
+
+impl RetainedPosition {
+    /// `position startpos`, with room for a whole game ahead of it.
+    fn new() -> Self {
+        Self {
+            startpos: true,
+            sfen: String::with_capacity(SFEN_CAPACITY),
+            moves: Vec::with_capacity(MAX_POSITION_MOVES),
+        }
+    }
+
+    /// Back to `position startpos`, every buffer keeping its room.
+    fn reset(&mut self) {
+        self.startpos = true;
+        self.sfen.clear();
+        self.moves.clear();
+    }
+
+    /// Take the starting position of a freshly parsed command, joining an
+    /// explicit SFEN's four fields into the buffer already held. The move list
+    /// is emptied for the replay that follows.
+    fn set_start(&mut self, sfen: PositionSfen<'_>) {
+        self.reset();
+        if let PositionSfen::Sfen(fields) = sfen {
+            self.startpos = false;
+            for (i, field) in fields.iter().enumerate() {
+                if i > 0 {
+                    self.sfen.push(' ');
+                }
+                self.sfen.push_str(field);
+            }
+        }
+    }
+
+    /// Build the starting position into `pos`, reusing the buffers it holds.
+    fn start_into(&self, pos: &mut Position) -> Result<(), SfenError> {
+        if self.startpos {
+            pos.reset_startpos();
+            Ok(())
+        } else {
+            parse_sfen_into(pos, &self.sfen)
+        }
+    }
+}
+
+/// Why a `position` command was refused. Each carries what the driver's
+/// diagnostic names, borrowed from the command line itself.
+enum PositionRefusal<'a> {
+    Sfen(SfenError),
+    IllegalMove(&'a str),
+    TooManyMoves,
+}
 
 // --- isready keep-alive (reference `Engine::run_heavy_job`).
 /// How often the keep-alive helper thread polls the stop flag while the heavy
@@ -413,7 +505,22 @@ pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
     /// The last `position` command in parsed form (`last_position_cmd_string`),
     /// retained so a Stochastic_Ponder `go ponder` can rewind it by one move
     /// and a Stochastic_Ponder `ponderhit` can re-apply the real position.
-    last_position: (PositionSfen, Vec<String>),
+    last_position: RetainedPosition,
+    /// Where the `position` command being read is assembled. A malformed line
+    /// must leave both the current position and the retained command exactly as
+    /// they were, so nothing is written through until the whole line has been
+    /// verified; the two are then swapped, which hands this the previous
+    /// command's buffers for the next line.
+    pending_position: RetainedPosition,
+    /// The position a `position` command is replayed into, holding whatever the
+    /// previous command left there. Swapped with [`Self::pos`] once the replay
+    /// has succeeded, so neither position is ever rebuilt from an empty buffer.
+    scratch_pos: Position,
+    /// The legal moves of the ply being replayed, against which the command's
+    /// next move is checked, and the pseudo-legal moves they are filtered from.
+    /// Both are built once, to the widest position's move count.
+    legal_buf: Vec<Move>,
+    pseudo_buf: Vec<ExtMove>,
     /// The last `go` command's limits (`last_go_cmd_string`), retained so a
     /// Stochastic_Ponder `ponderhit` can re-issue it with `ponder` stripped.
     last_go: Option<GoLimits>,
@@ -517,7 +624,11 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             best_previous_average_score: VALUE_INFINITE,
             previous_time_reduction: 0.85,
             last_game_ply: 0,
-            last_position: (PositionSfen::StartPos, Vec::new()),
+            last_position: RetainedPosition::new(),
+            pending_position: RetainedPosition::new(),
+            scratch_pos: Position::startpos(),
+            legal_buf: Vec::with_capacity(MAX_LEGAL_MOVES),
+            pseudo_buf: Vec::with_capacity(MAX_LEGAL_MOVES),
             last_go: None,
             pool,
             pool_threads: threads,
@@ -586,7 +697,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 Command::IsReady => self.handle_isready()?,
                 Command::SetOption { name, value } => self.handle_setoption(&name, &value)?,
                 Command::UsiNewGame => self.handle_usinewgame(),
-                Command::Position { sfen, moves } => self.handle_position(sfen, &moves)?,
+                Command::Position { sfen, moves } => self.handle_position(sfen, moves)?,
                 Command::Go(limits) => self.handle_go(limits)?,
                 #[cfg(not(feature = "verbose2"))]
                 Command::GoExtraClause(clause) => self.handle_go_extra_clause(&clause)?,
@@ -1155,39 +1266,83 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         Ok(())
     }
 
-    fn handle_position(&mut self, sfen: PositionSfen, moves: &[String]) -> io::Result<()> {
-        // Build a scratch Position. On any error, emit `info string …` and
-        // leave `self.pos` untouched — the input-validation contract: the prior
-        // position must survive a malformed `position` line.
-        let mut scratch = match &sfen {
-            PositionSfen::StartPos => Position::startpos(),
-            PositionSfen::Sfen(s) => match parse_sfen(s) {
-                Ok(p) => p,
-                Err(e) => {
-                    return diag!(self, "position parse error: {}", e);
-                }
-            },
-        };
-        let mut legal_buf: Vec<Move> = Vec::new();
-        for s in moves {
-            let parsed = match parse_usi_move(s, &scratch) {
-                Ok(m) => m,
-                Err(_) => {
-                    return diag!(self, "illegal move: {}", s);
-                }
-            };
+    fn handle_position<'a>(&mut self, sfen: PositionSfen<'a>, moves: &'a str) -> io::Result<()> {
+        match self.replay_position(sfen, moves) {
+            Ok(()) => Ok(()),
+            Err(PositionRefusal::Sfen(e)) => diag!(self, "position parse error: {}", e),
+            Err(PositionRefusal::IllegalMove(mv)) => diag!(self, "illegal move: {}", mv),
+            Err(PositionRefusal::TooManyMoves) => diag!(
+                self,
+                "position error: more than {} moves; position unchanged",
+                MAX_POSITION_MOVES,
+            ),
+        }
+    }
+
+    /// Replay one `position` command into the scratch buffers and, if every
+    /// move of it was legal, install the result as the current position and the
+    /// retained command.
+    ///
+    /// A refused command leaves both untouched — the input-validation contract:
+    /// the prior position must survive a malformed `position` line — which is
+    /// why the work happens in the scratch pair and the two installs are the
+    /// last thing done.
+    fn replay_position<'a>(
+        &mut self,
+        sfen: PositionSfen<'a>,
+        moves: &'a str,
+    ) -> Result<(), PositionRefusal<'a>> {
+        let Self {
+            pending_position: pending,
+            scratch_pos: scratch,
+            legal_buf,
+            pseudo_buf,
+            ..
+        } = self;
+        pending.set_start(sfen);
+        pending.start_into(scratch).map_err(PositionRefusal::Sfen)?;
+        for mv in moves.split_whitespace() {
+            if pending.moves.len() == MAX_POSITION_MOVES {
+                return Err(PositionRefusal::TooManyMoves);
+            }
+            let parsed =
+                parse_usi_move(mv, scratch).map_err(|_| PositionRefusal::IllegalMove(mv))?;
             legal_buf.clear();
-            scratch.generate_legal_all(&mut legal_buf);
+            scratch.generate_legal_all_with(pseudo_buf, legal_buf);
             if !legal_buf.contains(&parsed) {
-                return diag!(self, "illegal move: {}", s);
+                return Err(PositionRefusal::IllegalMove(mv));
             }
             scratch.do_move(parsed);
+            pending.moves.push(parsed);
         }
-        self.pos = scratch;
-        // Retain the parsed command for the Stochastic_Ponder rewind / re-issue
-        // (`last_position_cmd_string`).
-        self.last_position = (sfen, moves.to_vec());
+        // Both installs are a swap: what they displace becomes the next
+        // command's scratch, buffers and all. The retained command
+        // (`last_position_cmd_string`) is what the Stochastic_Ponder rewind /
+        // re-issue replays.
+        std::mem::swap(&mut self.pos, &mut self.scratch_pos);
+        std::mem::swap(&mut self.last_position, &mut self.pending_position);
         Ok(())
+    }
+
+    /// Rebuild the retained `position` command's first `plies` moves and install
+    /// the result as the current position — the Stochastic_Ponder rewind and
+    /// re-issue, which reach for a position the command list already describes.
+    ///
+    /// The retained moves were verified when the command arrived, so only its
+    /// SFEN can still be refused; that leaves the current position untouched.
+    fn install_retained_position(&mut self, plies: usize) {
+        let Self {
+            last_position: retained,
+            scratch_pos: scratch,
+            ..
+        } = self;
+        if retained.start_into(scratch).is_err() {
+            return;
+        }
+        for &mv in &retained.moves[..plies] {
+            scratch.do_move(mv);
+        }
+        std::mem::swap(&mut self.pos, &mut self.scratch_pos);
     }
 
     fn handle_usinewgame(&mut self) {
@@ -1196,7 +1351,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // `search_clear`). Clearing the table also resets its generation; the next
         // `go` bumps it again via `run_root`.
         self.finish_search_join();
-        self.pos = Position::startpos();
+        self.pos.reset_startpos();
         // The join above left this thread as the only one touching the table,
         // so the clear races nothing.
         self.tt.clear();
@@ -1220,7 +1375,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // Reset the side-flip detector and the retained command state (the
         // `last_position` default is the reference's `"position startpos"`).
         self.last_game_ply = 0;
-        self.last_position = (PositionSfen::StartPos, Vec::new());
+        self.last_position.reset();
         self.last_go = None;
         // Reset the helper workers' game-scoped histories too.
         // The reference `search_clear` clears every worker; here the helper
@@ -1311,14 +1466,11 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// best-effort trim — an empty move list (nothing to rewind) or a rebuild
     /// failure leaves the current position untouched.
     fn apply_stochastic_ponder_rewind(&mut self) {
-        let (sfen, moves) = &self.last_position;
-        if moves.is_empty() {
+        let plies = self.last_position.moves.len();
+        if plies == 0 {
             return;
         }
-        let rewound = &moves[..moves.len() - 1];
-        if let Some(pos) = build_position_from(sfen, rewound) {
-            self.pos = pos;
-        }
+        self.install_retained_position(plies - 1);
     }
 
     /// Build the [`CoordinatorJob`] for one search — the shared preamble of both
@@ -1804,10 +1956,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         self.finish_search_join();
 
         // Re-apply the real (current) position.
-        let (sfen, moves) = self.last_position.clone();
-        if let Some(pos) = build_position_from(&sfen, &moves) {
-            self.pos = pos;
-        }
+        self.install_retained_position(self.last_position.moves.len());
 
         // Re-issue the retained `go` with `ponder` stripped.
         if let Some(mut go) = self.last_go.clone() {
@@ -2239,29 +2388,6 @@ fn resolve_book_filename_with_ybb_fallback(requested: &Path) -> PathBuf {
         }
     }
     requested.to_path_buf()
-}
-
-/// Rebuild a [`Position`] from a parsed `position` command (start / SFEN plus a
-/// USI-move list), returning `None` on any parse or legality failure. Used by
-/// the Stochastic_Ponder rewind / re-issue paths, which reconstruct a position
-/// from the retained [`UsiDriver::last_position`] without the diagnostic side
-/// effects of [`UsiDriver::handle_position`].
-fn build_position_from(sfen: &PositionSfen, moves: &[String]) -> Option<Position> {
-    let mut pos = match sfen {
-        PositionSfen::StartPos => Position::startpos(),
-        PositionSfen::Sfen(s) => parse_sfen(s).ok()?,
-    };
-    let mut legal_buf: Vec<Move> = Vec::new();
-    for s in moves {
-        let parsed = parse_usi_move(s, &pos).ok()?;
-        legal_buf.clear();
-        pos.generate_legal_all(&mut legal_buf);
-        if !legal_buf.contains(&parsed) {
-            return None;
-        }
-        pos.do_move(parsed);
-    }
-    Some(pos)
 }
 
 /// Emit a bare `bestmove <mv>` for the resign / declaration-win short-circuits,
@@ -3631,6 +3757,26 @@ mod tests {
         String::from_utf8(bytes).expect("utf-8")
     }
 
+    /// A driver with nothing to read, for the handlers a test drives directly
+    /// rather than through a canned session.
+    fn idle_driver() -> UsiDriver<&'static [u8], Vec<u8>> {
+        UsiDriver::new(b"".as_slice(), Arc::new(Mutex::new(Vec::new())))
+    }
+
+    /// `n` legal moves from the initial position: both kings stepping onto the
+    /// square in front of them and back, for as long as asked.
+    fn king_shuffle(n: usize) -> String {
+        const CYCLE: [&str; 4] = ["5i5h", "5a5b", "5h5i", "5b5a"];
+        let mut line = String::new();
+        for i in 0..n {
+            if i > 0 {
+                line.push(' ');
+            }
+            line.push_str(CYCLE[i % CYCLE.len()]);
+        }
+        line
+    }
+
     /// The transcript a diagnostic `info string <body>` contributes in THIS
     /// build: the line with `verbose1`, nothing without it. Lets a pinned
     /// transcript stay byte-exact in both builds instead of being asserted in
@@ -3726,7 +3872,7 @@ mod tests {
             "info depth 0 multipv 1 score cp 0 nodes 0 nps 0 hashfull 0 time 1\n"
         );
 
-        let pos = parse_sfen("4k4/9/9/9/9/9/9/9/4K4 b P 1").expect("sfen parses");
+        let pos = yorkie_state::parse_sfen("4k4/9/9/9/9/9/9/9/4K4 b P 1").expect("sfen parses");
         info.pv = vec![parse_usi_move("P*5e", &pos).expect("drop parses")];
         info.hashfull = 1000;
         assert_eq!(
@@ -4073,6 +4219,111 @@ mod tests {
             bestmoves.len(),
             1,
             "expected one bestmove line, got {bestmoves:?}"
+        );
+    }
+
+    /// A `position` line carrying more moves than the retained command can hold
+    /// is refused by name, and the position the last accepted line named stands.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_move_list_past_the_bound_is_refused() {
+        let _tt = serial_tt();
+        let session = format!(
+            "position startpos moves 7g7f\n\
+             position startpos moves {}\n\
+             go\n\
+             quit\n",
+            king_shuffle(MAX_POSITION_MOVES + 1)
+        );
+        let out = run_with(&session);
+        if cfg!(feature = "verbose1") {
+            assert!(
+                out.contains(&format!(
+                    "info string position error: more than {MAX_POSITION_MOVES} moves"
+                )),
+                "missing the refusal in: {out}"
+            );
+        }
+        let bestmoves: Vec<&str> = out.lines().filter(|l| l.starts_with("bestmove ")).collect();
+        assert_eq!(
+            bestmoves.len(),
+            1,
+            "expected one bestmove line, got {bestmoves:?}"
+        );
+    }
+
+    /// What a refused line must leave behind, read off the driver itself: the
+    /// position of the last accepted command, and that command still retained
+    /// for the Stochastic_Ponder paths that replay it.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_refused_position_leaves_the_accepted_one_in_place() {
+        let _tt = serial_tt();
+        let mut driver = idle_driver();
+        driver
+            .handle_position(PositionSfen::StartPos, "7g7f 3c3d")
+            .expect("write");
+        let accepted_ply = driver.pos.ply();
+
+        for refused in [
+            "7g7f 1a1b",                                   // an illegal move mid-list
+            king_shuffle(MAX_POSITION_MOVES + 1).as_str(), // past the bound
+        ] {
+            driver
+                .handle_position(PositionSfen::StartPos, refused)
+                .expect("write");
+            assert_eq!(driver.pos.ply(), accepted_ply);
+            assert_eq!(driver.last_position.moves.len(), 2);
+        }
+
+        // A malformed SFEN is refused before any move is looked at.
+        driver
+            .handle_position(PositionSfen::Sfen(["not-a-board", "b", "-", "1"]), "")
+            .expect("write");
+        assert_eq!(driver.pos.ply(), accepted_ply);
+        assert_eq!(driver.last_position.moves.len(), 2);
+    }
+
+    /// A game's `position` commands are written into the buffers the driver was
+    /// built with: whatever the game's length, none of them is regrown, which is
+    /// what keeps the command path away from the allocator.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_games_position_commands_reuse_the_buffers() {
+        let _tt = serial_tt();
+        let mut driver = idle_driver();
+        let sfen = [
+            "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL",
+            "b",
+            "-",
+            "1",
+        ];
+        for plies in 0..64 {
+            driver
+                .handle_position(PositionSfen::StartPos, &king_shuffle(plies))
+                .expect("write");
+            driver
+                .handle_position(PositionSfen::Sfen(sfen), &king_shuffle(plies))
+                .expect("write");
+        }
+        assert_eq!(driver.last_position.moves.len(), 63);
+        for retained in [&driver.last_position, &driver.pending_position] {
+            assert_eq!(retained.moves.capacity(), MAX_POSITION_MOVES);
+            assert_eq!(retained.sfen.capacity(), SFEN_CAPACITY);
+        }
+        assert_eq!(driver.legal_buf.capacity(), MAX_LEGAL_MOVES);
+    }
+
+    /// The SFEN fields arrive split, and the driver joins them back into the one
+    /// string the parser reads — whatever ran between them on the wire.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_position_sfen_is_accepted_however_its_fields_were_spaced() {
+        let _tt = serial_tt();
+        let sfen = yorkie_state::STARTPOS_SFEN;
+        assert_eq!(
+            run_with(&format!("position   sfen  {sfen}   moves   7g7f\nquit\n")),
+            ""
         );
     }
 

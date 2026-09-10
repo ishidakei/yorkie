@@ -59,10 +59,24 @@ impl<T> PlyStack<T> {
         self.0.pop()
     }
 
+    /// Empty the stack, keeping every slot it has reserved.
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
     /// Slots that can still be pushed before the stack grows.
     #[cfg(test)]
     fn spare(&self) -> usize {
         self.0.capacity() - self.0.len()
+    }
+}
+
+/// A stack holding nothing and reserving nothing, which is what
+/// [`Position::reset_empty`] leaves behind when it takes a position's stacks to
+/// hand their reservation to the reset state.
+impl<T> Default for PlyStack<T> {
+    fn default() -> Self {
+        Self(Vec::new())
     }
 }
 
@@ -115,6 +129,28 @@ fn hand_is_equal_or_superior(superior: &Hand, inferior: &Hand) -> bool {
     HAND_KINDS
         .iter()
         .all(|&k| superior.count(k) >= inferior.count(k))
+}
+
+/// XOR `piece`'s `psq` term into whichever of the partial keys it belongs to
+/// (`xor_piece_for_partial_key`): a board pawn is the pawn key's alone, and
+/// everything else is its colour's non-pawn key, plus the minor-piece key where
+/// it is one.
+fn xor_piece_into_partial_keys(
+    piece: Piece,
+    sq: Square,
+    pawn_key: &mut u64,
+    minor_piece_key: &mut u64,
+    non_pawn_key: &mut [u64; Color::COUNT],
+) {
+    let term = crate::key::psq(piece, sq);
+    if piece.kind == PieceKind::Pawn && !piece.promoted {
+        *pawn_key ^= term;
+    } else {
+        if crate::key::is_minor_piece(piece) {
+            *minor_piece_key ^= term;
+        }
+        non_pawn_key[piece.color.index()] ^= term;
+    }
 }
 
 /// The piece sitting on `from` *before* a board move `m`, given the piece that
@@ -227,6 +263,19 @@ impl Eq for Position {}
 
 impl Position {
     pub fn empty() -> Self {
+        Self::empty_with(PlyStack::new(), PlyStack::new())
+    }
+
+    /// The empty board on the two stacks handed in, which are emptied but keep
+    /// whatever room they already hold. The single place every field of an
+    /// empty position is named, so a reset and a fresh construction cannot
+    /// drift apart.
+    fn empty_with(
+        mut history: PlyStack<StateInfo>,
+        mut check_info_stack: PlyStack<crate::search_movegen::CheckInfo>,
+    ) -> Self {
+        history.clear();
+        check_info_stack.clear();
         // An empty board with Black (the side whose term is *not* XORed in) to
         // move and no hand pieces hashes to zero on both halves. The partial
         // keys carry their empty-board values: `pawn_key` seeds with the
@@ -236,7 +285,7 @@ impl Position {
             hands: [Hand::empty(), Hand::empty()],
             side_to_move: Color::Black,
             ply: 1,
-            history: PlyStack::new(),
+            history,
             root: None,
             board_key: 0,
             hand_key: 0,
@@ -246,13 +295,30 @@ impl Position {
             // The empty board's check info (no kings, no attacks); recomputed
             // eagerly on the first state change (SFEN parse / `do_move`).
             check_info: crate::search_movegen::CheckInfo::EMPTY,
-            check_info_stack: PlyStack::new(),
+            check_info_stack,
         }
+    }
+
+    /// Become the empty board again without returning the per-move stacks to
+    /// the allocator: a caller that rebuilds a position command after command
+    /// reaches the allocator for them once, on the first one.
+    pub(crate) fn reset_empty(&mut self) {
+        *self = Self::empty_with(
+            std::mem::take(&mut self.history),
+            std::mem::take(&mut self.check_info_stack),
+        );
     }
 
     pub fn startpos() -> Self {
         crate::sfen::parse_sfen(crate::sfen::STARTPOS_SFEN)
             .expect("STARTPOS_SFEN is a hard-coded valid sfen")
+    }
+
+    /// Become the initial game position again, keeping the per-move stacks'
+    /// room the way [`Self::reset_empty`] does.
+    pub fn reset_startpos(&mut self) {
+        crate::sfen::parse_sfen_into(self, crate::sfen::STARTPOS_SFEN)
+            .expect("STARTPOS_SFEN is a hard-coded valid sfen");
     }
 
     pub const fn board(&self) -> &Board {
@@ -362,15 +428,13 @@ impl Position {
     /// (`xor_piece_for_partial_key`). XOR is self-inverse, so the same call
     /// both places and removes a piece.
     fn xor_piece_partial(&mut self, piece: Piece, sq: Square) {
-        let term = crate::key::psq(piece, sq);
-        if piece.kind == PieceKind::Pawn && !piece.promoted {
-            self.pawn_key ^= term;
-        } else {
-            if crate::key::is_minor_piece(piece) {
-                self.minor_piece_key ^= term;
-            }
-            self.non_pawn_key[piece.color.index()] ^= term;
-        }
+        xor_piece_into_partial_keys(
+            piece,
+            sq,
+            &mut self.pawn_key,
+            &mut self.minor_piece_key,
+            &mut self.non_pawn_key,
+        );
     }
 
     /// Recompute `(board_key, hand_key)` from scratch over the current board,
@@ -401,18 +465,25 @@ impl Position {
     /// Recompute the three partial keys from scratch over the current board,
     /// mirroring the per-piece walk in `Position::set`.
     fn recomputed_partial_keys(&self) -> (u64, u64, [u64; Color::COUNT]) {
-        let mut scratch = Position::empty();
+        // The empty board's values, which is what the terms below accumulate on
+        // top of: `pawn_key` seeds with the non-zero `noPawns` constant, the
+        // others with zero.
+        let mut pawn_key = crate::key::NO_PAWNS_SEED;
+        let mut minor_piece_key = 0;
+        let mut non_pawn_key = [0; Color::COUNT];
         for index in 0..Square::COUNT as u8 {
             let sq = Square::from_index(index).unwrap();
             if let Some(piece) = self.board.get(sq) {
-                scratch.xor_piece_partial(piece, sq);
+                xor_piece_into_partial_keys(
+                    piece,
+                    sq,
+                    &mut pawn_key,
+                    &mut minor_piece_key,
+                    &mut non_pawn_key,
+                );
             }
         }
-        (
-            scratch.pawn_key,
-            scratch.minor_piece_key,
-            scratch.non_pawn_key,
-        )
+        (pawn_key, minor_piece_key, non_pawn_key)
     }
 
     /// Reseed the stored keys and check info from a from-scratch recomputation.
@@ -1140,6 +1211,42 @@ mod tests {
         assert_eq!(work.history.len(), SEARCH_PLY_HEADROOM);
         assert!(work.history.spare() >= SEARCH_PLY_HEADROOM);
         assert!(work.check_info_stack.spare() >= SEARCH_PLY_HEADROOM);
+    }
+
+    /// Every field, not only the ones [`PartialEq`] compares: a reset position
+    /// has to be indistinguishable from a freshly built one down to the derived
+    /// caches, which is what the debug rendering covers.
+    #[test]
+    fn a_reset_position_is_a_freshly_built_one() {
+        let mut played = Position::startpos();
+        let pawn = Piece::new(PieceKind::Pawn, Color::Black);
+        played.do_move(Move::make(
+            Square::new(6, 6).unwrap(),
+            Square::new(6, 5).unwrap(),
+            pawn,
+        ));
+
+        let mut reset = played.clone();
+        reset.reset_empty();
+        assert_eq!(format!("{reset:?}"), format!("{:?}", Position::empty()));
+
+        let mut reset = played;
+        reset.reset_startpos();
+        assert_eq!(format!("{reset:?}"), format!("{:?}", Position::startpos()));
+    }
+
+    #[test]
+    fn a_reset_keeps_the_room_the_game_so_far_won() {
+        let mut game = Position::startpos();
+        for _ in 0..SEARCH_PLY_HEADROOM {
+            game.do_null_move();
+        }
+        let grown = game.history.0.capacity();
+        let grown_check_info = game.check_info_stack.0.capacity();
+
+        game.reset_startpos();
+        assert_eq!(game.history.0.capacity(), grown);
+        assert_eq!(game.check_info_stack.0.capacity(), grown_check_info);
     }
 
     #[test]

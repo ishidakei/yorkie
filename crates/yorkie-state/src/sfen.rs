@@ -53,6 +53,18 @@ impl fmt::Display for SfenError {
 impl std::error::Error for SfenError {}
 
 pub fn parse_sfen(s: &str) -> Result<Position, SfenError> {
+    let mut pos = Position::empty();
+    parse_sfen_into(&mut pos, s)?;
+    Ok(pos)
+}
+
+/// Parse `s` into `pos`, reusing the buffers it already holds instead of
+/// building a position of its own.
+///
+/// A rejected SFEN leaves `pos` holding whatever part of it had already been
+/// read, so a caller with a position to protect parses into a scratch and
+/// installs it only once this has returned `Ok`.
+pub fn parse_sfen_into(pos: &mut Position, s: &str) -> Result<(), SfenError> {
     let mut fields = s.split(' ');
     let board_field = fields.next().ok_or(SfenError::UnexpectedEnd)?;
     let stm_field = fields.next().ok_or(SfenError::UnexpectedEnd)?;
@@ -62,15 +74,15 @@ pub fn parse_sfen(s: &str) -> Result<Position, SfenError> {
         return Err(SfenError::UnexpectedTrailing);
     }
 
-    let mut pos = Position::empty();
-    parse_board(board_field, &mut pos)?;
-    parse_side_to_move(stm_field, &mut pos)?;
-    parse_hands(hand_field, &mut pos)?;
-    parse_ply(ply_field, &mut pos)?;
+    pos.reset_empty();
+    parse_board(board_field, pos)?;
+    parse_side_to_move(stm_field, pos)?;
+    parse_hands(hand_field, pos)?;
+    parse_ply(ply_field, pos)?;
     // The board / hand / side mutations above go through the direct setters,
     // which bypass incremental key maintenance; seed the keys once here.
     pos.refresh_keys();
-    Ok(pos)
+    Ok(())
 }
 
 fn parse_board(field: &str, pos: &mut Position) -> Result<(), SfenError> {
