@@ -1,0 +1,68 @@
+name: Docs
+
+# Publishes the crate documentation, private items included, at the repository's
+# GitHub Pages URL. Only a push to `main` deploys; a pull request is covered by
+# `ci.yml` and has nowhere to deploy to.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Pages accepts one deployment at a time. Queue rather than cancel, so that two
+# pushes in quick succession both reach the site instead of the second one
+# aborting the first mid-upload.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # `.cargo/config.toml` builds for the exact CPU of the machine doing the
+  # building (`-C target-cpu=native`), which holds as long as what it produces
+  # stays there. It does not hold here: the hosted runner fleet is not a single
+  # CPU model and `Swatinem/rust-cache` restores a `target/` directory built
+  # during an earlier run, so a natively built build script or proc macro can be
+  # handed to a runner lacking an instruction it was compiled with, and the first
+  # such instruction executed aborts the process with SIGILL. `x86-64-v3` (AVX2 +
+  # BMI2 + FMA) is a baseline every current x86-64 runner provides. An
+  # environment `RUSTFLAGS` overrides `build.rustflags` from
+  # `.cargo/config.toml`, and `rust-cache` mixes `RUSTFLAGS` into its cache key.
+  RUSTFLAGS: -C target-cpu=x86-64-v3
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo --version
+      - uses: Swatinem/rust-cache@v2
+      # `YORKIE_CONFIG` is deliberately unset: the documented build is the one a
+      # plain `cargo build --release` produces.
+      - run: cargo doc --no-deps --document-private-items --workspace
+      # `target/doc` has no `index.html` of its own, so the Pages URL would open
+      # on a directory listing. Send it to the engine crate.
+      - name: Write the landing page
+        run: |
+          printf '%s\n' \
+            '<meta http-equiv="refresh" content="0; url=yorkie/index.html">' \
+            > target/doc/index.html
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/doc
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
