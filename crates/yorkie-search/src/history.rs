@@ -19,6 +19,12 @@
 //! table's heap array goes through the shared huge-page allocator, mirroring
 //! the reference's `make_unique_large_page`. The allocator affects placement
 //! only.
+//!
+//! Three of the update methods carry `#[inline(always)]`. Their caller is the
+//! main search function, which is large enough that the ordinary `#[inline]`
+//! hint leaves the call standing; forcing the inline removes it and leaves the
+//! binary's text section smaller than it was. Every other accessor here is
+//! inlined without an attribute.
 
 use std::sync::atomic::{AtomicI16, Ordering};
 
@@ -143,6 +149,7 @@ impl CapturePieceToHistory {
 
     /// Gravity-update the entry for `moved` capturing `captured` on `to`
     /// (`D = 10692`).
+    #[inline(always)]
     pub fn update(&mut self, moved: Piece, to: Square, captured: Piece, bonus: i32) {
         let i = Self::index(moved, to, captured);
         self.table[i] = apply_gravity(self.table[i], bonus, CAPTURE_HISTORY_D);
@@ -194,6 +201,7 @@ impl ButterflyHistory {
     }
 
     /// Gravity-update `mainHistory[us][move.raw16]` (`D = 7183`).
+    #[inline(always)]
     pub fn update(&mut self, us: Color, m: Move, bonus: i32) {
         let i = Self::index(us, m);
         self.table[i] = apply_gravity(self.table[i], bonus, MAIN_HISTORY_D);
@@ -467,6 +475,7 @@ impl SharedHistories {
 
     /// Gravity-update the `[pc][to]` entry in the plane keyed by `pawn_key`
     /// (`D = 8192`).
+    #[inline(always)]
     pub fn pawn_update(&self, pawn_key: u64, pc: Piece, to: Square, bonus: i32) {
         apply_gravity_atomic(
             &self.pawn[self.pawn_index(pawn_key, pc, to)],
