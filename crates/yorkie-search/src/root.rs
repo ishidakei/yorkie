@@ -207,11 +207,18 @@ pub fn select_best_worker(workers: &[WorkerVote]) -> usize {
         (w.score as i64 - min_score as i64 + 14) * w.completed_depth as i64
     };
 
-    // `votes[pv[0]] += voting_value(w)` summed over workers.
-    let mut votes: std::collections::HashMap<Move, i64> = std::collections::HashMap::new();
-    for w in workers {
-        *votes.entry(w.pv0).or_insert(0) += voting_value(w);
-    }
+    // `votes[pv[0]] += voting_value(w)` summed over workers. A move's total is
+    // summed where it is read rather than tallied into a map first: only the two
+    // moves being compared are ever asked for, and the candidates are at most
+    // one per worker, so the tally would be scanned as a short list anyway — and
+    // this way the vote holds no buffer at all.
+    let vote_total = |mv: Move| -> i64 {
+        workers
+            .iter()
+            .filter(|w| w.pv0 == mv)
+            .map(&voting_value)
+            .sum()
+    };
 
     // Scan all workers keeping the best. `best` starts at the main worker
     // (index 0); comparing it against itself is a no-op.
@@ -223,8 +230,8 @@ pub fn select_best_worker(workers: &[WorkerVote]) -> usize {
         let best_score = cur.score;
         let new_score = th.score;
 
-        let best_vote = votes[&cur.pv0];
-        let new_vote = votes[&th.pv0];
+        let best_vote = vote_total(cur.pv0);
+        let new_vote = vote_total(th.pv0);
 
         let best_in_win = is_win(best_score);
         let new_in_win = is_win(new_score);

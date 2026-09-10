@@ -231,18 +231,84 @@ pub fn active_features(pos: &Position, perspective: Color) -> Vec<FeatureIndex> 
     list
 }
 
-/// [`active_features`] writing into a caller-owned buffer, so the finny cache's
-/// king-move arm does not allocate per node.
+/// Where the active-feature scan puts what it finds.
+///
+/// The scan yields exactly [`MAX_ACTIVE_FEATURES`] indices, so a caller that
+/// needs the list only for the length of one call fills a [`FeatureList`] in a
+/// local and never reaches the heap. The finny cache fills a `Vec` instead
+/// because it swaps the filled list into the entry it just rebuilt.
+pub(crate) trait FeatureSink {
+    /// Drop whatever a previous fill left and make room for a whole list.
+    fn restart(&mut self);
+    fn push(&mut self, index: FeatureIndex);
+    fn len(&self) -> usize;
+}
+
+impl FeatureSink for Vec<FeatureIndex> {
+    fn restart(&mut self) {
+        self.clear();
+        self.reserve(MAX_ACTIVE_FEATURES);
+    }
+
+    fn push(&mut self, index: FeatureIndex) {
+        Vec::push(self, index);
+    }
+
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+}
+
+/// An active-feature list held inline: the scan fills exactly
+/// [`MAX_ACTIVE_FEATURES`] slots, so the whole list fits a caller's stack frame.
+pub(crate) struct FeatureList {
+    entries: [FeatureIndex; MAX_ACTIVE_FEATURES],
+    len: usize,
+}
+
+impl FeatureList {
+    pub(crate) const fn new() -> Self {
+        Self {
+            entries: [0; MAX_ACTIVE_FEATURES],
+            len: 0,
+        }
+    }
+}
+
+impl std::ops::Deref for FeatureList {
+    type Target = [FeatureIndex];
+
+    fn deref(&self) -> &[FeatureIndex] {
+        &self.entries[..self.len]
+    }
+}
+
+impl FeatureSink for FeatureList {
+    fn restart(&mut self) {
+        self.len = 0;
+    }
+
+    fn push(&mut self, index: FeatureIndex) {
+        self.entries[self.len] = index;
+        self.len += 1;
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+/// [`active_features`] writing into a caller-owned buffer, so neither the finny
+/// cache's king-move arm nor a root refresh allocates one per call.
 ///
 /// # Panics
 /// Panics if `pos` is missing the `perspective` side's king.
-pub(crate) fn active_features_into(
+pub(crate) fn active_features_into<S: FeatureSink>(
     pos: &Position,
     perspective: Color,
-    list: &mut Vec<FeatureIndex>,
+    list: &mut S,
 ) {
-    list.clear();
-    list.reserve(MAX_ACTIVE_FEATURES);
+    list.restart();
 
     let own_king_persp = from_persp(king_square(pos, perspective), perspective);
     let mirror = needs_mirror(own_king_persp);

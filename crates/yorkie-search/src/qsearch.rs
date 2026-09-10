@@ -309,6 +309,16 @@ impl PonderSignal {
         }
     }
 
+    /// Rewind a signal for the next `go ponder`: the origin a `ponderhit` is
+    /// timed from moves to now, and no hit has arrived yet.
+    ///
+    /// Exclusive access is what makes this safe to do to a signal that has
+    /// already been shared — a search still holding it would see its own `go`'s
+    /// start time change underneath it.
+    pub fn restart(&mut self, active: bool) {
+        *self = PonderSignal::new(active);
+    }
+
     /// Whether the search is still pondering.
     pub fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)

@@ -23,9 +23,12 @@ use yorkie_search::{PvBound, PvInfo, PvOutputConfig, PvSink};
 // The per-game evaluation-noise seed: drawn here, read only by the search.
 #[cfg(feature = "random")]
 use yorkie_search::new_game_seed;
-use yorkie_state::{
-    ExtMove, Move, Position, SfenError, format_usi_move, parse_sfen_into, parse_usi_move,
-};
+use yorkie_state::{ExtMove, Move, Position, SfenError, parse_sfen_into, parse_usi_move};
+// A move's text as a `String`: what is left of it are the optional surfaces that
+// interpolate a move into a longer line. A `bestmove` reply, which every build
+// writes, composes its text in a stack buffer instead.
+#[cfg(feature = "verbose2")]
+use yorkie_state::format_usi_move;
 // A whole SFEN string is parsed only by the `verbose3` commands that carry one
 // as an argument; the `position` command's own is read field by field, into the
 // position the driver already holds.
@@ -41,6 +44,7 @@ use yorkie_storage::{clear_alloc_count, take_alloc_count};
 
 #[cfg(feature = "verbose3")]
 use crate::bench;
+use crate::bestmove::BestmoveBuf;
 use crate::formatter::Formatter;
 #[cfg(feature = "verbose2")]
 use crate::parser::MATE_UNLIMITED_MS;
@@ -435,6 +439,134 @@ struct SearchState {
     /// short-circuit the reference never touches `previousTimeReduction`, so the
     /// driver's persisted value is left unchanged.
     time_state: Option<(Value, Value, Option<f64>)>,
+    /// The collection buffers the coordinator filled, handed back for the next
+    /// `go` to fill again.
+    vote_buffers: VoteBuffers,
+}
+
+/// The handles a `go` hands its coordinator that carry no value from one search
+/// to the next: the flags the main loop signals on and the per-worker counters
+/// the workers tally into.
+///
+/// They belong to the session rather than to one search, and each `go` clears
+/// them ([`Self::arm`]) instead of building new ones, so starting a search
+/// reaches the allocator for none of them. Nothing races that reset: every `go`
+/// joins the previous coordinator first, and a joined coordinator has already
+/// collected every helper it dispatched.
+struct SearchHandles {
+    /// The one shared stop flag every worker polls.
+    stop: Arc<AtomicBool>,
+    /// The `go ponder` state. Handed to a search only when the `go` carries
+    /// `ponder`; every other `go` leaves it behind, inert.
+    ponder: Arc<PonderSignal>,
+    /// The Stochastic_Ponder teardown flag: set to drop a rewound search's
+    /// `bestmove`.
+    suppress_bestmove: Arc<AtomicBool>,
+    /// Raised when a search's reply reaches the output sink. Its only reader is
+    /// the `verbose3` `tt` commands' idle check.
+    #[cfg(feature = "verbose3")]
+    bestmove_sent: Arc<AtomicBool>,
+    /// Per-worker node counters (index 0 = main, `1..` = helpers), read by the
+    /// aggregate node ceiling and the final aggregated `info ... nodes` — both
+    /// `verbose2`, like the counters themselves.
+    #[cfg(feature = "verbose2")]
+    node_slots: Arc<Vec<AtomicU64>>,
+    /// Per-worker best-move-change counters: each worker bumps its own slot at
+    /// the root and the main worker folds them all each iteration.
+    bmc_slots: Arc<Vec<AtomicU64>>,
+}
+
+impl SearchHandles {
+    /// The handles for a pool of `n_threads` workers.
+    fn new(n_threads: usize) -> Self {
+        SearchHandles {
+            stop: Arc::new(AtomicBool::new(false)),
+            ponder: Arc::new(PonderSignal::new(false)),
+            suppress_bestmove: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "verbose3")]
+            bestmove_sent: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "verbose2")]
+            node_slots: new_tally(n_threads),
+            bmc_slots: new_tally(n_threads),
+        }
+    }
+
+    /// Give the counters one slot per worker of a freshly (re)built pool. Only a
+    /// pool rebuild changes the worker count, and no search runs across one.
+    fn fit_to_pool(&mut self, n_threads: usize) {
+        #[cfg(feature = "verbose2")]
+        {
+            self.node_slots = new_tally(n_threads);
+        }
+        self.bmc_slots = new_tally(n_threads);
+    }
+
+    /// Clear every flag and zero every counter for a search about to start, and
+    /// seed the ponder state from whether this `go` is a `go ponder`.
+    ///
+    /// Returns the ponder handle to install on the search, which is `None` for
+    /// every `go` that is not pondering — the distinction a stray `ponderhit`
+    /// falls back on.
+    fn arm(&mut self, ponder_mode: bool) -> Option<Arc<PonderSignal>> {
+        self.stop.store(false, Ordering::Relaxed);
+        self.suppress_bestmove.store(false, Ordering::Relaxed);
+        #[cfg(feature = "verbose3")]
+        self.bestmove_sent.store(false, Ordering::Relaxed);
+        #[cfg(feature = "verbose2")]
+        for slot in self.node_slots.iter() {
+            slot.store(0, Ordering::Relaxed);
+        }
+        for slot in self.bmc_slots.iter() {
+            slot.store(0, Ordering::Relaxed);
+        }
+        if !ponder_mode {
+            return None;
+        }
+        // The signal times a `ponderhit` from the `go` that started pondering,
+        // so a reused one is restarted here rather than merely re-flagged. The
+        // previous search has been joined, which leaves this handle the only
+        // one — and a signal that somehow still had a reader would be unsafe to
+        // rewind, so that case takes a fresh one.
+        match Arc::get_mut(&mut self.ponder) {
+            Some(signal) => signal.restart(true),
+            None => self.ponder = Arc::new(PonderSignal::new(true)),
+        }
+        Some(Arc::clone(&self.ponder))
+    }
+}
+
+/// One zeroed counter per worker.
+fn new_tally(n_threads: usize) -> Arc<Vec<AtomicU64>> {
+    Arc::new((0..n_threads).map(|_| AtomicU64::new(0)).collect())
+}
+
+/// The buffers a coordinator collects its workers into: one [`WorkerResult`] per
+/// worker, and the votes derived from them.
+///
+/// Session-owned and lent to each search exactly as the histories are, so the
+/// room for a pool's worth of results is won once rather than at every `go`.
+struct VoteBuffers {
+    results: Vec<WorkerResult>,
+    votes: Vec<WorkerVote>,
+}
+
+impl VoteBuffers {
+    fn for_pool(n_threads: usize) -> Self {
+        VoteBuffers {
+            results: Vec::with_capacity(n_threads),
+            votes: Vec::with_capacity(n_threads),
+        }
+    }
+
+    /// Make room for a freshly (re)built pool's workers. What the last search
+    /// left is dropped here rather than kept: a rebuilt pool's results have
+    /// nothing to do with the retired pool's.
+    fn fit_to_pool(&mut self, n_threads: usize) {
+        self.results.clear();
+        self.votes.clear();
+        self.results.reserve(n_threads);
+        self.votes.reserve(n_threads);
+    }
 }
 
 pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
@@ -546,11 +678,26 @@ pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
     /// at every pool (re)build from [`Self::worker_plan`]. Length equals the pool
     /// size, so `[0]` is the coordinator's and `[1..]` the helpers'.
     worker_shared: Vec<Arc<SharedHistories>>,
+    /// [`Self::worker_shared`] without the coordinator's slot-0 handle — worker
+    /// `h + 1`'s set at index `h` — behind an [`Arc`] so a `go` hands its
+    /// coordinator the list rather than a fresh copy of it. Rebuilt with the
+    /// pool, alongside its source.
+    helper_shared: Arc<Vec<Arc<SharedHistories>>>,
     /// Per-worker handles to the NNUE network the worker evaluates with — a
     /// clone of its *system* NUMA node's copy. Empty until a network is loaded;
     /// otherwise its length equals the pool size, so `[0]` is the coordinator's
     /// and `[1..]` the helpers'.
     worker_networks: Vec<Arc<Search>>,
+    /// [`Self::worker_networks`] without the coordinator's slot-0 handle, on the
+    /// same terms as [`Self::helper_shared`]. It holds network handles, so it is
+    /// emptied wherever its source is: a region may be refilled only once every
+    /// handle over it is gone.
+    helper_networks: Arc<Vec<Arc<Search>>>,
+    /// The flags and counters every `go` reuses.
+    handles: SearchHandles,
+    /// The coordinator's collection buffers. `None` only while a search holds
+    /// them, exactly like [`Self::histories`].
+    vote_buffers: Option<VoteBuffers>,
     /// The directory a relative `eval_dir` resolves against — the running
     /// executable's own, overridable via [`Self::with_eval_root`] so a test can
     /// present a directory of its own rather than the one it runs from.
@@ -598,9 +745,14 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             threads,
         ));
         let pool = ThreadPool::with_binding(threads, Arc::clone(&worker_plan));
+        // The pool decides the worker count — it refuses a size below one — so
+        // what the counters and buffers are sized by is the pool, not the
+        // setting it was asked for.
+        let workers = pool.size();
         // Build the per-node shared correction / pawn tables and give the
         // coordinator (worker 0) its node's set.
         let worker_shared = build_worker_shared(&worker_plan);
+        let helper_shared = helper_slice(&worker_shared);
         let histories = Some(WorkerHistories::with_shared(Arc::clone(&worker_shared[0])));
         // The coordinator's bundle is built (and filled) right here, on the USI
         // thread — so place it explicitly; see `place_coordinator_histories`.
@@ -635,8 +787,12 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             numa_layout,
             worker_plan,
             worker_shared,
+            helper_shared,
             // No network loaded yet; populated by the first `isready`.
             worker_networks: Vec::new(),
+            helper_networks: Arc::new(Vec::new()),
+            handles: SearchHandles::new(workers),
+            vote_buffers: Some(VoteBuffers::for_pool(workers)),
             eval_root: network_file::executable_directory(),
             keep_alive_poll: KEEP_ALIVE_POLL_INTERVAL,
             sysfs_root: PathBuf::from(SYSFS_ROOT),
@@ -778,6 +934,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 .join()
                 .expect("search worker thread must not panic");
             self.histories = Some(state.histories);
+            self.vote_buffers = Some(state.vote_buffers);
             // Carry the finished search's time-management outputs forward. The
             // reference runs this bookkeeping on every path, so the
             // short-circuits carry too, but with `tr == None`, since
@@ -870,6 +1027,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // game-scoped per-worker tables persist, so only its shared handle is
         // swapped.
         self.worker_shared = build_worker_shared(&self.worker_plan);
+        self.helper_shared = helper_slice(&self.worker_shared);
         if let Some(h) = self.histories.as_mut() {
             h.set_shared(Arc::clone(&self.worker_shared[0]));
         }
@@ -880,6 +1038,15 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         place_coordinator_histories(self.histories.as_ref(), self.worker_plan.system_nodes[0]);
         self.pool
             .set_with_binding(requested, Arc::clone(&self.worker_plan));
+        // The per-worker counters and the coordinator's collection buffers are
+        // sized by the worker count, so the rebuilt pool is where they are
+        // resized — nowhere else changes it, and no search runs across a
+        // rebuild.
+        let size = self.pool.size();
+        self.handles.fit_to_pool(size);
+        if let Some(buffers) = self.vote_buffers.as_mut() {
+            buffers.fit_to_pool(size);
+        }
         // Re-resolve the per-worker network handles for the fresh binding /
         // pool size: the reference forces replication right after
         // `resize_threads` (`ensure_network_replicated`).
@@ -902,11 +1069,13 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         let Some(eval) = self.eval.as_ref() else {
             // No network loaded; `go` before an `isready` resigns anyway.
             self.worker_networks = Vec::new();
+            self.helper_networks = Arc::new(Vec::new());
             return;
         };
 
         self.worker_networks =
             resolve_worker_networks(&eval.instances, &eval.by_node, &sys_nodes, requested);
+        self.helper_networks = helper_slice(&self.worker_networks);
     }
 
     /// Emit each non-blank line of `text` as `info string <line>` through the
@@ -1182,8 +1351,10 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // Nothing may still be reading the regions when they are filled: on a
         // multi-node machine they are the process's only storage for the
         // network. Any search has been joined by the caller, so dropping these
-        // handles drops the last references.
+        // handles drops the last references — both lists, since the helpers'
+        // holds the same handles.
         self.worker_networks = Vec::new();
+        self.helper_networks = Arc::new(Vec::new());
         self.eval = None;
 
         let outcome = |accepted: bool| if accepted { "applied" } else { "refused" };
@@ -1431,6 +1602,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             SearchState {
                 histories: outcome.histories,
                 time_state: outcome.time_state,
+                vote_buffers: outcome.vote_buffers,
             }
         });
 
@@ -1621,12 +1793,13 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 previous_time_reduction: self.previous_time_reduction,
             })
         };
-        // The shared `go ponder` signal, seeded active (`ponderMode`), installed on
-        // the main worker's control so it (and the coordinator's hold loop) can be
-        // driven by a later `ponderhit`. `None` on every non-ponder `go`.
-        let ponder = limits.ponder.then(|| Arc::new(PonderSignal::new(true)));
+        // Clear the session's flags and counters for this search, and take the
+        // `go ponder` signal (`ponderMode`) it hands the main worker's control,
+        // so that it — and the coordinator's hold loop — can be driven by a
+        // later `ponderhit`. `None` on every non-ponder `go`.
+        let ponder = self.handles.arm(limits.ponder);
         let control = SearchControl {
-            stop: Some(Arc::new(AtomicBool::new(false))),
+            stop: Some(Arc::clone(&self.handles.stop)),
             ponder: ponder.as_ref().map(Arc::clone),
             #[cfg(feature = "verbose2")]
             node_limit: limits.nodes,
@@ -1691,23 +1864,17 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             }
         };
 
-        // The worker count and the persistent helper slots to dispatch to. The
-        // pool is never resized while a coordinator runs (every resize path calls
+        // The persistent helper slots to dispatch to. The pool is never resized
+        // while a coordinator runs (every resize path calls
         // `finish_search_join` first), so these stay valid for this whole `go`.
-        let n_threads = self.pool.size();
         let helper_slots = self.pool.helper_slots();
-        // Each helper's node-shared tables: worker `h + 1` gets
-        // `worker_shared[h + 1]`, so drop the coordinator's slot-0 handle. The
-        // pool never resizes mid-`go`, so `worker_shared` (rebuilt only on a pool
-        // rebuild) stays aligned with these helpers for the whole search.
-        let helper_shared: Vec<Arc<SharedHistories>> =
-            self.worker_shared[1..].iter().map(Arc::clone).collect();
-        // Each helper's per-NUMA-node network: worker `h + 1` gets
-        // `worker_networks[h + 1]` — its system node's replica. Aligned with
-        // `worker_shared` (same per-worker indexing, rebuilt on the same pool
-        // rebuilds), so the pool never resizes mid-`go` and these stay valid.
-        let helper_networks: Vec<Arc<Search>> =
-            self.worker_networks[1..].iter().map(Arc::clone).collect();
+        // Each helper's node-shared tables and per-NUMA-node network: worker
+        // `h + 1` gets `worker_shared[h + 1]` and `worker_networks[h + 1]`, and
+        // both lists are held without the coordinator's slot-0 handle for that
+        // reason. Both are rebuilt only with the pool, which never happens
+        // mid-`go`, so they stay aligned with these helpers for the whole search.
+        let helper_shared = Arc::clone(&self.helper_shared);
+        let helper_networks = Arc::clone(&self.helper_networks);
 
         // The shared table is a `static`, so the coordinator gets the same
         // reference and nothing is handed over; the main histories are still
@@ -1718,6 +1885,10 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             .histories
             .take()
             .expect("session histories present when idle");
+        let vote_buffers = self
+            .vote_buffers
+            .take()
+            .expect("session collection buffers present when idle");
         // The coordinator (worker 0) evaluates with its own system node's network
         // replica; unbound / single-node → the one shared instance.
         let search = Arc::clone(&self.worker_networks[0]);
@@ -1746,12 +1917,13 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         #[cfg(feature = "verbose2")]
         let infinite = limits.infinite;
         // The Stochastic_Ponder teardown flag: when set, the coordinator emits
-        // no `bestmove` (nor final PV) for this search.
-        let suppress_bestmove = Arc::new(AtomicBool::new(false));
-        // Raised when this `go`'s reply reaches the output sink; the `tt`
-        // commands' idle check is the only reader, so only their feature has it.
+        // no `bestmove` (nor final PV) for this search. Raised alongside it, the
+        // flag saying this `go`'s reply reached the output sink; the `tt`
+        // commands' idle check is that one's only reader, so only their feature
+        // has it. Both were cleared for this search by `arm` above.
+        let suppress_bestmove = Arc::clone(&self.handles.suppress_bestmove);
         #[cfg(feature = "verbose3")]
-        let bestmove_sent = Arc::new(AtomicBool::new(false));
+        let bestmove_sent = Arc::clone(&self.handles.bestmove_sent);
 
         // Precompute the entering-king thresholds from the root position,
         // mirroring the reference `set_ekr` on the root worker. The rule itself
@@ -1777,10 +1949,13 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             control,
             stop,
             histories,
+            vote_buffers,
+            #[cfg(feature = "verbose2")]
+            node_slots: Arc::clone(&self.handles.node_slots),
+            bmc_slots: Arc::clone(&self.handles.bmc_slots),
             helper_slots,
             helper_shared,
             helper_networks,
-            n_threads,
             worker_plan,
             book,
             own_book,
@@ -1819,10 +1994,11 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             return Ok(0);
         };
         let outcome = run_coordinated(job);
-        // Return the session histories the job borrowed (the async path reclaims
-        // these on join; here we hand them straight back). Bench uses fixed
+        // Return the session state the job borrowed (the async path reclaims
+        // this on join; here we hand it straight back). Bench uses fixed
         // depth / nodes / movetime, so `time_state` is irrelevant to it.
         self.histories = Some(outcome.histories);
+        self.vote_buffers = Some(outcome.vote_buffers);
         Ok(outcome.nodes)
     }
 
@@ -2603,11 +2779,8 @@ fn emit_book_hit<W: Write>(
         }
         pv
     };
-    let mut bm = format_usi_move(hit.best);
-    if let Some(p) = hit.ponder {
-        bm.push_str(" ponder ");
-        bm.push_str(&format_usi_move(p));
-    }
+    let mut reply = BestmoveBuf::new();
+    let bm = reply.compose(hit.best, hit.ponder);
     let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
     #[cfg(feature = "verbose2")]
     let _ = Formatter::new(&mut *guard).info(&format!(
@@ -2619,7 +2792,7 @@ fn emit_book_hit<W: Write>(
     // before the reply.
     #[cfg(feature = "verbose1")]
     emit_stats(&mut *guard);
-    let _ = Formatter::new(&mut *guard).bestmove(&bm);
+    let _ = Formatter::new(&mut *guard).bestmove(bm);
     #[cfg(feature = "verbose3")]
     sent.store(true, Ordering::Relaxed);
 }
@@ -2837,9 +3010,11 @@ fn helper_loop(slot: Arc<HelperSlot>) {
 /// Each helper owns game-scoped histories that persist across `go`s, so the
 /// pool is recreated to reset them.
 struct ThreadPool {
-    /// One coordination slot per helper (`size − 1` of them). Shared with the
-    /// coordinator (which dispatches / collects) via [`Self::helper_slots`].
-    slots: Vec<Arc<HelperSlot>>,
+    /// One coordination slot per helper (`size − 1` of them). Behind an [`Arc`]
+    /// so the coordinator that dispatches to and collects from them is handed
+    /// the list itself rather than a copy of it per `go`; the list is replaced
+    /// only by a rebuild.
+    slots: Arc<Vec<Arc<HelperSlot>>>,
     /// The helper threads, joined on resize / teardown.
     handles: Vec<JoinHandle<()>>,
 }
@@ -2859,7 +3034,7 @@ impl ThreadPool {
     /// parks.
     fn with_binding(size: usize, plan: Arc<WorkerPlan>) -> Self {
         let mut pool = ThreadPool {
-            slots: Vec::new(),
+            slots: Arc::new(Vec::new()),
             handles: Vec::new(),
         };
         pool.set_with_binding(size, plan);
@@ -2889,6 +3064,7 @@ impl ThreadPool {
     fn set_with_binding(&mut self, size: usize, plan: Arc<WorkerPlan>) {
         self.shutdown();
         let size = size.max(1);
+        let mut slots = Vec::with_capacity(size - 1);
         for worker_id in 1..size {
             let slot = Arc::new(HelperSlot::new());
             let slot_for_thread = Arc::clone(&slot);
@@ -2900,8 +3076,9 @@ impl ThreadPool {
                 );
                 helper_loop(slot_for_thread);
             }));
-            self.slots.push(slot);
+            slots.push(slot);
         }
+        self.slots = Arc::new(slots);
     }
 
     /// Ask every helper to exit and join it, leaving only the main slot.
@@ -2909,14 +3086,14 @@ impl ThreadPool {
     /// `finish_search_join` every caller runs before a resize / teardown), so the
     /// `Exit` is never overwritten by a late `Finished` write.
     fn shutdown(&mut self) {
-        for slot in &self.slots {
+        for slot in self.slots.iter() {
             *slot.lock() = SlotState::Exit;
             slot.cv.notify_all();
         }
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
-        self.slots.clear();
+        self.slots = Arc::new(Vec::new());
     }
 
     /// The configured pool size: the main-worker slot plus the live helpers.
@@ -2924,10 +3101,10 @@ impl ThreadPool {
         self.slots.len() + 1
     }
 
-    /// Clone the helper slot handles so a coordinator can dispatch to and collect
-    /// from them for one `go`.
-    fn helper_slots(&self) -> Vec<Arc<HelperSlot>> {
-        self.slots.iter().map(Arc::clone).collect()
+    /// The helper slot list a coordinator dispatches to and collects from for one
+    /// `go`.
+    fn helper_slots(&self) -> Arc<Vec<Arc<HelperSlot>>> {
+        Arc::clone(&self.slots)
     }
 }
 
@@ -3145,6 +3322,15 @@ fn build_worker_shared(plan: &WorkerPlan) -> Vec<Arc<SharedHistories>> {
         .collect()
 }
 
+/// The helpers' share of a per-worker handle list: everything past worker 0,
+/// the coordinator, and nothing at all for a list that holds no worker.
+///
+/// The result is what a `go` hands its coordinator, so it is built where its
+/// source is and shared from there.
+fn helper_slice<T: Clone>(all: &[T]) -> Arc<Vec<T>> {
+    Arc::new(all.get(1..).unwrap_or_default().to_vec())
+}
+
 /// The node → worker-count map the shared-history construction sizes each set
 /// from. Pure — no allocation and no pinning.
 fn shared_node_counts(worker_nodes: &[NumaIndex]) -> std::collections::BTreeMap<NumaIndex, usize> {
@@ -3242,21 +3428,33 @@ struct CoordinatorJob<W: Write + Send + 'static> {
     stop: Arc<AtomicBool>,
     /// The main worker's game-scoped histories, returned to the driver on join.
     histories: WorkerHistories,
-    /// The persistent helper slots to dispatch to (`n_threads − 1` of them).
-    helper_slots: Vec<Arc<HelperSlot>>,
+    /// The session's collection buffers, returned to the driver on join beside
+    /// the histories. What the last search left is cleared before this one
+    /// fills them; nothing here resizes them, since their room is the pool's
+    /// property.
+    vote_buffers: VoteBuffers,
+    /// Per-worker node counters (index 0 = main, `1..` = helpers), zeroed for
+    /// this `go` by the driver. The aggregate node ceiling and the final
+    /// aggregated `info ... nodes` are the readers, both `verbose2`.
+    #[cfg(feature = "verbose2")]
+    node_slots: Arc<Vec<AtomicU64>>,
+    /// Per-worker best-move-change counters, same slot-per-worker shape and
+    /// zeroed on the same terms: each worker bumps its own slot at the root and
+    /// the main worker folds them all each iteration.
+    bmc_slots: Arc<Vec<AtomicU64>>,
+    /// The persistent helper slots to dispatch to, one per helper.
+    helper_slots: Arc<Vec<Arc<HelperSlot>>>,
     /// Each helper's node-shared correction / pawn tables, aligned
     /// with `helper_slots`: `helper_shared[h]` is worker `h + 1`'s
     /// [`SharedHistories`]. Handed to the helper in its [`HelperJob`]. The main
     /// worker's own shared handle already lives inside `histories`.
-    helper_shared: Vec<Arc<SharedHistories>>,
+    helper_shared: Arc<Vec<Arc<SharedHistories>>>,
     /// Each helper's per-NUMA-node network replica, aligned with
     /// `helper_slots`: `helper_networks[h]` is worker `h + 1`'s [`Search`]. Handed
     /// to the helper in its [`HelperJob`]. The main worker's own replica is
     /// `search`. When replication is inactive every entry is a clone of the one
     /// loaded instance.
-    helper_networks: Vec<Arc<Search>>,
-    /// The worker count (main + helpers).
-    n_threads: usize,
+    helper_networks: Arc<Vec<Arc<Search>>>,
     /// The active worker plan: the coordinator pins itself to worker 0's CPU and
     /// prefers that CPU's node for memory at the start of this `go`.
     worker_plan: Arc<WorkerPlan>,
@@ -3316,6 +3514,9 @@ struct CoordinatorJob<W: Write + Send + 'static> {
 /// `None` for a short-circuited `go`.
 struct CoordinatedOutcome {
     histories: WorkerHistories,
+    /// The collection buffers this search filled, on their way back to the
+    /// session that lent them.
+    vote_buffers: VoteBuffers,
     /// `bench` is the only reader (the async `go` path takes its node total off
     /// the wire), and `bench` is `verbose3`, so a build below it neither carries
     /// nor sums the total.
@@ -3347,10 +3548,13 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         control,
         stop,
         histories,
+        vote_buffers,
+        #[cfg(feature = "verbose2")]
+        node_slots,
+        bmc_slots,
         helper_slots,
         helper_shared,
         helper_networks,
-        n_threads,
         worker_plan,
         book,
         own_book,
@@ -3404,6 +3608,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         );
         return CoordinatedOutcome {
             histories,
+            vote_buffers,
             #[cfg(feature = "verbose3")]
             nodes: 0,
             time_state: skip_search_carry(),
@@ -3426,11 +3631,12 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
                 &writer,
                 #[cfg(feature = "verbose3")]
                 &bestmove_sent,
-                &format_usi_move(mv),
+                BestmoveBuf::new().compose(mv, None),
             );
         }
         return CoordinatedOutcome {
             histories,
+            vote_buffers,
             #[cfg(feature = "verbose3")]
             nodes: 0,
             time_state: skip_search_carry(),
@@ -3480,26 +3686,13 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
             );
             return CoordinatedOutcome {
                 histories,
+                vote_buffers,
                 #[cfg(feature = "verbose3")]
                 nodes: 0,
                 time_state: skip_search_carry(),
             };
         }
     }
-
-    // Per-worker node counters (index 0 = main, 1.. = helpers) for the aggregate
-    // `go nodes N` ceiling and the final aggregated `info ... nodes`. Both
-    // readers are `verbose2` — the ceiling with the clauses and keys that set
-    // it, the `info` line with every search line — and each worker's own
-    // `nodes`, which the search itself reads, is a counter of its own.
-    #[cfg(feature = "verbose2")]
-    let node_slots: Arc<Vec<AtomicU64>> =
-        Arc::new((0..n_threads).map(|_| AtomicU64::new(0)).collect());
-    // Per-worker best-move-change counters, same slot-per-worker shape: each
-    // worker bumps its own slot at the root, the main worker folds them all
-    // each iteration. Fresh (all-zero) per `go`.
-    let bmc_slots: Arc<Vec<AtomicU64>> =
-        Arc::new((0..n_threads).map(|_| AtomicU64::new(0)).collect());
 
     // Dispatch a job to every helper (index h in `helper_slots` → worker h + 1).
     for (h, slot) in helper_slots.iter().enumerate() {
@@ -3578,9 +3771,15 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     // Signal the helpers the search is over, then wait for and collect each one.
     // They observe the shared stop at their next checkpoint and finish promptly.
     stop.store(true, Ordering::Relaxed);
-    let mut results: Vec<WorkerResult> = Vec::with_capacity(n_threads);
+    let VoteBuffers {
+        mut results,
+        mut votes,
+    } = vote_buffers;
+    // The previous search's results are dropped here, at the point their room
+    // is about to be filled again.
+    results.clear();
     results.push(main_result);
-    for slot in &helper_slots {
+    for slot in helper_slots.iter() {
         results.push(slot.collect());
     }
 
@@ -3600,15 +3799,13 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         if !use_voting {
             break 'vote 0;
         }
-        let votes: Vec<WorkerVote> = results
-            .iter()
-            .map(|r| WorkerVote {
-                score: r.best.score,
-                pv0: r.best.pv[0],
-                pv_len: r.best.pv.len(),
-                completed_depth: r.completed_depth,
-            })
-            .collect();
+        votes.clear();
+        votes.extend(results.iter().map(|r| WorkerVote {
+            score: r.best.score,
+            pv0: r.best.pv[0],
+            pv_len: r.best.pv.len(),
+            completed_depth: r.completed_depth,
+        }));
         select_best_worker(&votes)
     };
     let chosen_result = &results[chosen];
@@ -3681,17 +3878,14 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     }
 
     // `bestmove [ponder]` — the ponder move is the chosen line's second PV move.
-    let mut bm = format_usi_move(best.mv);
-    if best.pv.len() >= 2 {
-        bm.push_str(" ponder ");
-        bm.push_str(&format_usi_move(best.pv[1]));
-    }
-
     // Resigning replaces the whole reply (the reference makes the search look
     // skipped and stacks `Move::resign()`), so it carries no ponder move.
-    if resign_by_value {
-        bm = "resign".to_string();
-    }
+    let mut reply = BestmoveBuf::new();
+    let bm = if resign_by_value {
+        "resign"
+    } else {
+        reply.compose(best.mv, (best.pv.len() >= 2).then(|| best.pv[1]))
+    };
 
     // A Stochastic_Ponder teardown stops the rewound search without emitting
     // its `bestmove`; the fresh re-issued `go` produces the single reply the
@@ -3702,7 +3896,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
             &writer,
             #[cfg(feature = "verbose3")]
             &bestmove_sent,
-            &bm,
+            bm,
         );
     }
 
@@ -3711,6 +3905,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     // the `bench` accumulation and the time-management carry-forward.
     CoordinatedOutcome {
         histories: qs.into_histories(),
+        vote_buffers: VoteBuffers { results, votes },
         #[cfg(feature = "verbose3")]
         nodes: total_nodes,
         time_state: Some((
@@ -4599,6 +4794,89 @@ mod tests {
     }
 
     #[test]
+    fn a_go_is_handed_the_pools_own_helper_list() {
+        // Nothing about dispatching to the helpers copies the list: every `go`
+        // gets the pool's, which only a rebuild replaces.
+        let mut pool = ThreadPool::new(3);
+        let first = pool.helper_slots();
+        assert!(Arc::ptr_eq(&first, &pool.helper_slots()));
+        pool.set(2);
+        assert!(
+            !Arc::ptr_eq(&first, &pool.helper_slots()),
+            "a rebuilt pool hands out its new slots"
+        );
+        assert_eq!(pool.helper_slots().len(), 1);
+    }
+
+    // --- the handles and buffers a `go` reuses ----------------------------
+
+    #[test]
+    fn arming_a_search_clears_what_the_last_one_left() {
+        let mut handles = SearchHandles::new(3);
+        let stop = Arc::clone(&handles.stop);
+        let bmc = Arc::clone(&handles.bmc_slots);
+        handles.stop.store(true, Ordering::Relaxed);
+        handles.suppress_bestmove.store(true, Ordering::Relaxed);
+        handles.bmc_slots[2].store(9, Ordering::Relaxed);
+        #[cfg(feature = "verbose2")]
+        handles.node_slots[1].store(9, Ordering::Relaxed);
+
+        assert!(
+            handles.arm(false).is_none(),
+            "no ponder signal for a plain go"
+        );
+
+        assert!(!handles.stop.load(Ordering::Relaxed));
+        assert!(!handles.suppress_bestmove.load(Ordering::Relaxed));
+        assert!(
+            handles
+                .bmc_slots
+                .iter()
+                .all(|s| s.load(Ordering::Relaxed) == 0),
+            "every best-move-change counter starts at zero"
+        );
+        #[cfg(feature = "verbose2")]
+        assert!(
+            handles
+                .node_slots
+                .iter()
+                .all(|s| s.load(Ordering::Relaxed) == 0),
+            "every node counter starts at zero"
+        );
+        assert!(
+            Arc::ptr_eq(&stop, &handles.stop) && Arc::ptr_eq(&bmc, &handles.bmc_slots),
+            "the flags and counters are cleared in place, not rebuilt"
+        );
+    }
+
+    #[test]
+    fn each_ponder_go_starts_from_an_unhit_signal() {
+        let mut handles = SearchHandles::new(1);
+        let first = handles.arm(true).expect("a `go ponder` carries the signal");
+        assert!(first.is_active());
+        first.ponderhit();
+        assert!(!first.is_active());
+        drop(first);
+
+        let second = handles.arm(true).expect("a `go ponder` carries the signal");
+        assert!(
+            second.is_active(),
+            "the next ponder search starts pondering rather than inheriting a hit"
+        );
+    }
+
+    #[test]
+    fn the_collection_buffers_hold_a_pools_worth_of_room() {
+        let mut buffers = VoteBuffers::for_pool(4);
+        assert!(buffers.results.capacity() >= 4 && buffers.votes.capacity() >= 4);
+        buffers.fit_to_pool(9);
+        assert!(buffers.results.capacity() >= 9 && buffers.votes.capacity() >= 9);
+        // A smaller pool keeps the room already won: nothing here ever shrinks.
+        buffers.fit_to_pool(2);
+        assert!(buffers.results.capacity() >= 9 && buffers.votes.capacity() >= 9);
+    }
+
+    #[test]
     fn thread_pool_zero_is_clamped_to_one() {
         // The driver never passes 0 (the option min is 1), but the pool clamps
         // defensively so `size − 1` never underflows.
@@ -4759,6 +5037,7 @@ mod tests {
         let handle = std::thread::spawn(|| SearchState {
             histories: WorkerHistories::new(),
             time_state: skip_search_carry(),
+            vote_buffers: VoteBuffers::for_pool(1),
         });
         driver.search = Some(ActiveSearch {
             handle,
@@ -4795,6 +5074,7 @@ mod tests {
         let handle = std::thread::spawn(|| SearchState {
             histories: WorkerHistories::new(),
             time_state: Some((10, 20, Some(1.25))),
+            vote_buffers: VoteBuffers::for_pool(1),
         });
         driver.search = Some(ActiveSearch {
             handle,

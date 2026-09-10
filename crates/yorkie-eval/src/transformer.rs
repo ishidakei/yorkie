@@ -21,7 +21,8 @@ use yorkie_state::{Color, Move, Position};
 
 use crate::aligned::Aligned64;
 use crate::features::{
-    FeatureIndex, MoveDelta, active_features, changed_indices, requires_full_refresh,
+    FeatureIndex, FeatureList, MoveDelta, active_features, active_features_into, changed_indices,
+    requires_full_refresh,
 };
 use crate::finny::FinnyCache;
 use crate::simd::{post_ft_kernel, transformer_kernel};
@@ -59,11 +60,16 @@ impl Accumulator {
     /// active feature columns, added with wrapping `i16`: the downstream
     /// clipped output transform saturates, so overflow here is intended.
     ///
+    /// The feature list is scanned into a local of fixed width, so seeding a
+    /// worker's root accumulator — the one place a search reaches this — costs
+    /// no allocation.
+    ///
     /// # Panics
     /// Panics if `pos` is missing either king.
     pub fn refresh(&mut self, net: &NnueNetwork, pos: &Position) {
+        let mut feats = FeatureList::new();
         for color in [Color::Black, Color::White] {
-            let feats = active_features(pos, color);
+            active_features_into(pos, color, &mut feats);
             refresh_perspective(
                 &mut self.perspectives[color.index()],
                 &net.ft_biases,
@@ -161,11 +167,13 @@ impl Accumulator {
                     );
                 }
                 None => {
+                    let mut feats = FeatureList::new();
+                    active_features_into(post_pos, color, &mut feats);
                     refresh_perspective(
                         &mut dst.perspectives[i],
                         &net.ft_biases,
                         &net.ft_weights,
-                        &active_features(post_pos, color),
+                        &feats,
                     );
                 }
             }

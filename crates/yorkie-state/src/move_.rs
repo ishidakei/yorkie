@@ -319,33 +319,75 @@ pub fn parse_usi_move(s: &str, pos: &Position) -> Result<Move, UsiMoveParseError
     }
 }
 
+/// The longest USI move text: two squares and the promotion marker.
+pub const MAX_USI_MOVE_LEN: usize = 5;
+
+/// A stack buffer one USI move is written into.
+///
+/// The text of a move is at most [`MAX_USI_MOVE_LEN`] bytes wide, so a caller
+/// that needs it only for as long as it takes to write it out borrows those
+/// bytes from here rather than taking a `String` per move.
+pub struct UsiMoveBuf {
+    bytes: [u8; MAX_USI_MOVE_LEN],
+    len: usize,
+}
+
+impl UsiMoveBuf {
+    pub const fn new() -> Self {
+        Self {
+            bytes: [0; MAX_USI_MOVE_LEN],
+            len: 0,
+        }
+    }
+
+    /// Write `m` into this buffer and return the text — [`format_usi_move`]
+    /// without the `String`, with the same behaviour on a non-move sentinel.
+    ///
+    /// # Panics
+    /// Panics on a king drop, which USI has no notation for.
+    pub fn format(&mut self, m: Move) -> &str {
+        self.len = 0;
+        if m.is_drop() {
+            self.push(drop_letter(m.dropped_piece_kind()));
+            self.push('*');
+        } else {
+            let from = m.from_sq();
+            self.push(file_to_usi(from.file()));
+            self.push(rank_to_usi(from.rank()));
+        }
+        let to = m.to_sq();
+        self.push(file_to_usi(to.file()));
+        self.push(rank_to_usi(to.rank()));
+        // A drop is never a promotion, and `is_promote` reads a bit the drop
+        // encoding uses for something else.
+        if !m.is_drop() && m.is_promote() {
+            self.push('+');
+        }
+        // Every byte written above is one of the ASCII characters the two
+        // digit-and-letter mappings and the two markers produce.
+        core::str::from_utf8(&self.bytes[..self.len]).expect("composed of ASCII characters")
+    }
+
+    fn push(&mut self, c: char) {
+        debug_assert!(c.is_ascii(), "USI move text is ASCII");
+        self.bytes[self.len] = c as u8;
+        self.len += 1;
+    }
+}
+
+impl Default for UsiMoveBuf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Format a [`Move`] as a USI move string — the inverse of [`parse_usi_move`].
 ///
 /// Behaviour on a non-move sentinel is unspecified: those values encode no
 /// square or piece in the layout this decodes.
 pub fn format_usi_move(m: Move) -> String {
-    if m.is_drop() {
-        let kind = m.dropped_piece_kind();
-        let letter = drop_letter(kind);
-        let to = m.to_sq();
-        format!(
-            "{letter}*{}{}",
-            file_to_usi(to.file()),
-            rank_to_usi(to.rank()),
-        )
-    } else {
-        let from = m.from_sq();
-        let to = m.to_sq();
-        let mut s = String::with_capacity(5);
-        s.push(file_to_usi(from.file()));
-        s.push(rank_to_usi(from.rank()));
-        s.push(file_to_usi(to.file()));
-        s.push(rank_to_usi(to.rank()));
-        if m.is_promote() {
-            s.push('+');
-        }
-        s
-    }
+    let mut buf = UsiMoveBuf::new();
+    buf.format(m).to_string()
 }
 
 fn drop_letter(kind: PieceKind) -> char {
@@ -1052,6 +1094,32 @@ mod tests {
             let m = Move::make_drop(PieceKind::Rook, Color::White, Square::new(8, 0).unwrap());
             assert_eq!(format_usi_move(m), "R*9a");
             let _ = pos;
+        }
+
+        #[test]
+        fn a_reused_buffer_carries_nothing_over() {
+            let pos = parse_sfen(SENNICHITE_SFEN).unwrap();
+            let mut buf = UsiMoveBuf::new();
+            let promoting = Move::make_promote(
+                Square::new(0, 0).unwrap(),
+                Square::new(8, 8).unwrap(),
+                Piece::new(PieceKind::Pawn, Color::Black),
+            );
+            assert_eq!(buf.format(promoting), "1a9i+");
+            assert_eq!(buf.format(parse_usi_move("P*5e", &pos).unwrap()), "P*5e");
+            assert_eq!(buf.format(promoting), "1a9i+");
+        }
+
+        #[test]
+        fn the_buffer_agrees_with_the_string_form_for_every_legal_move() {
+            let pos = parse_sfen(ALL_DROPS_SFEN).unwrap();
+            let mut moves: Vec<Move> = Vec::new();
+            pos.generate_legal_all(&mut moves);
+            assert!(!moves.is_empty(), "the position has legal moves");
+            let mut buf = UsiMoveBuf::new();
+            for m in moves {
+                assert_eq!(buf.format(m), format_usi_move(m));
+            }
         }
     }
 }

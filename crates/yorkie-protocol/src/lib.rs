@@ -1,6 +1,7 @@
 /// The feature-gated `bench` command — present only under `verbose3`.
 #[cfg(feature = "verbose3")]
 pub mod bench;
+pub(crate) mod bestmove;
 pub mod config;
 pub mod driver;
 pub mod formatter;
