@@ -24,7 +24,18 @@ use common::{StreamHarness, bestmove_lines, legal, parse, stage_configured_eval_
 use yorkie_protocol::config;
 use yorkie_state::parse_usi_move;
 
-const STARTPOS: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
+/// Black to move with five legal moves: four king steps off 5i, and the pawn
+/// on 5h one square forward.
+///
+/// A build can compile a node ceiling in, and a build carrying the `random`
+/// feature draws a fresh evaluation-noise seed for each game, which reshapes the
+/// tree: an opening position searched several PVs wide can spend a ceiling's
+/// worth of nodes on one iteration under one seed and reach the requested depth
+/// under the next, so an assertion about a completed iteration would hold or not
+/// by luck of the draw. A `go depth 4` from this position stays under two
+/// thousand nodes whatever the seed, which is inside every ceiling the suite
+/// builds with, so every iteration a test asks for is one the search completed.
+const FEW_LEGAL_MOVES: &str = "4k4/4p4/9/9/9/9/9/4P4/4K4 b - 1";
 /// White to move with exactly one legal move: the king on 5a must capture the
 /// checking gold on 5b (every other escape square is covered by that gold).
 const ONE_LEGAL_MOVE: &str = "4k4/4G4/9/9/9/9/9/9/4K4 w - 1";
@@ -126,11 +137,11 @@ fn the_configured_multipv_emits_that_many_ranked_lines_per_iteration() {
         return;
     }
     assert!(
-        want <= legal(&parse(STARTPOS)).len(),
+        want <= legal(&parse(FEW_LEGAL_MOVES)).len(),
         "the fixture must have at least MultiPV legal moves"
     );
 
-    let out = run_session("position startpos", "go depth 3");
+    let out = run_session(&format!("position sfen {FEW_LEGAL_MOVES}"), "go depth 3");
 
     // The last completed iteration emits exactly `want` ranked lines.
     let block = last_multipv_block(&out);
@@ -209,7 +220,7 @@ fn an_unthrottled_pv_interval_prints_every_iteration() {
         eprintln!("skipped: this build throttles the PV, so which iterations print is timing");
         return;
     }
-    let out = run_session("position startpos", "go depth 3");
+    let out = run_session(&format!("position sfen {FEW_LEGAL_MOVES}"), "go depth 3");
     for d in 1..=3 {
         assert!(
             out.lines()
@@ -228,7 +239,7 @@ fn a_final_pv_always_precedes_bestmove() {
     // `bestmove` is it, but a `MultiPV N` iteration ends on its `multipv N`
     // line while the bestmove comes from the ranked-first `multipv 1`.
     let ranked = config::MULTI_PV >= 2;
-    let out = run_session("position startpos", "go depth 3");
+    let out = run_session(&format!("position sfen {FEW_LEGAL_MOVES}"), "go depth 3");
 
     let bm_pos = out
         .find("\nbestmove ")
@@ -267,7 +278,7 @@ fn a_consideration_mode_pv_replays_as_a_legal_sequence() {
 
     // ConsiderationMode forces the interval to 0 internally, so per-iteration PVs
     // are emitted; the PV is collected from the transposition table.
-    let out = run_session("position startpos", "go depth 4");
+    let out = run_session(&format!("position sfen {FEW_LEGAL_MOVES}"), "go depth 4");
 
     let bms = bestmove_lines(&out);
     assert_eq!(
@@ -283,7 +294,7 @@ fn a_consideration_mode_pv_replays_as_a_legal_sequence() {
         .unwrap_or_else(|| panic!("no info pv line in:\n{out}"));
     let pv_str = pv_line.split(" pv ").nth(1).unwrap();
 
-    let mut pos = parse(STARTPOS);
+    let mut pos = parse(FEW_LEGAL_MOVES);
     let mut count = 0;
     for tok in pv_str.split_whitespace() {
         let mv = match parse_usi_move(tok, &pos) {

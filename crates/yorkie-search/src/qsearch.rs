@@ -17,13 +17,9 @@
 //! replacement selection against a cluster a child has since churned, and could
 //! pick a different slot.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-// `Duration` types the PV-output interval, which only a build that prints a PV
-// has.
-#[cfg(feature = "verbose2")]
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use yorkie_eval::{Accumulator, FinnyCache, MoveDelta, NnueNetwork, evaluate_with};
 use yorkie_state::{Color, Move, Piece, PieceKind, Position, RepetitionState, piece_value};
@@ -290,10 +286,16 @@ pub struct PonderSignal {
     /// `SearchManager::ponder` — true while `go ponder` is pondering; cleared by
     /// [`Self::ponderhit`].
     active: AtomicBool,
-    /// The instant a `ponderhit` arrived (`tm.ponderhitTime = now()`), stamped
-    /// **before** the flag is cleared so a worker that observes
-    /// `active == false` always sees the time — the reference ordering.
-    hit_at: Mutex<Option<Instant>>,
+    /// The instant this signal was created, which is the `go`'s own start. It is
+    /// the origin the stamp below counts from, and it is written once, before
+    /// the signal is shared.
+    start: Instant,
+    /// Nanoseconds from `start` to the `ponderhit` (`tm.ponderhitTime = now()`),
+    /// `0` while none has arrived. Stamped **before** the flag is cleared so a
+    /// worker that observes `active == false` always sees the time — the
+    /// reference ordering. An atomic rather than a lock: the search polls this
+    /// from `check_time`, and nothing on the search path may wait.
+    hit_at_nanos: AtomicU64,
 }
 
 impl PonderSignal {
@@ -302,7 +304,8 @@ impl PonderSignal {
     pub fn new(active: bool) -> Self {
         PonderSignal {
             active: AtomicBool::new(active),
-            hit_at: Mutex::new(None),
+            start: Instant::now(),
+            hit_at_nanos: AtomicU64::new(0),
         }
     }
 
@@ -315,13 +318,25 @@ impl PonderSignal {
     /// flag. The order matters — `check_time` / `set_search_end` read
     /// `ponderhitTime` after seeing `ponder == false`.
     pub fn ponderhit(&self) {
-        *self.hit_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        let nanos = u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        // `Release` here (and `Acquire` in `hit_at`) rather than `Relaxed`, even
+        // though clearing `active` below already publishes this write to a
+        // reader that goes through the flag: the pair makes `hit_at` correct on
+        // its own terms, for a reader that does not. On x86-64 both are plain
+        // moves, so the search path pays nothing for it.
+        self.hit_at_nanos.store(nanos.max(1), Ordering::Release);
         self.active.store(false, Ordering::Release);
     }
 
-    /// The stamped ponderhit instant, if a `ponderhit` has arrived.
+    /// The stamped ponderhit instant, if a `ponderhit` has arrived. A stamp of
+    /// `0` means none has; the `max(1)` above keeps that value free, at the cost
+    /// of reporting a ponderhit in the same nanosecond as the `go` one
+    /// nanosecond late.
     fn hit_at(&self) -> Option<Instant> {
-        *self.hit_at.lock().unwrap_or_else(|e| e.into_inner())
+        match self.hit_at_nanos.load(Ordering::Acquire) {
+            0 => None,
+            nanos => Some(self.start + Duration::from_nanos(nanos)),
+        }
     }
 }
 
