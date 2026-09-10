@@ -270,7 +270,7 @@ struct Candidate {
 /// `BookMoveSelector::probe_impl` for the root case.
 ///
 /// `books` is the Multiple Book priority list; every lookup goes through
-/// [`find_in_books`], which returns the first non-empty hit and never merges
+/// `find_in_books`, which returns the first non-empty hit and never merges
 /// across books.
 ///
 /// The `USI_OwnBook` gate is the caller's responsibility. Returns a miss for

@@ -221,8 +221,8 @@ pub struct Position {
     hand_key: u64,
     /// Partial position key over board pawns only — a promoted pawn is not a
     /// pawn here, and pieces in hand never contribute
-    /// (`StateInfo::pawnKey`). Seeded with the non-zero [`crate::key::no_pawns`]
-    /// value.
+    /// (`StateInfo::pawnKey`). Seeded with the non-zero
+    /// [`crate::key::NO_PAWNS_SEED`] value.
     pawn_key: u64,
     /// Partial position key over board minor pieces, per
     /// [`crate::key::is_minor_piece`] (`StateInfo::minorPieceKey`).
@@ -315,7 +315,7 @@ impl Position {
     }
 
     /// Become the initial game position again, keeping the per-move stacks'
-    /// room the way [`Self::reset_empty`] does.
+    /// room the way `reset_empty` does.
     pub fn reset_startpos(&mut self) {
         crate::sfen::parse_sfen_into(self, crate::sfen::STARTPOS_SFEN)
             .expect("STARTPOS_SFEN is a hard-coded valid sfen");

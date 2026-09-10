@@ -20,8 +20,8 @@
 //! ```
 //!
 //! [`PieceKind`] disagrees with the reference's `PieceType` ordering — it puts
-//! `Gold` between `Silver` and `Bishop` — so [`PIECE_KIND_TO_REF`] and its
-//! inverse [`REF_TO_PIECE_KIND`] translate between them.
+//! `Gold` between `Silver` and `Bishop` — so `PIECE_KIND_TO_REF` and its
+//! inverse `REF_TO_PIECE_KIND` translate between them.
 
 use core::fmt;
 

@@ -34,17 +34,17 @@ const MOVE_HORIZON: i32 = 160;
 /// handed the same values again at every `go`.
 #[derive(Clone, Copy, Debug)]
 pub struct TimeInput {
-    /// `limits.time[us]` — the side-to-move's remaining main clock [ms].
+    /// `limits.time[us]` — the side-to-move's remaining main clock in ms.
     pub time_us: i64,
-    /// `limits.inc[us]` — the side-to-move's Fischer increment [ms].
+    /// `limits.inc[us]` — the side-to-move's Fischer increment in ms.
     pub inc_us: i64,
-    /// `limits.byoyomi[us]` — the side-to-move's byoyomi [ms].
+    /// `limits.byoyomi[us]` — the side-to-move's byoyomi in ms.
     pub byoyomi_us: i64,
-    /// `limits.movetime` [ms] (`0` when not a `go movetime`). `go movetime` and
+    /// `limits.movetime` in ms (`0` when not a `go movetime`). `go movetime` and
     /// `go mate <ms>`, its only two sources, are `verbose2` clauses.
     #[cfg(feature = "verbose2")]
     pub movetime: i64,
-    /// `limits.rtime` [ms] (`0` when not a `go rtime`). `go rtime` is a
+    /// `limits.rtime` in ms (`0` when not a `go rtime`). `go rtime` is a
     /// `verbose2` clause and nothing else seeds it.
     #[cfg(feature = "verbose2")]
     pub rtime: i64,
@@ -61,11 +61,11 @@ pub struct TimeInput {
 /// ones this binary was built with.
 #[derive(Clone, Copy, Debug)]
 struct TimeSettings {
-    /// `options["NetworkDelay"]` [ms].
+    /// `options["NetworkDelay"]` in ms.
     network_delay: i64,
-    /// `options["NetworkDelay2"]` [ms].
+    /// `options["NetworkDelay2"]` in ms.
     network_delay2: i64,
-    /// `options["MinimumThinkingTime"]` [ms].
+    /// `options["MinimumThinkingTime"]` in ms.
     minimum_thinking_time: i64,
     /// `options["SlowMover"]` — percentage multiplier on the optimum time.
     slow_mover: i64,
@@ -318,7 +318,7 @@ impl TimeManagement {
         }
     }
 
-    /// Fix the search end time from the elapsed time `e` [ms] at which the
+    /// Fix the search end time from the elapsed time `e` in ms at which the
     /// search decided to stop, rounding the used time up to a full second and
     /// storing it as an offset from `start_time`.
     pub fn set_search_end(&mut self, e: i64) {
@@ -337,25 +337,25 @@ impl TimeManagement {
         self.search_end = self.round_up(t1.max(t2)) - start_minus_ponderhit;
     }
 
-    /// Elapsed time [ms] since `startTime`, measured against `now`.
+    /// Elapsed time in ms since `startTime`, measured against `now`.
     pub fn elapsed_from(&self, now: Instant) -> i64 {
         now.saturating_duration_since(self.start_time).as_millis() as i64
     }
 
-    /// Elapsed time [ms] since `startTime`, measured now.
+    /// Elapsed time in ms since `startTime`, measured now.
     pub fn elapsed(&self) -> i64 {
         self.elapsed_from(Instant::now())
     }
 
-    /// `optimum()` — the target think time [ms].
+    /// `optimum()` — the target think time in ms.
     pub fn optimum(&self) -> i64 {
         self.optimum_time
     }
-    /// `maximum()` — the hard think-time ceiling [ms].
+    /// `maximum()` — the hard think-time ceiling in ms.
     pub fn maximum(&self) -> i64 {
         self.maximum_time
     }
-    /// `minimum()` — the minimum think time [ms].
+    /// `minimum()` — the minimum think time in ms.
     pub fn minimum(&self) -> i64 {
         self.minimum_time
     }

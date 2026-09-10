@@ -364,7 +364,7 @@ pub fn value_from_tt(v: Value, ply: i32) -> Value {
     }
 }
 
-/// The output spelling of a [`Bound`], and the inverse of [`parse_bound`] for
+/// The output spelling of a [`Bound`], and the inverse of `parse_bound` for
 /// the three storable values. `Bound::None` never comes from a `tt store`, but
 /// an entry the search wrote can carry it, so it has a name too.
 pub fn bound_name(b: Bound) -> &'static str {

@@ -8,7 +8,7 @@
 //! ported, so the misses are preserved rather than fixed.
 //!
 //! Non-slider move origins are pre-filtered through the `CHECK_CAND_BB`
-//! superset tables in [`check_cand`]. Since the filter only removes origins the
+//! superset tables in `check_cand`. Since the filter only removes origins the
 //! inner tests would reject anyway, and the survivors are still iterated in
 //! ascending square order, the *first* mate found — and hence the returned move
 //! — is unchanged. The slider kinds have no such table, so those loops run
@@ -238,7 +238,7 @@ fn blockers_for_king(board: &Board, c: Color) -> Bb {
 
 /// `Position::pinned_pieces<C>(avoid)`: `C`'s own pieces pinned to `C`'s king,
 /// computed with `avoid` removed from both the sniper set and the between-count.
-/// Unlike [`blockers_for_king`] this counts against the full occupancy rather
+/// Unlike `blockers_for_king` this counts against the full occupancy rather
 /// than stripping the other snipers, which is what the reference does here.
 fn pinned_pieces_avoid(board: &Board, c: Color, avoid: Option<Square>) -> Bb {
     let Some(ksq) = try_find_king(board, c) else {

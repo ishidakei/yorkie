@@ -157,7 +157,7 @@ pub(crate) fn page_span(page: usize, addr: usize, len: usize) -> Option<(usize, 
 
 /// The system page size (`sysconf(_SC_PAGESIZE)`), falling back to 4 KiB when
 /// the query fails or reports a nonsensical value. Off Linux this is the 4 KiB
-/// constant — nothing there consumes it beyond the pure [`page_span`] tests.
+/// constant — nothing there consumes it beyond the pure `page_span` tests.
 pub fn page_size() -> usize {
     #[cfg(target_os = "linux")]
     {
@@ -202,7 +202,7 @@ pub fn set_current_thread_preferred_node(system_node: NumaIndex) -> bool {
 /// not passed, so a page that cannot be migrated is left in place and the call
 /// still succeeds.
 ///
-/// The range is widened to whole pages ([`page_span`]); callers pass
+/// The range is widened to whole pages (`page_span`); callers pass
 /// large-page-backed blocks, which are already 2 MiB-aligned and -sized.
 ///
 /// `system_node` is a **system** NUMA node index. Returns whether the kernel
@@ -234,7 +234,7 @@ pub fn migrate_region_to_node(addr: usize, len: usize, system_node: NumaIndex) -
 /// same non-fatal behaviour `MPOL_INTERLEAVE` has when one of its nodes fills
 /// up.
 ///
-/// The range is widened to whole pages ([`page_span`]). `system_node` is a
+/// The range is widened to whole pages (`page_span`). `system_node` is a
 /// **system** NUMA node index. Returns whether the kernel accepted the call;
 /// `false` leaves the range under whatever policy already governed it.
 ///
@@ -260,7 +260,7 @@ pub fn prefer_region_on_node(addr: usize, len: usize, system_node: NumaIndex) ->
 /// `numactl --interleave=all` installs process-wide, applied to one range
 /// instead, so nothing else in the process inherits it.
 ///
-/// The range is widened to whole pages ([`page_span`]); the caller's range is
+/// The range is widened to whole pages (`page_span`); the caller's range is
 /// already 2 MiB-aligned and -sized. `system_nodes` are **system** NUMA node
 /// indices, in any order. Returns whether the kernel accepted the call; `false`
 /// leaves the range under whatever policy already governed it.

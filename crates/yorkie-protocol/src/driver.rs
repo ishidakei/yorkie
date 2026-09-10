@@ -298,7 +298,7 @@ const BOOK_CONFIG: BookConfig = BookConfig {
 
 /// The reference `USIEngine::to_cp`: `100 * v / NormalizeToPawnValue`, with
 /// C++-style truncating division (Rust truncates toward zero, matching). Used
-/// by the `ResignValue` check; unlike [`format_score`] it does not special-case
+/// by the `ResignValue` check; unlike `format_score` it does not special-case
 /// mate scores (the reference `to_cp` applies the same linear map to all
 /// values).
 fn to_cp(v: Value) -> Value {
@@ -802,7 +802,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 
     /// Override the `isready` keep-alive poll interval, so a test can make a
     /// deliberately slowed heavy job elapse at least one tick. The newline still
-    /// fires only after [`KEEP_ALIVE_TICKS_PER_NEWLINE`] polls, so this scales
+    /// fires only after `KEEP_ALIVE_TICKS_PER_NEWLINE` polls, so this scales
     /// the whole cadence.
     pub fn with_keep_alive_poll(mut self, poll: Duration) -> Self {
         self.keep_alive_poll = poll;

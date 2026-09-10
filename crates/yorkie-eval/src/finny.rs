@@ -66,7 +66,7 @@ impl FinnyEntry {
     }
 }
 
-/// A worker-private finny table: one [`FinnyEntry`] per (perspective, own-king
+/// A worker-private finny table: one `FinnyEntry` per (perspective, own-king
 /// square).
 #[derive(Debug)]
 pub struct FinnyCache {

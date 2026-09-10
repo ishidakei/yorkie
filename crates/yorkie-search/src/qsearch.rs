@@ -358,7 +358,7 @@ impl PonderSignal {
 #[derive(Clone, Default)]
 pub struct SearchControl {
     /// Shared abort flag, set asynchronously by the driver on `stop` / `quit`
-    /// and polled at the [`CHECK_INTERVAL`] granularity. `None` (the default)
+    /// and polled at the `CHECK_INTERVAL` granularity. `None` (the default)
     /// means no external stop is possible.
     pub stop: Option<Arc<AtomicBool>>,
     /// The shared `go ponder` state, `Some` only on the main worker of one.
@@ -369,7 +369,7 @@ pub struct SearchControl {
     /// `go nodes` and the `NodesLimit` config key, its only two sources, are
     /// both `verbose2`; without that feature a search is bounded by its clock,
     /// its depth and `stop` alone. The counter the ceiling reads is not gated —
-    /// the search decides with it (see [`QSearch::nodes`]) — only the ceiling is.
+    /// the search decides with it (`QSearch::nodes`) — only the ceiling is.
     #[cfg(feature = "verbose2")]
     pub node_limit: Option<u64>,
     /// The reference `TimeManagement` state plus the limit classification the
@@ -394,7 +394,7 @@ pub struct TimeControl {
     /// clock-managed and the classification does not exist.
     #[cfg(feature = "verbose2")]
     pub use_time_management: bool,
-    /// `limits.movetime` [ms] (`Some` only for `go movetime`): `check_time` stops
+    /// `limits.movetime` in ms (`Some` only for `go movetime`): `check_time` stops
     /// the search once `elapsed >= movetime`. `go movetime` and `go mate <ms>`,
     /// its only two sources, are `verbose2` clauses.
     #[cfg(feature = "verbose2")]
@@ -415,8 +415,8 @@ pub struct TimeControl {
 /// stack and the one live set of worker history tables.
 ///
 /// Despite the name it drives the whole search: [`Self::run_root`] is iterative
-/// deepening, [`Self::search`] the interior body, and [`Self::qsearch`] the leaf
-/// they recurse into.
+/// deepening, `search` the interior body, and `qsearch` the leaf they recurse
+/// into.
 ///
 pub struct QSearch<'a> {
     net: &'a NnueNetwork,
@@ -557,7 +557,7 @@ pub struct QSearch<'a> {
     #[cfg(feature = "verbose2")]
     node_tally: Option<(Arc<Vec<AtomicU64>>, usize)>,
     /// Lazy-SMP shared best-move-change counters, in the same slot-per-worker
-    /// shape as [`Self::node_tally`]. Every worker adds to its own slot; only
+    /// shape as `node_tally`. Every worker adds to its own slot; only
     /// the main worker folds *every* slot into `totBestMoveChanges` and zeroes
     /// them, at each iteration end. Relaxed atomics, because the reference's
     /// cross-thread reads here are benign races.
@@ -973,8 +973,7 @@ impl<'a> QSearch<'a> {
     }
 
     /// Install the Lazy-SMP shared best-move-change counters. Leave unset for
-    /// the single-worker path, where [`Self::best_move_changes`] carries the
-    /// count.
+    /// the single-worker path, where `best_move_changes` carries the count.
     pub fn set_best_move_tally(&mut self, slots: Arc<Vec<AtomicU64>>, index: usize) {
         self.best_move_tally = Some((slots, index));
     }
@@ -1250,12 +1249,12 @@ impl<'a> QSearch<'a> {
     /// maintained accumulator. Every evaluation site in the search routes
     /// through here.
     ///
-    /// When [`Self::verify_accumulator`] is set — a test-only knob — it also
+    /// When `verify_accumulator` is set — a test-only knob — it also
     /// asserts the differential result equals a from-scratch
     /// [`yorkie_eval::evaluate`] of the current position.
     ///
     /// Being the one site every evaluation reaches is also what makes it the
-    /// place the per-game [`noise`] is added: a value the search derives for
+    /// place the per-game `noise` is added: a value the search derives for
     /// itself — a mate distance, a repetition verdict, the superior / inferior
     /// scores — never comes through here, and so carries no noise.
     #[inline]
@@ -1352,7 +1351,7 @@ impl<'a> QSearch<'a> {
     /// re-probe) keeps the stored TT state bit-identical to the reference even
     /// when a child has since churned the cluster — the write-slot-drift fix.
     ///
-    /// The entry takes the storing node's current [`Self::path_dep`], so the
+    /// The entry takes the storing node's current `path_dep`, so the
     /// mark travels with the value it belongs to.
     #[allow(clippy::too_many_arguments)]
     fn tt_store(

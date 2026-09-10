@@ -15,8 +15,8 @@
 //! `usi_hash` is the clearest case — the transposition table is a `static` whose
 //! length is that value — and the book-selection group, the draw and resign
 //! values, the entering-king rule and the time-management settings are the same
-//! shape, folded into [`crate::driver::BOOK_CONFIG`], the driver's own constants
-//! and the search layer's.
+//! shape, folded into the driver's `BOOK_CONFIG`, its other constants and the
+//! search layer's.
 
 /// The evaluation-noise amplitude, in the unit the search scores in.
 ///

@@ -15,7 +15,7 @@
 //! must hold under it. The crates that do not depend on this one keep the
 //! system allocator; none is on the allocation-hot path.
 //!
-//! [`crate::large_page::alloc_zeroed_large`] requests an over-aligned, zeroed
+//! [`crate::large_page`]'s `alloc_zeroed_large` requests an over-aligned, zeroed
 //! block through `std::alloc::alloc_zeroed`, and the
 //! [`GlobalAlloc`](std::alloc::GlobalAlloc) contract requires the returned
 //! pointer to satisfy the requested alignment whichever allocator is installed.
@@ -34,7 +34,7 @@
 //! the standard allocator in place. It gates the *static* only, so the set of
 //! tests miri executes is unchanged.
 //!
-//! With `verbose1` the installed allocator is [`CountingAlloc`] wrapping
+//! With `verbose1` the installed allocator is `CountingAlloc` wrapping
 //! mimalloc, which tallies the blocks the process is handed. The design rule is
 //! that a game allocates nothing on the heap — everything is taken at
 //! initialisation and reused — and the tally is how far the engine still is from

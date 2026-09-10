@@ -116,8 +116,8 @@ pub enum Command<'a> {
     /// A line no arm recognised. The line text is retained only so the
     /// `verbose1` diagnostic can echo it back; without that feature nothing can
     /// print it, so the variant carries nothing and the text is never copied.
-    /// Every construction goes through [`unknown`], which is where the two
-    /// shapes live.
+    /// Every construction goes through `unknown`, which is where the two shapes
+    /// live.
     #[cfg(feature = "verbose1")]
     Unknown(String),
     #[cfg(not(feature = "verbose1"))]

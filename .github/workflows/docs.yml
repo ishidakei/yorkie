@@ -34,6 +34,10 @@ env:
   # environment `RUSTFLAGS` overrides `build.rustflags` from
   # `.cargo/config.toml`, and `rust-cache` mixes `RUSTFLAGS` into its cache key.
   RUSTFLAGS: -C target-cpu=x86-64-v3
+  # A broken intra-doc link renders as plain text on the published site rather
+  # than failing anything, so the build refuses it instead: every rustdoc
+  # warning is an error here.
+  RUSTDOCFLAGS: -D warnings
 
 jobs:
   build:

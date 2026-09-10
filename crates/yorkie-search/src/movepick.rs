@@ -8,7 +8,7 @@
 //! order moves differently. [`MovePicker::next_move`] therefore takes the live
 //! [`WorkerHistories`] and scores each stage at stage-entry time, and holds the
 //! continuation planes as flat plane indices into the live
-//! [`ContinuationHistory`] rather than as snapshots.
+//! [`ContinuationHistory`](crate::ContinuationHistory) rather than as snapshots.
 //!
 //! Move *generation* carries no history dependence, so when a list is
 //! materialized never changes its contents or order; each list is nonetheless

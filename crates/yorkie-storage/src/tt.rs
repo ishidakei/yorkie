@@ -82,7 +82,7 @@
 //!
 //! **An entry can tear.** Relaxed atomics make each *field* access indivisible,
 //! but an entry is six fields with no cross-field atomicity, so a concurrent
-//! write can land between this thread's field reads and [`TTEntry::read`] return
+//! write can land between this thread's field reads and `TTEntry::read` return
 //! an old key fragment beside a new value. The reference tolerates exactly this:
 //! a mismatched fragment reads back as a miss or a wrong-position hit, and the
 //! caller validates every TT move against the actual position anyway.
@@ -640,8 +640,8 @@ fn cluster_index(key: u64, side_to_move: u8) -> usize {
     (index & !1) | (side_to_move as usize & 1)
 }
 
-/// The engine's transposition table — [`CLUSTER_COUNT`] contiguous
-/// [`Cluster`]s, on a [`TT_ALIGN`] boundary.
+/// The engine's transposition table — [`CLUSTER_COUNT`] contiguous `Cluster`s,
+/// on a [`TT_ALIGN`] boundary.
 ///
 /// There is exactly one, and [`Self::shared`] is the only way to reach it. A
 /// type this large is never a value: the private field keeps anything but that
@@ -767,7 +767,7 @@ impl TranspositionTable {
     }
 
     /// Bump the generation at the start of a root search
-    /// (`TranspositionTable::new_search`). Wraps within [`GENERATION_BITS`], so
+    /// (`TranspositionTable::new_search`). Wraps within `GENERATION_BITS`, so
     /// it never spills into the bound or pv bits of `genBound8`.
     pub fn new_search(&self) {
         let next = GENERATION8.load(REL).wrapping_add(1) & GENERATION_MASK;

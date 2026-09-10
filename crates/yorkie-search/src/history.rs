@@ -1,4 +1,5 @@
-//! History-table skeletons the [`MovePicker`] consults for move ordering.
+//! History-table skeletons the [`MovePicker`](crate::MovePicker) consults for
+//! move ordering.
 //!
 //! Each table is either zero-filled (via `new`) or filled once with the
 //! reference's `clear()` init constant (via
@@ -45,7 +46,7 @@ pub const CORRECTION_HISTORY_D: i32 = 1024;
 /// `ttMoveHistory` gravity limit.
 pub const TT_MOVE_HISTORY_D: i32 = 8192;
 
-/// Number of pawn-structure planes in [`PawnHistory`]
+/// Number of pawn-structure planes in [`SharedHistories`]'s pawn table
 /// (`PAWN_HISTORY_BASE_SIZE`; a power of two, thread count 1 × base 8192). The
 /// reference multiplies this by the thread count; this engine shares one table
 /// per NUMA node instead, so the base size stands.

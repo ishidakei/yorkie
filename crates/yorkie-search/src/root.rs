@@ -84,7 +84,7 @@ pub struct RootMove {
 
 /// `Vec::clone` allocates exactly the length it copies, so a derived clone would
 /// hand the copy a PV buffer that grows again on its first update; `clone` here
-/// keeps [`PV_CAPACITY`] instead. `clone_from` goes further and writes into the
+/// keeps `PV_CAPACITY` instead. `clone_from` goes further and writes into the
 /// destination's existing buffer, which is what lets a search record its best
 /// move once per iteration without reaching the allocator at all.
 impl Clone for RootMove {
@@ -399,7 +399,7 @@ const BASE_ENTERING_KING_POINTS: [i32; Color::COUNT] = match ENTERING_KING_RULE 
 /// `go` from the root position — the reference's `set_ekr` state.
 ///
 /// Only the handicap-aware rules read a position at all; under every other rule
-/// this is [`BASE_ENTERING_KING_POINTS`] and the node-side check never touches
+/// this is `BASE_ENTERING_KING_POINTS` and the node-side check never touches
 /// the snapshot. Total material on the board and in both hands is invariant
 /// across a game, since captures only move pieces to hands, so a snapshot taken
 /// from the root is exact for every node of that search.
