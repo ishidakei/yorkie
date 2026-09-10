@@ -526,7 +526,7 @@ pub(crate) fn is_uchifuzume_after_drop(
     }
     probe_buf.clear();
     let mut pseudo: Vec<ExtMove> = Vec::new();
-    post.generate_evasions(true, &mut pseudo);
+    post.generate_evasions::<true>(&mut pseudo);
     for em in pseudo {
         if post.is_legal(em.mv) {
             probe_buf.push(em.mv);

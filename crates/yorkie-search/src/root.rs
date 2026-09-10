@@ -11,6 +11,8 @@
 use yorkie_state::{Color, ExtMove, Move, PieceKind, Position, Square};
 use yorkie_storage::Value;
 
+use crate::config::GENERATE_ALL_LEGAL_MOVES;
+
 /// `VALUE_INFINITE`, duplicated from [`crate::qsearch`] so the pure root-move
 /// initialisation does not reach into that module's private constants.
 const VALUE_INFINITE: Value = 32001;
@@ -224,14 +226,14 @@ pub fn select_best_worker(workers: &[WorkerVote]) -> usize {
 /// at the cursor with the current last move and shrinks the list. That is *not*
 /// an order-preserving filter, and reproducing it exactly is what fixes
 /// `root_moves[0]` — the move the root search treats as its TT move.
-pub fn generate_root_moves(pos: &Position, all: bool) -> Vec<RootMove> {
+pub fn generate_root_moves(pos: &Position) -> Vec<RootMove> {
     // The generators emit `ExtMove`; the root list only needs the
     // `Move`, read via `.mv` in the legality compaction and `RootMove::new`.
     let mut pseudo: Vec<ExtMove> = Vec::new();
     if pos.in_check() {
-        pos.generate_evasions(all, &mut pseudo);
+        pos.generate_evasions::<GENERATE_ALL_LEGAL_MOVES>(&mut pseudo);
     } else {
-        pos.generate_non_evasions(all, &mut pseudo);
+        pos.generate_non_evasions::<GENERATE_ALL_LEGAL_MOVES>(&mut pseudo);
     }
 
     // `while (cur != last) if (!legal(*cur)) *cur = *(--last); else ++cur;`
@@ -282,59 +284,103 @@ impl EnteringKingRule {
     ];
 
     /// Map an option string to its rule. An unrecognised string falls back to
-    /// [`EnteringKingRule::None`]; the option layer only ever hands over a
-    /// declared `var`, so the fallback is unreachable in practice.
-    pub fn from_option(s: &str) -> Self {
-        match s {
-            "NoEnteringKing" => Self::None,
-            "CSARule24" => Self::Point24,
-            "CSARule24H" => Self::Point24H,
-            "CSARule27" => Self::Point27,
-            "CSARule27H" => Self::Point27H,
-            "TryRule" => Self::Try,
-            _ => Self::None,
+    /// [`EnteringKingRule::None`]; the config schema only accepts a declared
+    /// spelling, so the fallback is unreachable in practice.
+    ///
+    /// `const` because the rule the engine plays under is compiled in, and
+    /// resolving it here is what lets the node-side check be the one branch of
+    /// that rule.
+    pub const fn from_option(s: &str) -> Self {
+        // A `const fn` cannot `match` on a `&str`, so the choice list is walked
+        // by byte comparison instead.
+        if str_eq(s, "NoEnteringKing") {
+            Self::None
+        } else if str_eq(s, "CSARule24") {
+            Self::Point24
+        } else if str_eq(s, "CSARule24H") {
+            Self::Point24H
+        } else if str_eq(s, "CSARule27") {
+            Self::Point27
+        } else if str_eq(s, "CSARule27H") {
+            Self::Point27H
+        } else if str_eq(s, "TryRule") {
+            Self::Try
+        } else {
+            Self::None
         }
+    }
+
+    /// Whether this rule charges White the material a handicap removed, which is
+    /// the only thing that makes a threshold depend on the position.
+    const fn is_handicap_aware(self) -> bool {
+        matches!(self, Self::Point24H | Self::Point27H)
     }
 }
 
-/// The entering-king rule plus the per-side point thresholds, precomputed once
-/// per `go` from the root position — the reference's `set_ekr` state.
+/// Byte-wise `&str` equality, for [`EnteringKingRule::from_option`].
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// The entering-king rule this binary plays under, resolved from the config at
+/// build time. Every declaration check below branches on it, so the compiler
+/// keeps exactly the chosen rule's arm.
+pub const ENTERING_KING_RULE: EnteringKingRule =
+    EnteringKingRule::from_option(crate::config::ENTERING_KING_RULE);
+
+/// The compiled rule's per-side thresholds before any handicap adjustment —
+/// `Position::update_entering_point`'s starting pair, which for every rule but
+/// the two handicap-aware ones is also its final one.
+const BASE_ENTERING_KING_POINTS: [i32; Color::COUNT] = match ENTERING_KING_RULE {
+    EnteringKingRule::Point24 | EnteringKingRule::Point24H => [31, 31],
+    EnteringKingRule::Point27 | EnteringKingRule::Point27H => [28, 27],
+    // `EKR_NONE` / `EKR_TRY_RULE` never consult the thresholds.
+    EnteringKingRule::None | EnteringKingRule::Try => [0, 0],
+};
+
+/// The per-side point thresholds the compiled rule needs, precomputed once per
+/// `go` from the root position — the reference's `set_ekr` state.
 ///
-/// Total material on the board and in both hands is invariant across a game,
-/// since captures only move pieces to hands, so a snapshot taken from the root
-/// is exact for every node of that search.
+/// Only the handicap-aware rules read a position at all; under every other rule
+/// this is [`BASE_ENTERING_KING_POINTS`] and the node-side check never touches
+/// the snapshot. Total material on the board and in both hands is invariant
+/// across a game, since captures only move pieces to hands, so a snapshot taken
+/// from the root is exact for every node of that search.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnteringKingConfig {
-    rule: EnteringKingRule,
     /// `enteringKingPoint[]`, indexed by [`Color::index`] (Black 0, White 1).
     points: [i32; Color::COUNT],
 }
 
 impl EnteringKingConfig {
-    /// Snapshot `rule` against `root` and precompute `enteringKingPoint[]`
+    /// Precompute `enteringKingPoint[]` against `root`
     /// (`Position::update_entering_point`).
-    pub fn new(rule: EnteringKingRule, root: &Position) -> Self {
+    pub fn new(root: &Position) -> Self {
         Self {
-            rule,
-            points: entering_king_points(rule, root),
+            points: entering_king_points(ENTERING_KING_RULE, root),
         }
-    }
-
-    /// The configured rule.
-    pub fn rule(&self) -> EnteringKingRule {
-        self.rule
     }
 }
 
 impl Default for EnteringKingConfig {
-    /// The option default `CSARule27` with its fixed thresholds (Black 28,
-    /// White 27). The non-`_H` point rules never adjust for material, so the
-    /// default needs no position — the parity path (`QSearch::run_root`) relies
+    /// The compiled rule's unadjusted thresholds. Only the handicap-aware rules
+    /// move off them, and they move by an amount a root position states, which
+    /// a default has none of — the fixed-depth path (`QSearch::run_root`) relies
     /// on this.
     fn default() -> Self {
         Self {
-            rule: EnteringKingRule::Point27,
-            points: [28, 27],
+            points: BASE_ENTERING_KING_POINTS,
         }
     }
 }
@@ -349,10 +395,7 @@ fn entering_king_points(rule: EnteringKingRule, pos: &Position) -> [i32; Color::
         EnteringKingRule::None | EnteringKingRule::Try => return [0, 0],
     };
 
-    if matches!(
-        rule,
-        EnteringKingRule::Point24H | EnteringKingRule::Point27H
-    ) {
+    if rule.is_handicap_aware() {
         // Total material points: every piece on the board scores 1 (kings
         // included in this popcount), big pieces (bishop/rook family, promotions
         // included) score 4 more; hands add small 1 / big 5 (kings never in
@@ -386,24 +429,29 @@ fn entering_king_points(rule: EnteringKingRule, pos: &Position) -> [i32; Color::
     points
 }
 
-/// `Position::DeclarationWin()`, selecting behaviour by the configured
-/// [`EnteringKingRule`]:
+/// `Position::DeclarationWin()` under the compiled [`ENTERING_KING_RULE`]:
 ///
 /// * [`EnteringKingRule::None`] — always `None`.
 /// * point rules — [`Move::win`] when the side to move may declare: its king is
 ///   inside the enemy three ranks, it is not in check, it has at least 11
-///   pieces (king included) in the enemy field, and its point total reaches
-///   `config`'s per-side threshold.
+///   pieces (king included) in the enemy field, and its point total reaches the
+///   per-side threshold.
 /// * [`EnteringKingRule::Try`] — the king move onto the opponent king's initial
 ///   square, when that square is adjacent to our king, holds no own piece, and
 ///   is unattacked once our king vacates its square.
+///
+/// The rule is a constant, so what a build compiles here is the one arm it
+/// selects — and, under every rule but the two handicap-aware ones, the
+/// thresholds are constants too and `config` is never read.
 pub fn declaration_win(pos: &Position, config: &EnteringKingConfig) -> Option<Move> {
-    match config.rule {
+    match ENTERING_KING_RULE {
         EnteringKingRule::None => None,
-        EnteringKingRule::Point24
-        | EnteringKingRule::Point24H
-        | EnteringKingRule::Point27
-        | EnteringKingRule::Point27H => declaration_win_points(pos, config.points),
+        EnteringKingRule::Point24 | EnteringKingRule::Point27 => {
+            declaration_win_points(pos, BASE_ENTERING_KING_POINTS)
+        }
+        EnteringKingRule::Point24H | EnteringKingRule::Point27H => {
+            declaration_win_points(pos, config.points)
+        }
         EnteringKingRule::Try => declaration_win_try(pos),
     }
 }
@@ -545,16 +593,13 @@ mod tests {
     fn root_moves_equal_legal_captures_and_quiets_when_not_in_check() {
         let p = pos(STARTPOS);
         assert!(!p.in_check());
-        let rm: HashSet<Move> = generate_root_moves(&p, false)
-            .into_iter()
-            .map(|r| r.mv)
-            .collect();
+        let rm: HashSet<Move> = generate_root_moves(&p).into_iter().map(|r| r.mv).collect();
         assert!(!rm.is_empty());
 
         let mut caps: Vec<ExtMove> = Vec::new();
-        p.generate_captures(false, &mut caps);
+        p.generate_captures::<ALL>(&mut caps);
         let mut quiets: Vec<ExtMove> = Vec::new();
-        p.generate_quiets(false, &mut quiets);
+        p.generate_quiets::<ALL>(&mut quiets);
         let legal: HashSet<Move> = caps
             .into_iter()
             .chain(quiets)
@@ -568,13 +613,10 @@ mod tests {
     fn root_moves_equal_legal_evasions_when_in_check() {
         let p = pos(IN_CHECK);
         assert!(p.in_check());
-        let rm: HashSet<Move> = generate_root_moves(&p, false)
-            .into_iter()
-            .map(|r| r.mv)
-            .collect();
+        let rm: HashSet<Move> = generate_root_moves(&p).into_iter().map(|r| r.mv).collect();
 
         let mut ev: Vec<ExtMove> = Vec::new();
-        p.generate_evasions(false, &mut ev);
+        p.generate_evasions::<ALL>(&mut ev);
         let legal: HashSet<Move> = ev
             .into_iter()
             .map(|e| e.mv)
@@ -587,34 +629,68 @@ mod tests {
     fn root_moves_empty_when_checkmated() {
         let p = pos(CHECKMATE);
         assert!(p.in_check());
-        assert!(generate_root_moves(&p, false).is_empty());
+        assert!(generate_root_moves(&p).is_empty());
     }
 
-    #[test]
-    fn declaration_win_declines_a_normal_position() {
-        let cfg = EnteringKingConfig::default();
-        assert!(declaration_win(&pos(STARTPOS), &cfg).is_none());
-        // In check ⇒ no declaration even with pieces forward.
-        assert!(declaration_win(&pos(IN_CHECK), &cfg).is_none());
-    }
-
-    #[test]
-    fn declaration_win_detects_a_nyugyoku_position() {
-        let p = pos(NYUGYOKU);
-        assert!(!p.in_check());
-        assert_eq!(
-            declaration_win(&p, &EnteringKingConfig::default()),
-            Some(Move::win())
-        );
-    }
+    /// The `GenerateAllLegalMoves` setting this binary compiled, which is what
+    /// [`generate_root_moves`] generates under.
+    const ALL: bool = GENERATE_ALL_LEGAL_MOVES;
 
     // Rule-aware declaration. Positions are hand-built so a single
     // point of the score / count / threshold formula is exercised at a time.
+    // `declaration_win` itself runs under the one rule this binary compiled, so
+    // the per-rule cases drive that rule's branch directly.
 
-    /// A rule's config against a position (thresholds come from the position for
-    /// the `_H` variants; the point/`None`/`Try` cases ignore it).
-    fn cfg(rule: EnteringKingRule, p: &Position) -> EnteringKingConfig {
-        EnteringKingConfig::new(rule, p)
+    /// The declaration `rule` reaches at `p`, with that rule's thresholds taken
+    /// from the position.
+    fn declaration_under(rule: EnteringKingRule, p: &Position) -> Option<Move> {
+        match rule {
+            EnteringKingRule::None => None,
+            EnteringKingRule::Try => declaration_win_try(p),
+            _ => declaration_win_points(p, entering_king_points(rule, p)),
+        }
+    }
+
+    #[test]
+    fn each_declared_spelling_maps_to_its_own_rule() {
+        use EnteringKingRule::*;
+        const RULES: [EnteringKingRule; 6] = [None, Point24, Point24H, Point27, Point27H, Try];
+        for (s, rule) in EnteringKingRule::STRINGS.iter().zip(RULES) {
+            assert_eq!(EnteringKingRule::from_option(s), rule, "spelling `{s}`");
+        }
+        // An undeclared spelling cannot enable a declaration.
+        assert_eq!(EnteringKingRule::from_option("CSARule28"), None);
+    }
+
+    #[test]
+    fn declaration_win_takes_the_compiled_rules_branch() {
+        // Both a declarable and an undeclarable position, so a rule that never
+        // declares is distinguished from one that does.
+        for sfen in [NYUGYOKU, STARTPOS, IN_CHECK] {
+            let p = pos(sfen);
+            assert_eq!(
+                declaration_win(&p, &EnteringKingConfig::new(&p)),
+                declaration_under(ENTERING_KING_RULE, &p),
+                "compiled rule {ENTERING_KING_RULE:?} on `{sfen}`"
+            );
+        }
+    }
+
+    #[test]
+    fn point_rules_decline_a_normal_position() {
+        assert!(declaration_under(EnteringKingRule::Point27, &pos(STARTPOS)).is_none());
+        // In check ⇒ no declaration even with pieces forward.
+        assert!(declaration_under(EnteringKingRule::Point27, &pos(IN_CHECK)).is_none());
+    }
+
+    #[test]
+    fn point27_detects_a_nyugyoku_position() {
+        let p = pos(NYUGYOKU);
+        assert!(!p.in_check());
+        assert_eq!(
+            declaration_under(EnteringKingRule::Point27, &p),
+            Some(Move::win())
+        );
     }
 
     #[test]
@@ -625,12 +701,12 @@ mod tests {
         // so pawns are used to dial the score freely.)
         let declare = pos("GGGGKGGGG/GG7/9/9/9/9/9/9/8k b 18P 1");
         assert_eq!(
-            declaration_win(&declare, &cfg(EnteringKingRule::Point27, &declare)),
+            declaration_under(EnteringKingRule::Point27, &declare),
             Some(Move::win())
         );
         // One point of hand less (17P → 17) → 27 < 28, no declaration.
         let decline = pos("GGGGKGGGG/GG7/9/9/9/9/9/9/8k b 17P 1");
-        assert!(declaration_win(&decline, &cfg(EnteringKingRule::Point27, &decline)).is_none());
+        assert!(declaration_under(EnteringKingRule::Point27, &decline).is_none());
     }
 
     #[test]
@@ -639,12 +715,12 @@ mod tests {
         // hand of 17 pawns → 27, exactly the White threshold.
         let declare = pos("8K/9/9/9/9/9/9/gg7/ggggkgggg w 17p 1");
         assert_eq!(
-            declaration_win(&declare, &cfg(EnteringKingRule::Point27, &declare)),
+            declaration_under(EnteringKingRule::Point27, &declare),
             Some(Move::win())
         );
         // 16p → 26 < 27, no declaration.
         let decline = pos("8K/9/9/9/9/9/9/gg7/ggggkgggg w 16p 1");
-        assert!(declaration_win(&decline, &cfg(EnteringKingRule::Point27, &decline)).is_none());
+        assert!(declaration_under(EnteringKingRule::Point27, &decline).is_none());
     }
 
     #[test]
@@ -652,37 +728,19 @@ mod tests {
         // 24-point law: both sides need 31. Board score 10 + hand 21 (2R + 11P) = 31.
         let black_declare = pos("GGGGKGGGG/GG7/9/9/9/9/9/9/8k b 2R11P 1");
         assert_eq!(
-            declaration_win(
-                &black_declare,
-                &cfg(EnteringKingRule::Point24, &black_declare)
-            ),
+            declaration_under(EnteringKingRule::Point24, &black_declare),
             Some(Move::win())
         );
         let black_decline = pos("GGGGKGGGG/GG7/9/9/9/9/9/9/8k b 2R10P 1"); // 30
-        assert!(
-            declaration_win(
-                &black_decline,
-                &cfg(EnteringKingRule::Point24, &black_decline)
-            )
-            .is_none()
-        );
+        assert!(declaration_under(EnteringKingRule::Point24, &black_decline).is_none());
 
         let white_declare = pos("8K/9/9/9/9/9/9/gg7/ggggkgggg w 2r11p 1");
         assert_eq!(
-            declaration_win(
-                &white_declare,
-                &cfg(EnteringKingRule::Point24, &white_declare)
-            ),
+            declaration_under(EnteringKingRule::Point24, &white_declare),
             Some(Move::win())
         );
         let white_decline = pos("8K/9/9/9/9/9/9/gg7/ggggkgggg w 2r10p 1"); // 30
-        assert!(
-            declaration_win(
-                &white_decline,
-                &cfg(EnteringKingRule::Point24, &white_decline)
-            )
-            .is_none()
-        );
+        assert!(declaration_under(EnteringKingRule::Point24, &white_decline).is_none());
     }
 
     #[test]
@@ -691,18 +749,18 @@ mod tests {
         // thing that can decline the 10-piece case is the count gate.
         let eleven = pos("GGGGKGGGG/GG7/9/9/9/9/9/9/8k b 2R9P 1"); // king + 10 golds
         assert_eq!(
-            declaration_win(&eleven, &cfg(EnteringKingRule::Point27, &eleven)),
+            declaration_under(EnteringKingRule::Point27, &eleven),
             Some(Move::win())
         );
         let ten = pos("GGGGKGGGG/G8/9/9/9/9/9/9/8k b 2R9P 1"); // king + 9 golds
-        assert!(declaration_win(&ten, &cfg(EnteringKingRule::Point27, &ten)).is_none());
+        assert!(declaration_under(EnteringKingRule::Point27, &ten).is_none());
     }
 
     #[test]
     fn king_outside_enemy_field_never_declares() {
         // Black king on rank d (outside the enemy three ranks) with a large hand.
         let p = pos("9/9/9/4K4/9/9/9/9/8k b 2R4P 1");
-        assert!(declaration_win(&p, &cfg(EnteringKingRule::Point27, &p)).is_none());
+        assert!(declaration_under(EnteringKingRule::Point27, &p).is_none());
     }
 
     #[test]
@@ -712,12 +770,12 @@ mod tests {
         // dragon's +4 over a small piece is the only reason it reaches 28.
         let with_dragon = pos("GGGGKGGGG/+RG7/9/9/9/9/9/9/8k b 2R4P 1");
         assert_eq!(
-            declaration_win(&with_dragon, &cfg(EnteringKingRule::Point27, &with_dragon)),
+            declaration_under(EnteringKingRule::Point27, &with_dragon),
             Some(Move::win())
         );
         // Same shape with the dragon replaced by a small piece → 24 < 28.
         let all_small = pos("GGGGKGGGG/GG7/9/9/9/9/9/9/8k b 2R4P 1");
-        assert!(declaration_win(&all_small, &cfg(EnteringKingRule::Point27, &all_small)).is_none());
+        assert!(declaration_under(EnteringKingRule::Point27, &all_small).is_none());
     }
 
     #[test]
@@ -758,9 +816,11 @@ mod tests {
 
     #[test]
     fn no_entering_king_never_declares() {
-        // A clearly declarable 27-point position yields nothing under `None`.
+        // A clearly declarable 27-point position yields nothing under `None`,
+        // whose thresholds are the inert pair.
         let p = pos(NYUGYOKU);
-        assert!(declaration_win(&p, &cfg(EnteringKingRule::None, &p)).is_none());
+        assert!(declaration_under(EnteringKingRule::None, &p).is_none());
+        assert_eq!(entering_king_points(EnteringKingRule::None, &p), [0, 0]);
     }
 
     // --- TryRule. ---
@@ -776,10 +836,7 @@ mod tests {
         let king_sq = sq(4, 1);
         let try_sq = sq(4, 0);
         let expected = Move::make(king_sq, try_sq, p.board().get(king_sq).unwrap());
-        assert_eq!(
-            declaration_win(&p, &cfg(EnteringKingRule::Try, &p)),
-            Some(expected)
-        );
+        assert_eq!(declaration_under(EnteringKingRule::Try, &p), Some(expected));
         // The returned move is exactly what the normal generator produces.
         let mut legal = Vec::new();
         p.generate_legal_all(&mut legal);
@@ -793,24 +850,21 @@ mod tests {
         let king_sq = sq(4, 7);
         let try_sq = sq(4, 8);
         let expected = Move::make(king_sq, try_sq, p.board().get(king_sq).unwrap());
-        assert_eq!(
-            declaration_win(&p, &cfg(EnteringKingRule::Try, &p)),
-            Some(expected)
-        );
+        assert_eq!(declaration_under(EnteringKingRule::Try, &p), Some(expected));
     }
 
     #[test]
     fn try_rule_requires_king_adjacency() {
         // Black king on 5c is two ranks from 5a → not adjacent → no declaration.
         let p = pos("9/9/4K4/9/9/9/9/9/8k b - 1");
-        assert!(declaration_win(&p, &cfg(EnteringKingRule::Try, &p)).is_none());
+        assert!(declaration_under(EnteringKingRule::Try, &p).is_none());
     }
 
     #[test]
     fn try_rule_own_piece_on_the_square_blocks() {
         // Black gold sits on 5a → the try square holds an own piece → blocked.
         let p = pos("4G4/4K4/9/9/9/9/9/9/8k b - 1");
-        assert!(declaration_win(&p, &cfg(EnteringKingRule::Try, &p)).is_none());
+        assert!(declaration_under(EnteringKingRule::Try, &p).is_none());
     }
 
     #[test]
@@ -819,10 +873,7 @@ mod tests {
         // not attack 5b, so the king may capture-try onto it.
         let p = pos("4n4/4K4/9/9/9/9/9/9/8k b - 1");
         let expected = Move::make(sq(4, 1), sq(4, 0), p.board().get(sq(4, 1)).unwrap());
-        assert_eq!(
-            declaration_win(&p, &cfg(EnteringKingRule::Try, &p)),
-            Some(expected)
-        );
+        assert_eq!(declaration_under(EnteringKingRule::Try, &p), Some(expected));
     }
 
     #[test]
@@ -830,7 +881,7 @@ mod tests {
         // A White rook on 9a rakes rank a, so the try square 5a is attacked
         // (independently of our king) → blocked.
         let p = pos("r8/4K4/9/9/9/9/9/9/8k b - 1");
-        assert!(declaration_win(&p, &cfg(EnteringKingRule::Try, &p)).is_none());
+        assert!(declaration_under(EnteringKingRule::Try, &p).is_none());
     }
 
     #[test]
@@ -842,7 +893,7 @@ mod tests {
         let p = pos("9/4K4/4r4/9/9/9/9/9/8k b - 1");
         let king_sq = sq(4, 1);
         let try_sq = sq(4, 0);
-        assert!(declaration_win(&p, &cfg(EnteringKingRule::Try, &p)).is_none());
+        assert!(declaration_under(EnteringKingRule::Try, &p).is_none());
         // Discounting the king reveals the rook; discounting an unrelated empty
         // square leaves the king blocking it — pinpointing the king as the cause.
         assert!(p.is_attacked_discounting(try_sq, Color::White, king_sq));
@@ -853,7 +904,7 @@ mod tests {
 
     /// Two distinct legal moves from startpos, used as the workers' `pv[0]` votes.
     fn two_moves() -> (Move, Move) {
-        let rm = generate_root_moves(&pos(STARTPOS), false);
+        let rm = generate_root_moves(&pos(STARTPOS));
         (rm[0].mv, rm[1].mv)
     }
 

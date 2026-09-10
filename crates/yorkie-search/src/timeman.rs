@@ -23,9 +23,15 @@ use crate::book::Prng;
 const MOVE_HORIZON: i32 = 160;
 
 /// The raw inputs [`TimeManagement::init`] needs, extracted by the USI driver
-/// from the `go` limits, the engine options, and the root position. Keeping the
-/// input primitive (rather than the protocol `GoLimits`) preserves the layering
-/// rule that Search never depends on Protocol.
+/// from the `go` limits and the root position. Keeping the input primitive
+/// (rather than the protocol `GoLimits`) preserves the layering rule that Search
+/// never depends on Protocol.
+///
+/// Only what a `go` brings is here. The settings the budget also depends on —
+/// the two network delays, the minimum think time, the slow-mover percentage,
+/// the whole-second rounding, the two ponder toggles and the draw horizon — are
+/// compiled in, so [`TimeManagement::init`] reads them itself instead of being
+/// handed the same values again at every `go`.
 #[derive(Clone, Copy, Debug)]
 pub struct TimeInput {
     /// `limits.time[us]` — the side-to-move's remaining main clock [ms].
@@ -42,29 +48,54 @@ pub struct TimeInput {
     /// `verbose2` clause and nothing else seeds it.
     #[cfg(feature = "verbose2")]
     pub rtime: i64,
-    /// `options["NetworkDelay"]` [ms].
-    pub network_delay: i64,
-    /// `options["NetworkDelay2"]` [ms].
-    pub network_delay2: i64,
-    /// `options["MinimumThinkingTime"]` [ms].
-    pub minimum_thinking_time: i64,
-    /// `options["SlowMover"]` — percentage multiplier on the optimum time.
-    pub slow_mover: i64,
-    /// `options["RoundUpToFullSecond"]`.
-    pub round_up_to_fullsecond: bool,
-    /// `options["USI_Ponder"]`.
-    pub usi_ponder: bool,
-    /// `options["Stochastic_Ponder"]`.
-    pub stochastic_ponder: bool,
     /// `ply` — the root's game ply (`rootPos.game_ply()`; 1 at the hirate start).
     pub ply: i32,
-    /// `max_moves_to_draw` — the game ply past which a draw is adjudicated
-    /// (already the `0 → 100000` unlimited remap).
-    pub max_moves_to_draw: i32,
     /// The instant the `go` arrived (`limits.startTime`), the origin for
     /// [`TimeManagement::elapsed`].
     pub start_time: Instant,
 }
+
+/// The half of the budget's inputs that a `go` does not bring: the settings the
+/// engine compiles in. [`COMPILED`] is the one instance a search ever uses; the
+/// type exists so the arithmetic below can be exercised at values other than the
+/// ones this binary was built with.
+#[derive(Clone, Copy, Debug)]
+struct TimeSettings {
+    /// `options["NetworkDelay"]` [ms].
+    network_delay: i64,
+    /// `options["NetworkDelay2"]` [ms].
+    network_delay2: i64,
+    /// `options["MinimumThinkingTime"]` [ms].
+    minimum_thinking_time: i64,
+    /// `options["SlowMover"]` — percentage multiplier on the optimum time.
+    slow_mover: i64,
+    /// `options["RoundUpToFullSecond"]`.
+    round_up_to_fullsecond: bool,
+    /// `options["USI_Ponder"]` and `options["Stochastic_Ponder"]`, which between
+    /// them decide the optimum-time bonus.
+    usi_ponder: bool,
+    stochastic_ponder: bool,
+    /// The game ply past which a draw is adjudicated, with the reference's
+    /// `0 → 100000` unlimited remap applied.
+    max_moves_to_draw: i32,
+}
+
+/// The settings this binary plays under — assembled by the compiler, not at
+/// each `go`.
+const COMPILED: TimeSettings = TimeSettings {
+    network_delay: crate::config::NETWORK_DELAY,
+    network_delay2: crate::config::NETWORK_DELAY2,
+    minimum_thinking_time: crate::config::MINIMUM_THINKING_TIME,
+    slow_mover: crate::config::SLOW_MOVER,
+    round_up_to_fullsecond: crate::config::ROUND_UP_TO_FULL_SECOND,
+    usi_ponder: crate::config::USI_PONDER,
+    stochastic_ponder: crate::config::STOCHASTIC_PONDER,
+    max_moves_to_draw: if crate::config::MAX_MOVES_TO_DRAW == 0 {
+        100_000
+    } else {
+        crate::config::MAX_MOVES_TO_DRAW as i32
+    },
+};
 
 /// The reference `TimeManagement` state for one `go`.
 #[derive(Clone, Debug)]
@@ -100,6 +131,20 @@ impl TimeManagement {
     /// bump on top of a `go rtime` budget and is consulted nowhere else, so it
     /// is a parameter only where that clause exists.
     pub fn init(input: &TimeInput, #[cfg(feature = "verbose2")] prng: &mut Prng) -> TimeManagement {
+        Self::init_with(
+            input,
+            &COMPILED,
+            #[cfg(feature = "verbose2")]
+            prng,
+        )
+    }
+
+    /// [`Self::init`] against an explicit settings half.
+    fn init_with(
+        input: &TimeInput,
+        settings: &TimeSettings,
+        #[cfg(feature = "verbose2")] prng: &mut Prng,
+    ) -> TimeManagement {
         let &TimeInput {
             time_us,
             inc_us,
@@ -108,6 +153,10 @@ impl TimeManagement {
             movetime,
             #[cfg(feature = "verbose2")]
             rtime,
+            ply,
+            start_time,
+        } = input;
+        let &TimeSettings {
             network_delay,
             network_delay2,
             minimum_thinking_time,
@@ -115,10 +164,8 @@ impl TimeManagement {
             round_up_to_fullsecond,
             usi_ponder,
             stochastic_ponder,
-            ply,
             max_moves_to_draw,
-            start_time,
-        } = input;
+        } = settings;
 
         let mut tm = TimeManagement {
             start_time,
@@ -318,8 +365,11 @@ impl TimeManagement {
 mod tests {
     use super::*;
 
-    /// A `TimeInput` with the reference option defaults and no clock; individual
-    /// tests override the fields they exercise.
+    /// A `TimeInput` with no clock; individual tests override the fields they
+    /// exercise. The budgets the tests below pin are the reference's under the
+    /// option defaults, which is what the compiled settings are asserted to be
+    /// first, so a config that moved one of them fails there and not in a wall
+    /// of unexplained numbers.
     fn base() -> TimeInput {
         TimeInput {
             time_us: 0,
@@ -329,24 +379,38 @@ mod tests {
             movetime: 0,
             #[cfg(feature = "verbose2")]
             rtime: 0,
-            network_delay: 120,
-            network_delay2: 1120,
-            minimum_thinking_time: 2000,
-            slow_mover: 100,
-            round_up_to_fullsecond: true,
-            usi_ponder: false,
-            stochastic_ponder: false,
             ply: 1,
-            max_moves_to_draw: 100_000,
             start_time: Instant::now(),
         }
     }
 
+    #[test]
+    fn the_compiled_settings_are_the_reference_option_defaults() {
+        assert_eq!(
+            (
+                COMPILED.network_delay,
+                COMPILED.network_delay2,
+                COMPILED.minimum_thinking_time,
+                COMPILED.slow_mover,
+                COMPILED.round_up_to_fullsecond,
+            ),
+            (120, 1120, 2000, 100, true),
+        );
+    }
+
     fn init(input: &TimeInput) -> TimeManagement {
+        init_settings(input, &COMPILED)
+    }
+
+    /// The budget at settings other than the compiled ones — how the arithmetic
+    /// answers a setting is a property of the arithmetic, not of the one value
+    /// this binary happens to carry.
+    fn init_settings(input: &TimeInput, settings: &TimeSettings) -> TimeManagement {
         #[cfg(feature = "verbose2")]
         let mut prng = Prng::new(1);
-        TimeManagement::init(
+        TimeManagement::init_with(
             input,
+            settings,
             #[cfg(feature = "verbose2")]
             &mut prng,
         )
@@ -483,17 +547,16 @@ mod tests {
     #[test]
     fn mtg_equal_one_spends_remaining() {
         // At the draw horizon (MTG == 1) all three times equal remain_time.
-        // max_moves_to_draw - ply + 2 == 2 gives MTG = 1.
+        // `max_moves_to_draw - ply + 2 == 2` gives MTG = 1, which is the ply
+        // standing on the horizon itself.
         let input = TimeInput {
             time_us: 60_000,
             byoyomi_us: 5_000,
-            max_moves_to_draw: 100,
-            ply: 100,
+            ply: COMPILED.max_moves_to_draw,
             ..base()
         };
         let tm = init(&input);
         // remain_time = 60000 + 5000 - 1120 = 63880.
-        // MTG = min(100 - 100 + 2, move_horizon)/2 = min(2, ..)/2 = 1.
         assert_eq!(tm.minimum(), 63880);
         assert_eq!(tm.optimum(), 63880);
         assert_eq!(tm.maximum(), 63880);
@@ -501,11 +564,11 @@ mod tests {
 
     #[test]
     fn mtg_non_positive_sets_error_and_500() {
-        // max_moves_to_draw - ply + 2 <= 0 -> MTG <= 0 error path.
+        // `max_moves_to_draw - ply + 2 <= 0` -> MTG <= 0 error path: a ply past
+        // the horizon, which the search itself would already have adjudicated.
         let input = TimeInput {
             time_us: 60_000,
-            max_moves_to_draw: 10,
-            ply: 20,
+            ply: COMPILED.max_moves_to_draw + 2,
             ..base()
         };
         let tm = init(&input);
@@ -523,10 +586,15 @@ mod tests {
             time_us: 300_000,
             inc_us: 5_000,
             ply: 20,
-            round_up_to_fullsecond: false,
             ..base()
         };
-        let tm = init(&input);
+        let tm = init_settings(
+            &input,
+            &TimeSettings {
+                round_up_to_fullsecond: false,
+                ..COMPILED
+            },
+        );
 
         // With the per-move reserve off, `remain_estimate` keeps the whole
         // `(MTG + 1) * 1000`, and with round-up off `maximum` skips the
@@ -544,13 +612,18 @@ mod tests {
             ply: 1,
             ..base()
         });
-        let slow = init(&TimeInput {
-            time_us: 600_000,
-            byoyomi_us: 10_000,
-            ply: 1,
-            slow_mover: 200,
-            ..base()
-        });
+        let slow = init_settings(
+            &TimeInput {
+                time_us: 600_000,
+                byoyomi_us: 10_000,
+                ply: 1,
+                ..base()
+            },
+            &TimeSettings {
+                slow_mover: 200,
+                ..COMPILED
+            },
+        );
         // optimum doubles (t1.min(remain) * 200/100), maximum unchanged.
         assert_eq!(slow.optimum(), baseline.optimum() * 2);
         assert_eq!(slow.maximum(), baseline.maximum());
@@ -564,13 +637,19 @@ mod tests {
             ply: 1,
             ..base()
         });
-        let on = init(&TimeInput {
-            time_us: 600_000,
-            byoyomi_us: 10_000,
-            ply: 1,
-            usi_ponder: true,
-            ..base()
-        });
+        let on = init_settings(
+            &TimeInput {
+                time_us: 600_000,
+                byoyomi_us: 10_000,
+                ply: 1,
+                ..base()
+            },
+            &TimeSettings {
+                usi_ponder: true,
+                stochastic_ponder: false,
+                ..COMPILED
+            },
+        );
         // The bonus is applied to optimumTime pre-clamp; here the clamp does not
         // bind, so it is exactly optimum + optimum/4.
         assert_eq!(on.optimum(), off.optimum() + off.optimum() / 4);
@@ -584,14 +663,19 @@ mod tests {
             ply: 1,
             ..base()
         });
-        let both = init(&TimeInput {
-            time_us: 600_000,
-            byoyomi_us: 10_000,
-            ply: 1,
-            usi_ponder: true,
-            stochastic_ponder: true,
-            ..base()
-        });
+        let both = init_settings(
+            &TimeInput {
+                time_us: 600_000,
+                byoyomi_us: 10_000,
+                ply: 1,
+                ..base()
+            },
+            &TimeSettings {
+                usi_ponder: true,
+                stochastic_ponder: true,
+                ..COMPILED
+            },
+        );
         assert_eq!(both.optimum(), plain.optimum());
     }
 
@@ -647,11 +731,16 @@ mod tests {
 
     #[test]
     fn round_up_no_round_branch() {
-        let tm = init(&TimeInput {
-            time_us: 1_000_000,
-            round_up_to_fullsecond: false,
-            ..base()
-        });
+        let tm = init_settings(
+            &TimeInput {
+                time_us: 1_000_000,
+                ..base()
+            },
+            &TimeSettings {
+                round_up_to_fullsecond: false,
+                ..COMPILED
+            },
+        );
         // max=3001; -120 = 2881.
         assert_eq!(tm.round_up(3001), 2881);
         // max=2000; -120 = 1880.

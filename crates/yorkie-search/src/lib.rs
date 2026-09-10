@@ -15,6 +15,7 @@ use yorkie_eval::{Accumulator, NnueError, NnueNetwork, evaluate_with, network_fi
 use yorkie_state::{Move, Position};
 
 pub mod book;
+mod config;
 pub mod history;
 pub mod movepick;
 pub mod qsearch;

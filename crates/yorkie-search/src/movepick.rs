@@ -37,6 +37,7 @@ use std::cell::RefCell;
 
 use yorkie_state::{CheckSquares, ExtMove, Move, Position, piece_value};
 
+use crate::config::GENERATE_ALL_LEGAL_MOVES;
 use crate::history::LOW_PLY_HISTORY_SIZE;
 use crate::update::WorkerHistories;
 
@@ -266,12 +267,6 @@ pub struct MovePicker {
     skip_quiets: bool,
     stage: Stage,
 
-    /// The `GenerateAllLegalMoves` flag, stashed so the deferred quiet
-    /// generation at `QUIET_INIT` can reproduce the construction-time call
-    /// `generate_quiets(all, …)`. Only the `Main` kind reaches `QUIET_INIT`, so
-    /// it is unread for the other kinds.
-    all: bool,
-
     // The reference's pointers, as indices into `scratch.buf`.
     /// The next move to return.
     cur: usize,
@@ -300,14 +295,11 @@ impl MovePicker {
     /// `(ss-1-i)->continuationHistory`, of which qsearch scores read only plane
     /// `[0]`. There is no good/bad split in qsearch — the whole sorted list is
     /// emitted best-first.
-    pub fn new_qsearch(
-        pos: &Position,
-        tt_move: Option<Move>,
-        cont_planes: [usize; 6],
-        all: bool,
-    ) -> Self {
+    pub fn new_qsearch(pos: &Position, tt_move: Option<Move>, cont_planes: [usize; 6]) -> Self {
         let in_check = pos.in_check();
-        let tt = tt_move.filter(|&m| m.is_ok() && pos.pseudo_legal(m, all) && pos.is_legal(m));
+        let tt = tt_move.filter(|&m| {
+            m.is_ok() && pos.pseudo_legal::<GENERATE_ALL_LEGAL_MOVES>(m) && pos.is_legal(m)
+        });
         // The capture / evasion list is generated at the `*_INIT` stage entry,
         // not here, so a node that cuts off at the TT stage never pays for it.
         let scratch = take_scratch();
@@ -323,7 +315,6 @@ impl MovePicker {
             0,
             cont_planes,
             scratch,
-            all,
         )
     }
 
@@ -334,17 +325,18 @@ impl MovePicker {
         depth: i32,
         ply: i32,
         cont_planes: [usize; 6],
-        all: bool,
     ) -> Self {
         let in_check = pos.in_check();
-        let tt = tt_move.filter(|&m| m.is_ok() && pos.pseudo_legal(m, all) && pos.is_legal(m));
+        let tt = tt_move.filter(|&m| {
+            m.is_ok() && pos.pseudo_legal::<GENERATE_ALL_LEGAL_MOVES>(m) && pos.is_legal(m)
+        });
         // Neither list is materialized here: each generates at its `*_INIT`
         // stage entry, so a node that cuts off during the TT / good-capture
         // stages — or that had `skip_quiets` set by late-move pruning before
         // `QUIET_INIT` — never pays for the generation it does not reach.
         let scratch = take_scratch();
         let kind = if in_check { Kind::Evasion } else { Kind::Main };
-        Self::from_parts(kind, tt, depth, ply, 0, cont_planes, scratch, all)
+        Self::from_parts(kind, tt, depth, ply, 0, cont_planes, scratch)
     }
 
     /// Build a ProbCut picker for `pos` with SEE `threshold`.
@@ -356,15 +348,19 @@ impl MovePicker {
     /// The reference warns that ProbCut must never return a pawn non-promotion
     /// its generator would not produce; that holds by construction here, since
     /// `generate_captures` targets enemy squares only and so generates no quiet
-    /// pawn push regardless of `all`.
-    pub fn new_probcut(pos: &Position, tt_move: Option<Move>, threshold: i32, all: bool) -> Self {
+    /// pawn push regardless of `ALL`.
+    pub fn new_probcut(pos: &Position, tt_move: Option<Move>, threshold: i32) -> Self {
         let is_capture = |m: Move| !m.is_drop() && pos.board().get(m.to_sq()).is_some();
-        let tt = tt_move
-            .filter(|&m| m.is_ok() && is_capture(m) && pos.pseudo_legal(m, all) && pos.is_legal(m));
+        let tt = tt_move.filter(|&m| {
+            m.is_ok()
+                && is_capture(m)
+                && pos.pseudo_legal::<GENERATE_ALL_LEGAL_MOVES>(m)
+                && pos.is_legal(m)
+        });
         // The capture list is generated at `PROBCUT_INIT` stage entry, not
         // here: the buffer starts empty and is filled at that `next_move` arm.
         let scratch = take_scratch();
-        Self::from_parts(Kind::ProbCut, tt, 0, 0, threshold, [0; 6], scratch, all)
+        Self::from_parts(Kind::ProbCut, tt, 0, 0, threshold, [0; 6], scratch)
     }
 
     /// Generate the legal, TT-deduped capture (or, for the `Evasion` kind,
@@ -377,11 +373,10 @@ impl MovePicker {
     fn generate_capture_list(&mut self, pos: &Position) {
         let in_check = self.kind == Kind::Evasion;
         let tt = self.tt;
-        let all = self.all;
         if in_check {
-            pos.generate_evasions(all, &mut self.scratch.buf);
+            pos.generate_evasions::<GENERATE_ALL_LEGAL_MOVES>(&mut self.scratch.buf);
         } else {
-            pos.generate_captures(all, &mut self.scratch.buf);
+            pos.generate_captures::<GENERATE_ALL_LEGAL_MOVES>(&mut self.scratch.buf);
         }
         self.scratch
             .buf
@@ -404,7 +399,6 @@ impl MovePicker {
         threshold: i32,
         cont_planes: [usize; 6],
         scratch: PickerScratch,
-        all: bool,
     ) -> Self {
         MovePicker {
             kind,
@@ -416,7 +410,6 @@ impl MovePicker {
             scratch,
             skip_quiets: false,
             stage: Stage::Tt,
-            all,
             cur: 0,
             end_cur: 0,
             end_bad_captures: 0,
@@ -543,7 +536,7 @@ impl MovePicker {
                         // in the buffer changes the unsorted tail's final
                         // order. Dropping either here would silently reorder
                         // the surviving quiets.
-                        pos.generate_quiets(self.all, &mut self.scratch.buf);
+                        pos.generate_quiets::<GENERATE_ALL_LEGAL_MOVES>(&mut self.scratch.buf);
                         debug_assert!(
                             self.scratch.buf.len() <= MAX_MOVES,
                             "move buffer overflow: {} > {MAX_MOVES}",
@@ -670,8 +663,8 @@ mod twin {
     use yorkie_state::{Move, Position};
 
     use super::{
-        ExtMove, GOOD_QUIET_THRESHOLD, Kind, partial_insertion_sort, score_capture, score_evasion,
-        score_quiet,
+        ExtMove, GENERATE_ALL_LEGAL_MOVES, GOOD_QUIET_THRESHOLD, Kind, partial_insertion_sort,
+        score_capture, score_evasion, score_quiet,
     };
     use crate::update::WorkerHistories;
 
@@ -749,12 +742,13 @@ mod twin {
             pos: &Position,
             tt_move: Option<Move>,
             cont_planes: [usize; 6],
-            all: bool,
         ) -> Self {
             let in_check = pos.in_check();
-            let tt = tt_move.filter(|&m| m.is_ok() && pos.pseudo_legal(m, all) && pos.is_legal(m));
+            let tt = tt_move.filter(|&m| {
+                m.is_ok() && pos.pseudo_legal::<GENERATE_ALL_LEGAL_MOVES>(m) && pos.is_legal(m)
+            });
             let mut scratch = take_scratch();
-            Self::generate_into(pos, in_check, tt, all, &mut scratch.raw_captures);
+            Self::generate_into(pos, in_check, tt, &mut scratch.raw_captures);
             Self::from_parts(
                 if in_check {
                     Kind::Evasion
@@ -776,52 +770,45 @@ mod twin {
             depth: i32,
             ply: i32,
             cont_planes: [usize; 6],
-            all: bool,
         ) -> Self {
             let in_check = pos.in_check();
-            let tt = tt_move.filter(|&m| m.is_ok() && pos.pseudo_legal(m, all) && pos.is_legal(m));
+            let tt = tt_move.filter(|&m| {
+                m.is_ok() && pos.pseudo_legal::<GENERATE_ALL_LEGAL_MOVES>(m) && pos.is_legal(m)
+            });
             let mut scratch = take_scratch();
             if in_check {
-                Self::generate_into(pos, true, tt, all, &mut scratch.raw_captures);
+                Self::generate_into(pos, true, tt, &mut scratch.raw_captures);
                 return Self::from_parts(Kind::Evasion, tt, depth, ply, 0, cont_planes, scratch);
             }
-            Self::generate_into(pos, false, tt, all, &mut scratch.raw_captures);
+            Self::generate_into(pos, false, tt, &mut scratch.raw_captures);
             let mut tmp: Vec<ExtMove> = Vec::new();
-            pos.generate_quiets(all, &mut tmp);
+            pos.generate_quiets::<GENERATE_ALL_LEGAL_MOVES>(&mut tmp);
             scratch.raw_quiets.extend(tmp.into_iter().map(|e| e.mv));
             Self::from_parts(Kind::Main, tt, depth, ply, 0, cont_planes, scratch)
         }
 
-        pub(super) fn new_probcut(
-            pos: &Position,
-            tt_move: Option<Move>,
-            threshold: i32,
-            all: bool,
-        ) -> Self {
+        pub(super) fn new_probcut(pos: &Position, tt_move: Option<Move>, threshold: i32) -> Self {
             let is_capture = |m: Move| !m.is_drop() && pos.board().get(m.to_sq()).is_some();
             let tt = tt_move.filter(|&m| {
-                m.is_ok() && is_capture(m) && pos.pseudo_legal(m, all) && pos.is_legal(m)
+                m.is_ok()
+                    && is_capture(m)
+                    && pos.pseudo_legal::<GENERATE_ALL_LEGAL_MOVES>(m)
+                    && pos.is_legal(m)
             });
             let mut scratch = take_scratch();
-            Self::generate_into(pos, false, tt, all, &mut scratch.raw_captures);
+            Self::generate_into(pos, false, tt, &mut scratch.raw_captures);
             Self::from_parts(Kind::ProbCut, tt, 0, 0, threshold, [0; 6], scratch)
         }
 
-        fn generate_into(
-            pos: &Position,
-            in_check: bool,
-            tt: Option<Move>,
-            all: bool,
-            out: &mut Vec<Move>,
-        ) {
+        fn generate_into(pos: &Position, in_check: bool, tt: Option<Move>, out: &mut Vec<Move>) {
             // The generators emit `ExtMove`; the twin keeps its raw list as
             // `Move`, so unwrap `.mv` at this boundary — the twin's ordering
             // logic never sees an `ExtMove`.
             let mut tmp: Vec<ExtMove> = Vec::new();
             if in_check {
-                pos.generate_evasions(all, &mut tmp);
+                pos.generate_evasions::<GENERATE_ALL_LEGAL_MOVES>(&mut tmp);
             } else {
-                pos.generate_captures(all, &mut tmp);
+                pos.generate_captures::<GENERATE_ALL_LEGAL_MOVES>(&mut tmp);
             }
             for e in tmp {
                 if pos.is_legal(e.mv) && Some(e.mv) != tt {
@@ -1042,7 +1029,7 @@ mod tests {
     //   qsearch picker (init histories): MVV / capture-first behaviour
 
     fn qpicker(p: &Position, tt: Option<Move>) -> MovePicker {
-        MovePicker::new_qsearch(p, tt, SENTINEL_PLANES, false)
+        MovePicker::new_qsearch(p, tt, SENTINEL_PLANES)
     }
 
     #[cfg_attr(miri, ignore)]
@@ -1097,29 +1084,27 @@ mod tests {
 
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn qsearch_generate_all_legal_moves_adds_capture_nonpromotion() {
+    fn qsearch_yields_the_capture_nonpromotion_only_under_generate_all() {
         // A Black lance on 5d capturing a White pawn on 5b, the enemy second
-        // rank, where the non-promotion is suppressed by default.
+        // rank, where the non-promotion is suppressed unless the compiled
+        // `GenerateAllLegalMoves` widens the generator.
         let p = pos("k8/4p4/9/4L4/9/9/9/9/8K b - 1");
         let h = init_histories();
         assert!(!p.in_check());
 
-        let off = collect_usi(
-            MovePicker::new_qsearch(&p, None, SENTINEL_PLANES, false),
-            &p,
-            &h,
-        );
-        assert_eq!(off, vec!["5d5b+".to_string()], "default: promotion only");
-
-        let on = collect_usi(
-            MovePicker::new_qsearch(&p, None, SENTINEL_PLANES, true),
-            &p,
-            &h,
-        );
-        assert!(
-            on.contains(&"5d5b".to_string()),
-            "all-mode must yield the lance capture non-promotion: {on:?}",
-        );
+        let moves = collect_usi(MovePicker::new_qsearch(&p, None, SENTINEL_PLANES), &p, &h);
+        if GENERATE_ALL_LEGAL_MOVES {
+            assert!(
+                moves.contains(&"5d5b".to_string()),
+                "the widened generator must yield the lance capture non-promotion: {moves:?}",
+            );
+        } else {
+            assert_eq!(
+                moves,
+                vec!["5d5b+".to_string()],
+                "the default generator yields the promotion only",
+            );
+        }
     }
 
     #[cfg_attr(miri, ignore)]
@@ -1154,16 +1139,16 @@ mod tests {
     //   main-search picker with reference clear() histories
 
     fn main_picker(p: &Position, tt: Option<Move>, depth: i32, ply: i32) -> MovePicker {
-        MovePicker::new_main_search(p, tt, depth, ply, SENTINEL_PLANES, false)
+        MovePicker::new_main_search(p, tt, depth, ply, SENTINEL_PLANES)
     }
 
     /// The union of legal captures and legal quiets — the moves the not-in-check
     /// main picker is responsible for.
     fn legal_capture_and_quiet_set(p: &Position) -> std::collections::HashSet<Move> {
         let mut caps: Vec<ExtMove> = Vec::new();
-        p.generate_captures(false, &mut caps);
+        p.generate_captures::<GENERATE_ALL_LEGAL_MOVES>(&mut caps);
         let mut quiets: Vec<ExtMove> = Vec::new();
-        p.generate_quiets(false, &mut quiets);
+        p.generate_quiets::<GENERATE_ALL_LEGAL_MOVES>(&mut quiets);
         caps.into_iter()
             .chain(quiets)
             .map(|e| e.mv)
@@ -1228,7 +1213,7 @@ mod tests {
 
         // Pick an arbitrary legal quiet move as the TT move.
         let mut caps: Vec<ExtMove> = Vec::new();
-        p.generate_captures(false, &mut caps);
+        p.generate_captures::<GENERATE_ALL_LEGAL_MOVES>(&mut caps);
         let cap_set: std::collections::HashSet<Move> = caps.iter().map(|e| e.mv).collect();
         let tt = legal_moves(&p)
             .into_iter()
@@ -1499,7 +1484,7 @@ mod tests {
         // reflects the same (post-bump) ordering — i.e. scoring is not frozen at
         // construction.
         let mut h2 = init_histories();
-        let mut mp = MovePicker::new_main_search(&p, Some(cap_a), 6, 0, SENTINEL_PLANES, false);
+        let mut mp = MovePicker::new_main_search(&p, Some(cap_a), 6, 0, SENTINEL_PLANES);
         let tt_out = mp.next_move(&p, &h2).unwrap();
         assert_eq!(tt_out, cap_a, "TT move leads");
         // Bump cap_b between the TT stage and CAPTURE_INIT.
@@ -1543,7 +1528,7 @@ mod tests {
         );
         assert!(legal_moves(&p).contains(&q_target));
 
-        let mut mp = MovePicker::new_main_search(&p, None, 6, 0, cont_planes, false);
+        let mut mp = MovePicker::new_main_search(&p, None, 6, 0, cont_planes);
         // No captures in this position, so the first next_move enters QUIET_INIT.
         // Bump the plane cell for q_target before that first call.
         h.continuation.update_at(
@@ -1574,7 +1559,7 @@ mod tests {
         // The illegal knight move is generated (pseudo-legal) but not legal.
         let knight_illegal = "1g2e";
         let mut raw_ext: Vec<ExtMove> = Vec::new();
-        p.generate_quiets(false, &mut raw_ext);
+        p.generate_quiets::<GENERATE_ALL_LEGAL_MOVES>(&mut raw_ext);
         let raw_quiets: Vec<Move> = raw_ext.into_iter().map(|e| e.mv).collect();
         let raw_usi: Vec<String> = raw_quiets.iter().map(|&m| format_usi_move(m)).collect();
         assert_eq!(
@@ -1692,10 +1677,9 @@ mod tests {
     fn assert_gate_main(case: &GateCase, hist: &WorkerHistories, skip_at: Option<usize>) {
         let p = pos(case.sfen);
         let tt = tt_pick(&p, &case.tt);
-        let mut prod =
-            MovePicker::new_main_search(&p, tt, case.depth, case.ply, SENTINEL_PLANES, false);
+        let mut prod = MovePicker::new_main_search(&p, tt, case.depth, case.ply, SENTINEL_PLANES);
         let mut twin =
-            TwinMovePicker::new_main_search(&p, tt, case.depth, case.ply, SENTINEL_PLANES, false);
+            TwinMovePicker::new_main_search(&p, tt, case.depth, case.ply, SENTINEL_PLANES);
 
         let mut prod_seq = Vec::new();
         let mut twin_seq = Vec::new();
@@ -1730,8 +1714,8 @@ mod tests {
     fn assert_gate_qsearch(sfen: &str, tt_usi: Option<&str>, hist: &WorkerHistories) {
         let p = pos(sfen);
         let tt = tt_move(&p, tt_usi);
-        let mut prod = MovePicker::new_qsearch(&p, tt, SENTINEL_PLANES, false);
-        let mut twin = TwinMovePicker::new_qsearch(&p, tt, SENTINEL_PLANES, false);
+        let mut prod = MovePicker::new_qsearch(&p, tt, SENTINEL_PLANES);
+        let mut twin = TwinMovePicker::new_qsearch(&p, tt, SENTINEL_PLANES);
         let mut n = 0usize;
         loop {
             let a = prod.next_move(&p, hist);
@@ -1747,8 +1731,8 @@ mod tests {
     /// Drive both ProbCut pickers to exhaustion and assert identical sequences.
     fn assert_gate_probcut(sfen: &str, threshold: i32, hist: &WorkerHistories) {
         let p = pos(sfen);
-        let mut prod = MovePicker::new_probcut(&p, None, threshold, false);
-        let mut twin = TwinMovePicker::new_probcut(&p, None, threshold, false);
+        let mut prod = MovePicker::new_probcut(&p, None, threshold);
+        let mut twin = TwinMovePicker::new_probcut(&p, None, threshold);
         let mut n = 0usize;
         loop {
             let a = prod.next_move(&p, hist);

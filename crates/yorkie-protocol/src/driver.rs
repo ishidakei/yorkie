@@ -12,10 +12,9 @@ use std::time::{Duration, Instant};
 use yorkie_eval::{NnueError, network_file};
 use yorkie_numa::{NumaIndex, NumaLayout, mempolicy};
 use yorkie_search::{
-    BookConfig, BookHit, EnteringKingConfig, EnteringKingRule, PonderSignal, Prng, QSearch,
-    RootMove, Search, SearchControl, SharedHistories, TimeControl, TimeInput, TimeManagement,
-    WorkerHistories, WorkerResult, WorkerVote, declaration_win, generate_root_moves, probe_book,
-    select_best_worker,
+    BookConfig, BookHit, EnteringKingConfig, PonderSignal, Prng, QSearch, RootMove, Search,
+    SearchControl, SharedHistories, TimeControl, TimeInput, TimeManagement, WorkerHistories,
+    WorkerResult, WorkerVote, declaration_win, generate_root_moves, probe_book, select_best_worker,
 };
 // The PV-line surface: only a `verbose2` build renders one, so only it needs
 // the line's data type, its bound marker, the sink trait and the output config.
@@ -143,6 +142,63 @@ pub(crate) const PAWN_VALUE: Value = 90;
 /// `VALUE_INFINITE`: the pre-search `rootMoves[0].score` sentinel the
 /// `ResignValue` guard excludes.
 const VALUE_INFINITE: Value = 32001;
+
+/// `ResignValue`: the post-search resign threshold in centipawns. A searched
+/// best score at or below `-RESIGN_VALUE` resigns.
+const RESIGN_VALUE: Value = crate::config::RESIGN_VALUE as Value;
+
+/// The book-selection settings, as one value rather than eighteen reads at every
+/// `go`. `IgnoreBookPly` is not here — it is captured at book-load time and
+/// travels with [`LoadedBook`].
+///
+/// Both profiles' fields are present; the probe picks between them from
+/// `book_options_v2` and the root side to move. A setting the active profile
+/// does not own reads as its type's zero, which is inert on the leg that never
+/// consults it.
+const BOOK_CONFIG: BookConfig = BookConfig {
+    book_options_v2: crate::config::BOOK_OPTIONS_V2,
+    narrow_book: !crate::config::BOOK_OPTIONS_V2 && crate::config::NARROW_BOOK,
+    book_moves: crate::config::BOOK_MOVES,
+    ignore_rate: crate::config::BOOK_IGNORE_RATE,
+    eval_diff: if crate::config::BOOK_OPTIONS_V2 {
+        0
+    } else {
+        crate::config::BOOK_EVAL_DIFF
+    },
+    eval_black_diff: if crate::config::BOOK_OPTIONS_V2 {
+        crate::config::BOOK_EVAL_BLACK_DIFF
+    } else {
+        0
+    },
+    eval_white_diff: if crate::config::BOOK_OPTIONS_V2 {
+        crate::config::BOOK_EVAL_WHITE_DIFF
+    } else {
+        0
+    },
+    eval_black_limit: crate::config::BOOK_EVAL_BLACK_LIMIT,
+    eval_white_limit: crate::config::BOOK_EVAL_WHITE_LIMIT,
+    depth_limit: if crate::config::BOOK_OPTIONS_V2 {
+        0
+    } else {
+        crate::config::BOOK_DEPTH_LIMIT
+    },
+    depth_black_limit: if crate::config::BOOK_OPTIONS_V2 {
+        crate::config::BOOK_DEPTH_BLACK_LIMIT
+    } else {
+        0
+    },
+    depth_white_limit: if crate::config::BOOK_OPTIONS_V2 {
+        crate::config::BOOK_DEPTH_WHITE_LIMIT
+    } else {
+        0
+    },
+    consider_move_count: !crate::config::BOOK_OPTIONS_V2 && crate::config::CONSIDER_BOOK_MOVE_COUNT,
+    // Shapes the book `info` lines and nothing else, so it is read only in a
+    // build that prints them.
+    #[cfg(feature = "verbose2")]
+    pv_moves: crate::config::BOOK_PV_MOVES,
+    flipped_book: crate::config::FLIPPED_BOOK,
+};
 
 /// The reference `USIEngine::to_cp`: `100 * v / NormalizeToPawnValue`, with
 /// C++-style truncating division (Rust truncates toward zero, matching). Used
@@ -1179,37 +1235,6 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         clear_alloc_count();
     }
 
-    /// Snapshot the book-selection options into a [`BookConfig`] for one `go`.
-    /// `IgnoreBookPly` is not here — it is captured at load time and travels
-    /// with [`LoadedBook`].
-    ///
-    /// Both profiles' fields are snapshotted; the probe picks between them from
-    /// `book_options_v2` and the root side to move. An option the active profile
-    /// did not register reads as its type's zero, which is inert on the leg that
-    /// never consults it.
-    fn book_config(&self) -> BookConfig {
-        BookConfig {
-            book_options_v2: self.settings.book_options_v2(),
-            narrow_book: self.settings.narrow_book(),
-            book_moves: self.settings.book_moves(),
-            ignore_rate: self.settings.book_ignore_rate(),
-            eval_diff: self.settings.book_eval_diff(),
-            eval_black_diff: self.settings.book_eval_black_diff(),
-            eval_white_diff: self.settings.book_eval_white_diff(),
-            eval_black_limit: self.settings.book_eval_black_limit(),
-            eval_white_limit: self.settings.book_eval_white_limit(),
-            depth_limit: self.settings.book_depth_limit(),
-            depth_black_limit: self.settings.book_depth_black_limit(),
-            depth_white_limit: self.settings.book_depth_white_limit(),
-            consider_move_count: self.settings.consider_book_move_count(),
-            // Shapes the book `info` lines and nothing else, so it is read only
-            // in a build that prints them.
-            #[cfg(feature = "verbose2")]
-            pv_moves: self.settings.book_pv_moves(),
-            flipped_book: self.settings.flipped_book(),
-        }
-    }
-
     fn handle_go(&mut self, limits: GoLimits) -> io::Result<()> {
         // A new `go` supersedes any lingering search; reclaim its state first.
         self.finish_search_join();
@@ -1409,7 +1434,6 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 yorkie_state::Color::Black => (limits.btime, limits.binc),
                 yorkie_state::Color::White => (limits.wtime, limits.winc),
             };
-            let mmtd = remap_max_moves_to_draw(self.settings.max_moves_to_draw());
             // A distinct PRNG stream from the book selection, so `go rtime`'s
             // randomised budget never perturbs (or is perturbed by) book choice.
             // `go rtime` is the stream's only consumer, so it is drawn only in a
@@ -1425,15 +1449,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                     movetime: movetime.unwrap_or(0),
                     #[cfg(feature = "verbose2")]
                     rtime: limits.rtime.unwrap_or(0) as i64,
-                    network_delay: self.settings.network_delay(),
-                    network_delay2: self.settings.network_delay2(),
-                    minimum_thinking_time: self.settings.minimum_thinking_time(),
-                    slow_mover: self.settings.slow_mover(),
-                    round_up_to_fullsecond: self.settings.round_up_to_full_second(),
-                    usi_ponder: self.settings.usi_ponder(),
-                    stochastic_ponder: self.settings.stochastic_ponder(),
                     ply: self.pos.ply() as i32,
-                    max_moves_to_draw: mmtd,
                     start_time: now,
                 },
                 #[cfg(feature = "verbose2")]
@@ -1448,7 +1464,6 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 use_time_management,
                 #[cfg(feature = "verbose2")]
                 movetime,
-                n_threads: self.pool.size(),
                 best_previous_score: best_prev_score,
                 best_previous_average_score: best_prev_average_score,
                 previous_time_reduction: self.previous_time_reduction,
@@ -1562,11 +1577,11 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         let pos = self.pos.clone();
 
         // Book state for this `go`: the loaded book (cheap `Arc` clone), the
-        // `USI_OwnBook` gate, an options snapshot, a fresh seed, and whether a
-        // book reply must be held for `stop`/`ponderhit` (`go ponder`/`infinite`).
+        // `USI_OwnBook` gate, a fresh seed, and whether a book reply must be
+        // held for `stop`/`ponderhit` (`go ponder`/`infinite`). The selection
+        // settings are [`BOOK_CONFIG`] and travel with no job.
         let book = self.book.as_ref().map(Arc::clone);
         let own_book = self.settings.usi_own_book();
-        let book_config = self.book_config();
         self.book_seed = self
             .book_seed
             .wrapping_mul(6_364_136_223_846_793_005)
@@ -1586,38 +1601,12 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         #[cfg(feature = "verbose3")]
         let bestmove_sent = Arc::new(AtomicBool::new(false));
 
-        // Snapshot the entering-king rule for this `go` and precompute its
-        // per-side thresholds from the root position, mirroring the reference
-        // `set_ekr` on the root worker. The material total is invariant across
-        // the search, so every worker shares this one snapshot.
-        let entering_king = EnteringKingConfig::new(
-            EnteringKingRule::from_option(self.settings.entering_king_rule()),
-            &pos,
-        );
-
-        // Snapshot the `MaxMovesToDraw` horizon for this `go`, applying the
-        // reference's `0 → 100000` remap: a set value of 0 means unlimited.
-        // Passed per `go`, like the entering-king config, so every worker
-        // shares one value and no global is touched.
-        let max_moves_to_draw = remap_max_moves_to_draw(self.settings.max_moves_to_draw());
-
-        // Draw contempt is `drawValueTable[REPETITION_DRAW][us]` for the root
-        // side to move; the search returns `+draw_contempt` for the root side
-        // and `-draw_contempt` for the opponent.
-        let draw_option = match self.pos.side_to_move() {
-            yorkie_state::Color::Black => self.settings.draw_value_black(),
-            yorkie_state::Color::White => self.settings.draw_value_white(),
-        };
-        let draw_contempt: Value = (draw_option as Value) * PAWN_VALUE / 100;
-
-        // `ResignValue`: the post-search resign threshold in centipawns.
-        // Consumed on the coordinator at emit time.
-        let resign_value = self.settings.resign_value() as Value;
-
-        // `GenerateAllLegalMoves`: when true the search also considers the
-        // non-promoting moves the default generator suppresses. Every worker
-        // shares the flag.
-        let generate_all_legal_moves = self.settings.generate_all_legal_moves();
+        // Precompute the entering-king thresholds from the root position,
+        // mirroring the reference `set_ekr` on the root worker. The rule itself
+        // is compiled in; only its two handicap-aware forms read a position at
+        // all. The material total is invariant across the search, so every
+        // worker shares this one snapshot.
+        let entering_king = EnteringKingConfig::new(&pos);
 
         // The per-`go` coordinator (worker slot 0) pins itself to its assigned
         // CPU — and points its allocations at that CPU's node — at the start of
@@ -1642,7 +1631,6 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             n_threads,
             worker_plan,
             book,
-            book_config,
             own_book,
             book_seed,
             ponder,
@@ -1652,10 +1640,6 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             #[cfg(feature = "verbose3")]
             bestmove_sent,
             entering_king,
-            max_moves_to_draw,
-            draw_contempt,
-            resign_value,
-            generate_all_legal_moves,
             #[cfg(feature = "verbose2")]
             mate_mode,
             #[cfg(feature = "random")]
@@ -2150,18 +2134,6 @@ impl<W: Write + Send> PvSink for WriterPvSink<W> {
     }
 }
 
-/// Apply the reference's `MaxMovesToDraw` remap: a set option value of `0`
-/// means "unlimited" and is rewritten to `100000` internally; any other value
-/// passes through. The option itself still reports `0` — only the search-side
-/// horizon uses the remapped value.
-fn remap_max_moves_to_draw(option_value: i64) -> i32 {
-    if option_value == 0 {
-        100_000
-    } else {
-        option_value as i32
-    }
-}
-
 /// The two book extensions the reference's name resolution knows about.
 const BOOK_EXT_YBB: &str = "ybb";
 const BOOK_EXT_DB: &str = "db";
@@ -2561,14 +2533,8 @@ struct HelperJob {
     /// This helper's index into `node_slots` / `bmc_slots` (`>= 1`; index 0 is the
     /// main worker).
     index: usize,
-    /// The entering-king declaration config snapshot for this `go`.
+    /// The entering-king declaration thresholds snapshot for this `go`.
     entering_king: EnteringKingConfig,
-    /// The `MaxMovesToDraw` horizon for this `go` (already `0 → 100000` remapped).
-    max_moves_to_draw: i32,
-    /// The root-side draw contempt for this `go` (already pawn-scaled).
-    draw_contempt: Value,
-    /// `GenerateAllLegalMoves` — expose suppressed non-promotions.
-    generate_all_legal_moves: bool,
     /// `go mate` mode — disable early mate break, enable mate-found stop. Only
     /// a `verbose2` build can parse the clause that sets it.
     #[cfg(feature = "verbose2")]
@@ -2704,9 +2670,6 @@ fn helper_loop(slot: Arc<HelperSlot>) {
             qs.set_node_tally(Arc::clone(&job.node_slots), job.index);
             qs.set_best_move_tally(Arc::clone(&job.bmc_slots), job.index);
             qs.set_entering_king(job.entering_king);
-            qs.set_max_moves_to_draw(job.max_moves_to_draw);
-            qs.set_draw_value(job.draw_contempt);
-            qs.set_generate_all_legal_moves(job.generate_all_legal_moves);
             #[cfg(feature = "verbose2")]
             qs.set_mate_mode(job.mate_mode);
             #[cfg(feature = "random")]
@@ -3173,8 +3136,6 @@ struct CoordinatorJob<W: Write + Send + 'static> {
     worker_plan: Arc<WorkerPlan>,
     /// The loaded opening book to probe once, if any.
     book: Option<Arc<LoadedBook>>,
-    /// The book-selection config snapshot for this `go`.
-    book_config: BookConfig,
     /// `USI_OwnBook` — the master gate; when off the book is never probed.
     own_book: bool,
     /// The seed for this `go`'s book PRNG (deterministic within a session).
@@ -3197,19 +3158,8 @@ struct CoordinatorJob<W: Write + Send + 'static> {
     /// never sets it — nothing went out. `verbose3`, like the reader.
     #[cfg(feature = "verbose3")]
     bestmove_sent: Arc<AtomicBool>,
-    /// The entering-king declaration config snapshot for this `go`.
+    /// The entering-king declaration thresholds snapshot for this `go`.
     entering_king: EnteringKingConfig,
-    /// The `MaxMovesToDraw` horizon for this `go` (already `0 → 100000` remapped).
-    max_moves_to_draw: i32,
-    /// The root-side draw contempt `drawValueTable[REPETITION_DRAW][us]` for this
-    /// `go` (`DrawValueBlack`/`DrawValueWhite`, already pawn-scaled).
-    draw_contempt: Value,
-    /// The `ResignValue` threshold in centipawns; a searched best score at or
-    /// below `-resign_value` resigns.
-    resign_value: Value,
-    /// `GenerateAllLegalMoves` — expose the suppressed non-promotions to the
-    /// search generators.
-    generate_all_legal_moves: bool,
     /// `go mate` mode — disables the early mate break and enables the mate-found
     /// stop rule. Only a `verbose2` build can parse the clause that sets it.
     #[cfg(feature = "verbose2")]
@@ -3277,7 +3227,6 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         n_threads,
         worker_plan,
         book,
-        book_config,
         own_book,
         book_seed,
         ponder,
@@ -3287,10 +3236,6 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         #[cfg(feature = "verbose3")]
         bestmove_sent,
         entering_king,
-        max_moves_to_draw,
-        draw_contempt,
-        resign_value,
-        generate_all_legal_moves,
         #[cfg(feature = "verbose2")]
         mate_mode,
         #[cfg(feature = "random")]
@@ -3323,7 +3268,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     // Build the root-move list once (the reference `start_thinking`). The resign
     // and declaration-win short-circuits emit and return before any helper is
     // dispatched, exactly as `start_searching` exits before `threads.start_searching()`.
-    let root_moves = generate_root_moves(&pos, generate_all_legal_moves);
+    let root_moves = generate_root_moves(&pos);
     if root_moves.is_empty() {
         emit_bestmove(
             &writer,
@@ -3377,7 +3322,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
             &loaded.books,
             loaded.ignore_book_ply,
             &pos,
-            &book_config,
+            &BOOK_CONFIG,
             &mut prng,
         );
         #[cfg(feature = "verbose1")]
@@ -3446,9 +3391,6 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
             bmc_slots: Arc::clone(&bmc_slots),
             index: h + 1,
             entering_king,
-            max_moves_to_draw,
-            draw_contempt,
-            generate_all_legal_moves,
             #[cfg(feature = "verbose2")]
             mate_mode,
             #[cfg(feature = "random")]
@@ -3472,9 +3414,6 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
     qs.set_node_tally(Arc::clone(&node_slots), 0);
     qs.set_best_move_tally(Arc::clone(&bmc_slots), 0);
     qs.set_entering_king(entering_king);
-    qs.set_max_moves_to_draw(max_moves_to_draw);
-    qs.set_draw_value(draw_contempt);
-    qs.set_generate_all_legal_moves(generate_all_legal_moves);
     #[cfg(feature = "verbose2")]
     qs.set_mate_mode(mate_mode);
     #[cfg(feature = "random")]
@@ -3585,7 +3524,7 @@ fn run_coordinated<W: Write + Send + 'static>(job: CoordinatorJob<W>) -> Coordin
         } else {
             best.uci_score
         };
-        to_cp(resign_score) <= -resign_value
+        to_cp(resign_score) <= -RESIGN_VALUE
     };
 
     // Final PV output before `bestmove`. `pv_idx == lines.len()` makes every

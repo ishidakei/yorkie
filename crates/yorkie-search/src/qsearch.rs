@@ -29,6 +29,7 @@ use yorkie_eval::{Accumulator, FinnyCache, MoveDelta, NnueNetwork, evaluate_with
 use yorkie_state::{Color, Move, Piece, PieceKind, Position, RepetitionState, piece_value};
 use yorkie_storage::{Bound, TranspositionTable, TtSlot, Value};
 
+use crate::config::GENERATE_ALL_LEGAL_MOVES;
 use crate::history::{ContinuationCorrectionHistory, ContinuationHistory, CorrChannel};
 use crate::movepick::MovePicker;
 use crate::root::{
@@ -64,11 +65,56 @@ const DEPTH_UNSEARCHED: i32 = -2;
 const FUTILITY_MARGIN: Value = 328;
 /// SEE cutoff for a capture with no futility exemption.
 const SEE_CAPTURE_MARGIN: i32 = -73;
-/// The default-remapped `MaxMovesToDraw`: the `0` option default is rewritten
-/// to `100000`. This is the default [`QSearch::max_moves_to_draw`] value, i.e.
-/// the fixed-depth parity path — the driver overrides it per `go` from the
-/// `MaxMovesToDraw` option.
-const MAX_MOVES_TO_DRAW: i32 = 100_000;
+/// The `MaxMovesToDraw` horizon this binary plays under: the game ply past
+/// which every interior / qsearch node adjudicates an unconditional draw. A
+/// configured `0` means unlimited, which the reference rewrites to `100000`.
+const MAX_MOVES_TO_DRAW: i32 = if crate::config::MAX_MOVES_TO_DRAW == 0 {
+    100_000
+} else {
+    crate::config::MAX_MOVES_TO_DRAW as i32
+};
+
+/// Entries in the `reductions[]` table — `1..600` are filled, `[0]` is 0.
+const REDUCTIONS_LEN: usize = 600;
+
+/// `reductions[i] = int(2763/128.0 * ln(i))`, the reference's per-`go`
+/// `init_reductions` table with the depth-independent factor it always uses.
+/// Nothing about it varies at run time, so it is one `static` of fixed length
+/// and [`QSearch::reduction`] indexes it against a literal bound.
+static REDUCTIONS: [i32; REDUCTIONS_LEN] = {
+    let mut table = [0i32; REDUCTIONS_LEN];
+    let mut i = 1;
+    while i < REDUCTIONS_LEN {
+        table[i] = (2763.0 / 128.0 * const_ln(i as f64)) as i32;
+        i += 1;
+    }
+    table
+};
+
+/// `ln(x)` for `x >= 1`, in a form the constant evaluator can run: halve `x`
+/// into `[0.75, 1.5)` — exact, since it only changes the exponent — and sum the
+/// `atanh` series there, where `|s| <= 0.2` makes the tail negligible after the
+/// terms kept. `f64::ln` itself is not available in a `const` context.
+const fn const_ln(x: f64) -> f64 {
+    let mut m = x;
+    let mut halvings = 0i32;
+    while m >= 1.5 {
+        m /= 2.0;
+        halvings += 1;
+    }
+    // ln(m) = 2·atanh((m-1)/(m+1)) = 2·(s + s³/3 + s⁵/5 + …).
+    let s = (m - 1.0) / (m + 1.0);
+    let s2 = s * s;
+    let mut term = s;
+    let mut sum = 0.0f64;
+    let mut n = 1i32;
+    while n <= 25 {
+        sum += term / n as f64;
+        term *= s2;
+        n += 2;
+    }
+    2.0 * sum + halvings as f64 * std::f64::consts::LN_2
+}
 
 /// `mate_in(ply)`.
 fn mate_in(ply: i32) -> Value {
@@ -328,9 +374,6 @@ pub struct TimeControl {
     /// its only two sources, are `verbose2` clauses.
     #[cfg(feature = "verbose2")]
     pub movetime: Option<i64>,
-    /// `threads.size()` — the worker count, the divisor of the best-move
-    /// instability factor.
-    pub n_threads: usize,
     /// `main_manager()->bestPreviousScore` — the previous `go`'s reported score
     /// (`VALUE_INFINITE` for the first move of a game), used to seed
     /// `iterValue`.
@@ -376,17 +419,18 @@ pub struct QSearch<'a> {
     /// recursion.
     pv_node: bool,
     /// Whether TT hits are honoured (`ReadTT`). Invariant down the recursion.
+    /// The engine always honours them; the `ReadTT == false` instantiation
+    /// exists to be exercised, so only a test build carries the state and only
+    /// there is [`Self::reads_tt`] anything but the constant `true`.
+    #[cfg(test)]
     read_tt: bool,
 
     /// Root side-to-move, used by [`Self::draw_value`] to reproduce the
     /// contempt-signed `drawValueTable[REPETITION_DRAW]` (set once per search
-    /// from the root side).
+    /// from the root side). The contempt's magnitude is compiled in
+    /// ([`DRAW_CONTEMPT_BLACK`] / [`DRAW_CONTEMPT_WHITE`]); this is what gives
+    /// it its sign.
     root_us: Color,
-    /// `drawValueTable[REPETITION_DRAW][root_us]`, i.e. the contempt draw score
-    /// for the root side. With default options (`DrawValueBlack/White = -2`)
-    /// and `PawnValue = 90` this is `-2 * 90 / 100 == -1` (C++ truncation
-    /// toward zero); the opponent side gets `-draw_contempt`.
-    draw_contempt: Value,
 
     /// The persistent search stack (`STACK_BASE` sentinels + `MAX_PLY` + 1),
     /// a fixed-size boxed array (length [`STACK_LEN`]) mirroring the reference's
@@ -409,18 +453,16 @@ pub struct QSearch<'a> {
     finny: Box<FinnyCache>,
     /// Test-only: when set, [`Self::static_eval`] asserts the differential
     /// accumulator equals a from-scratch [`yorkie_eval::evaluate`] at every
-    /// evaluation point (the accumulator-equivalence test). Off by default, so
-    /// production searches never invoke the refresh entry point; enabled via
-    /// [`Self::set_verify_accumulator`] by the equivalence test.
+    /// evaluation point (the accumulator-equivalence test). Enabled via
+    /// [`Self::set_verify_accumulator`] by that test alone, so a build that is
+    /// not the test build neither carries the flag nor compiles the check.
+    #[cfg(test)]
     verify_accumulator: bool,
 
     /// The single set of live worker history tables, read **everywhere** in the
     /// search tree, so that an interior update is visible to a later leaf
     /// qsearch — the reference's contract.
     histories: WorkerHistories,
-    /// `reductions[i] = int(2763/128.0 * ln(i))` for `i in 1..600`, `[0] == 0`.
-    /// Read by [`Self::reduction`].
-    reductions: Vec<i32>,
     /// `rootDelta` — the width `beta - alpha` of the *root* aspiration window,
     /// read by [`Self::reduction`]. [`Self::run_root`] sets it before each
     /// `search<Root>` call; the default is the full-window width
@@ -439,23 +481,14 @@ pub struct QSearch<'a> {
     /// fixed-depth parity path); the driver sets it via [`Self::set_control`]
     /// before an under-clock `go`.
     control: SearchControl,
-    /// The entering-king declaration config for this `go`: the
-    /// selected rule plus its precomputed per-side point thresholds, read by the
-    /// two in-search `declaration_win` checks (`run_root`'s root shortcut and the
-    /// interior Step-5 check). Defaults to `CSARule27` with its fixed thresholds,
-    /// which is what the fixed-depth parity path searches under; the driver
-    /// overrides it per `go` via [`Self::set_entering_king`].
+    /// The entering-king declaration thresholds for this `go`, read by the two
+    /// in-search `declaration_win` checks (`run_root`'s root shortcut and the
+    /// interior Step-5 check). The rule itself is compiled in, and only its two
+    /// handicap-aware forms make a threshold depend on the root position; under
+    /// every other rule the checks read the compiled pair and never this
+    /// snapshot. The driver installs it per `go` via
+    /// [`Self::set_entering_king`].
     entering_king: EnteringKingConfig,
-    /// The game ply past which the search adjudicates an unconditional draw,
-    /// already `0 → 100000` remapped. Defaults to the unlimited
-    /// [`MAX_MOVES_TO_DRAW`].
-    max_moves_to_draw: i32,
-    /// `generate_all_legal_moves`: when true the search-facing move generators
-    /// also yield the non-promoting moves the default generator suppresses
-    /// (pawn/lance/knight non-promotions etc.). Set per `go` via
-    /// [`Self::set_generate_all_legal_moves`]; `false` on the fixed-depth
-    /// parity path, so generation stays bit-identical to today.
-    generate_all_legal_moves: bool,
     /// `go mate` mode (`limits.mate != 0`). When set, the iterative-deepening
     /// early mate/mated break is disabled (the search keeps proving within its
     /// time budget) and the mate-found stop rule is armed so a proven mate
@@ -680,10 +713,17 @@ pub struct PvOutputConfig {
     pub start_time: Instant,
 }
 
-/// `DrawValueBlack` / `DrawValueWhite` default.
-const DRAW_VALUE_OPTION_DEFAULT: i32 = -2;
-/// `Eval::PawnValue`, used to scale the contempt option.
+/// `Eval::PawnValue`, used to scale the contempt setting.
 const PAWN_VALUE: i32 = 90;
+
+/// `drawValueTable[REPETITION_DRAW][BLACK]`: the `DrawValueBlack` setting scaled
+/// by [`PAWN_VALUE`], truncated toward zero as the reference's integer division
+/// is — with the default `-2` that is `-2 * 90 / 100 == -1`.
+const DRAW_CONTEMPT_BLACK: Value =
+    (crate::config::DRAW_VALUE_BLACK * PAWN_VALUE as i64 / 100) as Value;
+/// `drawValueTable[REPETITION_DRAW][WHITE]`, from `DrawValueWhite`.
+const DRAW_CONTEMPT_WHITE: Value =
+    (crate::config::DRAW_VALUE_WHITE * PAWN_VALUE as i64 / 100) as Value;
 
 /// A fresh evaluation-noise seed for one game.
 ///
@@ -755,13 +795,9 @@ impl<'a> QSearch<'a> {
             sel_depth: 0,
             nmp_min_ply: 0,
             pv_node: false,
+            #[cfg(test)]
             read_tt: true,
             root_us: Color::Black,
-            // Default draw contempt = the baked `DrawValueBlack/White = -2`
-            // option scaled by `PawnValue`: `-2 * 90 / 100 == -1`. A bare
-            // `run`/`run_search` (the fixed-depth parity path) never calls
-            // `set_draw_value`, so this default keeps that path bit-identical.
-            draw_contempt: DRAW_VALUE_OPTION_DEFAULT * PAWN_VALUE / 100,
             // A fixed-size boxed array; each cell's `pv` is preallocated so a
             // PV update never grows the buffer on the hot path. Built as a
             // `Vec` (each cell distinct — `SearchStackCell` is not `Copy`) then
@@ -790,22 +826,14 @@ impl<'a> QSearch<'a> {
                 .expect("ACC_LEN slots collected"),
             acc_depth: 0,
             finny: FinnyCache::new(),
+            #[cfg(test)]
             verify_accumulator: false,
             histories,
-            reductions: {
-                let mut r = vec![0i32; 600];
-                for (i, slot) in r.iter_mut().enumerate().skip(1) {
-                    *slot = (2763.0 / 128.0 * (i as f64).ln()) as i32;
-                }
-                r
-            },
             root_delta: 2 * VALUE_INFINITE,
             root_depth: 1,
             last_iteration_pv: Vec::new(),
             control: SearchControl::default(),
             entering_king: EnteringKingConfig::default(),
-            max_moves_to_draw: MAX_MOVES_TO_DRAW,
-            generate_all_legal_moves: false,
             #[cfg(feature = "verbose2")]
             mate_mode: false,
             calls_cnt: CHECK_INTERVAL,
@@ -845,6 +873,34 @@ impl<'a> QSearch<'a> {
         self.verify_accumulator = verify;
     }
 
+    /// Whether TT hits are honoured at the node about to probe. The engine
+    /// always honours them, so this is the constant `true` outside the test
+    /// build that exercises the `ReadTT == false` instantiation.
+    #[inline]
+    fn reads_tt(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.read_tt
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    }
+
+    /// Set whether TT hits are honoured. Every descent into a child restores
+    /// `true`, mirroring the reference's `ReadTT` template argument; with no
+    /// state behind it that restoration compiles to nothing.
+    #[inline]
+    fn set_read_tt(&mut self, read_tt: bool) {
+        #[cfg(test)]
+        {
+            self.read_tt = read_tt;
+        }
+        #[cfg(not(test))]
+        let _ = read_tt;
+    }
+
     /// Install the time / node / stop [`SearchControl`] for the coming search.
     /// With the default (empty) control every stop-check site is inert and the
     /// search runs the fixed-depth parity path.
@@ -852,36 +908,12 @@ impl<'a> QSearch<'a> {
         self.control = control;
     }
 
-    /// Install the entering-king declaration config for this `go`.
-    /// Called by the driver after snapshotting the `EnteringKingRule` option and
-    /// computing the per-side thresholds from the root position; every worker
-    /// (main + helpers) gets the same config, since the material total is
+    /// Install the entering-king declaration thresholds for this `go`. Called by
+    /// the driver after computing them from the root position; every worker
+    /// (main + helpers) gets the same snapshot, since the material total is
     /// invariant across the search.
     pub fn set_entering_king(&mut self, config: EnteringKingConfig) {
         self.entering_king = config;
-    }
-
-    /// Install the `MaxMovesToDraw` horizon for this `go`.
-    /// `value` must already be the `0 → 100000` remapped value (the driver does
-    /// the remap): the game ply past which every interior / qsearch node returns
-    /// the forced-draw score. Every worker (main + helpers) gets the same value.
-    pub fn set_max_moves_to_draw(&mut self, value: i32) {
-        self.max_moves_to_draw = value;
-    }
-
-    /// Install the root-side draw contempt for this `go`. `contempt` must
-    /// already be pawn-scaled; [`Self::draw_value`] then returns it for the root
-    /// side and its negation for the opponent.
-    pub fn set_draw_value(&mut self, contempt: Value) {
-        self.draw_contempt = contempt;
-    }
-
-    /// Install the `GenerateAllLegalMoves` flag for this `go`:
-    /// when true the search-facing generators also yield the non-promoting moves
-    /// the default generator suppresses. Every worker gets the same flag; `false`
-    /// (the default) leaves generation bit-identical to the parity path.
-    pub fn set_generate_all_legal_moves(&mut self, all: bool) {
-        self.generate_all_legal_moves = all;
     }
 
     /// Install this game's evaluation noise: `amplitude` in the unit the search
@@ -1150,7 +1182,7 @@ impl<'a> QSearch<'a> {
         self.nodes = 0;
         self.sel_depth = 0;
         self.pv_node = pv_node;
-        self.read_tt = read_tt;
+        self.set_read_tt(read_tt);
         self.root_us = pos.side_to_move();
         self.stopped = false;
         self.calls_cnt = CHECK_INTERVAL;
@@ -1202,6 +1234,7 @@ impl<'a> QSearch<'a> {
     #[inline]
     fn static_eval(&self, pos: &Position) -> Value {
         let value = evaluate_with(self.net, self.acc(), pos);
+        #[cfg(test)]
         if self.verify_accumulator {
             assert_eq!(
                 value,
@@ -1268,10 +1301,16 @@ impl<'a> QSearch<'a> {
             RepetitionState::Win => VALUE_MATE,
             RepetitionState::Lose => -VALUE_MATE,
             RepetitionState::Draw => {
+                // The magnitude is the root side's compiled contempt; the side
+                // asking only decides its sign.
+                let contempt = match self.root_us {
+                    Color::Black => DRAW_CONTEMPT_BLACK,
+                    Color::White => DRAW_CONTEMPT_WHITE,
+                };
                 if c == self.root_us {
-                    self.draw_contempt
+                    contempt
                 } else {
-                    -self.draw_contempt
+                    -contempt
                 }
             }
             // VALUE_SUPERIOR == VALUE_MAX_EVAL.
@@ -1405,7 +1444,7 @@ impl<'a> QSearch<'a> {
             }
         }
         // The reference's `depth <= -16 → draw` measure is `#if 0`: not ported.
-        if ply >= MAX_PLY || pos.ply() as i32 > self.max_moves_to_draw {
+        if ply >= MAX_PLY || pos.ply() as i32 > MAX_MOVES_TO_DRAW {
             return self.draw_value(RepetitionState::Draw, us) + value_draw(self.nodes);
         }
 
@@ -1415,7 +1454,7 @@ impl<'a> QSearch<'a> {
         // Capture the entry location once (like the reference's Step-3
         // `ttWriter`); every write below targets this exact slot.
         let (found, tt_data, tt_slot) = self.tt.locate(pos_key, side);
-        let tt_hit = found && self.read_tt;
+        let tt_hit = found && self.reads_tt();
         // Widened O(1), without legal-move generation; the MovePicker's TT
         // stage re-validates with `pseudo_legal` + `is_legal`.
         let tt_move = if tt_hit {
@@ -1541,8 +1580,7 @@ impl<'a> QSearch<'a> {
         // evasion ordering is a constant shift.
         let cont_planes: [usize; 6] =
             std::array::from_fn(|i| self.stack[Self::si(ply) - 1 - i].cont_hist);
-        let mut mp =
-            MovePicker::new_qsearch(pos, tt_move, cont_planes, self.generate_all_legal_moves);
+        let mut mp = MovePicker::new_qsearch(pos, tt_move, cont_planes);
 
         let mut best_move = Move::none();
 
@@ -1707,7 +1745,7 @@ impl QSearch<'_> {
 
         // The root-move list is built once from the legal moves (the reference's
         // `start_thinking`). No legal move ⇒ `bestmove resign` with mated_in(1).
-        let root_moves = generate_root_moves(pos, self.generate_all_legal_moves);
+        let root_moves = generate_root_moves(pos);
         if root_moves.is_empty() {
             return RootOutcome {
                 best_move: Move::resign(),
@@ -1785,7 +1823,7 @@ impl QSearch<'_> {
         limit_depth: i32,
     ) -> WorkerResult {
         self.root_us = root_pos.side_to_move();
-        self.read_tt = true;
+        self.set_read_tt(true);
         self.nodes = 0;
         self.sel_depth = 0;
         self.last_iteration_pv.clear();
@@ -1846,16 +1884,20 @@ impl QSearch<'_> {
         // in via the time control; the fixed-depth / helper path uses the
         // first-move-of-a-game sentinels, but never reads them (the block is
         // time-gated).
-        let (best_previous_score, best_previous_average_score, previous_time_reduction, n_threads) =
+        let (best_previous_score, best_previous_average_score, previous_time_reduction) =
             match &self.control.time {
                 Some(tc) => (
                     tc.best_previous_score,
                     tc.best_previous_average_score,
                     tc.previous_time_reduction,
-                    tc.n_threads,
                 ),
-                None => (VALUE_INFINITE, VALUE_INFINITE, 0.85, 1),
+                None => (VALUE_INFINITE, VALUE_INFINITE, 0.85),
             };
+        // `threads.size()` — the divisor of the best-move instability factor,
+        // and the worker count this binary was built with. The one command that
+        // rebuilds the pool at another size searches to a fixed depth, node
+        // count or move time, none of which reaches the block below.
+        let n_threads = crate::config::THREADS.max(1) as usize;
         let iter_seed = if best_previous_score == VALUE_INFINITE {
             0
         } else {
@@ -2431,7 +2473,7 @@ impl QSearch<'_> {
                 match pos.to_move(data.move16) {
                     Some(mm)
                         if mm.is_ok()
-                            && pos.pseudo_legal(mm, self.generate_all_legal_moves)
+                            && pos.pseudo_legal::<GENERATE_ALL_LEGAL_MOVES>(mm)
                             && pos.is_legal(mm) =>
                     {
                         mm
@@ -2481,7 +2523,7 @@ impl QSearch<'_> {
             // Push the child TT move only if it is playable here.
             if let Some(m) = pos.to_move(data.move16)
                 && m.is_ok()
-                && pos.pseudo_legal(m, self.generate_all_legal_moves)
+                && pos.pseudo_legal::<GENERATE_ALL_LEGAL_MOVES>(m)
                 && pos.is_legal(m)
             {
                 best.pv.push(m);
@@ -2571,7 +2613,7 @@ impl QSearch<'_> {
 
     /// `reduction(i, d, mn, delta)`, scaled by 1024.
     fn reduction(&self, improving: bool, d: i32, mn: i32, delta: i32) -> i32 {
-        let reduction_scale = self.reductions[d as usize] * self.reductions[mn as usize];
+        let reduction_scale = REDUCTIONS[d as usize] * REDUCTIONS[mn as usize];
         reduction_scale - delta * 585 / self.root_delta
             + (!improving as i32) * reduction_scale * 206 / 512
             + 1133
@@ -2644,7 +2686,7 @@ impl QSearch<'_> {
         self.nodes = 0;
         self.sel_depth = 0;
         self.root_us = pos.side_to_move();
-        self.read_tt = true;
+        self.set_read_tt(true);
         self.root_delta = (beta - alpha).max(1);
         self.root_depth = depth;
         self.last_iteration_pv.clear();
@@ -2688,7 +2730,7 @@ impl QSearch<'_> {
         // need nothing done between them.
         if depth <= 0 {
             self.pv_node = pv_node;
-            self.read_tt = true;
+            self.set_read_tt(true);
             return self.qsearch(pos, ply, alpha, beta);
         }
 
@@ -2749,7 +2791,7 @@ impl QSearch<'_> {
             // The reference folds `threads.stop` into this return: an
             // aborted non-root node yields the draw score without touching the
             // TT.
-            if self.stopped || ply >= MAX_PLY || pos.ply() as i32 > self.max_moves_to_draw {
+            if self.stopped || ply >= MAX_PLY || pos.ply() as i32 > MAX_MOVES_TO_DRAW {
                 return self.draw_value(RepetitionState::Draw, us) + value_draw(self.nodes);
             }
 
@@ -2974,7 +3016,7 @@ impl QSearch<'_> {
             // Step 7. Razoring.
             if !pv_node && eval < alpha - 502 - 306 * depth * depth {
                 self.pv_node = false;
-                self.read_tt = true;
+                self.set_read_tt(true);
                 return self.qsearch(pos, ply, alpha, beta);
             }
 
@@ -3104,12 +3146,7 @@ impl QSearch<'_> {
             if depth >= 3 && !is_decisive(beta) && !(is_valid(tt_value) && tt_value < prob_cut_beta)
             {
                 let prob_cut_depth = depth - 4;
-                let mut mp = MovePicker::new_probcut(
-                    pos,
-                    tt_move,
-                    prob_cut_beta - static_eval,
-                    self.generate_all_legal_moves,
-                );
+                let mut mp = MovePicker::new_probcut(pos, tt_move, prob_cut_beta - static_eval);
                 while let Some(mv) = mp.next_move(pos, &self.histories) {
                     if mv == excluded_move || !pos.is_legal(mv) {
                         continue;
@@ -3125,7 +3162,7 @@ impl QSearch<'_> {
                         ContinuationCorrectionHistory::plane_index(moved, mv.to_sq());
                     self.push_accumulator(pos, &acc_delta);
                     self.pv_node = false;
-                    self.read_tt = true;
+                    self.set_read_tt(true);
                     #[cfg(feature = "verbose3")]
                     let node_path_dep = self.path_dep;
                     let mut value = -self.qsearch(pos, ply + 1, -prob_cut_beta, -prob_cut_beta + 1);
@@ -3190,14 +3227,7 @@ impl QSearch<'_> {
         // as snapshots, so a plane updated by an earlier move's subtree is seen
         // when a later stage scores against it.
         let cont_planes: [usize; 6] = std::array::from_fn(|i| self.stack[s - 1 - i].cont_hist);
-        let mut mp = MovePicker::new_main_search(
-            pos,
-            tt_move,
-            depth,
-            ply,
-            cont_planes,
-            self.generate_all_legal_moves,
-        );
+        let mut mp = MovePicker::new_main_search(pos, tt_move, depth, ply, cont_planes);
 
         let mut move_count = 0i32;
         let mut quiets_searched = SearchedList::new();
@@ -3335,7 +3365,7 @@ impl QSearch<'_> {
                 // exactly as the reference's re-entry does.
                 self.stack[s].excluded_move = mv;
                 self.pv_node = false;
-                self.read_tt = true;
+                self.set_read_tt(true);
                 #[cfg(feature = "verbose3")]
                 let node_path_dep = self.path_dep;
                 let s_value = self.search(
@@ -3456,7 +3486,7 @@ impl QSearch<'_> {
                 let d = ((new_depth - r / 1024).min(new_depth + 2)).max(1) + pv_node as i32;
                 self.stack[s].reduction = new_depth - d;
                 self.pv_node = false;
-                self.read_tt = true;
+                self.set_read_tt(true);
                 value = -self.search(
                     pos,
                     ply + 1,
@@ -3503,7 +3533,7 @@ impl QSearch<'_> {
                 }
                 let nd = new_depth - (r > 4628) as i32 - (r > 5772 && new_depth > 2) as i32;
                 self.pv_node = false;
-                self.read_tt = true;
+                self.set_read_tt(true);
                 value = -self.search(
                     pos,
                     ply + 1,
@@ -3526,7 +3556,7 @@ impl QSearch<'_> {
                     new_depth = new_depth.max(1);
                 }
                 self.pv_node = true;
-                self.read_tt = true;
+                self.set_read_tt(true);
                 value = -self.search(
                     pos,
                     ply + 1,
@@ -4001,73 +4031,55 @@ mod tests {
 
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn draw_value_table_matches_defaults_and_contempt() {
+    fn draw_value_table_rows_other_than_the_draw_are_fixed() {
         let net = zero_net();
         let table = fresh_tt();
         let mut q = QSearch::new(&net, &table);
         // Emulate a root search with Black to move.
         q.root_us = Color::Black;
-        q.draw_contempt = DRAW_VALUE_OPTION_DEFAULT * PAWN_VALUE / 100; // -1
 
-        // REPETITION_DRAW is contempt-signed: -1 for the root side, +1 for the
-        // opponent.
-        assert_eq!(q.draw_value(RepetitionState::Draw, Color::Black), -1);
-        assert_eq!(q.draw_value(RepetitionState::Draw, Color::White), 1);
-        // The other rows are the fixed `drawValueTable` defaults.
-        assert_eq!(q.draw_value(RepetitionState::Win, Color::Black), VALUE_MATE);
-        assert_eq!(
-            q.draw_value(RepetitionState::Lose, Color::Black),
-            -VALUE_MATE
-        );
-        assert_eq!(
-            q.draw_value(RepetitionState::Superior, Color::Black),
-            VALUE_MAX_EVAL
-        );
-        assert_eq!(
-            q.draw_value(RepetitionState::Inferior, Color::Black),
-            -VALUE_MAX_EVAL
-        );
-        // Contempt default truncates toward zero: -2 * 90 / 100 == -1.
-        assert_eq!(q.draw_contempt, -1);
+        // Every row but REPETITION_DRAW is a fixed `drawValueTable` value, the
+        // same for either side.
+        for c in [Color::Black, Color::White] {
+            assert_eq!(q.draw_value(RepetitionState::Win, c), VALUE_MATE);
+            assert_eq!(q.draw_value(RepetitionState::Lose, c), -VALUE_MATE);
+            assert_eq!(q.draw_value(RepetitionState::Superior, c), VALUE_MAX_EVAL);
+            assert_eq!(q.draw_value(RepetitionState::Inferior, c), -VALUE_MAX_EVAL);
+            assert_eq!(q.draw_value(RepetitionState::None, c), VALUE_DRAW);
+        }
     }
 
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn set_draw_value_signs_the_repetition_draw_row_per_side() {
-        // `set_draw_value(contempt)` installs the pawn-scaled
-        // per-`go` draw contempt; the REPETITION_DRAW row is `+contempt` for the
-        // root side and `-contempt` for the opponent (the reference's symmetric
-        // `drawValueTable[REPETITION_DRAW][us] = +dv`, `[~us] = -dv`).
+    fn the_repetition_draw_row_is_the_compiled_contempt_signed_per_side() {
+        // The REPETITION_DRAW row is `+contempt` for the root side and
+        // `-contempt` for the opponent (the reference's symmetric
+        // `drawValueTable[REPETITION_DRAW][us] = +dv`, `[~us] = -dv`), where
+        // the contempt is the root side's `DrawValue` setting scaled by
+        // `PawnValue` and truncated toward zero.
+        assert_eq!(
+            DRAW_CONTEMPT_BLACK,
+            (crate::config::DRAW_VALUE_BLACK * PAWN_VALUE as i64 / 100) as Value
+        );
+        assert_eq!(
+            DRAW_CONTEMPT_WHITE,
+            (crate::config::DRAW_VALUE_WHITE * PAWN_VALUE as i64 / 100) as Value
+        );
+
         let net = zero_net();
         let table = fresh_tt();
         let mut q = QSearch::new(&net, &table);
 
-        // Black to move at the root, DrawValueBlack = 500 ⇒ contempt = 500*90/100.
         q.root_us = Color::Black;
-        let contempt = 500 * PAWN_VALUE / 100; // 450
-        q.set_draw_value(contempt);
-        assert_eq!(q.draw_value(RepetitionState::Draw, Color::Black), contempt);
-        assert_eq!(q.draw_value(RepetitionState::Draw, Color::White), -contempt);
+        let black = DRAW_CONTEMPT_BLACK;
+        assert_eq!(q.draw_value(RepetitionState::Draw, Color::Black), black);
+        assert_eq!(q.draw_value(RepetitionState::Draw, Color::White), -black);
 
         // White to move at the root: the same mechanism, opposite root side.
         q.root_us = Color::White;
-        let contempt_w = 300 * PAWN_VALUE / 100; // 270
-        q.set_draw_value(contempt_w);
-        assert_eq!(
-            q.draw_value(RepetitionState::Draw, Color::White),
-            contempt_w
-        );
-        assert_eq!(
-            q.draw_value(RepetitionState::Draw, Color::Black),
-            -contempt_w
-        );
-
-        // The win/loss/superior/inferior rows are untouched by contempt.
-        assert_eq!(q.draw_value(RepetitionState::Win, Color::Black), VALUE_MATE);
-        assert_eq!(
-            q.draw_value(RepetitionState::Superior, Color::White),
-            VALUE_MAX_EVAL
-        );
+        let white = DRAW_CONTEMPT_WHITE;
+        assert_eq!(q.draw_value(RepetitionState::Draw, Color::White), white);
+        assert_eq!(q.draw_value(RepetitionState::Draw, Color::Black), -white);
     }
 
     // Stand-pat.
@@ -4219,9 +4231,7 @@ mod tests {
         let mut p = pos(THREE_CAPTURES);
         let mut q = QSearch::new(&net, &table);
         q.root_us = p.side_to_move();
-        q.draw_contempt = DRAW_VALUE_OPTION_DEFAULT * PAWN_VALUE / 100;
         q.pv_node = false;
-        q.read_tt = true;
         q.nodes = 0;
         // A dummy previous move whose destination is 5g (internal (4,6)).
         let prev = Move::make(
@@ -4488,9 +4498,7 @@ mod tests {
         let mut p = pos(TWO_KINGS);
         let mut q = QSearch::new(&net, &table);
         q.root_us = p.side_to_move(); // Black
-        q.draw_contempt = DRAW_VALUE_OPTION_DEFAULT * PAWN_VALUE / 100; // -1
         q.pv_node = false;
-        q.read_tt = true;
 
         // At ply == MAX_PLY the node returns draw_value(DRAW, us) + dither.
         q.nodes = 0;
@@ -4538,9 +4546,7 @@ mod tests {
 
         let mut q = QSearch::new(&net, &table);
         q.root_us = p.side_to_move(); // Black
-        q.draw_contempt = DRAW_VALUE_OPTION_DEFAULT * PAWN_VALUE / 100; // -1
         q.pv_node = false;
-        q.read_tt = true;
         q.nodes = 0;
         // draw_value(DRAW, Black=root_us) + value_draw(0) == -1 + -1 == -2.
         assert_eq!(q.qsearch(&mut p, 6, -1, 0), -2);
@@ -4627,7 +4633,6 @@ mod tests {
             let mut q = QSearch::new(&net, &table);
             q.root_us = p.side_to_move();
             q.pv_node = false;
-            q.read_tt = true;
 
             q.nodes = 0;
             q.qsearch(&mut p, 6, -1, 0);
@@ -4810,15 +4815,7 @@ mod tests {
             movetime: 0,
             #[cfg(feature = "verbose2")]
             rtime: 0,
-            network_delay: 0,
-            network_delay2: 0,
-            minimum_thinking_time: 0,
-            slow_mover: 100,
-            round_up_to_fullsecond: false,
-            usi_ponder: true,
-            stochastic_ponder: false,
             ply: 1,
-            max_moves_to_draw: 100_000,
             start_time: start,
         };
         let tm = TimeManagement::init(
@@ -4843,7 +4840,6 @@ mod tests {
                 use_time_management: true,
                 #[cfg(feature = "verbose2")]
                 movetime: None,
-                n_threads: 1,
                 best_previous_score: VALUE_INFINITE,
                 best_previous_average_score: VALUE_INFINITE,
                 previous_time_reduction: 0.85,
@@ -4902,87 +4898,89 @@ mod tests {
         assert_eq!(out.nodes, 0);
     }
 
-    // MaxMovesToDraw horizon. The `0 → 100000` remap is
-    // the driver's job; here the search field is set directly.
+    // MaxMovesToDraw horizon — the compiled setting, with the reference's
+    // `0 → 100000` remap applied. The fixtures below sit at a game ply the
+    // horizon may or may not be under, so each asserts the behaviour of its own
+    // side of it.
+
+    #[test]
+    fn an_unlimited_horizon_is_the_references_sentinel() {
+        // `0` means unlimited, which the reference expresses as a ply count no
+        // game reaches rather than as a true infinity.
+        if crate::config::MAX_MOVES_TO_DRAW == 0 {
+            assert_eq!(MAX_MOVES_TO_DRAW, 100_000);
+        } else {
+            assert_eq!(
+                i64::from(MAX_MOVES_TO_DRAW),
+                crate::config::MAX_MOVES_TO_DRAW
+            );
+        }
+    }
 
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn qsearch_forced_draw_past_max_moves_to_draw_is_exact() {
-        // With the horizon set below the game ply, the ply-0 qsearch node
-        // adjudicates an unconditional draw before any eval or `do_move`. The
-        // expected value is `draw_contempt (-1) + value_draw(0) (-1)`.
+    fn qsearch_adjudicates_a_draw_past_the_horizon() {
+        // Startpos at game ply 60, Black to move. Past the horizon the ply-0
+        // qsearch node adjudicates an unconditional draw before any eval or
+        // `do_move`, worth `draw contempt + value_draw(0)`; below it the node
+        // runs a real qsearch, which at startpos has no capture and stands pat
+        // on the zero-eval network.
+        const GAME_PLY: i32 = 60;
         let net = zero_net();
         let table = fresh_tt();
         let mut p = pos("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 60");
         let out = {
             let mut q = QSearch::new(&net, &table);
-            q.set_max_moves_to_draw(50); // game_ply 60 > 50 → forced draw at ply 0.
             q.run(&mut p, -VALUE_INFINITE, VALUE_INFINITE, true, true)
         };
-        assert_eq!(
-            out.value, -2,
-            "forced-draw value = draw_contempt + value_draw(0)"
-        );
-        assert_eq!(out.nodes, 0, "the horizon draw returns before any do_move");
+        if GAME_PLY > MAX_MOVES_TO_DRAW {
+            assert_eq!(
+                out.value,
+                DRAW_CONTEMPT_BLACK + value_draw(0),
+                "forced-draw value = draw contempt + value_draw(0)"
+            );
+            assert_eq!(out.nodes, 0, "the horizon draw returns before any do_move");
+        } else {
+            assert_eq!(
+                out.value, 0,
+                "an unreached horizon ⇒ zero-eval stand-pat, not the draw exit"
+            );
+        }
     }
 
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn qsearch_default_horizon_does_not_force_draw() {
-        // The same position under the default (unlimited) horizon runs a real
-        // qsearch: no captures at startpos, zero-eval stand-pat ⇒ value 0. The
-        // point is it did NOT take the -2 forced-draw exit — the horizon is what
-        // changed the outcome.
-        let net = zero_net();
-        let table = fresh_tt();
-        let mut p = pos("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 60");
-        let out = {
-            let mut q = QSearch::new(&net, &table); // default max_moves_to_draw.
-            q.run(&mut p, -VALUE_INFINITE, VALUE_INFINITE, true, true)
-        };
-        assert_eq!(
-            out.value, 0,
-            "unlimited horizon ⇒ zero-eval stand-pat, not the draw exit"
-        );
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn run_root_max_moves_to_draw_suppresses_a_mate() {
-        // A gold-drop head mate (`G*8a`) at a high game ply: the White king on
-        // 9a is not in check at the root, and dropping the supported gold beside
-        // it is mate. With the horizon set below the game ply, every interior
-        // node adjudicates a draw before the mate is seen.
+    fn run_root_sees_a_mate_only_below_the_horizon() {
+        // A gold-drop head mate (`G*8a`) at game ply 100: the White king on 9a
+        // is not in check at the root, and dropping the supported gold beside it
+        // is mate. Past the horizon every interior node adjudicates a draw
+        // before the mate is seen.
+        const GAME_PLY: i32 = 100;
         let net = zero_net();
         let p = pos("k8/9/G1N6/9/9/9/9/9/8K b G 100");
-
-        let unlimited = {
-            let table = fresh_tt();
+        let table = fresh_tt();
+        let out = {
             let mut q = QSearch::new(&net, &table);
             q.run_root(&p, 2)
         };
-        assert!(
-            is_win(unlimited.score),
-            "unlimited horizon must find the mate, got score {}",
-            unlimited.score
-        );
-
-        let capped = {
-            let table = fresh_tt();
-            let mut q = QSearch::new(&net, &table);
-            q.set_max_moves_to_draw(50); // game_ply 100 > 50 at every interior node.
-            q.run_root(&p, 2)
-        };
-        assert!(
-            !is_decisive(capped.score),
-            "the horizon must suppress the mate, got score {}",
-            capped.score
-        );
-        assert!(
-            capped.score.abs() <= 2,
-            "capped score must be in the draw band, got {}",
-            capped.score
-        );
+        if GAME_PLY > MAX_MOVES_TO_DRAW {
+            assert!(
+                !is_decisive(out.score),
+                "the horizon must suppress the mate, got score {}",
+                out.score
+            );
+            assert!(
+                out.score.abs() <= DRAW_CONTEMPT_BLACK.abs() + 1,
+                "capped score must be in the draw band, got {}",
+                out.score
+            );
+        } else {
+            assert!(
+                is_win(out.score),
+                "an unreached horizon must find the mate, got score {}",
+                out.score
+            );
+        }
     }
 
     // Interior main search (`QSearch::search`). Values here are hand-computed
@@ -4996,26 +4994,36 @@ mod tests {
         let table = fresh_tt();
         let mut q = QSearch::new(&net, &table);
 
-        // reductions[i] == int(2763/128.0 * ln(i)), reductions[0] == 0.
-        assert_eq!(q.reductions[0], 0);
-        assert_eq!(q.reductions[1], 0); // ln(1) == 0
-        assert_eq!(q.reductions[2], 14);
-        assert_eq!(q.reductions[3], 23);
-        assert_eq!(q.reductions[4], 29);
-        assert_eq!(q.reductions[8], 44);
-        assert_eq!(q.reductions[10], 49);
+        // REDUCTIONS[i] == int(2763/128.0 * ln(i)), REDUCTIONS[0] == 0.
+        assert_eq!(REDUCTIONS[0], 0);
+        assert_eq!(REDUCTIONS[1], 0); // ln(1) == 0
+        assert_eq!(REDUCTIONS[2], 14);
+        assert_eq!(REDUCTIONS[3], 23);
+        assert_eq!(REDUCTIONS[4], 29);
+        assert_eq!(REDUCTIONS[8], 44);
+        assert_eq!(REDUCTIONS[10], 49);
+
+        // The table is built by the constant evaluator, which cannot call
+        // `f64::ln`; every entry must still be what that call would have given.
+        for (i, &r) in REDUCTIONS.iter().enumerate().skip(1) {
+            assert_eq!(
+                r,
+                (2763.0 / 128.0 * (i as f64).ln()) as i32,
+                "REDUCTIONS[{i}] diverges from the library logarithm"
+            );
+        }
 
         // reduction(i, d, mn, delta) = rs - delta*585/rootDelta
         //                            + (!i)*rs*206/512 + 1133, rs = red[d]*red[mn].
         q.root_delta = 1000;
-        let rs = q.reductions[8] * q.reductions[4];
+        let rs = REDUCTIONS[8] * REDUCTIONS[4];
         assert_eq!(q.reduction(true, 8, 4, 100), rs - 100 * 585 / 1000 + 1133);
         assert_eq!(
             q.reduction(false, 8, 4, 100),
             rs - 100 * 585 / 1000 + rs * 206 / 512 + 1133,
         );
         q.root_delta = 200;
-        let rs2 = q.reductions[10] * q.reductions[2];
+        let rs2 = REDUCTIONS[10] * REDUCTIONS[2];
         assert_eq!(
             q.reduction(false, 10, 2, 50),
             rs2 - 50 * 585 / 200 + rs2 * 206 / 512 + 1133,
@@ -5212,8 +5220,6 @@ mod tests {
         q.nodes = 0;
         q.sel_depth = 0;
         q.root_us = Color::White;
-        q.draw_contempt = DRAW_VALUE_OPTION_DEFAULT * PAWN_VALUE / 100;
-        q.read_tt = true;
         q.root_delta = 2 * VALUE_INFINITE;
         q.root_depth = 1;
 
@@ -5397,8 +5403,8 @@ mod tests {
             inputs.extend(accepted.iter().map(|&m| Some(m)));
             for tt_move in inputs {
                 for mut mp in [
-                    MovePicker::new_qsearch(p, tt_move, [0; 6], false),
-                    MovePicker::new_main_search(p, tt_move, 6, 0, [0; 6], false),
+                    MovePicker::new_qsearch(p, tt_move, [0; 6]),
+                    MovePicker::new_main_search(p, tt_move, 6, 0, [0; 6]),
                 ] {
                     while let Some(m) = mp.next_move(p, &hist) {
                         assert!(
@@ -5424,10 +5430,10 @@ mod tests {
     fn strict_search_legal(p: &Position) -> Vec<Move> {
         let mut pseudo: Vec<yorkie_state::ExtMove> = Vec::new();
         if p.in_check() {
-            p.generate_evasions(false, &mut pseudo);
+            p.generate_evasions::<false>(&mut pseudo);
         } else {
-            p.generate_captures(false, &mut pseudo);
-            p.generate_quiets(false, &mut pseudo);
+            p.generate_captures::<false>(&mut pseudo);
+            p.generate_quiets::<false>(&mut pseudo);
         }
         pseudo
             .into_iter()
@@ -5448,18 +5454,18 @@ mod tests {
                 "{ctx}: to_move({f:#06x}) != its own move"
             );
             assert!(
-                p.pseudo_legal(m, false),
+                p.pseudo_legal::<false>(m),
                 "{ctx}: strict-legal {m:?} is not pseudo_legal(all=false)"
             );
             assert!(
-                p.pseudo_legal(m, true),
+                p.pseudo_legal::<true>(m),
                 "{ctx}: strict-legal {m:?} is not pseudo_legal(all=true)"
             );
             assert!(p.is_legal(m), "{ctx}: strict-legal {m:?} is not legal");
             // The production chain (all=false) accepts exactly `m` for `f`.
             let accepted = p
                 .to_move(f)
-                .filter(|&mm| mm.is_ok() && p.pseudo_legal(mm, false) && p.is_legal(mm));
+                .filter(|&mm| mm.is_ok() && p.pseudo_legal::<false>(mm) && p.is_legal(mm));
             assert_eq!(
                 accepted,
                 Some(m),
@@ -5482,18 +5488,18 @@ mod tests {
         // A torn drop fragment carrying a stray promote bit widens to the same
         // clean drop, so `move16` is not asserted to round-trip over the full
         // sweep — only over real moves, in `legal_move_chain_oracle`.
-        for all in [false, true] {
-            let mut accepted = 0usize;
-            for bits in 0u32..=0xFFFF {
-                let m16 = bits as u16;
-                if let Some(m) = p.to_move(m16)
-                    && m.is_ok()
-                    && p.pseudo_legal(m, all)
-                    && p.is_legal(m)
-                {
-                    accepted += 1;
-                }
-            }
+        fn acceptances<const ALL: bool>(p: &Position) -> usize {
+            (0u32..=0xFFFF)
+                .filter(|&bits| {
+                    p.to_move(bits as u16)
+                        .is_some_and(|m| m.is_ok() && p.pseudo_legal::<ALL>(m) && p.is_legal(m))
+                })
+                .count()
+        }
+        for (all, accepted) in [
+            (false, acceptances::<false>(p)),
+            (true, acceptances::<true>(p)),
+        ] {
             assert!(
                 accepted >= strict.len(),
                 "{ctx}: {accepted} acceptances (all={all}) < {} strict-legal moves",
@@ -5508,7 +5514,7 @@ mod tests {
             if let Some(old) = QSearch::select_tt_move(&perft_legal, m16) {
                 let new = p
                     .to_move(m16)
-                    .filter(|&m| m.is_ok() && p.pseudo_legal(m, true) && p.is_legal(m));
+                    .filter(|&m| m.is_ok() && p.pseudo_legal::<true>(m) && p.is_legal(m));
                 assert_eq!(
                     new,
                     Some(old),
