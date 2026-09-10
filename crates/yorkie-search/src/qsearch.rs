@@ -831,7 +831,9 @@ impl<'a> QSearch<'a> {
             histories,
             root_delta: 2 * VALUE_INFINITE,
             root_depth: 1,
-            last_iteration_pv: Vec::new(),
+            // Reserved to the longest PV a root move can hold, so the copy each
+            // completed iteration makes into it never grows the buffer.
+            last_iteration_pv: Vec::with_capacity(MAX_PLY as usize + 1),
             control: SearchControl::default(),
             entering_king: EnteringKingConfig::default(),
             #[cfg(feature = "verbose2")]
@@ -1915,7 +1917,8 @@ impl QSearch<'_> {
         let multi_pv = self.multi_pv.min(root_moves.len()).max(1);
 
         // The last *completed* iteration's root move — the stable result an
-        // aborted search rolls back to.
+        // aborted search rolls back to. Every iteration after the first copies
+        // into the buffer this one is holding.
         let mut completed_best: Option<RootMove> = None;
         // The coordinator's final-PV fallback is their only reader, so a build
         // that prints no PV neither keeps nor copies them.
@@ -2017,8 +2020,12 @@ impl QSearch<'_> {
             {
                 last_best_move_depth = root_depth;
             }
-            self.last_iteration_pv = root_moves[0].pv.clone();
-            completed_best = Some(root_moves[0].clone());
+            self.last_iteration_pv.clear();
+            self.last_iteration_pv.extend_from_slice(&root_moves[0].pv);
+            match completed_best.as_mut() {
+                Some(slot) => slot.clone_from(&root_moves[0]),
+                None => completed_best = Some(root_moves[0].clone()),
+            }
             #[cfg(feature = "verbose2")]
             {
                 completed_lines = root_moves[..multi_pv].to_vec();
@@ -2159,8 +2166,9 @@ impl QSearch<'_> {
 
         // Only an abort during iteration 1 leaves `completed_best` empty, and
         // then `root_moves[0]` — the best-so-far after the partial iteration's
-        // sort — is still a legal move.
-        let best = completed_best.unwrap_or_else(|| root_moves[0].clone());
+        // sort — is still a legal move. Nothing reads the list afterwards, so it
+        // is taken out of it rather than copied.
+        let best = completed_best.unwrap_or_else(|| root_moves.swap_remove(0));
         #[cfg(feature = "verbose2")]
         if completed_lines.is_empty() {
             completed_lines = vec![best.clone()];

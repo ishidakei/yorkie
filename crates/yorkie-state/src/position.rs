@@ -24,6 +24,70 @@ const HAND_KINDS: [PieceKind; 7] = [
 /// regardless of `plies_from_null`.
 const MAX_REPETITION_PLY: i32 = 16;
 
+/// Deepest ply a search descends to (`MAX_PLY`). The search layer holds the
+/// same value, but the stacks below have to be sized for it here, one layer
+/// underneath.
+const MAX_SEARCH_PLY: usize = 246;
+
+/// Spare slots a [`PlyStack`] carries from the moment it is built or cloned: a
+/// whole search's descent below the state it is handed, plus the two plies the
+/// search stack keeps past its deepest live one. A `do_move` inside a search
+/// therefore never grows a stack, however long the game history in front of it.
+const SEARCH_PLY_HEADROOM: usize = MAX_SEARCH_PLY + 2;
+
+/// A stack pushed by `do_move` and popped by `undo_move`, holding
+/// [`SEARCH_PLY_HEADROOM`] slots in reserve.
+///
+/// A plain `Vec` would be reserved once and then lose the reservation to the
+/// next clone, since `Vec::clone` allocates exactly the length it copies — and
+/// a clone is precisely what a search is handed to work on. The headroom is
+/// therefore re-established per clone, on top of whatever the game so far has
+/// already pushed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PlyStack<T>(Vec<T>);
+
+impl<T> PlyStack<T> {
+    fn new() -> Self {
+        Self(Vec::with_capacity(SEARCH_PLY_HEADROOM))
+    }
+
+    fn push(&mut self, value: T) {
+        self.0.push(value);
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        self.0.pop()
+    }
+
+    /// Slots that can still be pushed before the stack grows.
+    #[cfg(test)]
+    fn spare(&self) -> usize {
+        self.0.capacity() - self.0.len()
+    }
+}
+
+impl<T: Clone> Clone for PlyStack<T> {
+    fn clone(&self) -> Self {
+        let mut items = Vec::with_capacity(self.0.len() + SEARCH_PLY_HEADROOM);
+        items.extend(self.0.iter().cloned());
+        Self(items)
+    }
+}
+
+impl<T> std::ops::Deref for PlyStack<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for PlyStack<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        &mut self.0
+    }
+}
+
 /// Classification of a repeated position (`RepetitionState`).
 ///
 /// `Win` and `Lose` are from the viewpoint of the **side to move** in the
@@ -108,7 +172,7 @@ pub struct Position {
     hands: [Hand; Color::COUNT],
     side_to_move: Color,
     ply: u16,
-    history: Vec<StateInfo>,
+    history: PlyStack<StateInfo>,
     /// Snapshot of the position before the first move of the current line.
     /// `history` records only post-move states, so the root is not otherwise
     /// recoverable, yet `is_repetition` must be able to look back to it.
@@ -140,7 +204,7 @@ pub struct Position {
     /// The stack of parent [`Self::check_info`] values, so `undo_move` /
     /// `undo_null_move` restore the parent's in O(1). Excluded from
     /// [`PartialEq`] as auxiliary cache state.
-    check_info_stack: Vec<crate::search_movegen::CheckInfo>,
+    check_info_stack: PlyStack<crate::search_movegen::CheckInfo>,
 }
 
 /// Structural equality over the primary state alone. The keys are a derived
@@ -162,7 +226,7 @@ impl PartialEq for Position {
 impl Eq for Position {}
 
 impl Position {
-    pub const fn empty() -> Self {
+    pub fn empty() -> Self {
         // An empty board with Black (the side whose term is *not* XORed in) to
         // move and no hand pieces hashes to zero on both halves. The partial
         // keys carry their empty-board values: `pawn_key` seeds with the
@@ -172,7 +236,7 @@ impl Position {
             hands: [Hand::empty(), Hand::empty()],
             side_to_move: Color::Black,
             ply: 1,
-            history: Vec::new(),
+            history: PlyStack::new(),
             root: None,
             board_key: 0,
             hand_key: 0,
@@ -182,7 +246,7 @@ impl Position {
             // The empty board's check info (no kings, no attacks); recomputed
             // eagerly on the first state change (SFEN parse / `do_move`).
             check_info: crate::search_movegen::CheckInfo::EMPTY,
-            check_info_stack: Vec::new(),
+            check_info_stack: PlyStack::new(),
         }
     }
 
@@ -1058,6 +1122,27 @@ mod tests {
     }
 
     #[test]
+    fn the_per_move_stacks_keep_a_search_worth_of_room_past_the_game_so_far() {
+        let fresh = Position::startpos();
+        assert!(fresh.history.spare() >= SEARCH_PLY_HEADROOM);
+        assert!(fresh.check_info_stack.spare() >= SEARCH_PLY_HEADROOM);
+
+        // A game long enough to have consumed a stack that was only reserved
+        // once, at construction.
+        let mut game = fresh;
+        for _ in 0..SEARCH_PLY_HEADROOM {
+            game.do_null_move();
+        }
+
+        // The copy a search is handed: the headroom is on top of the history it
+        // inherits, so descending `MAX_SEARCH_PLY` plies grows neither stack.
+        let work = game.clone();
+        assert_eq!(work.history.len(), SEARCH_PLY_HEADROOM);
+        assert!(work.history.spare() >= SEARCH_PLY_HEADROOM);
+        assert!(work.check_info_stack.spare() >= SEARCH_PLY_HEADROOM);
+    }
+
+    #[test]
     fn position_occurrences_zero_in_fresh_state() {
         assert_eq!(Position::startpos().position_occurrences(), 0);
         assert_eq!(Position::empty().position_occurrences(), 0);
@@ -1680,7 +1765,9 @@ mod tests {
         p.hands = last.hands;
         p.set_side_to_move(last.side_to_move);
         p.refresh_keys();
-        p.history = states.to_vec();
+        for s in states {
+            p.history.push(s.clone());
+        }
         for (idx, s) in p.history.iter_mut().enumerate() {
             s.plies_from_null = idx as i32 + 1;
         }

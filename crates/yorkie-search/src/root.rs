@@ -41,9 +41,15 @@ fn is_loss(v: Value) -> bool {
 /// unobservable.
 const MEAN_SQUARED_INIT: i64 = -(VALUE_INFINITE as i64 * VALUE_INFINITE as i64);
 
+/// Capacity every [`RootMove::pv`] is built and copied with: the root move plus
+/// the deepest line below it the search can return, which is the same bound the
+/// search stack's own PV cells hold. A PV update then writes into the buffer the
+/// move already owns instead of growing one.
+const PV_CAPACITY: usize = MAX_PLY as usize + 1;
+
 /// One root move and the per-iteration statistics `search<Root>` maintains for
 /// it. Only the fields the depth-1 path reads or writes are kept.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct RootMove {
     /// `pv[0]` — the move itself.
     pub mv: Move,
@@ -76,13 +82,46 @@ pub struct RootMove {
     pub effort: u64,
 }
 
+/// `Vec::clone` allocates exactly the length it copies, so a derived clone would
+/// hand the copy a PV buffer that grows again on its first update; `clone` here
+/// keeps [`PV_CAPACITY`] instead. `clone_from` goes further and writes into the
+/// destination's existing buffer, which is what lets a search record its best
+/// move once per iteration without reaching the allocator at all.
+impl Clone for RootMove {
+    fn clone(&self) -> Self {
+        let mut copy = Self::new(self.mv);
+        copy.clone_from(self);
+        copy
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.mv = source.mv;
+        self.pv.clear();
+        self.pv.extend_from_slice(&source.pv);
+        self.score = source.score;
+        self.uci_score = source.uci_score;
+        self.previous_score = source.previous_score;
+        self.average_score = source.average_score;
+        self.mean_squared_score = source.mean_squared_score;
+        self.sel_depth = source.sel_depth;
+        #[cfg(feature = "verbose2")]
+        {
+            self.score_lowerbound = source.score_lowerbound;
+            self.score_upperbound = source.score_upperbound;
+        }
+        self.effort = source.effort;
+    }
+}
+
 impl RootMove {
     /// A fresh root move: `pv == [m]`, every score at its `-VALUE_INFINITE` /
     /// `MEAN_SQUARED_INIT` sentinel.
     pub fn new(m: Move) -> Self {
+        let mut pv = Vec::with_capacity(PV_CAPACITY);
+        pv.push(m);
         Self {
             mv: m,
-            pv: vec![m],
+            pv,
             score: -VALUE_INFINITE,
             uci_score: -VALUE_INFINITE,
             previous_score: -VALUE_INFINITE,
@@ -630,6 +669,60 @@ mod tests {
         let p = pos(CHECKMATE);
         assert!(p.in_check());
         assert!(generate_root_moves(&p).is_empty());
+    }
+
+    #[test]
+    fn every_generated_root_move_starts_with_a_full_pv_buffer() {
+        for rm in generate_root_moves(&pos(STARTPOS)) {
+            assert_eq!(rm.pv.capacity(), PV_CAPACITY);
+        }
+    }
+
+    #[test]
+    fn a_root_move_carries_its_pv_buffer_and_every_field_through_a_copy() {
+        let list = generate_root_moves(&pos(STARTPOS));
+        let (a, b) = (list[0].mv, list[1].mv);
+        let mut src = RootMove::new(a);
+        src.pv.push(b);
+        src.score = 12;
+        src.uci_score = 13;
+        src.previous_score = 14;
+        src.average_score = 15;
+        src.mean_squared_score = 16;
+        src.sel_depth = 17;
+        src.effort = 18;
+        #[cfg(feature = "verbose2")]
+        {
+            src.score_lowerbound = true;
+            src.score_upperbound = true;
+        }
+
+        let copy = src.clone();
+        assert_eq!(copy.pv.capacity(), PV_CAPACITY);
+        assert_eq!(copy.pv, src.pv);
+
+        let mut slot = RootMove::new(b);
+        let buffer = slot.pv.as_ptr();
+        slot.clone_from(&src);
+        assert_eq!(
+            slot.pv.as_ptr(),
+            buffer,
+            "the copy replaced the buffer instead of writing into it"
+        );
+        assert_eq!(slot.mv, a);
+        assert_eq!(slot.pv, src.pv);
+        assert_eq!(slot.score, 12);
+        assert_eq!(slot.uci_score, 13);
+        assert_eq!(slot.previous_score, 14);
+        assert_eq!(slot.average_score, 15);
+        assert_eq!(slot.mean_squared_score, 16);
+        assert_eq!(slot.sel_depth, 17);
+        assert_eq!(slot.effort, 18);
+        #[cfg(feature = "verbose2")]
+        {
+            assert!(slot.score_lowerbound);
+            assert!(slot.score_upperbound);
+        }
     }
 
     /// The `GenerateAllLegalMoves` setting this binary compiled, which is what
