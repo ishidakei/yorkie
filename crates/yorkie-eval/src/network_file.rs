@@ -3,32 +3,35 @@
 //!
 //! The parameters are laid out ahead of time, in the order and at the alignment
 //! the kernels read them, so nothing here decodes, permutes or allocates a
-//! network. What is left is a choice about memory, and the machine the binary
-//! was built on decides it:
+//! network. What is left is where in memory they go, and the answer is always a
+//! region this binary declares — the parameters have one address for the life
+//! of the process, which is what lets an evaluation reach them at that address
+//! plus a constant. How the region is filled is the one thing the machine the
+//! binary was built on decides:
 //!
-//! - **One NUMA node.** The file is mapped read-only and shared. The pages are
-//!   the page cache's, so every engine process on the machine reads the same
-//!   physical copy of the network, and a huge-page hint over the mapping is all
-//!   that is left to ask for.
+//! - **One NUMA node.** The file is mapped read-only and shared *onto* the
+//!   region, replacing its pages with the page cache's, so every engine process
+//!   on the machine reads the same physical copy of the network and the address
+//!   is still the one the linker fixed. A huge-page hint over it is all that is
+//!   left to ask for.
 //! - **Several NUMA nodes.** A mapping would put one copy on one node and make
 //!   every other node's workers read across the interconnect for every
-//!   evaluation. Instead the parameters are copied into a `static` region per
-//!   node whose workers read them, each placed on its node before the copy so
-//!   that every page's first touch lands there.
+//!   evaluation. Instead there is one region per node whose workers read it, and
+//!   the parameters are copied in, each region placed on its node before the
+//!   copy so that every page's first touch lands there.
 //!
 //! The regions are declared like the transposition table's storage: zero-filled
 //! space stated to the assembler, not an array initialiser the constant
-//! evaluator has to produce. A binary built for a single-node machine declares
-//! none of it.
+//! evaluator has to produce.
 
 use std::fs::File;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use yorkie_storage::{LARGE_PAGE_ALIGN, MappedRegion};
+use yorkie_storage::LARGE_PAGE_ALIGN;
 
 use crate::config::EVAL_DIR;
-use crate::types::{Backing, NnueError, NnueNetwork};
+use crate::types::{NetworkParams, NnueError, sealed};
 
 // The file's own definition — its name, its layout, its header — is shared with
 // the build script that writes it, and is part of this module's surface: a
@@ -69,20 +72,19 @@ pub const SHARED_MAPPING: bool = MACHINE_NODES == 1;
 /// number of huge pages so each region starts on such a boundary.
 pub const REGION_BYTES: usize = DATA_BYTES.next_multiple_of(LARGE_PAGE_ALIGN);
 
-/// The space the on-node regions occupy in this binary — none of it on a
-/// machine whose single node makes the shared mapping the answer.
-const REGION_STORAGE_BYTES: usize = if SHARED_MAPPING {
-    0
-} else {
-    REGION_BYTES * MACHINE_NODES
-};
+/// How many regions this binary declares: one per NUMA node whose workers can
+/// read their own copy, and one for the mapping every worker shares where the
+/// machine has a single node.
+pub const REGION_COUNT: usize = if SHARED_MAPPING { 1 } else { MACHINE_NODES };
+
+/// The space the regions occupy in this binary.
+const REGION_STORAGE_BYTES: usize = REGION_BYTES * REGION_COUNT;
 
 // A region covers the parameters and is a whole number of huge pages, so each
-// one starts on such a boundary and none of them overlaps its neighbour; and
-// the storage is there exactly when the copies are what this binary uses.
+// one starts on such a boundary and none of them overlaps its neighbour.
 const _: () = assert!(REGION_BYTES >= DATA_BYTES);
 const _: () = assert!(REGION_BYTES.is_multiple_of(LARGE_PAGE_ALIGN));
-const _: () = assert!((REGION_STORAGE_BYTES == 0) == SHARED_MAPPING);
+const _: () = assert!(REGION_COUNT >= 1);
 
 // The regions' storage: `REGION_STORAGE_BYTES` zero bytes on a huge-page
 // boundary, stated to the assembler rather than built by the constant
@@ -117,10 +119,11 @@ unsafe extern "C" {
     static REGIONS: [u8; REGION_STORAGE_BYTES];
 }
 
-/// The same storage for a miri build, which cannot see the symbol above. A
-/// single-node machine makes this empty, which is what miri runs on.
+/// The same storage for a miri build, which cannot see the symbol above.
+/// Mutable, because a region is written once before it is read and an
+/// immutable `static` is not storage a write may land in.
 #[cfg(miri)]
-static REGIONS: [u8; REGION_STORAGE_BYTES] = [0; REGION_STORAGE_BYTES];
+static mut REGIONS: [u8; REGION_STORAGE_BYTES] = [0; REGION_STORAGE_BYTES];
 
 /// The directory a relative `eval_dir` resolves against: the running
 /// executable's own, so an engine finds its network beside itself however the
@@ -182,73 +185,152 @@ pub fn read_header(path: &Path) -> Result<Header, NnueError> {
     }
 }
 
-/// Open the network at `path` as one read-only mapping shared by every process
-/// that maps it, with the complaints the conversion had about the source file.
-pub fn open_shared(path: &Path) -> Result<(NnueNetwork, Vec<String>), NnueError> {
-    let header = read_header(path)?;
-    let region =
-        MappedRegion::open(path, DATA_OFFSET as u64, DATA_BYTES).map_err(|e| NnueError::Io {
-            path: path.display().to_string(),
-            source: e,
-        })?;
-    let base = region.addr() as *mut u8;
-    // SAFETY: the mapping covers `DATA_BYTES` readable bytes at `base` and is
-    // owned by the network built here, so it outlives every view carved from
-    // it. Every byte of the region is an initialised parameter, and the views
-    // are only ever read through a shared reference to the network.
-    let net = unsafe {
-        NnueNetwork::over(
-            header.net.clone(),
-            source_digest(header.source),
-            &NetDims::STANDARD,
-            base,
-            Backing::Mapped(region),
-        )
-    };
-    Ok((net, header.warnings))
+/// The network region `SLOT` holds — a type, not a value, because there is
+/// nothing to carry: the region is a `static`, so its address is the linker's
+/// and every parameter in it is that symbol plus a constant. An evaluation
+/// reaches its weights at an immediate displacement off a RIP-relative symbol,
+/// with no base to load from anywhere.
+///
+/// `SLOT` counts from zero over the regions this binary declares
+/// ([`REGION_COUNT`] of them); naming one it does not is a compile error.
+///
+/// The region has to have been filled first, by [`map_shared`] or
+/// [`load_into_region`]; that is `isready`'s job and it finishes before any
+/// search thread exists, so nothing here asks whether it happened.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Region<const SLOT: usize>;
+
+impl<const SLOT: usize> Region<SLOT> {
+    /// Refuses a slot this binary declares no region for, when the binary is
+    /// compiled rather than when it runs.
+    const DECLARED: () = assert!(SLOT < REGION_COUNT, "this binary declares no such region");
+
+    /// The network region `SLOT` holds.
+    pub const fn new() -> Self {
+        let () = Self::DECLARED;
+        Self
+    }
 }
 
-/// The `(address, byte length)` of on-node region `slot`, for a caller placing
-/// it: a NUMA policy over its pages, or a huge-page hint.
+impl<const SLOT: usize> sealed::Sealed for Region<SLOT> {}
+
+impl<const SLOT: usize> NetworkParams for Region<SLOT> {
+    fn parameters(&self) -> *const u8 {
+        let () = Self::DECLARED;
+        // SAFETY: the regions are one `static` block of `REGION_COUNT` regions
+        // of `REGION_BYTES`, and `SLOT` is below that count, so the offset
+        // lands inside the block. A region is `REGION_BYTES` (>= `DATA_BYTES`)
+        // bytes on a `SECTION_ALIGN` boundary, and it holds the file's
+        // parameters — in the kernels' own layout — before a reader exists. It
+        // is zero-filled until then, which is a valid, if pointless, network.
+        unsafe { regions_base().add(SLOT * REGION_BYTES) }
+    }
+}
+
+/// The `(address, byte length)` of region `slot`, for a caller placing it: a
+/// NUMA policy over its pages, or a huge-page hint.
 ///
 /// `slot` counts from zero over the regions this binary declares
-/// ([`MACHINE_NODES`] of them, none on a single-node machine).
+/// ([`REGION_COUNT`] of them).
 pub fn region_backing(slot: usize) -> (usize, usize) {
     assert!(
-        slot < MACHINE_NODES && !SHARED_MAPPING,
+        slot < REGION_COUNT,
         "region {slot} is not one this binary declares",
     );
-    (regions_base() + slot * REGION_BYTES, REGION_BYTES)
+    (regions_base() as usize + slot * REGION_BYTES, REGION_BYTES)
 }
 
 /// The address the declared regions start at — the symbol's own, which the
 /// linker put on a huge-page boundary.
-fn regions_base() -> usize {
-    (&raw const REGIONS) as usize
+///
+/// Computed off the instruction pointer, in one instruction, rather than read
+/// out of the global offset table. The symbol is this binary's own and hidden,
+/// but the storage is stated to the assembler, so the only way to name it from
+/// Rust is an `extern` declaration — and that is a promise the definition may
+/// live in another object, which costs an indirection through the table. The
+/// indirection is a memory load, and this address exists precisely so that
+/// reaching a parameter needs none.
+#[cfg(not(miri))]
+fn regions_base() -> *const u8 {
+    let base: *const u8;
+    // SAFETY: the instruction computes an address and does nothing else: it
+    // reads and writes no memory, leaves the flags alone, and its one output is
+    // a symbol's address, which is fixed for the life of the process.
+    unsafe {
+        core::arch::asm!(
+            "lea {base}, [rip + {regions}]",
+            base = lateout(reg) base,
+            regions = sym REGIONS,
+            options(nomem, nostack, preserves_flags, pure),
+        );
+    }
+    base
 }
 
-/// Copy the network at `path` into on-node region `slot` and read it from
-/// there.
+/// The same address for a miri build, which cannot run the instruction above
+/// and does not need to: nothing it runs evaluates a position.
+#[cfg(miri)]
+fn regions_base() -> *const u8 {
+    (&raw const REGIONS).cast()
+}
+
+/// Put the network at `path` into region 0 as the file's own pages, shared with
+/// every other process that maps them, and report the complaints the conversion
+/// had about the source file.
+///
+/// The mapping lands *on* the region, so the parameters keep the address this
+/// binary declares while the pages behind it are the page cache's.
+///
+/// # Safety
+/// No search may still be reading region 0: its pages are replaced.
+pub unsafe fn map_shared(path: &Path) -> Result<Vec<String>, NnueError> {
+    let header = read_header(path)?;
+    let (addr, _) = region_backing(0);
+    // SAFETY: the region is this binary's own `REGION_BYTES` of storage, which
+    // covers the rounded-up mapping, and the caller guarantees nothing is
+    // reading it.
+    let mapped =
+        unsafe { yorkie_storage::map_file_onto(addr, DATA_BYTES, path, DATA_OFFSET as u64) }
+            .map_err(|e| NnueError::Io {
+                path: path.display().to_string(),
+                source: e,
+            })?;
+    if !mapped {
+        // Where a file cannot be mapped at all, the parameters are read in
+        // instead: the same bytes at the same address, without the sharing.
+        // SAFETY: as the mapping above.
+        unsafe { fill_region(addr, path)? };
+    }
+    Ok(header.warnings)
+}
+
+/// Copy the network at `path` into region `slot`.
 ///
 /// The copy runs after the caller has placed the region, so every page's first
 /// touch — this write — lands where the policy says.
 ///
 /// # Safety
-/// No network built over `slot` may still be alive: the region is the process's
+/// No search may still be reading region `slot`: the region is the process's
 /// only storage for that copy, so writing it again while something reads it
 /// would change parameters underneath a search.
-pub unsafe fn load_into_region(
-    slot: usize,
-    path: &Path,
-) -> Result<(NnueNetwork, Vec<String>), NnueError> {
+pub unsafe fn load_into_region(slot: usize, path: &Path) -> Result<Vec<String>, NnueError> {
     let header = read_header(path)?;
     let (addr, _) = region_backing(slot);
-    let base = addr as *mut u8;
+    // SAFETY: forwarded to the caller, who owns the same obligation.
+    unsafe { fill_region(addr, path)? };
+    Ok(header.warnings)
+}
 
+/// Read the file's data region into the `DATA_BYTES` at `addr`.
+///
+/// # Safety
+/// `addr` must start a region this binary declares, and nothing may be reading
+/// it.
+unsafe fn fill_region(addr: usize, path: &Path) -> Result<(), NnueError> {
     // SAFETY: the region is `REGION_BYTES` (>= `DATA_BYTES`) writable bytes
     // this binary declares, and the caller guarantees nothing else is reading
     // them.
-    let target = unsafe { std::slice::from_raw_parts_mut(base, DATA_BYTES) };
+    let target = unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, DATA_BYTES) };
     let mut file = File::open(path).map_err(|e| NnueError::Io {
         path: path.display().to_string(),
         source: e,
@@ -256,29 +338,7 @@ pub unsafe fn load_into_region(
     read_data_region(&mut file, target).map_err(|e| NnueError::Io {
         path: path.display().to_string(),
         source: e,
-    })?;
-
-    // SAFETY: the region holds `DATA_BYTES` initialised parameter bytes, it is
-    // `static` and so outlives every view, and the caller's contract keeps any
-    // earlier views out of the way.
-    let net = unsafe {
-        NnueNetwork::over(
-            header.net.clone(),
-            source_digest(header.source),
-            &NetDims::STANDARD,
-            base,
-            Backing::Region,
-        )
-    };
-    Ok((net, header.warnings))
-}
-
-/// The digest a network carries for the file its parameters came from.
-fn source_digest(source: Source) -> [u8; 32] {
-    match source {
-        Source::Sha256(digest) => digest,
-        Source::Absent => [0u8; 32],
-    }
+    })
 }
 
 /// Read the data region of an open evaluation file into `target`.

@@ -163,6 +163,85 @@ pub fn net_spans(dims: &NetDims) -> NetSpans {
     }
 }
 
+/// Every parameter array's place in the data region, in a form a constant can
+/// hold: the stacks in a fixed-size array rather than a `Vec`, so each offset
+/// is a compile-time value and the kernels reach a parameter array at the
+/// region's base plus a literal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConstSpans {
+    pub ft_biases: Span,
+    pub ft_weights: Span,
+    pub stacks: [StackSpans; LAYER_STACKS],
+    pub total_bytes: usize,
+}
+
+/// A zeroed span, only ever the value an array is filled with before the walk
+/// below overwrites every element of it.
+const NO_SPAN: Span = Span {
+    offset: 0,
+    count: 0,
+};
+
+const NO_STACK: StackSpans = StackSpans {
+    fc_0_biases: NO_SPAN,
+    fc_0_weights: NO_SPAN,
+    fc_1_biases: NO_SPAN,
+    fc_1_weights: NO_SPAN,
+    fc_2_biases: NO_SPAN,
+    fc_2_weights: NO_SPAN,
+};
+
+/// One array's span and the cursor past it.
+const fn step(cursor: usize, count: usize, size: usize) -> (Span, usize) {
+    let (offset, next) = place(cursor, count, size);
+    (Span { offset, count }, next)
+}
+
+/// [`net_spans`] as a `const fn`. A unit test holds the two walks against each
+/// other; the stack count is part of the result type, so `dims` has to name
+/// [`LAYER_STACKS`] of them.
+pub const fn const_net_spans(dims: &NetDims) -> ConstSpans {
+    assert!(
+        dims.layer_stacks == LAYER_STACKS,
+        "the constant layout carries exactly LAYER_STACKS stacks",
+    );
+    let (ft_biases, cursor) = step(0, dims.hidden_size, 2);
+    let (ft_weights, cursor) = step(cursor, dims.hidden_size * dims.num_features, 2);
+
+    let mut stacks = [NO_STACK; LAYER_STACKS];
+    let mut cursor = cursor;
+    let mut i = 0;
+    while i < LAYER_STACKS {
+        let (fc_0_biases, next) = step(cursor, dims.fc_0_output, 4);
+        let (fc_0_weights, next) = step(next, dims.fc_0_output * dims.fc_0_padded_input, 1);
+        let (fc_1_biases, next) = step(next, dims.fc_1_output, 4);
+        let (fc_1_weights, next) = step(next, dims.fc_1_output * dims.fc_1_padded_input, 1);
+        let (fc_2_biases, next) = step(next, dims.fc_2_output, 4);
+        let (fc_2_weights, next) = step(next, dims.fc_2_output * dims.fc_2_padded_input, 1);
+        stacks[i] = StackSpans {
+            fc_0_biases,
+            fc_0_weights,
+            fc_1_biases,
+            fc_1_weights,
+            fc_2_biases,
+            fc_2_weights,
+        };
+        cursor = next;
+        i += 1;
+    }
+
+    ConstSpans {
+        ft_biases,
+        ft_weights,
+        stacks,
+        total_bytes: cursor,
+    }
+}
+
+/// Where every parameter array of the shipped network sits inside the data
+/// region — the layout the kernels address, as literals.
+pub const SPANS: ConstSpans = const_net_spans(&NetDims::STANDARD);
+
 /// The byte size of the data region, as a constant: the same walk
 /// [`net_spans`] performs, in a form a `static`'s size can be written from. A
 /// unit test holds the two against each other.

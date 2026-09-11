@@ -14,37 +14,35 @@
 use std::path::Path;
 
 use crate::nnue_layout::{NetDims, NetHeader};
-use crate::nnue_source::{convert, sha256};
-use crate::types::{NnueError, NnueNetwork, NnueNetworkBuilder};
+use crate::nnue_source::convert;
+use crate::types::{NnueError, OwnedNetwork};
 
 /// Reads and validates the SFNN-1536 network file at `path`, discarding any
 /// non-fatal warnings. Use [`load_network_with_warnings`] to surface them.
-pub fn load_network(path: &Path) -> Result<NnueNetwork, NnueError> {
+pub fn load_network(path: &Path) -> Result<OwnedNetwork, NnueError> {
     load_network_with_warnings(path).map(|(net, _warnings)| net)
 }
 
 /// Reads and validates the SFNN-1536 network file at `path`, returning the
 /// network together with any non-fatal warning bodies. Structural problems and
 /// a version mismatch still fail with an error.
-pub fn load_network_with_warnings(path: &Path) -> Result<(NnueNetwork, Vec<String>), NnueError> {
+pub fn load_network_with_warnings(path: &Path) -> Result<(OwnedNetwork, Vec<String>), NnueError> {
     let bytes = std::fs::read(path).map_err(|e| NnueError::Io {
         path: path.display().to_string(),
         source: e,
     })?;
-    let digest = sha256(&bytes);
-    network_from_bytes(&bytes, &NetDims::STANDARD, digest)
+    network_from_bytes(&bytes, &NetDims::STANDARD)
 }
 
 /// The network `bytes` describe, in a freshly allocated block.
 fn network_from_bytes(
     bytes: &[u8],
     dims: &NetDims,
-    sha256: [u8; 32],
-) -> Result<(NnueNetwork, Vec<String>), NnueError> {
+) -> Result<(OwnedNetwork, Vec<String>), NnueError> {
     let converted = convert(bytes, dims).map_err(|reason| NnueError::InvalidFormat { reason })?;
-    let mut builder = NnueNetworkBuilder::with_dims(converted.net.clone(), sha256, dims);
-    builder.fill(&converted.data);
-    Ok((builder.build(), converted.warnings))
+    let mut owned = OwnedNetwork::zeroed();
+    owned.fill(&converted.data);
+    Ok((owned, converted.warnings))
 }
 
 /// The parameters `bytes` lay out, as the kernels read them — the same region
@@ -66,11 +64,67 @@ pub fn source_header(bytes: &[u8], dims: &NetDims) -> Result<NetHeader, NnueErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nnue_layout::LAYER_STACKS;
+    use crate::nnue_layout::{LAYER_STACKS, NetSpans, Span, net_spans};
     use crate::nnue_source::{
         ARCH_STRING, FT_HASH, LEB128_MAGIC, NET_HASH, NNUE_HASH_VALUE, NNUE_VERSION,
-        SECTION_HASH_WARNING,
+        SECTION_HASH_WARNING, sha256,
     };
+
+    /// The conversion's output held against the dimensions that produced it.
+    ///
+    /// The engine's own layout is a set of constants for the shipped
+    /// dimensions, so a test that varies them reads the parameters through the
+    /// walked spans instead.
+    #[derive(Debug)]
+    struct Converted {
+        header: NetHeader,
+        data: Vec<u8>,
+        spans: NetSpans,
+    }
+
+    impl Converted {
+        /// The `i16` array `span` describes, decoded byte by byte: the
+        /// conversion hands back a plain `Vec<u8>`, whose start carries no
+        /// alignment the elements could be read through directly.
+        fn i16_array(&self, span: Span) -> Vec<i16> {
+            self.data[span.offset..span.offset + span.count * 2]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&b| i16::from_le_bytes(b))
+                .collect()
+        }
+
+        fn ft_biases(&self) -> Vec<i16> {
+            self.i16_array(self.spans.ft_biases)
+        }
+
+        fn ft_weights(&self) -> Vec<i16> {
+            self.i16_array(self.spans.ft_weights)
+        }
+
+        fn stacks(&self) -> usize {
+            self.spans.stacks.len()
+        }
+    }
+
+    /// [`network_from_bytes`] for arbitrary dimensions: what the conversion
+    /// produced, without the engine's constant layout over it.
+    fn network_from_bytes(
+        bytes: &[u8],
+        dims: &NetDims,
+    ) -> Result<(Converted, Vec<String>), NnueError> {
+        let converted =
+            convert(bytes, dims).map_err(|reason| NnueError::InvalidFormat { reason })?;
+        Ok((
+            Converted {
+                header: converted.net,
+                data: converted.data,
+                spans: net_spans(dims),
+            },
+            converted.warnings,
+        ))
+    }
 
     const TEST_DIMS: NetDims = NetDims {
         hidden_size: 4,
@@ -186,8 +240,7 @@ mod tests {
     #[test]
     fn valid_header_round_trips() {
         let bytes = build_valid_bytes(&TEST_DIMS, ARCH_STRING);
-        let (net, warnings) =
-            network_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).expect("should parse");
+        let (net, warnings) = network_from_bytes(&bytes, &TEST_DIMS).expect("should parse");
         assert!(
             warnings.is_empty(),
             "clean file must not warn: {warnings:?}"
@@ -195,30 +248,30 @@ mod tests {
         assert_eq!(net.header.version, NNUE_VERSION);
         assert_eq!(net.header.hash, NNUE_HASH_VALUE);
         assert_eq!(net.header.arch_id, ARCH_STRING);
-        assert_eq!(net.ft_biases.len(), TEST_DIMS.hidden_size);
+        assert_eq!(net.ft_biases().len(), TEST_DIMS.hidden_size);
         assert_eq!(
-            net.ft_weights.len(),
+            net.ft_weights().len(),
             TEST_DIMS.hidden_size * TEST_DIMS.num_features
         );
-        assert_eq!(net.stacks.len(), TEST_DIMS.layer_stacks);
-        let stack = &net.stacks[0];
-        assert_eq!(stack.fc_0_biases.len(), TEST_DIMS.fc_0_output);
+        assert_eq!(net.stacks(), TEST_DIMS.layer_stacks);
+        let stack = net.spans.stacks[0];
+        assert_eq!(stack.fc_0_biases.count, TEST_DIMS.fc_0_output);
         assert_eq!(
-            stack.fc_0_weights.len(),
+            stack.fc_0_weights.count,
             TEST_DIMS.fc_0_output * TEST_DIMS.fc_0_padded_input
         );
-        assert_eq!(stack.fc_1_biases.len(), TEST_DIMS.fc_1_output);
+        assert_eq!(stack.fc_1_biases.count, TEST_DIMS.fc_1_output);
         assert_eq!(
-            stack.fc_1_weights.len(),
+            stack.fc_1_weights.count,
             TEST_DIMS.fc_1_output * TEST_DIMS.fc_1_padded_input
         );
-        assert_eq!(stack.fc_2_biases.len(), TEST_DIMS.fc_2_output);
+        assert_eq!(stack.fc_2_biases.count, TEST_DIMS.fc_2_output);
         assert_eq!(
-            stack.fc_2_weights.len(),
+            stack.fc_2_weights.count,
             TEST_DIMS.fc_2_output * TEST_DIMS.fc_2_padded_input
         );
-        assert!(net.ft_biases.iter().all(|&x| x == 0));
-        assert!(net.ft_weights.iter().all(|&x| x == 0));
+        assert!(net.ft_biases().iter().all(|&x| x == 0));
+        assert!(net.ft_weights().iter().all(|&x| x == 0));
     }
 
     #[test]
@@ -226,22 +279,20 @@ mod tests {
         // The architecture string is never compared, so with matching hashes a
         // different one loads cleanly.
         let bytes = build_valid_bytes(&TEST_DIMS, "SFNNwoP1024");
-        let (net, warnings) =
-            network_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).expect("should parse");
+        let (net, warnings) = network_from_bytes(&bytes, &TEST_DIMS).expect("should parse");
         assert!(
             warnings.is_empty(),
             "arch difference must not warn: {warnings:?}"
         );
         assert_eq!(net.header.arch_id, "SFNNwoP1024");
-        assert_eq!(net.stacks.len(), TEST_DIMS.layer_stacks);
+        assert_eq!(net.stacks(), TEST_DIMS.layer_stacks);
     }
 
     #[test]
     fn non_utf8_arch_string_loads_without_complaint() {
         // Raw, non-UTF-8 arch bytes are rendered lossily and never rejected.
         let bytes = build_valid_bytes_arch(&TEST_DIMS, &[0xFF, 0xFE, 0x00, 0x80]);
-        let (net, warnings) =
-            network_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).expect("should parse");
+        let (net, warnings) = network_from_bytes(&bytes, &TEST_DIMS).expect("should parse");
         assert!(
             warnings.is_empty(),
             "arch bytes must not warn: {warnings:?}"
@@ -251,14 +302,14 @@ mod tests {
             "non-UTF-8 bytes should render lossily, got {:?}",
             net.header.arch_id
         );
-        assert_eq!(net.stacks.len(), TEST_DIMS.layer_stacks);
+        assert_eq!(net.stacks(), TEST_DIMS.layer_stacks);
     }
 
     #[test]
     fn short_read_is_rejected() {
         let bytes = build_valid_bytes(&TEST_DIMS, ARCH_STRING);
         let truncated = &bytes[..bytes.len() - 5];
-        let err = network_from_bytes(truncated, &TEST_DIMS, [0u8; 32]).unwrap_err();
+        let err = network_from_bytes(truncated, &TEST_DIMS).unwrap_err();
         match err {
             NnueError::InvalidFormat { reason } => assert!(
                 reason.contains("unexpected size"),
@@ -272,7 +323,7 @@ mod tests {
     fn oversize_trailer_is_rejected() {
         let mut bytes = build_valid_bytes(&TEST_DIMS, ARCH_STRING);
         bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
-        let err = network_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).unwrap_err();
+        let err = network_from_bytes(&bytes, &TEST_DIMS).unwrap_err();
         match err {
             NnueError::InvalidFormat { reason } => assert!(
                 reason.contains("unexpected size"),
@@ -286,7 +337,7 @@ mod tests {
     fn wrong_version_is_hard_rejected_with_reference_message() {
         let mut bytes = build_valid_bytes(&TEST_DIMS, ARCH_STRING);
         bytes[..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
-        let err = network_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).unwrap_err();
+        let err = network_from_bytes(&bytes, &TEST_DIMS).unwrap_err();
         match err {
             NnueError::InvalidFormat { reason } => {
                 assert!(
@@ -304,8 +355,7 @@ mod tests {
         let mut bytes = build_valid_bytes(&TEST_DIMS, ARCH_STRING);
         // The top-level hash sits right after the 4-byte version.
         bytes[4..8].copy_from_slice(&0x1234_5678u32.to_le_bytes());
-        let (net, warnings) =
-            network_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).expect("should load");
+        let (net, warnings) = network_from_bytes(&bytes, &TEST_DIMS).expect("should load");
         // Exactly one warning: the file-level hash mismatch, naming both arches.
         assert_eq!(
             warnings.len(),
@@ -323,9 +373,9 @@ mod tests {
             "got: {w}"
         );
         // Parameters are still read intact.
-        assert_eq!(net.ft_biases.len(), TEST_DIMS.hidden_size);
-        assert_eq!(net.stacks.len(), TEST_DIMS.layer_stacks);
-        assert!(net.ft_biases.iter().all(|&x| x == 0));
+        assert_eq!(net.ft_biases().len(), TEST_DIMS.hidden_size);
+        assert_eq!(net.stacks(), TEST_DIMS.layer_stacks);
+        assert!(net.ft_biases().iter().all(|&x| x == 0));
     }
 
     #[test]
@@ -334,10 +384,9 @@ mod tests {
         // ft_hash follows version(4) + hash(4) + arch_size(4) + arch bytes.
         let ft_hash_pos = 12 + ARCH_STRING.len();
         bytes[ft_hash_pos..ft_hash_pos + 4].copy_from_slice(&0x0BAD_F00Du32.to_le_bytes());
-        let (net, warnings) =
-            network_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).expect("should load");
+        let (net, warnings) = network_from_bytes(&bytes, &TEST_DIMS).expect("should load");
         assert_eq!(warnings, vec![SECTION_HASH_WARNING.to_string()]);
-        assert_eq!(net.stacks.len(), TEST_DIMS.layer_stacks);
+        assert_eq!(net.stacks(), TEST_DIMS.layer_stacks);
     }
 
     #[test]
@@ -350,10 +399,9 @@ mod tests {
             LEB128_MAGIC.len() + 4 + TEST_DIMS.hidden_size * TEST_DIMS.num_features;
         let net_hash_pos = 12 + ARCH_STRING.len() + 4 + ft_bias_block + ft_weight_block;
         bytes[net_hash_pos..net_hash_pos + 4].copy_from_slice(&0x0BAD_CAFEu32.to_le_bytes());
-        let (net, warnings) =
-            network_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).expect("should load");
+        let (net, warnings) = network_from_bytes(&bytes, &TEST_DIMS).expect("should load");
         assert_eq!(warnings, vec![SECTION_HASH_WARNING.to_string()]);
-        assert_eq!(net.stacks.len(), TEST_DIMS.layer_stacks);
+        assert_eq!(net.stacks(), TEST_DIMS.layer_stacks);
     }
 
     #[test]
@@ -361,7 +409,7 @@ mod tests {
         let mut bytes = build_valid_bytes(&TEST_DIMS, ARCH_STRING);
         let magic_start = 12 + ARCH_STRING.len() + 4;
         bytes[magic_start] = b'X';
-        let err = network_from_bytes(&bytes, &TEST_DIMS, [0u8; 32]).unwrap_err();
+        let err = network_from_bytes(&bytes, &TEST_DIMS).unwrap_err();
         assert!(
             matches!(err, NnueError::InvalidFormat { .. }),
             "expected InvalidFormat, got {err:?}"
@@ -378,13 +426,12 @@ mod tests {
         }
 
         let bytes = build_bytes_with_ft(&SCALE_DIMS, ARCH_STRING, &biases, &weights);
-        let (net, _warnings) =
-            network_from_bytes(&bytes, &SCALE_DIMS, [0u8; 32]).expect("should parse");
+        let (net, _warnings) = network_from_bytes(&bytes, &SCALE_DIMS).expect("should parse");
 
         let expected_row: [i16; 5] = [0, 2, -2, 32_766, -32_768];
-        assert_eq!(&*net.ft_biases, &expected_row[..]);
-        assert_eq!(net.ft_weights.len(), weights.len());
-        for chunk in net.ft_weights.chunks(expected_row.len()) {
+        assert_eq!(net.ft_biases(), &expected_row[..]);
+        assert_eq!(net.ft_weights().len(), weights.len());
+        for chunk in net.ft_weights().chunks(expected_row.len()) {
             assert_eq!(chunk, &expected_row[..]);
         }
     }
@@ -395,7 +442,7 @@ mod tests {
         let weights = vec![0i16; SCALE_DIMS.hidden_size * SCALE_DIMS.num_features];
 
         let bytes = build_bytes_with_ft(&SCALE_DIMS, ARCH_STRING, &biases, &weights);
-        let err = network_from_bytes(&bytes, &SCALE_DIMS, [0u8; 32]).unwrap_err();
+        let err = network_from_bytes(&bytes, &SCALE_DIMS).unwrap_err();
 
         match err {
             NnueError::InvalidFormat { reason } => {

@@ -9,9 +9,7 @@
 //! alpha-beta, no quiescence, no transposition table, no time management, and
 //! no reference-parity claim.
 
-use std::path::Path;
-
-use yorkie_eval::{Accumulator, NnueError, NnueNetwork, evaluate_with, network_file};
+use yorkie_eval::{Accumulator, NetworkParams, evaluate_with};
 use yorkie_state::{Move, Position};
 
 pub mod book;
@@ -109,48 +107,20 @@ pub struct SearchResult {
     pub nodes: u64,
 }
 
-/// A greedy 1-ply search that owns a loaded NNUE network.
-pub struct Search {
-    net: NnueNetwork,
+/// A greedy 1-ply search over a loaded NNUE network.
+pub struct Search<N: NetworkParams> {
+    net: N,
 }
 
-impl Search {
-    /// Wrap an already-loaded network.
-    pub fn new(net: NnueNetwork) -> Self {
+impl<N: NetworkParams> Search<N> {
+    /// A search reading `net`.
+    pub fn new(net: N) -> Self {
         Self { net }
     }
 
-    /// Open the evaluation file at `path` as one mapping, shared by everything
-    /// that reads it, and wrap the network it holds.
-    ///
-    /// Also returns the complaints the conversion had about the source network
-    /// (hash mismatches), which the driver emits as `info string` lines before
-    /// `readyok`. An empty vector means the file was made from a clean source.
-    pub fn map_evaluation_file(path: &Path) -> Result<(Self, Vec<String>), NnueError> {
-        let (net, warnings) = network_file::open_shared(path)?;
-        Ok((Self::new(net), warnings))
-    }
-
-    /// Copy the evaluation file at `path` into on-node region `slot` and wrap
-    /// the network it holds, so the workers on that node read parameters their
-    /// own node's memory holds.
-    ///
-    /// # Safety
-    /// No search built over `slot` may still be alive: the region is the
-    /// process's only storage for that copy, so filling it again while
-    /// something reads it would change parameters underneath a search.
-    pub unsafe fn load_evaluation_file_into_region(
-        slot: usize,
-        path: &Path,
-    ) -> Result<(Self, Vec<String>), NnueError> {
-        // SAFETY: forwarded to the caller, who owns the same obligation.
-        let (net, warnings) = unsafe { network_file::load_into_region(slot, path)? };
-        Ok((Self::new(net), warnings))
-    }
-
     /// The network this search evaluates with.
-    pub fn network(&self) -> &NnueNetwork {
-        &self.net
+    pub fn network(&self) -> N {
+        self.net
     }
 
     /// Greedy 1-ply move choice.
@@ -187,7 +157,7 @@ impl Search {
         // child evaluated without disturbing the caller's position.
         let mut work = pos.clone();
         let mut root_acc = Accumulator::new();
-        root_acc.refresh(&self.net, &work);
+        root_acc.refresh(self.net, &work);
 
         let mut best_move = moves[0];
         let mut best_score = i32::MIN;
@@ -195,9 +165,9 @@ impl Search {
             // `update_after_move` leaves `work` unchanged; apply the move for
             // real so `evaluate_with` sees the child's side to move and king
             // ranks, then undo it.
-            let child_acc = root_acc.update_after_move(&self.net, &mut work, mv);
+            let child_acc = root_acc.update_after_move(self.net, &mut work, mv);
             let undo = work.do_move(mv);
-            let score = -evaluate_with(&self.net, &child_acc, &work);
+            let score = -evaluate_with(self.net, &child_acc, &work);
             work.undo_move(mv, undo);
 
             if score > best_score {
@@ -226,8 +196,8 @@ impl Search {
 mod tests {
     use super::*;
     use yorkie_eval::{
-        FC_0_PADDED_INPUT_DIMS, HIDDEN_SIZE, HIDDEN1_DIMS, NUM_FEATURES, NetHeader, NnueNetwork,
-        NnueNetworkBuilder, evaluate,
+        FC_0_PADDED_INPUT_DIMS, HIDDEN_SIZE, HIDDEN1_DIMS, LAYER_STACKS, NUM_FEATURES,
+        NetworkParams, OwnedNetwork, evaluate,
     };
     use yorkie_state::{Move, Position, format_usi_move, parse_sfen};
     use yorkie_storage::LargePageArray;
@@ -249,21 +219,16 @@ mod tests {
     /// `transformed[LANE_A] + transformed[LANE_B]`: biases are zero, so the
     /// accumulator is a pure sum of active feature columns, and only the fc_0
     /// shortcut row carries a non-zero weight.
-    fn net_with_ft(ft_weights: LargePageArray<i16>) -> NnueNetwork {
-        let header = NetHeader {
-            version: 0,
-            hash: 0,
-            arch_id: "synthetic".to_string(),
-        };
-        let mut b = NnueNetworkBuilder::new(header, [0u8; 32]);
+    fn net_with_ft(ft_weights: LargePageArray<i16>) -> OwnedNetwork {
+        let mut b = OwnedNetwork::zeroed();
         b.ft_weights_mut().copy_from_slice(&ft_weights);
         let row = HIDDEN1_DIMS * FC_0_PADDED_INPUT_DIMS;
-        for s in 0..b.layer_stacks() {
+        for s in 0..LAYER_STACKS {
             let w = b.fc_0_weights_mut(s);
             w[row + LANE_A] = 1;
             w[row + LANE_B] = 1;
         }
-        b.build()
+        b
     }
 
     /// All-zero feature-transformer weights: every position evaluates to 0.
@@ -324,7 +289,7 @@ mod tests {
     /// the child from scratch, negate for the mover, and keep the first
     /// maximum in generation order. Deliberately shares no code with the
     /// incremental path inside [`Search::go`].
-    fn full_refresh_argmax(net: &NnueNetwork, p: &Position) -> Option<Move> {
+    fn full_refresh_argmax<N: NetworkParams>(net: N, p: &Position) -> Option<Move> {
         let mut work = p.clone();
         let mut best: Option<Move> = None;
         let mut best_score = i32::MIN;
@@ -356,8 +321,8 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn no_legal_move_returns_none() {
-        let net = net_with_ft(patterned_ft());
-        let search = Search::new(net);
+        let owned = net_with_ft(patterned_ft());
+        let search = Search::new(owned.network());
         let mut sink = RecordingSink::default();
         let result = search.go(&pos(MATE_SFEN), &SearchLimits::default(), &mut sink);
         assert!(result.best_move.is_none());
@@ -384,7 +349,8 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        let search = Search::new(net_with_ft(material_ft(40)));
+        let owned = net_with_ft(material_ft(40));
+        let search = Search::new(owned.network());
         let mut sink = NullInfoSink;
         let result = search.go(&p, &SearchLimits::default(), &mut sink);
         assert_eq!(
@@ -403,7 +369,8 @@ mod tests {
         let moves = legal_moves(&p);
         assert!(moves.len() > 1);
 
-        let search = Search::new(net_with_ft(zeroed_ft()));
+        let owned = net_with_ft(zeroed_ft());
+        let search = Search::new(owned.network());
         let mut sink = NullInfoSink;
         let result = search.go(&p, &SearchLimits::default(), &mut sink);
         assert_eq!(result.best_move, Some(moves[0]));
@@ -414,7 +381,8 @@ mod tests {
     #[test]
     fn choice_is_deterministic_across_runs() {
         let p = pos(ONE_CAPTURE_SFEN);
-        let search = Search::new(net_with_ft(patterned_ft()));
+        let owned = net_with_ft(patterned_ft());
+        let search = Search::new(owned.network());
         let a = search.go(&p, &SearchLimits::default(), &mut NullInfoSink);
         let b = search.go(&p, &SearchLimits::default(), &mut NullInfoSink);
         assert_eq!(a.best_move, b.best_move);
@@ -434,8 +402,8 @@ mod tests {
             "4k4/3P3+PL/2N2PR2/1L2BNS2/4N4/9/9/9/4K4 b - 1",                   // promotion-zone
             "l7l/1r1sg2k1/2nppgsp1/p1p3p1p/1p2N4/2P1P1P2/PPSP1PB1P/3GG1SR1/LN2K3L b BNPp 1", // mid-game
         ];
-        let net = net_with_ft(patterned_ft());
-        let search = Search::new(net);
+        let owned = net_with_ft(patterned_ft());
+        let search = Search::new(owned.network());
         for sfen in SFENS {
             let p = pos(sfen);
             let result = search.go(&p, &SearchLimits::default(), &mut NullInfoSink);
@@ -451,7 +419,8 @@ mod tests {
     #[test]
     fn emits_one_info_report_with_expected_fields() {
         let p = pos(ONE_CAPTURE_SFEN);
-        let search = Search::new(net_with_ft(material_ft(40)));
+        let owned = net_with_ft(material_ft(40));
+        let search = Search::new(owned.network());
         let mut sink = RecordingSink::default();
         let result = search.go(&p, &SearchLimits::default(), &mut sink);
 

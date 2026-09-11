@@ -130,7 +130,7 @@ fn format_score(v: i32) -> ScoreJson {
     }
 }
 
-fn assert_fixture(name: &str, net: &yorkie_eval::NnueNetwork, tt: &TranspositionTable) {
+fn assert_fixture<N: yorkie_eval::NetworkParams>(name: &str, net: N, tt: &TranspositionTable) {
     let json = load_fixture(name);
     assert_eq!(json.depth, 5, "{name}: depth-5 fixtures only");
 
@@ -190,12 +190,13 @@ fn depth5_search_matches_reference_fixtures() {
         return;
     }
 
-    let net = yorkie_eval::load_network(&path).expect("real nn.bin should load and validate");
+    let owned = yorkie_eval::load_network(&path).expect("real nn.bin should load and validate");
+    let net = owned.network();
 
     // The one shared table, cleared per fixture (the usinewgame equivalent).
     let tt = TranspositionTable::shared();
 
     for name in FIXTURES {
-        assert_fixture(name, &net, tt);
+        assert_fixture(name, net, tt);
     }
 }

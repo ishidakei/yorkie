@@ -22,8 +22,9 @@
 mod common;
 
 use common::{NOISY_EVALUATION, drive, evaluation_is_noise_free, stage_configured_eval_dir};
+use yorkie_eval::{Region, network_file};
 use yorkie_protocol::{UsiDriver, config};
-use yorkie_search::{QSearch, RootKind, RootOutcome, Search};
+use yorkie_search::{QSearch, RootKind, RootOutcome};
 use yorkie_state::{Move, Position, format_usi_move, parse_sfen, parse_usi_move};
 use yorkie_storage::TranspositionTable;
 
@@ -37,6 +38,28 @@ fn cleared_tt() -> &'static TranspositionTable {
     let tt = TranspositionTable::shared();
     tt.clear();
     tt
+}
+
+/// Put the evaluation file at `path` in the region the engine reads it from,
+/// and report the network there.
+///
+/// The region is a `static`, so this is the same one the driver session that
+/// follows fills with the same file — which is what makes the two searches
+/// comparable, exactly as the shared table above does. The type is the one the
+/// session's own workers are compiled for, so the direct searches below run the
+/// very same instantiation.
+fn place_network(path: &std::path::Path) -> Region<0> {
+    // SAFETY: the session driven below has not started, and no other search is
+    // running in this test executable, so nothing is reading the region.
+    unsafe {
+        if network_file::SHARED_MAPPING {
+            network_file::map_shared(path)
+        } else {
+            network_file::load_into_region(0, path)
+        }
+    }
+    .expect("the synthetic network opens");
+    Region::new()
 }
 
 /// The USI-string form of a `run_root` outcome's bestmove (the synthetic
@@ -75,13 +98,13 @@ fn synthetic_network_session_matches_direct_search_choice() {
     let path = stage_configured_eval_dir();
 
     // Independent, direct depth-1 root-search choice for the same network +
-    // startpos, on the same table the session will use. Scoped so the network
-    // frees before the driver session loads its own.
+    // startpos, on the same table the session will use. The session below
+    // places the very same file in the very same region, so what it evaluates
+    // with is what this reads.
     let startpos = parse_sfen(yorkie_state::STARTPOS_SFEN).expect("startpos SFEN");
     let expected_usi = {
-        let (search, _warnings) =
-            Search::map_evaluation_file(&path).expect("the synthetic network opens");
-        let outcome = QSearch::new(search.network(), cleared_tt()).run_root(&startpos, 1);
+        let net = place_network(&path);
+        let outcome = QSearch::new(net, cleared_tt()).run_root(&startpos, 1);
         bestmove_usi(&outcome)
     };
     // The session below starts from an empty table, as this search just did.
@@ -200,15 +223,13 @@ fn synthetic_network_reuse_reset_and_mate_resign() {
 
     // Independent depth-1 root-search choices, reproducing the session's TT
     // lifecycle: an empty table for `go` #1 (post-7g7f), then `usinewgame`
-    // (tt.clear) before `go` #2 (startpos). Scoped so the network frees before
-    // the driver loads its own.
+    // (tt.clear) before `go` #2 (startpos).
     let (expected_after_7g7f, expected_startpos) = {
-        let (search, _warnings) =
-            Search::map_evaluation_file(&file).expect("the synthetic network opens");
+        let net = place_network(&file);
         let tt = cleared_tt();
-        let e1 = bestmove_usi(&QSearch::new(search.network(), tt).run_root(&post_7g7f, 1));
+        let e1 = bestmove_usi(&QSearch::new(net, tt).run_root(&post_7g7f, 1));
         tt.clear(); // usinewgame equivalent.
-        let e2 = bestmove_usi(&QSearch::new(search.network(), tt).run_root(&startpos, 1));
+        let e2 = bestmove_usi(&QSearch::new(net, tt).run_root(&startpos, 1));
         (e1, e2)
     };
     // The session below starts from an empty table, as the first search did.

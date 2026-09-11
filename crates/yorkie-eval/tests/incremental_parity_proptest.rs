@@ -17,7 +17,7 @@
 
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseResult;
-use yorkie_eval::{Accumulator, NnueNetwork, active_backend, evaluate, evaluate_with};
+use yorkie_eval::{Accumulator, NetworkParams, Region, active_backend, evaluate, evaluate_with};
 
 mod common;
 use yorkie_state::{Color, Move, Position, Undo, format_usi_move, parse_sfen};
@@ -41,7 +41,7 @@ thread_local! {
     /// The network, opened at most once per test thread. Proptest runs every
     /// case of a property on the same thread, and opening the file per case
     /// would dominate the runtime.
-    static NETWORK: Option<NnueNetwork> = common::engine_network();
+    static NETWORK: Option<Region<0>> = common::engine_network();
 }
 
 /// A root index plus a line of legal-move selectors; each selector picks
@@ -53,7 +53,7 @@ fn arb_line() -> impl Strategy<Value = (usize, Vec<u16>)> {
     )
 }
 
-fn refreshed(net: &NnueNetwork, pos: &Position) -> Accumulator {
+fn refreshed<N: NetworkParams>(net: N, pos: &Position) -> Accumulator {
     let mut acc = Accumulator::new();
     acc.refresh(net, pos);
     acc
@@ -61,8 +61,8 @@ fn refreshed(net: &NnueNetwork, pos: &Position) -> Accumulator {
 
 /// Both accumulator halves must be bit-identical to a from-scratch refresh of
 /// `pos`, and `evaluate_with` must agree with the full-refresh `evaluate`.
-fn check_matches_refresh(
-    net: &NnueNetwork,
+fn check_matches_refresh<N: NetworkParams>(
+    net: N,
     acc: &Accumulator,
     pos: &Position,
     ctx: &str,
@@ -100,7 +100,7 @@ fn legal_moves(pos: &Position) -> Vec<Move> {
     buf
 }
 
-fn run_line(net: &NnueNetwork, root_index: usize, selectors: &[u16]) -> TestCaseResult {
+fn run_line<N: NetworkParams>(net: N, root_index: usize, selectors: &[u16]) -> TestCaseResult {
     let sfen = ROOT_SFENS[root_index];
     let mut pos = parse_sfen(sfen).expect("root sfen parses");
     let root = refreshed(net, &pos);
@@ -153,7 +153,7 @@ proptest! {
         NETWORK.with(|net| match net {
             // Not staged in this checkout, so the property is vacuous.
             None => Ok(()),
-            Some(net) => run_line(net, root_index, &selectors),
+            Some(net) => run_line(*net, root_index, &selectors),
         })?;
     }
 }

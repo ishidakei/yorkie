@@ -293,26 +293,16 @@ mod tests {
     use super::*;
     use crate::aligned::Aligned64;
     use crate::types::{
-        FC_1_INPUT_DIMS, FC_2_INPUT_DIMS, LAYER_STACKS, NetDims, NetHeader, NetworkStack,
-        NnueNetwork, NnueNetworkBuilder,
+        FC_1_INPUT_DIMS, FC_2_INPUT_DIMS, LAYER_STACKS, NetStack, NetworkParams, OwnedNetwork,
     };
 
-    /// A network (standard FC dims, tiny FT) whose first stack the caller fills
-    /// through `fill`; returned by value so its arena outlives the borrowed
-    /// `&net.stacks[0]`.
-    fn stack_net(fill: impl FnOnce(&mut NnueNetworkBuilder)) -> NnueNetwork {
-        let dims = NetDims {
-            num_features: 1,
-            ..NetDims::STANDARD
-        };
-        let header = NetHeader {
-            version: 0,
-            hash: 0,
-            arch_id: String::new(),
-        };
-        let mut b = NnueNetworkBuilder::with_dims(header, [0u8; 32], &dims);
+    /// A network whose first stack the caller fills through `fill`; returned by
+    /// value so the block holding the parameters outlives the stack read out of
+    /// it.
+    fn stack_net(fill: impl FnOnce(&mut OwnedNetwork)) -> OwnedNetwork {
+        let mut b = OwnedNetwork::zeroed();
         fill(&mut b);
-        b.build()
+        b
     }
 
     macro_rules! require_avx512bw {
@@ -564,7 +554,7 @@ mod tests {
         }
     }
 
-    fn seeded_net(seed: u32) -> NnueNetwork {
+    fn seeded_net(seed: u32) -> OwnedNetwork {
         stack_net(|b| {
             for (i, s) in b.fc_0_biases_mut(0).iter_mut().enumerate() {
                 *s = (i as i32).wrapping_mul(11).wrapping_sub(seed as i32 * 5);
@@ -596,12 +586,12 @@ mod tests {
         })
     }
 
-    fn per_layer_reference_score(transformed: &[u8; FC_0_INPUT_DIMS], stack: &NetworkStack) -> i32 {
+    fn per_layer_reference_score(transformed: &[u8; FC_0_INPUT_DIMS], stack: NetStack) -> i32 {
         let mut fc_0_out = [0i32; FC_0_OUTPUT_DIMS];
         scalar_post_ft::affine(
             &mut fc_0_out,
-            &stack.fc_0_biases,
-            &stack.fc_0_weights,
+            stack.fc_0_biases(),
+            stack.fc_0_weights(),
             transformed,
             FC_0_INPUT_DIMS,
             FC_0_PADDED_INPUT_DIMS,
@@ -618,8 +608,8 @@ mod tests {
         let mut fc_1_out = [0i32; FC_1_OUTPUT_DIMS];
         scalar_post_ft::affine(
             &mut fc_1_out,
-            &stack.fc_1_biases,
-            &stack.fc_1_weights,
+            stack.fc_1_biases(),
+            stack.fc_1_weights(),
             &fc_1_in,
             FC_1_INPUT_DIMS,
             FC_1_PADDED_INPUT_DIMS,
@@ -630,8 +620,8 @@ mod tests {
         let mut fc_2_out = [0i32; FC_2_OUTPUT_DIMS];
         scalar_post_ft::affine(
             &mut fc_2_out,
-            &stack.fc_2_biases,
-            &stack.fc_2_weights,
+            stack.fc_2_biases(),
+            stack.fc_2_weights(),
             &ac_1,
             FC_2_INPUT_DIMS,
             FC_2_PADDED_INPUT_DIMS,
@@ -646,7 +636,7 @@ mod tests {
         for bucket in 0..LAYER_STACKS {
             let seed = 100 + bucket as u32;
             let net = seeded_net(seed);
-            let stack = &net.stacks[0];
+            let stack = net.network().stack(0);
             let mut transformed = [0u8; FC_0_INPUT_DIMS];
             for (i, slot) in transformed.iter_mut().enumerate() {
                 *slot = ((i as u32).wrapping_mul(11).wrapping_add(seed) % 256) as u8;
@@ -656,12 +646,12 @@ mod tests {
             let fused = unsafe {
                 fused_fc_chain(
                     &transformed,
-                    &stack.fc_0_biases,
-                    &stack.fc_0_weights,
-                    &stack.fc_1_biases,
-                    &stack.fc_1_weights,
-                    &stack.fc_2_biases,
-                    &stack.fc_2_weights,
+                    stack.fc_0_biases(),
+                    stack.fc_0_weights(),
+                    stack.fc_1_biases(),
+                    stack.fc_1_weights(),
+                    stack.fc_2_biases(),
+                    stack.fc_2_weights(),
                 )
             };
 
@@ -682,19 +672,19 @@ mod tests {
         let net = stack_net(|b| {
             b.fc_0_biases_mut(0)[HIDDEN1_DIMS] = SHORTCUT_K;
         });
-        let stack = &net.stacks[0];
+        let stack = net.network().stack(0);
         let transformed = [42u8; FC_0_INPUT_DIMS];
 
         // SAFETY: guarded by `require_vnni!`.
         let fused = unsafe {
             fused_fc_chain(
                 &transformed,
-                &stack.fc_0_biases,
-                &stack.fc_0_weights,
-                &stack.fc_1_biases,
-                &stack.fc_1_weights,
-                &stack.fc_2_biases,
-                &stack.fc_2_weights,
+                stack.fc_0_biases(),
+                stack.fc_0_weights(),
+                stack.fc_1_biases(),
+                stack.fc_1_weights(),
+                stack.fc_2_biases(),
+                stack.fc_2_weights(),
             )
         };
         assert_eq!(fused, SHORTCUT_K);

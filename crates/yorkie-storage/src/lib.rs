@@ -3,8 +3,9 @@
 //!
 //! It hosts the transposition table ([`tt`]), the `.ybb` opening-book reader
 //! ([`book`]), the huge-page-backed allocator ([`large_page`]) the other layers
-//! use for their big allocations, and the huge-page-aligned read-only file
-//! mapping ([`mapped`]) the evaluation network is read through. It also
+//! use for their big allocations, and the read-only file mapping ([`mapped`])
+//! that puts the evaluation network's pages at an address the caller chose. It
+//! also
 //! declares the process-wide
 //! `#[global_allocator]` ([`allocator`]) — a whole-program property rather than
 //! a Storage concern, placed here for the reason those module docs give.
@@ -27,7 +28,7 @@ pub use allocator::{CountingAlloc, clear_alloc_count, take_alloc_count};
 pub use arena::{ARENA_SUB_ALIGN, ArenaLayout, ArenaSlice, LargePageArena, Section};
 pub use book::{Book, BookError, BookMove};
 pub use large_page::{LARGE_PAGE_ALIGN, LargePageArray, LargePageBox, Zeroable, advise_huge_pages};
-pub use mapped::MappedRegion;
+pub use mapped::map_file_onto;
 pub use tt::{
     Bound, CLUSTER_COUNT, DEPTH_NONE, Depth, TABLE_BYTES, TT_ALIGN, TTData, TTWriter,
     TranspositionTable, TtSlot, VALUE_NONE, Value,

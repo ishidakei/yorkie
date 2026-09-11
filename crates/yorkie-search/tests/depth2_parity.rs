@@ -127,7 +127,8 @@ fn depth2_startpos_7g7f_matches_reference() {
         return;
     }
 
-    let net = yorkie_eval::load_network(&path).expect("real nn.bin should load and validate");
+    let owned = yorkie_eval::load_network(&path).expect("real nn.bin should load and validate");
+    let net = owned.network();
     // usinewgame: the shared table, emptied.
     let tt = TranspositionTable::shared();
     tt.clear();
@@ -137,7 +138,7 @@ fn depth2_startpos_7g7f_matches_reference() {
     let pos = setup(&json);
 
     let outcome = {
-        let mut search = QSearch::new(&net, tt);
+        let mut search = QSearch::new(net, tt);
         search.run_root(&pos, json.depth)
     };
 

@@ -9,6 +9,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 use yorkie_eval::network_file::{self, Header, NetDims, Source};
+use yorkie_eval::{NetworkParams, Region};
 
 /// A header describing exactly the file this build reads.
 fn matching_header() -> Header {
@@ -24,6 +25,23 @@ fn matching_header() -> Header {
             arch_id: "SFNNwoP1536".to_string(),
         },
         warnings: vec!["Warning : nn.bin hash mismatch.".to_string()],
+    }
+}
+
+/// Put the file at `path` into region 0 the way the engine does, and report the
+/// complaints it carried.
+///
+/// One test executable is one process, and nothing else in it is reading the
+/// region, so filling it here asks nothing of the caller.
+fn place(path: &std::path::Path) -> Result<Vec<String>, yorkie_eval::NnueError> {
+    // SAFETY: no search exists in a test executable that has not started one,
+    // so nothing is reading the region being filled.
+    unsafe {
+        if network_file::SHARED_MAPPING {
+            network_file::map_shared(path)
+        } else {
+            network_file::load_into_region(0, path)
+        }
     }
 }
 
@@ -154,14 +172,15 @@ fn a_matching_file_opens_and_carries_its_warnings_forward() {
     let header = network_file::read_header(&path).expect("the header is this build's");
     assert_eq!(header.warnings, matching_header().warnings);
 
-    let (net, warnings) = network_file::open_shared(&path).expect("the file opens");
+    let warnings = place(&path).expect("the file opens");
     assert_eq!(warnings, matching_header().warnings);
+    let net = Region::<0>::new();
     assert_eq!(
-        net.ft_weights.len(),
+        net.ft_weights().len(),
         yorkie_eval::HIDDEN_SIZE * yorkie_eval::NUM_FEATURES
     );
     assert!(
-        net.ft_weights.iter().all(|&w| w == 0),
+        net.ft_weights().iter().all(|&w| w == 0),
         "the parameter region of this file is a hole, which reads as zeros"
     );
     let (addr, len) = net.parameter_region();
@@ -183,7 +202,7 @@ fn a_file_from_another_build_is_refused_when_it_is_opened() {
     header.source = other_source();
     write_file(&path, &header);
 
-    let err = network_file::open_shared(&path).expect_err("must refuse");
+    let err = place(&path).expect_err("must refuse");
     assert!(
         format!("{err}").contains("not the one this build reads"),
         "got: {err}"
@@ -197,7 +216,7 @@ fn a_file_from_another_build_is_refused_when_it_is_opened() {
 fn an_absent_file_is_reported_as_the_missing_network_it_is() {
     let path = temp_path("absent");
     let _ = std::fs::remove_file(&path);
-    let err = network_file::open_shared(&path).expect_err("must fail");
+    let err = place(&path).expect_err("must fail");
     let message = format!("{err}");
     assert!(
         message.contains("failed to open NNUE file"),

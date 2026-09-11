@@ -23,7 +23,7 @@ use crate::transformer::{Accumulator, FT_OUTPUT_DIMS};
 use crate::types::{
     FC_0_INPUT_DIMS, FC_0_OUTPUT_DIMS, FC_0_PADDED_INPUT_DIMS, FC_1_INPUT_DIMS, FC_1_OUTPUT_DIMS,
     FC_1_PADDED_INPUT_DIMS, FC_2_INPUT_DIMS, FC_2_OUTPUT_DIMS, FC_2_PADDED_INPUT_DIMS,
-    HIDDEN1_DIMS, LAYER_STACKS, NetworkStack, NnueNetwork,
+    HIDDEN1_DIMS, LAYER_STACKS, NetStack, NetworkParams,
 };
 
 /// The fixed-point scale applied to the network output to produce the final
@@ -76,7 +76,7 @@ pub fn layer_stack_index(pos: &Position) -> usize {
 ///
 /// # Panics
 /// Panics if `pos` is missing either king.
-pub fn evaluate(net: &NnueNetwork, pos: &Position) -> i32 {
+pub fn evaluate<N: NetworkParams>(net: N, pos: &Position) -> i32 {
     let mut acc = Accumulator::new();
     acc.refresh(net, pos);
     evaluate_with(net, &acc, pos)
@@ -88,14 +88,13 @@ pub fn evaluate(net: &NnueNetwork, pos: &Position) -> i32 {
 ///
 /// # Panics
 /// Panics if `pos` is missing either king.
-pub fn evaluate_with(net: &NnueNetwork, acc: &Accumulator, pos: &Position) -> i32 {
+pub fn evaluate_with<N: NetworkParams>(net: N, acc: &Accumulator, pos: &Position) -> i32 {
     let bucket = layer_stack_index(pos);
-    debug_assert!(bucket < net.stacks.len());
 
     let mut transformed = [0u8; FT_OUTPUT_DIMS];
     acc.output_transform(pos.side_to_move(), &mut transformed);
 
-    let score = per_layer_flow(&transformed, &net.stacks[bucket]);
+    let score = per_layer_flow(&transformed, net.stack(bucket));
     // The one site that consumes `FV_SCALE`.
     score / FV_SCALE
 }
@@ -112,7 +111,7 @@ pub fn evaluate_with(net: &NnueNetwork, acc: &Accumulator, pos: &Position) -> i3
     target_feature = "avx512bw",
     target_feature = "avx512vnni"
 ))]
-fn per_layer_flow(transformed: &[u8; FC_0_INPUT_DIMS], stack: &NetworkStack) -> i32 {
+fn per_layer_flow(transformed: &[u8; FC_0_INPUT_DIMS], stack: NetStack) -> i32 {
     // Imported here rather than at module scope, where the `use` would be
     // unused on a non-VNNI build.
     use crate::simd;
@@ -124,12 +123,12 @@ fn per_layer_flow(transformed: &[u8; FC_0_INPUT_DIMS], stack: &NetworkStack) -> 
     unsafe {
         simd::avx512_post_ft::fused_fc_chain(
             transformed,
-            &stack.fc_0_biases,
-            &stack.fc_0_weights,
-            &stack.fc_1_biases,
-            &stack.fc_1_weights,
-            &stack.fc_2_biases,
-            &stack.fc_2_weights,
+            stack.fc_0_biases(),
+            stack.fc_0_weights(),
+            stack.fc_1_biases(),
+            stack.fc_1_weights(),
+            stack.fc_2_biases(),
+            stack.fc_2_weights(),
         )
     }
 }
@@ -142,7 +141,7 @@ fn per_layer_flow(transformed: &[u8; FC_0_INPUT_DIMS], stack: &NetworkStack) -> 
     target_feature = "avx512bw",
     target_feature = "avx512vnni"
 )))]
-fn per_layer_flow(transformed: &[u8; FC_0_INPUT_DIMS], stack: &NetworkStack) -> i32 {
+fn per_layer_flow(transformed: &[u8; FC_0_INPUT_DIMS], stack: NetStack) -> i32 {
     per_layer_flow_unfused(transformed, stack)
 }
 
@@ -150,12 +149,12 @@ fn per_layer_flow(transformed: &[u8; FC_0_INPUT_DIMS], stack: &NetworkStack) -> 
 /// can hold it against the fused chain, which is why a VNNI build needs the
 /// `allow(dead_code)`.
 #[allow(dead_code)]
-fn per_layer_flow_unfused(transformed: &[u8; FC_0_INPUT_DIMS], stack: &NetworkStack) -> i32 {
+fn per_layer_flow_unfused(transformed: &[u8; FC_0_INPUT_DIMS], stack: NetStack) -> i32 {
     let mut fc_0_out = [0i32; FC_0_OUTPUT_DIMS];
     post_ft_kernel::affine(
         &mut fc_0_out,
-        &stack.fc_0_biases,
-        &stack.fc_0_weights,
+        stack.fc_0_biases(),
+        stack.fc_0_weights(),
         transformed,
         FC_0_INPUT_DIMS,
         FC_0_PADDED_INPUT_DIMS,
@@ -175,8 +174,8 @@ fn per_layer_flow_unfused(transformed: &[u8; FC_0_INPUT_DIMS], stack: &NetworkSt
     let mut fc_1_out = [0i32; FC_1_OUTPUT_DIMS];
     post_ft_kernel::affine(
         &mut fc_1_out,
-        &stack.fc_1_biases,
-        &stack.fc_1_weights,
+        stack.fc_1_biases(),
+        stack.fc_1_weights(),
         &fc_1_in,
         FC_1_INPUT_DIMS,
         FC_1_PADDED_INPUT_DIMS,
@@ -188,8 +187,8 @@ fn per_layer_flow_unfused(transformed: &[u8; FC_0_INPUT_DIMS], stack: &NetworkSt
     let mut fc_2_out = [0i32; FC_2_OUTPUT_DIMS];
     post_ft_kernel::affine(
         &mut fc_2_out,
-        &stack.fc_2_biases,
-        &stack.fc_2_weights,
+        stack.fc_2_biases(),
+        stack.fc_2_weights(),
         &ac_1,
         FC_2_INPUT_DIMS,
         FC_2_PADDED_INPUT_DIMS,
@@ -202,38 +201,15 @@ fn per_layer_flow_unfused(transformed: &[u8; FC_0_INPUT_DIMS], stack: &NetworkSt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{NetDims, NetHeader, NnueNetworkBuilder};
+    use crate::types::OwnedNetwork;
     use yorkie_state::parse_sfen;
-
-    fn synthetic_header() -> NetHeader {
-        NetHeader {
-            version: 0,
-            hash: 0,
-            arch_id: "synthetic".to_string(),
-        }
-    }
-
-    /// A builder with the standard FC dims but a one-feature transformer, so
-    /// the FC forward pass runs without a 215 MiB allocation.
-    fn builder_tiny_ft() -> NnueNetworkBuilder {
-        let dims = NetDims {
-            num_features: 1,
-            ..NetDims::STANDARD
-        };
-        NnueNetworkBuilder::with_dims(synthetic_header(), [0u8; 32], &dims)
-    }
-
-    /// An all-zero network with the standard FC dims (tiny FT).
-    fn zero_net_tiny_ft() -> NnueNetwork {
-        builder_tiny_ft().build()
-    }
 
     #[test]
     fn zero_network_evaluates_to_zero() {
         // `per_layer_flow` ignores the feature transformer.
-        let net = zero_net_tiny_ft();
+        let owned = OwnedNetwork::zeroed();
         let transformed = [0u8; FC_0_INPUT_DIMS];
-        assert_eq!(per_layer_flow(&transformed, &net.stacks[0]), 0);
+        assert_eq!(per_layer_flow(&transformed, owned.network().stack(0)), 0);
     }
 
     #[test]
@@ -243,7 +219,7 @@ mod tests {
         // fc_0_out[15]=100+4*39=256. ac_0[0]=167>>6=2, ac_sqr_0 all 0.
         // fc_1_in[15]=2 -> fc_1_out[0]=30+7*2=44; ac_1[0]=44>>6=0.
         // fc_2_out[0]=1000+256=1256.
-        let mut b = builder_tiny_ft();
+        let mut b = OwnedNetwork::zeroed();
         b.fc_0_biases_mut(0)[0] = 50;
         b.fc_0_weights_mut(0)[0] = 3;
         b.fc_0_biases_mut(0)[HIDDEN1_DIMS] = 100;
@@ -251,8 +227,7 @@ mod tests {
         b.fc_1_biases_mut(0)[0] = 30;
         b.fc_1_weights_mut(0)[15] = 7;
         b.fc_2_biases_mut(0)[0] = 1_000;
-        let net = b.build();
-        let stack = &net.stacks[0];
+        let stack = b.network().stack(0);
 
         let mut transformed = [0u8; FC_0_INPUT_DIMS];
         transformed[0] = 39;
@@ -267,7 +242,7 @@ mod tests {
         // On a VNNI build this pits the fused chain against the unfused one; on
         // any other build the two are the same code, and the check merely keeps
         // the unfused form exercised.
-        let mut b = builder_tiny_ft();
+        let mut b = OwnedNetwork::zeroed();
         for (i, w) in b.fc_0_weights_mut(0).iter_mut().enumerate() {
             *w = ((i as i32 * 7) % 61 - 30) as i8;
         }
@@ -286,8 +261,7 @@ mod tests {
         for (i, bias) in b.fc_2_biases_mut(0).iter_mut().enumerate() {
             *bias = (i as i32 * 211) % 2_001 - 1_000;
         }
-        let net = b.build();
-        let stack = &net.stacks[0];
+        let stack = b.network().stack(0);
 
         for seed in [0u32, 1, 97] {
             let mut transformed = [0u8; FC_0_INPUT_DIMS];
@@ -304,12 +278,12 @@ mod tests {
 
     #[test]
     fn evaluate_zero_network_is_zero_for_both_sides() {
-        // Full-size zeroed FT weights, so the refresh's feature-column indexing
-        // stays in bounds; the sparse positions below touch few pages.
-        let net = NnueNetworkBuilder::new(synthetic_header(), [0u8; 32]).build();
+        // Zeroed FT weights, so the refresh's feature-column indexing stays in
+        // bounds; the sparse positions below touch few pages.
+        let owned = OwnedNetwork::zeroed();
         for sfen in ["8K/9/9/9/9/9/9/9/8k b - 1", "8K/9/9/9/9/9/9/9/8k w - 1"] {
             let pos = parse_sfen(sfen).unwrap();
-            assert_eq!(evaluate(&net, &pos), 0, "sfen `{sfen}`");
+            assert_eq!(evaluate(owned.network(), &pos), 0, "sfen `{sfen}`");
         }
     }
 

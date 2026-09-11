@@ -1,9 +1,16 @@
-//! The loaded network and the loader error type for SFNN-1536.
+//! Where the parameters of SFNN-1536 are, and the loader error type.
 //!
 //! The dimensions and the byte layout the parameters sit in are the shared
-//! definition the build script writes the evaluation file from; what this
-//! module adds is the typed views the kernels read through, and the memory
-//! those views point into.
+//! definition the build script writes the evaluation file from. What this
+//! module adds is the addressing: every array's offset inside the parameter
+//! region is a compile-time constant, so a network is nothing but the address
+//! that region starts at, and its accessors are `base + literal` — no view to
+//! build, no table to walk, nothing to keep alive.
+//!
+//! *Which* address is a type, not a value: [`NetworkParams`] is the contract,
+//! [`crate::network_file::Region`] answers it with the linker's address and
+//! therefore has no fields, and [`PtrNetwork`] answers it with an address
+//! chosen while the process runs.
 //!
 //! The prose here follows the reference's naming: the **FT layer** is the
 //! feature transformer, and **L1 / L2 / L3** are the dense layers after it. The
@@ -12,267 +19,275 @@
 
 use std::fmt;
 
-use yorkie_storage::{ArenaSlice, MappedRegion};
-
 #[cfg(any(test, feature = "source-network"))]
 use yorkie_storage::LargePageArray;
 
+use crate::nnue_layout::{DATA_BYTES, SECTION_ALIGN, SPANS, Span, StackSpans};
 pub use crate::nnue_layout::{
     FC_0_INPUT_DIMS, FC_0_OUTPUT_DIMS, FC_0_PADDED_INPUT_DIMS, FC_1_INPUT_DIMS, FC_1_OUTPUT_DIMS,
     FC_1_PADDED_INPUT_DIMS, FC_2_INPUT_DIMS, FC_2_OUTPUT_DIMS, FC_2_PADDED_INPUT_DIMS, HIDDEN_SIZE,
     HIDDEN1_DIMS, HIDDEN2_DIMS, LAYER_STACKS, NUM_FEATURES, NetDims, NetHeader,
 };
-use crate::nnue_layout::{Span, StackSpans, net_spans};
 
-/// One layer stack's parameter arrays, each a 64-byte-aligned view into the
-/// network's one region of memory.
-#[derive(Debug)]
-pub struct NetworkStack {
-    pub fc_0_biases: ArenaSlice<i32>,
-    pub fc_0_weights: ArenaSlice<i8>,
-    pub fc_1_biases: ArenaSlice<i32>,
-    pub fc_1_weights: ArenaSlice<i8>,
-    pub fc_2_biases: ArenaSlice<i32>,
-    pub fc_2_weights: ArenaSlice<i8>,
+/// The feature transformer's two arrays, at the offsets the layout fixed.
+const FT_BIASES: Span = SPANS.ft_biases;
+const FT_WEIGHTS: Span = SPANS.ft_weights;
+
+/// The first layer stack's six arrays, and the distance from one stack to the
+/// next. Every stack has the same shape, so the stacks are evenly spaced and a
+/// bucket's arrays are reached by multiplying rather than by looking an offset
+/// up.
+const STACK_0: StackSpans = SPANS.stacks[0];
+const STACK_STRIDE: usize = SPANS.stacks[1].fc_0_biases.offset - STACK_0.fc_0_biases.offset;
+
+// The even spacing the stride assumes, proved over every stack rather than
+// asserted about the first two.
+const _: () = {
+    let mut i = 0;
+    while i < LAYER_STACKS {
+        let stack = SPANS.stacks[i];
+        let step = i * STACK_STRIDE;
+        assert!(stack.fc_0_biases.offset == STACK_0.fc_0_biases.offset + step);
+        assert!(stack.fc_0_weights.offset == STACK_0.fc_0_weights.offset + step);
+        assert!(stack.fc_1_biases.offset == STACK_0.fc_1_biases.offset + step);
+        assert!(stack.fc_1_weights.offset == STACK_0.fc_1_weights.offset + step);
+        assert!(stack.fc_2_biases.offset == STACK_0.fc_2_biases.offset + step);
+        assert!(stack.fc_2_weights.offset == STACK_0.fc_2_weights.offset + step);
+        i += 1;
+    }
+};
+
+// Every array starts on the cache line the AVX-512 loads assume, and the whole
+// walk fits the region the file's data section is sized to.
+const _: () = assert!(FT_BIASES.offset.is_multiple_of(SECTION_ALIGN));
+const _: () = assert!(FT_WEIGHTS.offset.is_multiple_of(SECTION_ALIGN));
+const _: () = assert!(STACK_STRIDE.is_multiple_of(SECTION_ALIGN));
+const _: () = assert!(SPANS.total_bytes == DATA_BYTES);
+
+/// One layer stack's parameter arrays: the address its `fc_0_biases` starts at,
+/// with the other five a literal away.
+#[derive(Clone, Copy, Debug)]
+pub struct NetStack {
+    /// The stack's own base — the region's base advanced by the stack's stride
+    /// — so the six offsets below are the same literals for every bucket.
+    base: *const u8,
 }
 
-/// The memory a network's parameters live in, kept alongside the views so it
-/// outlives them.
-pub(crate) enum Backing {
-    /// The evaluation file's own pages, mapped read-only and shared with every
-    /// process that maps them.
-    Mapped(MappedRegion),
-    /// A region this binary declares, one per NUMA node whose workers read it.
-    /// It is `static`, so there is nothing to keep alive here.
-    Region,
-    /// A block on the heap, for the tooling that builds a network in memory
-    /// rather than reading one the build laid out.
-    #[cfg(any(test, feature = "source-network"))]
-    Owned(LargePageArray<u8>),
+impl NetStack {
+    pub fn fc_0_biases(&self) -> &[i32] {
+        // SAFETY: as `NetworkParams::parameters`, for this array of this stack.
+        unsafe { array(self.base, STACK_0.fc_0_biases) }
+    }
+
+    pub fn fc_0_weights(&self) -> &[i8] {
+        // SAFETY: as above.
+        unsafe { array(self.base, STACK_0.fc_0_weights) }
+    }
+
+    pub fn fc_1_biases(&self) -> &[i32] {
+        // SAFETY: as above.
+        unsafe { array(self.base, STACK_0.fc_1_biases) }
+    }
+
+    pub fn fc_1_weights(&self) -> &[i8] {
+        // SAFETY: as above.
+        unsafe { array(self.base, STACK_0.fc_1_weights) }
+    }
+
+    pub fn fc_2_biases(&self) -> &[i32] {
+        // SAFETY: as above.
+        unsafe { array(self.base, STACK_0.fc_2_biases) }
+    }
+
+    pub fn fc_2_weights(&self) -> &[i8] {
+        // SAFETY: as above.
+        unsafe { array(self.base, STACK_0.fc_2_weights) }
+    }
 }
 
-impl fmt::Debug for Backing {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Backing::Mapped(region) => write!(f, "Mapped({region:?})"),
-            Backing::Region => f.write_str("Region"),
-            #[cfg(any(test, feature = "source-network"))]
-            Backing::Owned(bytes) => write!(f, "Owned({} bytes)", bytes.len()),
+/// The module [`NetworkParams`] is sealed against: implementing it outside this
+/// crate would mean naming a trait that is not reachable from outside it.
+pub(crate) mod sealed {
+    pub trait Sealed {}
+}
+
+/// A network: the address its parameters start at, and the arrays a constant
+/// away from it.
+///
+/// Everything but the address is a constant — which array sits where, how long
+/// each one is, how far apart the layer stacks are — so an evaluation reaches a
+/// parameter at the address plus a literal. There is no view to load, nothing
+/// to reference-count, and nothing that has to be kept alive alongside it.
+///
+/// Which address is a *type*: [`crate::network_file::Region`] carries none at
+/// all, because its parameters are where the linker put them, and
+/// [`PtrNetwork`] carries one because its are wherever the process put them.
+/// Everything that reads parameters — the kernels, the accumulator, the finny
+/// cache, the search — is generic over this trait and monomorphised for the one
+/// it is given. `Sized` is a supertrait for that reason: it makes
+/// `dyn NetworkParams` a compile error, so nothing can turn the choice back
+/// into a run-time one.
+pub trait NetworkParams: sealed::Sealed + Copy + Send + Sync + Sized {
+    /// The address the parameters start at.
+    ///
+    /// It must address at least `DATA_BYTES` initialised bytes, aligned to a
+    /// 64-byte boundary and laid out as the shared layout describes, and they
+    /// must stay there, unwritten, for as long as this network is read. Every
+    /// accessor below relies on that, which is why the trait is sealed.
+    fn parameters(&self) -> *const u8;
+
+    /// The address and length of the parameters, for a caller placing them: a
+    /// NUMA policy over the pages, or a huge-page hint.
+    fn parameter_region(&self) -> (usize, usize) {
+        (self.parameters() as usize, DATA_BYTES)
+    }
+
+    fn ft_biases(&self) -> &[i16] {
+        // SAFETY: as `NetworkParams::parameters`, for the feature transformer's
+        // biases.
+        unsafe { array(self.parameters(), FT_BIASES) }
+    }
+
+    fn ft_weights(&self) -> &[i16] {
+        // SAFETY: as above, for its weights.
+        unsafe { array(self.parameters(), FT_WEIGHTS) }
+    }
+
+    /// Layer stack `bucket`'s six arrays.
+    ///
+    /// The stride carries the bucket, so what the stack's own accessors add is
+    /// the first stack's offsets — the same literals whichever bucket this is.
+    fn stack(&self, bucket: usize) -> NetStack {
+        debug_assert!(bucket < LAYER_STACKS);
+        NetStack {
+            // SAFETY: `bucket` is below `LAYER_STACKS`, so the stack it names
+            // lies inside the region the implementor vouched for.
+            base: unsafe { self.parameters().add(bucket * STACK_STRIDE) },
         }
     }
 }
 
-/// A loaded SFNN network.
+/// A network at an address the process chose, rather than one the linker fixed.
 ///
-/// Every parameter array is a 64-byte-aligned [`ArenaSlice`] view into **one**
-/// contiguous region, which is what the AVX-512 kernels require and what lets
-/// the whole network be a single mapping or a single copy.
-///
-/// The views are read-only by contract: the region behind a mapped network is
-/// mapped without write permission, so taking a `&mut` to one would fault.
-/// Nothing does — a network is reached through a shared reference from the
-/// moment it exists.
-pub struct NnueNetwork {
-    pub header: NetHeader,
-    /// The memory the views point into, dropped after them (views carry no drop
-    /// glue, so field order cannot produce a use-after-free).
-    backing: Backing,
-    /// The address and byte length of the parameters, for a caller placing
-    /// them.
-    region: (usize, usize),
-    pub ft_biases: ArenaSlice<i16>,
-    pub ft_weights: ArenaSlice<i16>,
-    /// The layer stacks, inline: an evaluation reaches its bucket's stack at a
-    /// fixed offset from the network rather than through a pointer of its own.
-    pub stacks: [NetworkStack; LAYER_STACKS],
-    /// The SHA-256 of the network file this one's parameters came from; all
-    /// zero when they were not read from one.
-    pub sha256: [u8; 32],
+/// The engine never plays with one: what it plays with is
+/// [`crate::network_file::Region`], whose address is a constant. This is for
+/// everything that reads parameters from somewhere else — a network a test made
+/// up, and the source file's own reader — and it is what lets two different
+/// networks exist in one process, which is the whole of why it is a second
+/// type.
+#[derive(Clone, Copy, Debug)]
+pub struct PtrNetwork {
+    base: *const u8,
 }
 
-/// The parameters themselves are a few hundred mebibytes, so what a network
-/// shows of itself is what it is, not what it holds.
-impl fmt::Debug for NnueNetwork {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("NnueNetwork")
-            .field("header", &self.header)
-            .field("backing", &self.backing)
-            .field("stacks", &self.stacks.len())
-            .finish()
-    }
-}
+// SAFETY: a network is read-only from the moment it exists — the parameters are
+// written once, before any thread reads them — so handing the address to
+// another thread exposes nothing a `&[u8]` would not.
+unsafe impl Send for PtrNetwork {}
+unsafe impl Sync for PtrNetwork {}
 
-impl NnueNetwork {
-    /// Build the views of a network whose parameters are already laid out at
-    /// `base`.
-    ///
-    /// The stack count is part of the type, so `dims` has to name
-    /// [`LAYER_STACKS`] of them.
+impl sealed::Sealed for PtrNetwork {}
+
+impl PtrNetwork {
+    /// The network whose parameters start at `base`.
     ///
     /// # Safety
-    /// `base` must address at least `data_bytes(dims)` initialised bytes,
-    /// aligned to a 64-byte boundary, laid out as the shared layout describes,
-    /// and they must live as long as `backing` keeps them — which is for the
-    /// life of the returned network.
-    pub(crate) unsafe fn over(
-        header: NetHeader,
-        sha256: [u8; 32],
-        dims: &NetDims,
-        base: *mut u8,
-        backing: Backing,
-    ) -> Self {
-        assert_eq!(
-            dims.layer_stacks, LAYER_STACKS,
-            "a network in memory carries exactly {LAYER_STACKS} layer stacks",
-        );
-        let spans = net_spans(dims);
-        // SAFETY: every span lies inside the region the caller vouched for, and
-        // each starts on a 64-byte boundary, so each view is aligned and
-        // in-bounds; the spans are disjoint, so no two views alias.
-        let stacks = std::array::from_fn(|i| unsafe { stack_views(base, &spans.stacks[i]) });
-        // SAFETY: as the stacks above, for the two feature-transformer spans.
-        unsafe {
-            Self {
-                header,
-                backing,
-                region: (base as usize, spans.total_bytes),
-                ft_biases: view(base, spans.ft_biases),
-                ft_weights: view(base, spans.ft_weights),
-                stacks,
-                sha256,
-            }
-        }
-    }
-
-    /// The `(address, byte length)` of the parameters, for a caller placing
-    /// them: a huge-page hint over the region, or a memory policy over its
-    /// pages.
-    ///
-    /// The address is a `usize` because the consumer hands it to the kernel as
-    /// a range descriptor and never dereferences it. It is on a huge-page
-    /// boundary however the parameters were read.
-    pub fn parameter_region(&self) -> (usize, usize) {
-        self.region
+    /// `base` must meet what [`NetworkParams::parameters`] requires of the
+    /// address it returns.
+    pub const unsafe fn over(base: *const u8) -> Self {
+        Self { base }
     }
 }
 
-/// One typed view of `span` inside the region at `base`.
+impl NetworkParams for PtrNetwork {
+    fn parameters(&self) -> *const u8 {
+        self.base
+    }
+}
+
+/// The typed array `span` describes, measured from `base`.
 ///
 /// # Safety
-/// As [`NnueNetwork::over`], for this one span.
-unsafe fn view<T>(base: *mut u8, span: Span) -> ArenaSlice<T> {
-    // SAFETY: the caller vouches for the region; `span.offset` is 64-byte
-    // aligned, hence aligned for `T`.
-    unsafe { ArenaSlice::from_raw(base.add(span.offset) as *mut T, span.count) }
+/// As [`NetworkParams::parameters`], for this one array.
+unsafe fn array<'a, T>(base: *const u8, span: Span) -> &'a [T] {
+    // SAFETY: the caller vouches for the region; every span starts on a
+    // 64-byte boundary, hence aligned for `T`.
+    unsafe { std::slice::from_raw_parts(base.add(span.offset) as *const T, span.count) }
 }
 
-/// The six views of one layer stack.
+/// A network in this process's own memory, filled array by array.
 ///
-/// # Safety
-/// As [`NnueNetwork::over`], for this stack's spans.
-unsafe fn stack_views(base: *mut u8, spans: &StackSpans) -> NetworkStack {
-    // SAFETY: as `view`, for each of the stack's disjoint spans.
-    unsafe {
-        NetworkStack {
-            fc_0_biases: view(base, spans.fc_0_biases),
-            fc_0_weights: view(base, spans.fc_0_weights),
-            fc_1_biases: view(base, spans.fc_1_biases),
-            fc_1_weights: view(base, spans.fc_1_weights),
-            fc_2_biases: view(base, spans.fc_2_biases),
-            fc_2_weights: view(base, spans.fc_2_weights),
-        }
-    }
-}
-
-/// In-place builder for a [`NnueNetwork`] in this process's own memory:
-/// allocate the region up front, fill each parameter array through a mutable
-/// view of it, then [`build`](Self::build).
-///
-/// The engine never builds a network this way — it reads one the build already
-/// laid out — so this is compiled only into the tooling that needs a network in
-/// memory: a synthetic one a test writes parameter by parameter, and the source
-/// file's own reader.
+/// The engine never builds one — it reads the region the evaluation file was
+/// placed in — so this is compiled only into the tooling that needs a network
+/// it made up: a synthetic one a test writes parameter by parameter, and the
+/// source file's own reader. The parameters go in the layout the kernels read,
+/// which is the layout the constants above address, so the dimensions are the
+/// shipped ones and nothing else.
 #[cfg(any(test, feature = "source-network"))]
-pub struct NnueNetworkBuilder {
-    header: NetHeader,
-    sha256: [u8; 32],
-    dims: NetDims,
-    spans: crate::nnue_layout::NetSpans,
+pub struct OwnedNetwork {
     bytes: LargePageArray<u8>,
 }
 
 #[cfg(any(test, feature = "source-network"))]
-impl NnueNetworkBuilder {
-    /// A zeroed builder for the shipped SFNN-1536 dimensions.
-    pub fn new(header: NetHeader, sha256: [u8; 32]) -> Self {
-        Self::with_dims(header, sha256, &NetDims::STANDARD)
-    }
-
-    /// A zeroed builder for arbitrary `dims`.
-    pub fn with_dims(header: NetHeader, sha256: [u8; 32], dims: &NetDims) -> Self {
-        let spans = net_spans(dims);
+impl OwnedNetwork {
+    /// A network of all-zero parameters.
+    pub fn zeroed() -> Self {
         Self {
-            header,
-            sha256,
-            dims: *dims,
-            bytes: LargePageArray::<u8>::zeroed(spans.total_bytes.max(1)),
-            spans,
+            bytes: LargePageArray::<u8>::zeroed(DATA_BYTES),
         }
     }
 
-    /// Mutable view of `ft_biases` (`hidden_size` i16).
-    pub fn ft_biases_mut(&mut self) -> &mut [i16] {
-        let span = self.spans.ft_biases;
-        self.slice_mut(span)
+    /// The network these parameters make up.
+    ///
+    /// Borrowed from the owner, so nothing reads the parameters after the block
+    /// holding them is gone.
+    pub fn network(&self) -> PtrNetwork {
+        // SAFETY: the block holds `DATA_BYTES` zeroed — hence initialised —
+        // bytes on a large-page boundary, so every span is aligned and
+        // in-bounds, and the borrow keeps it alive for as long as the network.
+        unsafe { PtrNetwork::over(self.bytes.as_ptr()) }
     }
 
-    /// Mutable view of `ft_weights` (`hidden_size * num_features` i16).
+    /// Mutable view of `ft_biases` (`HIDDEN_SIZE` i16).
+    pub fn ft_biases_mut(&mut self) -> &mut [i16] {
+        self.slice_mut(FT_BIASES)
+    }
+
+    /// Mutable view of `ft_weights` (`HIDDEN_SIZE * NUM_FEATURES` i16).
     pub fn ft_weights_mut(&mut self) -> &mut [i16] {
-        let span = self.spans.ft_weights;
-        self.slice_mut(span)
+        self.slice_mut(FT_WEIGHTS)
     }
 
     /// Mutable view of stack `i`'s `fc_0_biases`.
     pub fn fc_0_biases_mut(&mut self, i: usize) -> &mut [i32] {
-        let span = self.spans.stacks[i].fc_0_biases;
-        self.slice_mut(span)
+        self.slice_mut(SPANS.stacks[i].fc_0_biases)
     }
     /// Mutable view of stack `i`'s `fc_0_weights`.
     pub fn fc_0_weights_mut(&mut self, i: usize) -> &mut [i8] {
-        let span = self.spans.stacks[i].fc_0_weights;
-        self.slice_mut(span)
+        self.slice_mut(SPANS.stacks[i].fc_0_weights)
     }
     /// Mutable view of stack `i`'s `fc_1_biases`.
     pub fn fc_1_biases_mut(&mut self, i: usize) -> &mut [i32] {
-        let span = self.spans.stacks[i].fc_1_biases;
-        self.slice_mut(span)
+        self.slice_mut(SPANS.stacks[i].fc_1_biases)
     }
     /// Mutable view of stack `i`'s `fc_1_weights`.
     pub fn fc_1_weights_mut(&mut self, i: usize) -> &mut [i8] {
-        let span = self.spans.stacks[i].fc_1_weights;
-        self.slice_mut(span)
+        self.slice_mut(SPANS.stacks[i].fc_1_weights)
     }
     /// Mutable view of stack `i`'s `fc_2_biases`.
     pub fn fc_2_biases_mut(&mut self, i: usize) -> &mut [i32] {
-        let span = self.spans.stacks[i].fc_2_biases;
-        self.slice_mut(span)
+        self.slice_mut(SPANS.stacks[i].fc_2_biases)
     }
     /// Mutable view of stack `i`'s `fc_2_weights`.
     pub fn fc_2_weights_mut(&mut self, i: usize) -> &mut [i8] {
-        let span = self.spans.stacks[i].fc_2_weights;
-        self.slice_mut(span)
+        self.slice_mut(SPANS.stacks[i].fc_2_weights)
     }
 
-    /// Number of layer stacks the layout carries.
-    pub fn layer_stacks(&self) -> usize {
-        self.spans.stacks.len()
-    }
-
-    /// The raw parameter bytes being filled, in the layout the kernels read
-    /// them — what the source file's reader hands out so the same bytes can be
-    /// held against the file the build wrote.
+    /// The raw parameter bytes, in the layout the kernels read them — what the
+    /// source file's reader hands out so the same bytes can be held against the
+    /// file the build wrote.
     pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..self.spans.total_bytes]
+        &self.bytes[..DATA_BYTES]
     }
 
     /// Overwrite the whole parameter region with `bytes`, which must be the
@@ -280,28 +295,10 @@ impl NnueNetworkBuilder {
     pub fn fill(&mut self, bytes: &[u8]) {
         assert_eq!(
             bytes.len(),
-            self.spans.total_bytes,
+            DATA_BYTES,
             "the parameter region's size is fixed by the dimensions",
         );
         self.bytes[..bytes.len()].copy_from_slice(bytes);
-    }
-
-    /// Finish: consume the filled region and produce the network (no copy).
-    pub fn build(self) -> NnueNetwork {
-        let base = self.bytes.as_ptr() as *mut u8;
-        // SAFETY: the block holds `total_bytes` zeroed — hence initialised —
-        // bytes on a large-page boundary, so every span is aligned and
-        // in-bounds, and it moves into the network as the backing, which keeps
-        // it alive for exactly as long as the views.
-        unsafe {
-            NnueNetwork::over(
-                self.header,
-                self.sha256,
-                &self.dims,
-                base,
-                Backing::Owned(self.bytes),
-            )
-        }
     }
 
     /// A typed mutable view of `span` in the block being filled.
@@ -374,44 +371,33 @@ impl std::error::Error for NnueError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nnue_layout::{DATA_BYTES, SECTION_ALIGN, data_bytes};
-
-    /// A small synthetic net for the layout tests: a tiny feature transformer,
-    /// standard FC shapes and stack count.
-    fn small_net() -> NnueNetwork {
-        let dims = NetDims {
-            num_features: 3,
-            ..NetDims::STANDARD
-        };
-        let header = NetHeader {
-            version: 0,
-            hash: 0,
-            arch_id: "layout-test".to_string(),
-        };
-        NnueNetworkBuilder::with_dims(header, [0u8; 32], &dims).build()
-    }
+    use crate::nnue_layout::net_spans;
 
     /// Every parameter sub-array's `(start_addr, byte_len)`.
-    fn sub_arrays(net: &NnueNetwork) -> Vec<(usize, usize)> {
+    fn sub_arrays(net: &PtrNetwork) -> Vec<(usize, usize)> {
         let mut v = vec![
-            (net.ft_biases.as_ptr() as usize, net.ft_biases.len() * 2),
-            (net.ft_weights.as_ptr() as usize, net.ft_weights.len() * 2),
+            (net.ft_biases().as_ptr() as usize, net.ft_biases().len() * 2),
+            (
+                net.ft_weights().as_ptr() as usize,
+                net.ft_weights().len() * 2,
+            ),
         ];
-        for s in &net.stacks {
-            v.push((s.fc_0_biases.as_ptr() as usize, s.fc_0_biases.len() * 4));
-            v.push((s.fc_0_weights.as_ptr() as usize, s.fc_0_weights.len()));
-            v.push((s.fc_1_biases.as_ptr() as usize, s.fc_1_biases.len() * 4));
-            v.push((s.fc_1_weights.as_ptr() as usize, s.fc_1_weights.len()));
-            v.push((s.fc_2_biases.as_ptr() as usize, s.fc_2_biases.len() * 4));
-            v.push((s.fc_2_weights.as_ptr() as usize, s.fc_2_weights.len()));
+        for i in 0..LAYER_STACKS {
+            let s = net.stack(i);
+            v.push((s.fc_0_biases().as_ptr() as usize, s.fc_0_biases().len() * 4));
+            v.push((s.fc_0_weights().as_ptr() as usize, s.fc_0_weights().len()));
+            v.push((s.fc_1_biases().as_ptr() as usize, s.fc_1_biases().len() * 4));
+            v.push((s.fc_1_weights().as_ptr() as usize, s.fc_1_weights().len()));
+            v.push((s.fc_2_biases().as_ptr() as usize, s.fc_2_biases().len() * 4));
+            v.push((s.fc_2_weights().as_ptr() as usize, s.fc_2_weights().len()));
         }
         v
     }
 
     #[test]
     fn every_sub_array_is_64_byte_aligned() {
-        let net = small_net();
-        for (addr, _) in sub_arrays(&net) {
+        let owned = OwnedNetwork::zeroed();
+        for (addr, _) in sub_arrays(&owned.network()) {
             assert_eq!(
                 addr % SECTION_ALIGN,
                 0,
@@ -422,8 +408,8 @@ mod tests {
 
     #[test]
     fn sub_arrays_are_disjoint_and_inside_one_region() {
-        let net = small_net();
-        let mut spans = sub_arrays(&net);
+        let owned = OwnedNetwork::zeroed();
+        let mut spans = sub_arrays(&owned.network());
         spans.sort_by_key(|&(addr, _)| addr);
         // Pairwise non-overlap: each start is at or after the previous end.
         for w in spans.windows(2) {
@@ -435,54 +421,32 @@ mod tests {
             );
         }
         // The whole spread fits inside the one region the dimensions size.
-        let dims = NetDims {
-            num_features: 3,
-            ..NetDims::STANDARD
-        };
         let (first, _) = *spans.first().unwrap();
         let (last, last_len) = *spans.last().unwrap();
-        assert!((last + last_len) - first <= data_bytes(&dims));
+        assert!((last + last_len) - first <= DATA_BYTES);
     }
 
     #[test]
-    fn builder_fills_are_visible_through_the_views() {
-        let dims = NetDims {
-            num_features: 3,
-            ..NetDims::STANDARD
-        };
-        let mut b = NnueNetworkBuilder::with_dims(
-            NetHeader {
-                version: 1,
-                hash: 2,
-                arch_id: "fill".to_string(),
-            },
-            [7u8; 32],
-            &dims,
-        );
-        b.ft_biases_mut()[0] = -321;
-        b.ft_weights_mut()[dims.hidden_size] = 99; // second feature column, lane 0
-        b.fc_0_biases_mut(1)[3] = 77;
-        b.fc_2_weights_mut(0)[1] = -5;
-        let net = b.build();
-        assert_eq!(net.ft_biases[0], -321);
-        assert_eq!(net.ft_weights[dims.hidden_size], 99);
-        assert_eq!(net.stacks[1].fc_0_biases[3], 77);
-        assert_eq!(net.stacks[0].fc_2_weights[1], -5);
-        assert_eq!(net.header.version, 1);
-        assert_eq!(net.sha256, [7u8; 32]);
+    fn fills_are_visible_through_the_network() {
+        let mut owned = OwnedNetwork::zeroed();
+        owned.ft_biases_mut()[0] = -321;
+        owned.ft_weights_mut()[HIDDEN_SIZE] = 99; // second feature column, lane 0
+        owned.fc_0_biases_mut(1)[3] = 77;
+        owned.fc_2_weights_mut(0)[1] = -5;
+        let net = owned.network();
+        assert_eq!(net.ft_biases()[0], -321);
+        assert_eq!(net.ft_weights()[HIDDEN_SIZE], 99);
+        assert_eq!(net.stack(1).fc_0_biases()[3], 77);
+        assert_eq!(net.stack(0).fc_2_weights()[1], -5);
     }
 
     #[test]
-    fn every_stack_sits_inside_the_network_itself() {
-        let net = small_net();
-        let base = &net as *const NnueNetwork as usize;
-        for stack in &net.stacks {
-            let at = stack as *const NetworkStack as usize;
-            assert!(
-                at >= base && at + size_of::<NetworkStack>() <= base + size_of::<NnueNetwork>(),
-                "a stack must be reachable at an offset from the network, not through a pointer",
-            );
-        }
+    fn the_constant_layout_matches_the_walked_one() {
+        let walked = net_spans(&NetDims::STANDARD);
+        assert_eq!(SPANS.ft_biases, walked.ft_biases);
+        assert_eq!(SPANS.ft_weights, walked.ft_weights);
+        assert_eq!(SPANS.stacks.as_slice(), walked.stacks.as_slice());
+        assert_eq!(SPANS.total_bytes, walked.total_bytes);
     }
 
     #[test]

@@ -26,7 +26,7 @@ use crate::features::{
 };
 use crate::finny::FinnyCache;
 use crate::simd::{post_ft_kernel, transformer_kernel};
-use crate::types::{FC_0_INPUT_DIMS, HIDDEN_SIZE, NnueNetwork};
+use crate::types::{FC_0_INPUT_DIMS, HIDDEN_SIZE, NetworkParams};
 
 /// Width of the byte buffer the output transform fills: one lane per fc_0
 /// input, i.e. `HIDDEN_SIZE/2` per perspective across the two perspectives.
@@ -66,14 +66,14 @@ impl Accumulator {
     ///
     /// # Panics
     /// Panics if `pos` is missing either king.
-    pub fn refresh(&mut self, net: &NnueNetwork, pos: &Position) {
+    pub fn refresh<N: NetworkParams>(&mut self, net: N, pos: &Position) {
         let mut feats = FeatureList::new();
         for color in [Color::Black, Color::White] {
             active_features_into(pos, color, &mut feats);
             refresh_perspective(
                 &mut self.perspectives[color.index()],
-                &net.ft_biases,
-                &net.ft_weights,
+                net.ft_biases(),
+                net.ft_weights(),
                 &feats,
             );
         }
@@ -88,9 +88,9 @@ impl Accumulator {
     ///
     /// # Panics
     /// Panics if `pos`, before or after `mv`, is missing either king.
-    pub fn update_after_move(
+    pub fn update_after_move<N: NetworkParams>(
         &self,
-        net: &NnueNetwork,
+        net: N,
         pos: &mut Position,
         mv: Move,
     ) -> Accumulator {
@@ -121,15 +121,20 @@ impl Accumulator {
             if refresh[i] {
                 refresh_perspective(
                     &mut next.perspectives[i],
-                    &net.ft_biases,
-                    &net.ft_weights,
+                    net.ft_biases(),
+                    net.ft_weights(),
                     &active_features(pos, color),
                 );
             } else {
                 let after = active_features(pos, color);
                 let (removed, added) = changed_indices(&before[i], &after);
                 next.perspectives[i].copy_from_slice(&self.perspectives[i]);
-                apply_diff(&mut next.perspectives[i], &net.ft_weights, &added, &removed);
+                apply_diff(
+                    &mut next.perspectives[i],
+                    net.ft_weights(),
+                    &added,
+                    &removed,
+                );
             }
         }
 
@@ -147,10 +152,10 @@ impl Accumulator {
     ///
     /// # Panics
     /// Panics if `post_pos` is missing either king.
-    pub fn derive_into(
+    pub fn derive_into<N: NetworkParams>(
         src: &Accumulator,
         dst: &mut Accumulator,
-        net: &NnueNetwork,
+        net: N,
         post_pos: &Position,
         delta: &MoveDelta,
     ) {
@@ -161,7 +166,7 @@ impl Accumulator {
                     dst.perspectives[i].copy_from_slice(&src.perspectives[i]);
                     apply_diff(
                         &mut dst.perspectives[i],
-                        &net.ft_weights,
+                        net.ft_weights(),
                         pd.added(),
                         pd.removed(),
                     );
@@ -171,8 +176,8 @@ impl Accumulator {
                     active_features_into(post_pos, color, &mut feats);
                     refresh_perspective(
                         &mut dst.perspectives[i],
-                        &net.ft_biases,
-                        &net.ft_weights,
+                        net.ft_biases(),
+                        net.ft_weights(),
                         &feats,
                     );
                 }
@@ -193,10 +198,10 @@ impl Accumulator {
     ///
     /// # Panics
     /// Panics if `post_pos` is missing either king.
-    pub fn derive_into_cached(
+    pub fn derive_into_cached<N: NetworkParams>(
         src: &Accumulator,
         dst: &mut Accumulator,
-        net: &NnueNetwork,
+        net: N,
         post_pos: &Position,
         delta: &MoveDelta,
         cache: &mut FinnyCache,
@@ -208,7 +213,7 @@ impl Accumulator {
                     dst.perspectives[i].copy_from_slice(&src.perspectives[i]);
                     apply_diff(
                         &mut dst.perspectives[i],
-                        &net.ft_weights,
+                        net.ft_weights(),
                         pd.added(),
                         pd.removed(),
                     );
@@ -278,7 +283,7 @@ pub(crate) fn apply_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{NetHeader, NnueNetworkBuilder};
+    use crate::types::OwnedNetwork;
     use yorkie_state::{Move, PieceKind, format_usi_move, parse_sfen, parse_usi_move};
 
     const STARTPOS: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
@@ -347,9 +352,9 @@ mod tests {
         assert!(out.iter().all(|&x| x == i16::MIN));
     }
 
-    /// A full-size network whose weight columns are seeded only where the given
-    /// position references them, so the ~215 MiB block stays on lazy zero pages.
-    fn synthetic_net_for(pos: &Position) -> NnueNetwork {
+    /// A network whose weight columns are seeded only where the given position
+    /// references them, so the ~215 MiB block stays on lazy zero pages.
+    fn synthetic_net_for(pos: &Position) -> OwnedNetwork {
         synthetic_net_covering(std::slice::from_ref(pos))
     }
 
@@ -357,48 +362,36 @@ mod tests {
     /// incremental-update test passes both the pre- and post-move positions, so
     /// the delta lands on nonzero columns rather than untouched zero pages,
     /// where its add side would be a trivial no-op.
-    fn synthetic_net_covering(positions: &[Position]) -> NnueNetwork {
-        synthetic_net_covering_salted(positions, 0)
-    }
-
-    /// [`synthetic_net_covering`] with every bias and weight shifted by `salt`,
-    /// so two nets over the same positions hold different parameters.
-    fn synthetic_net_covering_salted(positions: &[Position], salt: i16) -> NnueNetwork {
-        let header = NetHeader {
-            version: 0,
-            hash: 0,
-            arch_id: "synthetic".to_string(),
-        };
-        // All parameters live in one arena; the FC arrays stay zero.
-        let mut builder = NnueNetworkBuilder::new(header, [0u8; 32]);
-        for (i, slot) in builder.ft_biases_mut().iter_mut().enumerate() {
-            *slot = ((i as i16) % 17 - 8).wrapping_add(salt);
+    fn synthetic_net_covering(positions: &[Position]) -> OwnedNetwork {
+        // All parameters live in one block; the FC arrays stay zero.
+        let mut owned = OwnedNetwork::zeroed();
+        for (i, slot) in owned.ft_biases_mut().iter_mut().enumerate() {
+            *slot = (i as i16) % 17 - 8;
         }
         {
-            let ft_weights = builder.ft_weights_mut();
+            let ft_weights = owned.ft_weights_mut();
             for pos in positions {
                 for color in [Color::Black, Color::White] {
                     for idx in active_features(pos, color) {
                         let base = idx as usize * HIDDEN_SIZE;
                         for (i, slot) in ft_weights[base..base + HIDDEN_SIZE].iter_mut().enumerate()
                         {
-                            *slot = (((idx as i32).wrapping_mul(31).wrapping_add(i as i32 * 7) % 23
-                                - 11) as i16)
-                                .wrapping_add(salt);
+                            *slot = ((idx as i32).wrapping_mul(31).wrapping_add(i as i32 * 7) % 23
+                                - 11) as i16;
                         }
                     }
                 }
             }
         }
-        builder.build()
+        owned
     }
 
     /// Recompute one perspective without sharing code with `refresh`.
-    fn expected_half(net: &NnueNetwork, pos: &Position, color: Color) -> Vec<i16> {
-        let mut acc: Vec<i16> = net.ft_biases.to_vec();
+    fn expected_half<N: NetworkParams>(net: N, pos: &Position, color: Color) -> Vec<i16> {
+        let mut acc: Vec<i16> = net.ft_biases().to_vec();
         for idx in active_features(pos, color) {
             let base = idx as usize * HIDDEN_SIZE;
-            let col = &net.ft_weights[base..base + HIDDEN_SIZE];
+            let col = &net.ft_weights()[base..base + HIDDEN_SIZE];
             for (a, &w) in acc.iter_mut().zip(col.iter()) {
                 *a = a.wrapping_add(w);
             }
@@ -410,13 +403,14 @@ mod tests {
     #[test]
     fn refresh_matches_independent_recomputation() {
         let pos = parse_sfen(STARTPOS).unwrap();
-        let net = synthetic_net_for(&pos);
+        let owned = synthetic_net_for(&pos);
+        let net = owned.network();
         let mut acc = Accumulator::new();
-        acc.refresh(&net, &pos);
+        acc.refresh(net, &pos);
         for color in [Color::Black, Color::White] {
             assert_eq!(
                 acc.perspective(color),
-                expected_half(&net, &pos, color).as_slice(),
+                expected_half(net, &pos, color).as_slice(),
                 "{color:?} perspective mismatch",
             );
         }
@@ -426,11 +420,12 @@ mod tests {
     #[test]
     fn refresh_is_deterministic() {
         let pos = parse_sfen(STARTPOS).unwrap();
-        let net = synthetic_net_for(&pos);
+        let owned = synthetic_net_for(&pos);
+        let net = owned.network();
         let mut a = Accumulator::new();
         let mut b = Accumulator::new();
-        a.refresh(&net, &pos);
-        b.refresh(&net, &pos);
+        a.refresh(net, &pos);
+        b.refresh(net, &pos);
         for color in [Color::Black, Color::White] {
             assert_eq!(a.perspective(color), b.perspective(color));
         }
@@ -444,18 +439,19 @@ mod tests {
 
         let mut after_pos = pos.clone();
         after_pos.do_move(mv);
-        let net = synthetic_net_covering(&[pos.clone(), after_pos]);
+        let owned = synthetic_net_covering(&[pos.clone(), after_pos]);
+        let net = owned.network();
 
         let mut prev = Accumulator::new();
-        prev.refresh(&net, &pos);
+        prev.refresh(net, &pos);
 
         let pos_snapshot = pos.clone();
-        let next = prev.update_after_move(&net, &mut pos, mv);
+        let next = prev.update_after_move(net, &mut pos, mv);
         assert_eq!(pos, pos_snapshot, "update_after_move mutated the position");
 
         let undo = pos.do_move(mv);
         let mut expected = Accumulator::new();
-        expected.refresh(&net, &pos);
+        expected.refresh(net, &pos);
         pos.undo_move(mv, undo);
 
         for color in [Color::Black, Color::White] {
@@ -521,21 +517,22 @@ mod tests {
             walk.do_move(mv);
             visited.push(walk.clone());
         }
-        let net = synthetic_net_covering(&visited);
+        let owned = synthetic_net_covering(&visited);
+        let net = owned.network();
 
         let mut pos = parse_sfen(STARTPOS).unwrap();
         let mut base = Accumulator::new();
-        base.refresh(&net, &pos);
+        base.refresh(net, &pos);
 
         let mut stack: Vec<Accumulator> = vec![base];
         for usi in LINE {
             let mv = parse_usi_move(usi, &pos).unwrap();
-            let next = stack.last().unwrap().update_after_move(&net, &mut pos, mv);
+            let next = stack.last().unwrap().update_after_move(net, &mut pos, mv);
             stack.push(next);
             pos.do_move(mv);
 
             let mut expected = Accumulator::new();
-            expected.refresh(&net, &pos);
+            expected.refresh(net, &pos);
             for color in [Color::Black, Color::White] {
                 assert_eq!(
                     stack.last().unwrap().perspective(color),
@@ -558,21 +555,22 @@ mod tests {
 
         let mut after_pos = pos.clone();
         after_pos.do_move(mv);
-        let net = synthetic_net_covering(&[pos.clone(), after_pos]);
+        let owned = synthetic_net_covering(&[pos.clone(), after_pos]);
+        let net = owned.network();
 
         let mut parent = Accumulator::new();
-        parent.refresh(&net, &pos);
+        parent.refresh(net, &pos);
 
         // The scan-based form runs its own do/undo and leaves `pos` intact.
-        let oracle = parent.update_after_move(&net, &mut pos, mv);
+        let oracle = parent.update_after_move(net, &mut pos, mv);
 
         let delta = MoveDelta::from_move(&pos, mv);
         let undo = pos.do_move(mv);
         let mut child = Accumulator::new();
-        Accumulator::derive_into(&parent, &mut child, &net, &pos, &delta);
+        Accumulator::derive_into(&parent, &mut child, net, &pos, &delta);
 
         let mut expected = Accumulator::new();
-        expected.refresh(&net, &pos);
+        expected.refresh(net, &pos);
         pos.undo_move(mv, undo);
 
         // `derive_into` writes only `dst`, so a search pop that discards the
@@ -658,13 +656,14 @@ mod tests {
         // A null move changes no pieces and no king squares, so the search's
         // reuse of the parent accumulator across one is exact.
         let mut pos = parse_sfen(STARTPOS).unwrap();
-        let net = synthetic_net_for(&pos);
+        let owned = synthetic_net_for(&pos);
+        let net = owned.network();
         let mut acc = Accumulator::new();
-        acc.refresh(&net, &pos);
+        acc.refresh(net, &pos);
 
         pos.do_null_move();
         let mut expected = Accumulator::new();
-        expected.refresh(&net, &pos);
+        expected.refresh(net, &pos);
         for color in [Color::Black, Color::White] {
             assert_eq!(
                 acc.perspective(color),
@@ -713,11 +712,12 @@ mod tests {
             visited.push(walk.clone());
         }
         assert!(line.len() >= 30, "playout too short: {}", line.len());
-        let net = synthetic_net_covering(&visited);
+        let owned = synthetic_net_covering(&visited);
+        let net = owned.network();
 
         let mut pos = parse_sfen(STARTPOS).unwrap();
         let mut base = Accumulator::new();
-        base.refresh(&net, &pos);
+        base.refresh(net, &pos);
         let mut stack: Vec<Accumulator> = vec![base];
 
         let mut saw_capture = false;
@@ -734,10 +734,10 @@ mod tests {
             let delta = MoveDelta::from_move(&pos, mv);
             pos.do_move(mv);
             let mut child = Accumulator::new();
-            Accumulator::derive_into(stack.last().unwrap(), &mut child, &net, &pos, &delta);
+            Accumulator::derive_into(stack.last().unwrap(), &mut child, net, &pos, &delta);
 
             let mut expected = Accumulator::new();
-            expected.refresh(&net, &pos);
+            expected.refresh(net, &pos);
             for color in [Color::Black, Color::White] {
                 assert_eq!(
                     child.perspective(color),
@@ -764,9 +764,9 @@ mod tests {
 
     /// Rebuild `color`'s half through `cache`, compare against the independent
     /// recomputation, then re-check the cache's own invariant.
-    fn assert_cached_refresh_matches(
+    fn assert_cached_refresh_matches<N: NetworkParams>(
         cache: &mut FinnyCache,
-        net: &NnueNetwork,
+        net: N,
         pos: &Position,
         color: Color,
         what: &str,
@@ -785,18 +785,19 @@ mod tests {
     #[test]
     fn cached_refresh_matches_a_cold_entry_then_a_warm_one() {
         let pos = parse_sfen(STARTPOS).unwrap();
-        let net = synthetic_net_for(&pos);
+        let owned = synthetic_net_for(&pos);
+        let net = owned.network();
         let mut cache = FinnyCache::new();
 
         for color in [Color::Black, Color::White] {
             let king = pos.king_square(color).unwrap();
             assert!(!cache.is_warm(color, king), "entry warm before any rebuild");
-            assert_cached_refresh_matches(&mut cache, &net, &pos, color, "cold entry");
+            assert_cached_refresh_matches(&mut cache, net, &pos, color, "cold entry");
             assert!(cache.is_warm(color, king), "entry not warmed by a rebuild");
             // A second pass over the same position leaves the diff empty.
             assert_cached_refresh_matches(
                 &mut cache,
-                &net,
+                net,
                 &pos,
                 color,
                 "warm entry, same position",
@@ -814,46 +815,20 @@ mod tests {
         let b = parse_sfen("4k4/9/2+R6/9/9/1n2s4/9/9/4K4 b GPl2p 1").unwrap();
         assert_eq!(a.king_square(Color::Black), b.king_square(Color::Black));
 
-        let net = synthetic_net_covering(&[a.clone(), b.clone()]);
+        let owned = synthetic_net_covering(&[a.clone(), b.clone()]);
+        let net = owned.network();
         let mut cache = FinnyCache::new();
 
-        assert_cached_refresh_matches(&mut cache, &net, &a, Color::Black, "cold entry");
+        assert_cached_refresh_matches(&mut cache, net, &a, Color::Black, "cold entry");
         assert_cached_refresh_matches(
             &mut cache,
-            &net,
+            net,
             &b,
             Color::Black,
             "stale entry, same bucket",
         );
         // ...and back again, so the diff runs in both directions.
-        assert_cached_refresh_matches(&mut cache, &net, &a, Color::Black, "stale entry, reversed");
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn cached_refresh_invalidates_on_a_network_change() {
-        let pos = parse_sfen(STARTPOS).unwrap();
-        let net_a = synthetic_net_covering_salted(std::slice::from_ref(&pos), 0);
-        let net_b = synthetic_net_covering_salted(std::slice::from_ref(&pos), 5);
-        // Both nets are live at once, so they cannot share an identity token.
-        assert_ne!(
-            net_a.ft_biases.to_vec(),
-            net_b.ft_biases.to_vec(),
-            "the two synthetic nets must actually differ",
-        );
-
-        let mut cache = FinnyCache::new();
-        assert_cached_refresh_matches(&mut cache, &net_a, &pos, Color::Black, "net A, cold");
-
-        // Rebuilding the same position against a different network must reset
-        // the cache: reusing the entry would return the first net's half.
-        assert_cached_refresh_matches(&mut cache, &net_b, &pos, Color::Black, "net B after net A");
-        assert!(
-            !cache.is_warm(Color::White, pos.king_square(Color::White).unwrap()),
-            "the reset must clear every entry, not just the one rebuilt",
-        );
-        // And back again, which must reset once more.
-        assert_cached_refresh_matches(&mut cache, &net_a, &pos, Color::Black, "net A after net B");
+        assert_cached_refresh_matches(&mut cache, net, &a, Color::Black, "stale entry, reversed");
     }
 
     #[cfg_attr(miri, ignore)]
@@ -864,10 +839,11 @@ mod tests {
         let mv = parse_usi_move("5i5h", &pos).unwrap();
         let mut after_pos = pos.clone();
         after_pos.do_move(mv);
-        let net = synthetic_net_covering(&[pos.clone(), after_pos]);
+        let owned = synthetic_net_covering(&[pos.clone(), after_pos]);
+        let net = owned.network();
 
         let mut parent = Accumulator::new();
-        parent.refresh(&net, &pos);
+        parent.refresh(net, &pos);
 
         let delta = MoveDelta::from_move(&pos, mv);
         assert!(
@@ -877,14 +853,14 @@ mod tests {
         pos.do_move(mv);
 
         let mut uncached = Accumulator::new();
-        Accumulator::derive_into(&parent, &mut uncached, &net, &pos, &delta);
+        Accumulator::derive_into(&parent, &mut uncached, net, &pos, &delta);
 
         let mut cache = FinnyCache::new();
         let mut cached = Accumulator::new();
-        Accumulator::derive_into_cached(&parent, &mut cached, &net, &pos, &delta, &mut cache);
+        Accumulator::derive_into_cached(&parent, &mut cached, net, &pos, &delta, &mut cache);
 
         let mut expected = Accumulator::new();
-        expected.refresh(&net, &pos);
+        expected.refresh(net, &pos);
 
         for color in [Color::Black, Color::White] {
             assert_eq!(
@@ -932,7 +908,8 @@ mod tests {
             visited.push(walk.clone());
         }
         assert!(line.len() >= 30, "playout too short: {}", line.len());
-        let net = synthetic_net_covering(&visited);
+        let owned = synthetic_net_covering(&visited);
+        let net = owned.network();
 
         let mut cache = FinnyCache::new();
         let mut king_moves = 0usize;
@@ -945,7 +922,7 @@ mod tests {
         for pass in 0..2 {
             let mut pos = parse_sfen(STARTPOS).unwrap();
             let mut base = Accumulator::new();
-            base.refresh(&net, &pos);
+            base.refresh(net, &pos);
             let mut stack: Vec<Accumulator> = vec![base];
 
             for (i, &mv) in line.iter().enumerate() {
@@ -974,14 +951,14 @@ mod tests {
                     Accumulator::derive_into_cached(
                         stack.last().unwrap(),
                         &mut child,
-                        &net,
+                        net,
                         &pos,
                         &delta,
                         &mut cache,
                     );
 
                     let mut expected = Accumulator::new();
-                    expected.refresh(&net, &pos);
+                    expected.refresh(net, &pos);
                     for color in [Color::Black, Color::White] {
                         assert_eq!(
                             child.perspective(color),
@@ -990,7 +967,7 @@ mod tests {
                             format_usi_move(sib),
                         );
                     }
-                    cache.assert_invariant(&net);
+                    cache.assert_invariant(net);
 
                     pos.undo_move(sib, undo);
                     if sib == mv {

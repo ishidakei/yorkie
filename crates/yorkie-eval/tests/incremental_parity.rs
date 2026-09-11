@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use yorkie_eval::{Accumulator, NnueNetwork, evaluate, evaluate_with};
+use yorkie_eval::{Accumulator, NetworkParams, evaluate, evaluate_with};
 
 mod common;
 use yorkie_state::{Color, Move, Position, Undo, format_usi_move, parse_sfen, parse_usi_move};
@@ -33,7 +33,7 @@ fn workspace_relative(rel: &str) -> PathBuf {
 }
 
 /// Refresh a fresh accumulator from `pos`.
-fn refreshed(net: &NnueNetwork, pos: &Position) -> Accumulator {
+fn refreshed<N: NetworkParams>(net: N, pos: &Position) -> Accumulator {
     let mut acc = Accumulator::new();
     acc.refresh(net, pos);
     acc
@@ -41,7 +41,7 @@ fn refreshed(net: &NnueNetwork, pos: &Position) -> Accumulator {
 
 /// Assert both halves of `acc` are bit-identical to a from-scratch refresh of
 /// `pos`, and that `evaluate_with(acc)` matches the full-refresh `evaluate`.
-fn assert_matches_refresh(net: &NnueNetwork, acc: &Accumulator, pos: &Position, ctx: &str) {
+fn assert_matches_refresh<N: NetworkParams>(net: N, acc: &Accumulator, pos: &Position, ctx: &str) {
     let fresh = refreshed(net, pos);
     for color in [Color::Black, Color::White] {
         assert_eq!(
@@ -68,8 +68,8 @@ struct Frame {
 /// Advance `pos` by `mv`: build the incremental child accumulator from `parent`,
 /// apply the move for real, and verify the child accumulator matches a fresh
 /// refresh of the post-move position. Returns the frame to push.
-fn advance(
-    net: &NnueNetwork,
+fn advance<N: NetworkParams>(
+    net: N,
     pos: &mut Position,
     parent: &Accumulator,
     mv: Move,
@@ -83,7 +83,13 @@ fn advance(
 
 /// Pop `frame` off `pos` and confirm the now-current parent accumulator is
 /// still valid for the restored position.
-fn retreat(net: &NnueNetwork, pos: &mut Position, frame: Frame, parent: &Accumulator, ctx: &str) {
+fn retreat<N: NetworkParams>(
+    net: N,
+    pos: &mut Position,
+    frame: Frame,
+    parent: &Accumulator,
+    ctx: &str,
+) {
     pos.undo_move(frame.mv, frame.undo);
     assert_matches_refresh(net, parent, pos, &format!("{ctx} [after undo]"));
 }
@@ -126,14 +132,14 @@ fn incremental_accumulator_matches_refresh_on_fixture_lines() {
             .to_string();
 
         let mut pos = parse_sfen(sfen).expect("fixture sfen parses");
-        let root = refreshed(&net, &pos);
+        let root = refreshed(net, &pos);
         let mut frames: Vec<Frame> = Vec::new();
 
         for (ply, usi) in moves.iter().enumerate() {
             let mv = parse_usi_move(usi, &pos).expect("fixture move parses");
             let ctx = format!("{name} ply {ply} `{usi}`");
             let parent = frames.last().map_or(&root, |f| &f.acc);
-            let frame = advance(&net, &mut pos, parent, mv, &ctx);
+            let frame = advance(net, &mut pos, parent, mv, &ctx);
             frames.push(frame);
         }
 
@@ -142,7 +148,7 @@ fn incremental_accumulator_matches_refresh_on_fixture_lines() {
             let usi = format_usi_move(frame.mv);
             let parent = frames.last().map_or(&root, |f| &f.acc);
             retreat(
-                &net,
+                net,
                 &mut pos,
                 frame,
                 parent,
@@ -183,7 +189,7 @@ fn incremental_accumulator_matches_refresh_on_random_playouts() {
 
     for (fi, sfen) in FIXTURE_SFENS.iter().enumerate() {
         let mut pos = parse_sfen(sfen).expect("fixture sfen parses");
-        let root = refreshed(&net, &pos);
+        let root = refreshed(net, &pos);
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ (fi as u64).wrapping_add(1));
 
         let mut frames: Vec<Frame> = Vec::new();
@@ -199,7 +205,7 @@ fn incremental_accumulator_matches_refresh_on_random_playouts() {
                     let usi = format_usi_move(frame.mv);
                     let parent = frames.last().map_or(&root, |f| &f.acc);
                     retreat(
-                        &net,
+                        net,
                         &mut pos,
                         frame,
                         parent,
@@ -211,7 +217,7 @@ fn incremental_accumulator_matches_refresh_on_random_playouts() {
             let mv = legal[rng.pick(legal.len())];
             let ctx = format!("fixture {fi} ply {plies} `{}`", format_usi_move(mv));
             let parent = frames.last().map_or(&root, |f| &f.acc);
-            let frame = advance(&net, &mut pos, parent, mv, &ctx);
+            let frame = advance(net, &mut pos, parent, mv, &ctx);
             frames.push(frame);
             plies += 1;
         }
@@ -221,7 +227,7 @@ fn incremental_accumulator_matches_refresh_on_random_playouts() {
             let usi = format_usi_move(frame.mv);
             let parent = frames.last().map_or(&root, |f| &f.acc);
             retreat(
-                &net,
+                net,
                 &mut pos,
                 frame,
                 parent,

@@ -359,7 +359,8 @@ pub const WORKER_CPUS: &[usize] = &[{cpus}];
 ///
 /// This is what the per-worker memory placement and the shared tables are keyed
 /// by, and `isready` holds it against the running machine before a game.
-pub const WORKER_SYSTEM_NODES: &[usize] = &[{nodes}];",
+pub const WORKER_SYSTEM_NODES: &[usize] = &[{nodes}];
+{regions}",
         shape = yorkie_numa::format_cpu_list({
             let mut sorted = cpus.to_vec();
             sorted.sort_unstable();
@@ -367,6 +368,67 @@ pub const WORKER_SYSTEM_NODES: &[usize] = &[{nodes}];",
         }),
         cpus = list(cpus),
         nodes = list(system_nodes),
+        regions = render_eval_regions(system_nodes),
+    )
+}
+
+/// The generated items pairing each system NUMA node a worker sits on with the
+/// evaluation region that node's workers read.
+///
+/// A worker's node is known when the binary is built, so which region it reads
+/// is too, and so is the network type that addresses it. What the macro
+/// produces is the one place the node number turns into that type: a `match`
+/// over a constant, run once when a worker thread is spawned and once when a
+/// `go` starts its coordinator, and never again. Every arm names a distinct
+/// `Region<_>`, so the search is compiled once per region the machine needs and
+/// no evaluation loads a base address from anywhere.
+fn render_eval_regions(system_nodes: &[NumaIndex]) -> String {
+    let mut distinct: Vec<NumaIndex> = system_nodes.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+
+    let nodes = distinct
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let arms = distinct
+        .iter()
+        .enumerate()
+        .map(|(slot, node)| {
+            format!(
+                "            {node}usize => {{\n                \
+                 let $net = ::yorkie_eval::Region::<{slot}usize>::new();\n                \
+                 $body\n            }}\n"
+            )
+        })
+        .collect::<String>();
+
+    format!(
+        "
+/// The system NUMA nodes whose workers read a network of their own, ascending:
+/// evaluation region `i` is the one node `EVAL_REGION_NODES[i]`'s workers read.
+///
+/// One entry on a machine whose workers all sit on one node, which is every
+/// single-node machine; otherwise one per node the assignment spreads onto.
+pub const EVAL_REGION_NODES: &[usize] = &[{nodes}];
+
+/// Bind `$net` to the network a worker on system NUMA node `$node` reads, and
+/// run `$body` with it.
+///
+/// `$node` is one of [`EVAL_REGION_NODES`] — every worker's node is, since the
+/// assignment is what that list is built from — and an unknown one is a
+/// contradiction of the constants rather than a case to handle.
+macro_rules! with_eval_network {{
+    ($node:expr, |$net:ident| $body:expr) => {{
+        match $node {{
+{arms}            other => unreachable!(
+                \"no worker sits on system NUMA node {{other}}: this binary was built for {nodes}\"
+            ),
+        }}
+    }};
+}}
+pub(crate) use with_eval_network;"
     )
 }
 

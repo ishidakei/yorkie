@@ -22,8 +22,8 @@
 //!
 //! That mentions no position, only a feature multiset, which is why an entry
 //! stays valid across nodes, searches and whole games. Only the weights
-//! changing underneath can invalidate it, so the cache carries a
-//! network-identity token and resets itself when the token moves.
+//! changing underneath could invalidate it, and they cannot: the parameters are
+//! placed once, before any worker exists, and are read-only from then on.
 //!
 //! Applying `changed_indices(entry.active, new_active)` to the entry preserves
 //! the invariant and re-establishes the accumulator identity for the new
@@ -41,7 +41,7 @@ use crate::features::{
     DiffScratch, FeatureIndex, MAX_ACTIVE_FEATURES, active_features_into, changed_indices_into,
 };
 use crate::transformer::{apply_diff, refresh_perspective};
-use crate::types::{HIDDEN_SIZE, NnueNetwork};
+use crate::types::{HIDDEN_SIZE, NetworkParams};
 
 /// One cached refreshed half: the accumulation and the active-feature list it
 /// was built from.
@@ -74,28 +74,10 @@ pub struct FinnyCache {
     /// not the mirrored `sq_k_code`: two mirror-equivalent king squares
     /// generate different index sets and must not share an entry.
     entries: [[FinnyEntry; Square::COUNT]; Color::COUNT],
-    /// Identity of the network the entries were built against; see
-    /// [`network_token`]. `None` until the first rebuild.
-    token: Option<NetworkToken>,
     /// Reusable buffer for the post-move active-feature list.
     scratch_active: Vec<FeatureIndex>,
     /// Reusable buffers for the entry-vs-position feature diff.
     diff: DiffScratch,
-}
-
-/// Identity of the loaded network, as seen by the cache.
-///
-/// Both the network address and its FT weight-block base are recorded, because
-/// a freed network's address can be reused. For both to coincide the new
-/// network's parameter arena would also have to land on the old base, and the
-/// arena is a separate, much larger allocation.
-type NetworkToken = (usize, usize);
-
-fn network_token(net: &NnueNetwork) -> NetworkToken {
-    (
-        net as *const NnueNetwork as usize,
-        net.ft_weights.as_ptr() as usize,
-    )
 }
 
 impl FinnyCache {
@@ -105,20 +87,9 @@ impl FinnyCache {
     pub fn new() -> Box<Self> {
         Box::new(FinnyCache {
             entries: std::array::from_fn(|_| std::array::from_fn(|_| FinnyEntry::new())),
-            token: None,
             scratch_active: Vec::with_capacity(MAX_ACTIVE_FEATURES),
             diff: DiffScratch::default(),
         })
-    }
-
-    /// Drop every cached half. The entries keep their allocations and are
-    /// rebuilt lazily.
-    fn invalidate(&mut self) {
-        for per_color in self.entries.iter_mut() {
-            for entry in per_color.iter_mut() {
-                entry.initialized = false;
-            }
-        }
     }
 
     /// Rebuild `perspective`'s half of the accumulator for `pos` into `dst`,
@@ -126,19 +97,13 @@ impl FinnyCache {
     ///
     /// # Panics
     /// Panics if `pos` is missing `perspective`'s king.
-    pub(crate) fn refresh_into(
+    pub(crate) fn refresh_into<N: NetworkParams>(
         &mut self,
-        net: &NnueNetwork,
+        net: N,
         pos: &Position,
         perspective: Color,
         dst: &mut [i16],
     ) {
-        let token = network_token(net);
-        if self.token != Some(token) {
-            self.invalidate();
-            self.token = Some(token);
-        }
-
         // Destructure so the entry borrow and the scratch borrows are disjoint.
         let FinnyCache {
             entries,
@@ -162,7 +127,7 @@ impl FinnyCache {
             changed_indices_into(&entry.active, scratch_active, diff);
             apply_diff(
                 &mut entry.accumulation,
-                &net.ft_weights,
+                net.ft_weights(),
                 &diff.added,
                 &diff.removed,
             );
@@ -170,8 +135,8 @@ impl FinnyCache {
             // A cold entry pays the from-scratch rebuild once per bucket.
             refresh_perspective(
                 &mut entry.accumulation,
-                &net.ft_biases,
-                &net.ft_weights,
+                net.ft_biases(),
+                net.ft_weights(),
                 scratch_active,
             );
             entry.initialized = true;
@@ -193,16 +158,16 @@ impl FinnyCache {
 
     /// Recompute `biases + sum(columns)` from `entry.active` and compare, for
     /// every initialised entry.
-    pub(crate) fn assert_invariant(&self, net: &NnueNetwork) {
+    pub(crate) fn assert_invariant<N: NetworkParams>(&self, net: N) {
         for per_color in self.entries.iter() {
             for entry in per_color.iter() {
                 if !entry.initialized {
                     continue;
                 }
-                let mut expected: Vec<i16> = net.ft_biases.to_vec();
+                let mut expected: Vec<i16> = net.ft_biases().to_vec();
                 for &idx in &entry.active {
                     let base = idx as usize * HIDDEN_SIZE;
-                    let col = &net.ft_weights[base..base + HIDDEN_SIZE];
+                    let col = &net.ft_weights()[base..base + HIDDEN_SIZE];
                     for (a, &w) in expected.iter_mut().zip(col.iter()) {
                         *a = a.wrapping_add(w);
                     }

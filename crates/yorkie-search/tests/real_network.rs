@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use yorkie_eval::{NnueNetwork, evaluate};
+use yorkie_eval::{NetworkParams, evaluate};
 use yorkie_search::{NullInfoSink, Search, SearchLimits};
 use yorkie_state::{Move, Position, parse_sfen};
 
@@ -26,7 +26,7 @@ fn legal_moves(p: &Position) -> Vec<Move> {
 
 /// Independent full-refresh argmax, sharing no code with `Search::go`'s
 /// incremental accumulator path.
-fn full_refresh_argmax(net: &NnueNetwork, p: &Position) -> Option<Move> {
+fn full_refresh_argmax<N: NetworkParams>(net: N, p: &Position) -> Option<Move> {
     let mut work = p.clone();
     let mut best: Option<Move> = None;
     let mut best_score = i32::MIN;
@@ -54,9 +54,8 @@ fn startpos_choice_is_legal_deterministic_and_matches_full_refresh() {
         return;
     }
 
-    let search = Search::new(
-        yorkie_eval::load_network(&path).expect("real nn.bin should load and validate"),
-    );
+    let owned = yorkie_eval::load_network(&path).expect("real nn.bin should load and validate");
+    let search = Search::new(owned.network());
     let p = parse_sfen(STARTPOS).expect("valid startpos SFEN");
 
     let a = search.go(&p, &SearchLimits::default(), &mut NullInfoSink);

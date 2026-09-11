@@ -136,7 +136,8 @@ fn depth16_search_matches_reference_fixture() {
         );
         return;
     }
-    let net = yorkie_eval::load_network(&path).expect("real nn.bin should load and validate");
+    let owned = yorkie_eval::load_network(&path).expect("real nn.bin should load and validate");
+    let net = owned.network();
 
     let tt = TranspositionTable::shared();
 
@@ -149,7 +150,7 @@ fn depth16_search_matches_reference_fixture() {
     let pos = setup(&json);
 
     let outcome = {
-        let mut qs = QSearch::new(&net, tt);
+        let mut qs = QSearch::new(net, tt);
         qs.run_root(&pos, json.depth)
     };
 

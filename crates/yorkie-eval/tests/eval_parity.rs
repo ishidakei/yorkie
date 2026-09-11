@@ -160,7 +160,7 @@ fn eval_fixtures_match_reference_exactly() {
     let mut mismatches = Vec::new();
     for fixture in &fixtures {
         let pos = position_for(fixture);
-        let actual = evaluate(&net, &pos);
+        let actual = evaluate(net, &pos);
         let diff = (actual - fixture.eval).abs();
         if diff > TOLERANCE {
             mismatches.push(format!(
