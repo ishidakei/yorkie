@@ -23,7 +23,7 @@ mod common;
 
 use common::{NOISY_EVALUATION, drive, evaluation_is_noise_free, stage_configured_eval_dir};
 use yorkie_eval::{Region, network_file};
-use yorkie_protocol::{UsiDriver, config};
+use yorkie_protocol::{UsiEngine, config};
 use yorkie_search::{QSearch, RootKind, RootOutcome};
 use yorkie_state::{Move, Position, format_usi_move, parse_sfen, parse_usi_move};
 use yorkie_storage::TranspositionTable;
@@ -169,7 +169,7 @@ fn isready_keep_alive_emits_bare_newline_during_heavy_load() {
 
     let input = "usi\nisready\nquit\n".to_string();
     let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let driver = UsiDriver::new(input.as_bytes(), std::sync::Arc::clone(&output))
+    let driver = UsiEngine::new(input.as_bytes(), std::sync::Arc::clone(&output))
         .with_eval_root(eval_root)
         .with_keep_alive_poll(std::time::Duration::from_micros(100));
     driver.run().expect("driver run");

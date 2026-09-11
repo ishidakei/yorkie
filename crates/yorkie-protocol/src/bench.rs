@@ -5,7 +5,7 @@
 //! default build has neither this parse nor the `bench` command token.
 //!
 //! This module owns only the semantic parse of the argument tokens into a
-//! [`BenchConfig`]; the driver consumes it.
+//! [`BenchConfig`]; the command handler consumes it.
 //!
 //! ```text
 //! bench [ttSizeMB] [threads] [limit] [default|current|<fenFile>] [limitType]
@@ -29,7 +29,7 @@ use std::fs;
 
 use yorkie_state::format_sfen;
 
-use crate::parser::GoLimits;
+use crate::engine::GoParams;
 
 /// The reference `Defaults` position list, transcribed verbatim (every SFEN,
 /// same order). Used when the position source is `default` (or omitted).
@@ -51,7 +51,7 @@ const DEFAULT_LIMIT: &str = "15000";
 const DEFAULT_FEN_SOURCE: &str = "default";
 const DEFAULT_LIMIT_TYPE: &str = "movetime";
 
-/// A `bench` argument-parse failure, surfaced by the driver as an `info string`
+/// A `bench` argument-parse failure, surfaced as an `info string`
 /// so a garbage argument fails loudly without panicking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BenchParseError(pub String);
@@ -70,8 +70,8 @@ pub struct BenchConfig {
     pub threads: i64,
     /// The per-position search limit, applied to every position exactly as a
     /// normal `go` would consume it.
-    pub limits: GoLimits,
-    /// The positions to search, as SFEN strings (each parsed by the driver).
+    pub limits: GoParams,
+    /// The positions to search, as SFEN strings (each parsed by the caller).
     pub fens: Vec<String>,
 }
 
@@ -110,7 +110,7 @@ pub fn parse_bench(tokens: &[String], current_sfen: &str) -> Result<BenchConfig,
         .parse()
         .map_err(|_| BenchParseError(format!("invalid limit `{limit_arg}`")))?;
 
-    let mut limits = GoLimits::default();
+    let mut limits = GoParams::default();
     match limit_type.as_str() {
         "depth" => {
             let d = u32::try_from(limit)
@@ -156,7 +156,7 @@ pub fn parse_bench(tokens: &[String], current_sfen: &str) -> Result<BenchConfig,
 }
 
 /// The SFEN of a position, for the `current` position source. A thin re-export
-/// of [`yorkie_state::format_sfen`] so the driver expresses intent at the call
+/// of [`yorkie_state::format_sfen`] so the caller expresses intent at the call
 /// site (`bench::current_sfen(&self.pos)`).
 pub fn current_sfen(pos: &yorkie_state::Position) -> String {
     format_sfen(pos)

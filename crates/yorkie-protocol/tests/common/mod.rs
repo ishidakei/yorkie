@@ -20,7 +20,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use yorkie_eval::network_file;
-use yorkie_protocol::UsiDriver;
+use yorkie_protocol::UsiEngine;
 use yorkie_state::{Move, Position, parse_sfen, parse_usi_move, sfen_pack};
 
 /// The message a test that is pinned to the test config's values fails with when
@@ -288,10 +288,10 @@ fn driver<R: BufRead>(
     reader: R,
     output: Arc<Mutex<Vec<u8>>>,
     book_seed: Option<u64>,
-) -> UsiDriver<R, Vec<u8>> {
+) -> UsiEngine<R, Vec<u8>> {
     let driver = match book_seed {
-        Some(seed) => UsiDriver::with_book_seed(reader, output, seed),
-        None => UsiDriver::new(reader, output),
+        Some(seed) => UsiEngine::with_book_seed(reader, output, seed),
+        None => UsiEngine::new(reader, output),
     };
     match EVAL_ROOT.get() {
         Some(root) => driver.with_eval_root(root.clone()),

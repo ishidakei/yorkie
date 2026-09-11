@@ -53,8 +53,8 @@ pub use update::{
 
 /// Search limits for one `go` invocation.
 ///
-/// Greedy 1-ply consults no limit; the type exists so the USI driver can map
-/// its `GoLimits` onto a Search-layer type without this crate depending on
+/// Greedy 1-ply consults no limit; the type exists so the Protocol layer can map
+/// its `GoParams` onto a Search-layer type without this crate depending on
 /// Protocol.
 #[derive(Debug, Clone, Default)]
 pub struct SearchLimits {}

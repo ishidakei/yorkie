@@ -1,12 +1,27 @@
-// Only the score / PV renderers use it, and both are optional surfaces.
-#[cfg(feature = "verbose2")]
-use core::fmt::NumBuffer;
+//! The engine proper: the game state, the worker pool and the search, with no
+//! protocol text anywhere in it.
+//!
+//! What a host says and what the engine does are two different things, and this
+//! is the second of them. An [`Engine`] holds the position, the worker pool and
+//! its handles, the placed transposition table and evaluation network, the
+//! opening book, the per-game seeds and the time-management carry-forward; it
+//! offers [`Engine::set_position`], [`Engine::go`], [`Engine::stop`],
+//! [`Engine::ponderhit`], [`Engine::new_game`] and [`Engine::ready`] as plain
+//! functions over typed arguments and typed results. Nothing here knows what a
+//! reply line looks like.
+//!
+//! Where the engine has something to say — a reply, an initialisation notice, a
+//! diagnostic — it says it through [`EngineSink`], a generic parameter rather
+//! than a runtime-chosen sink: a build compiles exactly one protocol layer, so
+//! the type is known when the binary is, every call is a direct one, and nothing
+//! on the game path is dispatched through a pointer.
+
 use std::collections::BTreeSet;
-use std::io::{self, BufRead, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::thread::{self, JoinHandle};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use yorkie_eval::{NetworkParams, NnueError, network_file};
@@ -17,92 +32,31 @@ use yorkie_search::{
     WorkerVote, declaration_win, generate_root_moves, probe_book, select_best_worker,
 };
 // The PV-line surface: only a `verbose2` build renders one, so only it needs
-// the line's data type, its bound marker, the sink trait and the output config.
+// the line's data type, the sink trait the search emits through and the output
+// config.
 #[cfg(feature = "verbose2")]
-use yorkie_search::{PvBound, PvInfo, PvOutputConfig, PvSink};
+use yorkie_search::{PvInfo, PvOutputConfig, PvSink};
 // The per-game evaluation-noise seed: drawn here, read only by the search.
 #[cfg(feature = "random")]
 use yorkie_search::new_game_seed;
 use yorkie_state::{ExtMove, Move, Position, SfenError, parse_sfen_into, parse_usi_move};
-// A move's text as a `String`: what is left of it are the optional surfaces that
-// interpolate a move into a longer line. A `bestmove` reply, which every build
-// writes, composes its text in a stack buffer instead.
-#[cfg(feature = "verbose2")]
-use yorkie_state::format_usi_move;
-// A whole SFEN string is parsed only by the `verbose3` commands that carry one
-// as an argument; the `position` command's own is read field by field, into the
-// position the driver already holds.
-#[cfg(feature = "verbose3")]
-use yorkie_state::parse_sfen;
 use yorkie_storage::{Book, TranspositionTable, Value};
-#[cfg(feature = "verbose3")]
-use yorkie_storage::{TTData, VALUE_NONE};
 // The per-reply allocation tally: raised by the counting global allocator this
-// feature installs, and read by the statistics line that reports it.
+// feature installs, and cleared where an interval starts.
 #[cfg(feature = "verbose1")]
-use yorkie_storage::{clear_alloc_count, take_alloc_count};
+use yorkie_storage::clear_alloc_count;
 
-#[cfg(feature = "verbose3")]
-use crate::bench;
-use crate::bestmove::BestmoveBuf;
 use crate::config::{self, with_eval_network};
-use crate::formatter::Formatter;
-#[cfg(feature = "verbose2")]
-use crate::parser::MATE_UNLIMITED_MS;
-use crate::parser::{Command, GoLimits, PositionSfen, parse_line};
 #[cfg(feature = "random")]
 use crate::settings::RANDOM_AMPLITUDE;
 use crate::settings::Settings;
-#[cfg(feature = "verbose1")]
-use crate::stats::StatsBuf;
-#[cfg(feature = "verbose3")]
-use crate::tt_command::{
-    TtCommand, TtPosition, TtStoreArgs, bound_name, parse_tt, value_from_tt, value_to_tt,
-};
-
-/// Emit one diagnostic `info string` line through a [`UsiDriver`] — the
-/// `verbose1` surface — and compile the message only into a build that has that
-/// surface.
-///
-/// A macro rather than a plain method call because the message text is part of
-/// the surface: below `verbose1` the expansion drops the format string and the
-/// formatting with it, keeping the text out of the binary, and yields the same
-/// `Ok(())` so every call site's `?` / `return` shape is identical in both
-/// builds. Arguments are still named once each, so a value computed only for the
-/// message cannot be left behind as an unused binding.
-///
-/// Pass interpolated values as trailing arguments (`"illegal move: {}", s`)
-/// rather than as inline captures at any call site a build below `verbose1`
-/// still compiles: an inline capture is invisible to the expansion that drops
-/// the message, so the binding it names would go unused there.
-macro_rules! diag {
-    ($driver:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
-        #[cfg(feature = "verbose1")]
-        {
-            $driver.info_string_diag(format_args!($fmt $(, $arg)*))
-        }
-        #[cfg(not(feature = "verbose1"))]
-        {
-            let _ = &$driver;
-            $(let _ = &$arg;)*
-            Ok::<(), io::Error>(())
-        }
-    }};
-}
-
-/// The public values used in the `id name` / `id author` lines.
-///
-/// The version part is this project's own generation number (see
-/// `CHANGELOG.md`), not an upstream-tracking number; the upstream YaneuraOu
-/// baseline is documented in `README.md` instead.
-pub const ENGINE_NAME: &str = "Yorkie 3.1.0";
-pub const ENGINE_AUTHOR: &str = "Kei Ishida <ishida.kei@gmail.com>";
 
 // The transposition table is a `static` sized from the `usi_hash` config
 // constant (the reference's `USI_Hash` option — the depth-1 fixture capture
 // condition) when the binary is built, so no command and no reply can change
-// how big it is. What `isready` still decides is where its pages live; see
-// [`UsiDriver::place_transposition_table`].
+// how big it is. What the readiness handshake still decides is where its pages
+// live; see
+// [`Engine::place_transposition_table`].
 
 /// The largest iterative-deepening depth a `go` ever requests. `run_root`'s own
 /// `rootDepth + 1 < MAX_PLY` guard (`MAX_PLY == 246`) is the real ceiling; this
@@ -112,15 +66,15 @@ pub const ENGINE_AUTHOR: &str = "Kei Ishida <ishida.kei@gmail.com>";
 const SEARCH_MAX_DEPTH: i32 = 245;
 
 /// Where the running machine's NUMA layout is read from, for the one check that
-/// reads it: `isready`'s, which holds the machine against the layout this binary
-/// was built for.
+/// reads it: [`Engine::ready`]'s, which holds the machine against the layout
+/// this binary was built for.
 const SYSFS_ROOT: &str = "/sys";
 
 /// Moves one `position` command may carry. A shogi game reaches its result in a
 /// few hundred plies — a build that sets a draw ply cap stops one far sooner —
 /// so the bound is out of a game's reach, and a command that exceeds it is
 /// refused rather than allowed to grow the buffer that holds it.
-const MAX_POSITION_MOVES: usize = 1024;
+pub(crate) const MAX_POSITION_MOVES: usize = 1024;
 
 /// Room the retained SFEN buffer starts with: enough for the longest SFEN a
 /// board can spell — every square occupied by a promoted piece, both hands
@@ -132,7 +86,7 @@ const SFEN_CAPACITY: usize = 256;
 /// legality buffer is built to hold (the reference's `MAX_MOVES`).
 const MAX_LEGAL_MOVES: usize = 600;
 
-/// A `position` command in the form the driver replays it from: where the game
+/// A position command in the form the engine replays it from: where the game
 /// starts, and the moves that reached the position it names, already parsed and
 /// verified legal in sequence.
 ///
@@ -193,47 +147,69 @@ impl RetainedPosition {
     }
 }
 
-/// Why a `position` command was refused. Each carries what the driver's
-/// diagnostic names, borrowed from the command line itself.
-enum PositionRefusal<'a> {
+/// Why a position command was refused. Each carries what a diagnostic would
+/// name, borrowed from the command line itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PositionRefusal<'a> {
     Sfen(SfenError),
     IllegalMove(&'a str),
     TooManyMoves,
 }
 
-// --- isready keep-alive (reference `Engine::run_heavy_job`).
-/// How often the keep-alive helper thread polls the stop flag while the heavy
-/// `isready` initialisation runs (reference: `sleep_for(100ms)`).
-const KEEP_ALIVE_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// How many polls elapse between bare keep-alive newlines: `50 * 100ms = 5s`
-/// (reference: `if (++count >= 50 /* 5秒 */)`). A GUI (Shogidokoro / ShogiGUI)
-/// reads the periodic empty line as a sign the engine is alive and does not
-/// time out while the book load, the table's placement and the evaluation
-/// network's — a copy of a few hundred mebibytes per node, where the machine
-/// calls for copies — run between `isready` and `readyok`.
-const KEEP_ALIVE_TICKS_PER_NEWLINE: u32 = 50;
+/// Where a position starts: the implicit initial position, or an explicit SFEN
+/// whose four fields — board, side to move, hands, ply — are borrowed from the
+/// command that named them rather than copied out of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PositionSfen<'a> {
+    StartPos,
+    Sfen([&'a str; 4]),
+}
 
+/// Everything that bounds one search, captured verbatim — including what a
+/// given build does not act on, so a protocol layer's parse is lossless.
+///
+/// Six of the bounds are `verbose2`: `depth`, `nodes`, `movetime`, `infinite`,
+/// `mate` and `rtime`. A build without that feature has no source for any of
+/// them — the two config keys that seed the first two need the same feature —
+/// so the fields carry it rather than standing unfillable.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GoParams {
+    #[cfg(feature = "verbose2")]
+    pub depth: Option<u32>,
+    #[cfg(feature = "verbose2")]
+    pub nodes: Option<u64>,
+    #[cfg(feature = "verbose2")]
+    pub movetime: Option<u64>,
+    pub wtime: Option<u64>,
+    pub btime: Option<u64>,
+    pub winc: Option<u64>,
+    pub binc: Option<u64>,
+    pub byoyomi: Option<u64>,
+    #[cfg(feature = "verbose2")]
+    pub infinite: bool,
+    /// Think on the predicted position; hold the reply until the prediction is
+    /// confirmed or the search is stopped.
+    pub ponder: bool,
+    /// Mate-search mode with a time budget in milliseconds, where
+    /// [`MATE_UNLIMITED_MS`] stands for unlimited.
+    #[cfg(feature = "verbose2")]
+    pub mate: Option<u64>,
+    /// A randomised minimum-thinking-time budget used for self-play variety.
+    /// `init_` seeds all three time bounds from it (plus a decaying random bump)
+    /// and returns early. `None` means no such budget.
+    #[cfg(feature = "verbose2")]
+    pub rtime: Option<u64>,
+}
+
+/// The unlimited mate-search budget (`limits.mate = INT32_MAX`).
+#[cfg(feature = "verbose2")]
+pub const MATE_UNLIMITED_MS: u64 = i32::MAX as u64;
 /// The evaluation-noise seed a `bench` runs under. What the command reports is a
 /// node count two runs — and two processes — have to agree on, so the clean
 /// starting state it builds for itself fixes the seed as well as the table and
 /// the histories. A game draws its own.
 #[cfg(all(feature = "verbose3", feature = "random"))]
 const BENCH_RANDOM_SEED: u64 = 0;
-
-// Reference USI score conversion. These are `pub(crate)` so the `verbose3` `tt`
-// commands, which speak the same score surface, do not grow a second copy of
-// the scale.
-//
-// The mate scale is only needed to *render* a score, and both surfaces that
-// render one are optional, so the default build compiles neither the two
-// constants nor `push_score` / `format_score`. `PAWN_VALUE` is unconditional:
-// `to_cp` and the draw-contempt scaling read it in every build.
-/// `VALUE_MATE`.
-#[cfg(feature = "verbose2")]
-pub(crate) const VALUE_MATE: Value = 32000;
-/// `VALUE_TB_WIN_IN_MAX_PLY`: the `is_decisive` threshold.
-#[cfg(feature = "verbose2")]
-pub(crate) const VALUE_TB_WIN_IN_MAX_PLY: Value = VALUE_MATE - 246;
 /// `Eval::PawnValue` / `NormalizeToPawnValue`.
 pub(crate) const PAWN_VALUE: Value = 90;
 /// `VALUE_INFINITE`: the pre-search `rootMoves[0].score` sentinel the
@@ -243,7 +219,6 @@ const VALUE_INFINITE: Value = 32001;
 /// `ResignValue`: the post-search resign threshold in centipawns. A searched
 /// best score at or below `-RESIGN_VALUE` resigns.
 const RESIGN_VALUE: Value = crate::config::RESIGN_VALUE as Value;
-
 /// The book-selection settings, as one value rather than eighteen reads at every
 /// `go`. `IgnoreBookPly` is not here — it is captured at book-load time and
 /// travels with [`LoadedBook`].
@@ -306,37 +281,9 @@ fn to_cp(v: Value) -> Value {
     100 * v / PAWN_VALUE
 }
 
-/// Append a search value to `out` the way the reference USI layer formats it: a
-/// mate distance for decisive scores, else centipawns.
-///
-/// Appending in place keeps the `info` PV path free of the `String` temporary
-/// [`format_score`] hands back; [`format_score`] itself stays for the two book
-/// call sites that need an owned value.
-#[cfg(feature = "verbose2")]
-fn push_score(out: &mut String, v: Value) {
-    let mut digits = NumBuffer::new();
-    if v.abs() >= VALUE_TB_WIN_IN_MAX_PLY {
-        let distance = VALUE_MATE - v.abs();
-        let mate = if v > 0 { distance } else { -distance };
-        out.push_str("mate ");
-        out.push_str(mate.format_into(&mut digits));
-    } else {
-        out.push_str("cp ");
-        out.push_str((100 * v / PAWN_VALUE).format_into(&mut digits));
-    }
-}
-
-/// [`push_score`] into a fresh `String`.
-#[cfg(feature = "verbose2")]
-pub(crate) fn format_score(v: Value) -> String {
-    let mut out = String::new();
-    push_score(&mut out, v);
-    out
-}
-
 /// The file the evaluation network in memory was read from.
 ///
-/// The path is retained so `isready` is idempotent: a repeat reuses what is
+/// The path is retained so [`Engine::ready`] is idempotent: a repeat reuses what is
 /// already there instead of reading the file again. There is nothing else to
 /// record — a region is a `static` this binary declares, which region a worker
 /// reads follows from the compiled assignment, and both are known before the
@@ -352,17 +299,6 @@ pub(crate) fn format_score(v: Value) -> String {
 /// a system node share one copy.
 struct LoadedEval {
     path: PathBuf,
-}
-
-/// The result of the heavy `isready` initialisation, produced inside the
-/// [`KeepAlive`] scope and consumed by [`UsiDriver::handle_isready`] once the
-/// keep-alive helper has stopped: the network is ready (`readyok`), the load
-/// failed, or the machine is not the one this binary plans its threads for.
-/// Each failure is one `info string` and no `readyok`.
-enum IsreadyOutcome {
-    Ready,
-    LoadFailed(String),
-    LayoutMismatch(String),
 }
 
 /// The opened opening books plus the `IgnoreBookPly` value captured at load
@@ -381,10 +317,10 @@ struct LoadedBook {
 }
 
 /// A search worker running on its own thread. The main thread
-/// keeps reading USI lines while this runs; `stop` / `quit` set [`Self::stop`],
+/// keeps reading commands while this runs; a stop request sets [`Self::stop`],
 /// which the search polls at the reference `check_time` granularity. The worker
-/// emits its own `info` / `bestmove`, then returns the session-owned
-/// [`SearchState`] so the driver can reclaim it for the next `go`.
+/// emits its own progress and its reply, then returns the session-owned
+/// [`SearchState`] so the engine can reclaim it for the next `go`.
 struct ActiveSearch {
     handle: JoinHandle<SearchState>,
     stop: Arc<AtomicBool>,
@@ -393,40 +329,40 @@ struct ActiveSearch {
     /// search into a normal time-managed one; `None` means this was not a ponder
     /// search, and a stray `ponderhit` falls back to a `stop`.
     ponder: Option<Arc<PonderSignal>>,
-    /// Suppresses the coordinator's `bestmove` (and final PV) for the
+    /// Suppresses the coordinator's reply (and final PV) for the
     /// Stochastic_Ponder ponderhit teardown, which stops the rewound search
     /// without emitting anything.
     suppress: Arc<AtomicBool>,
-    /// Set by the coordinator *inside* the critical section that writes
-    /// `bestmove`, so this search counts as finished from the moment its reply
-    /// is on the wire.
+    /// Set by the coordinator *inside* the critical section that writes the
+    /// reply, so this search counts as finished from the moment that reply is
+    /// on the wire.
     ///
-    /// [`JoinHandle::is_finished`] is not that moment: the coordinator emits
-    /// `bestmove` and only then unwinds, so a host that reads `bestmove` and
+    /// [`JoinHandle::is_finished`] is not that moment: the coordinator emits its
+    /// reply and only then unwinds, so a host that reads the reply and
     /// immediately sends the next command can land in the window where the
     /// thread has not yet returned. A flag stamped under the output lock closes
-    /// it — any reader that has seen the `bestmove` line took the same lock
-    /// afterwards, so it cannot see this as unset.
+    /// it — any reader that has seen the reply took the same lock afterwards, so
+    /// it cannot see this as unset.
     ///
     /// The `tt` commands' idle check is its only reader, and they are
     /// `verbose3`, so a build without that feature neither carries nor raises it.
     #[cfg(feature = "verbose3")]
-    bestmove_sent: Arc<AtomicBool>,
+    reply_sent: Arc<AtomicBool>,
     /// The root game ply this search ran at (`rootPos.game_ply()`), carried so
-    /// a completed real search updates the driver's `last_game_ply`.
+    /// a completed real search updates the engine's `last_game_ply`.
     game_ply: i32,
 }
 
 /// The session-owned search state a `go` lends to its worker and reclaims when
 /// the worker finishes: the game-scoped worker history tables, which persist
-/// across `go`s within one game and are reset by `usinewgame`.
+/// across `go`s within one game and are reset by [`Engine::new_game`].
 ///
 /// The transposition table is not part of this handover — it lives behind an
 /// [`Arc`], so the worker gets a clone and never hands it back.
 struct SearchState {
     histories: WorkerHistories,
     /// The chosen worker's reported score / average score and the main worker's
-    /// final `timeReduction`, carried back so the driver seeds the next `go`'s
+    /// final `timeReduction`, carried back so the engine seeds the next `go`'s
     /// time management.
     ///
     /// Always `Some`: the reference runs this bookkeeping on *every* path,
@@ -434,7 +370,7 @@ struct SearchState {
     /// `-VALUE_INFINITE` defaults and the current ply. The third element is
     /// `Some(tr)` only when a real search produced a fresh `timeReduction`; on a
     /// short-circuit the reference never touches `previousTimeReduction`, so the
-    /// driver's persisted value is left unchanged.
+    /// engine's persisted value is left unchanged.
     time_state: Option<(Value, Value, Option<f64>)>,
     /// The collection buffers the coordinator filled, handed back for the next
     /// `go` to fill again.
@@ -457,12 +393,12 @@ struct SearchHandles {
     /// `ponder`; every other `go` leaves it behind, inert.
     ponder: Arc<PonderSignal>,
     /// The Stochastic_Ponder teardown flag: set to drop a rewound search's
-    /// `bestmove`.
-    suppress_bestmove: Arc<AtomicBool>,
+    /// reply.
+    suppress_reply: Arc<AtomicBool>,
     /// Raised when a search's reply reaches the output sink. Its only reader is
-    /// the `verbose3` `tt` commands' idle check.
+    /// the `verbose3` table-inspection commands' idle check.
     #[cfg(feature = "verbose3")]
-    bestmove_sent: Arc<AtomicBool>,
+    reply_sent: Arc<AtomicBool>,
     /// Per-worker node counters (index 0 = main, `1..` = helpers), read by the
     /// aggregate node ceiling and the final aggregated `info ... nodes` — both
     /// `verbose2`, like the counters themselves.
@@ -479,9 +415,9 @@ impl SearchHandles {
         SearchHandles {
             stop: Arc::new(AtomicBool::new(false)),
             ponder: Arc::new(PonderSignal::new(false)),
-            suppress_bestmove: Arc::new(AtomicBool::new(false)),
+            suppress_reply: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "verbose3")]
-            bestmove_sent: Arc::new(AtomicBool::new(false)),
+            reply_sent: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "verbose2")]
             node_slots: new_tally(n_threads),
             bmc_slots: new_tally(n_threads),
@@ -506,9 +442,9 @@ impl SearchHandles {
     /// falls back on.
     fn arm(&mut self, ponder_mode: bool) -> Option<Arc<PonderSignal>> {
         self.stop.store(false, Ordering::Relaxed);
-        self.suppress_bestmove.store(false, Ordering::Relaxed);
+        self.suppress_reply.store(false, Ordering::Relaxed);
         #[cfg(feature = "verbose3")]
-        self.bestmove_sent.store(false, Ordering::Relaxed);
+        self.reply_sent.store(false, Ordering::Relaxed);
         #[cfg(feature = "verbose2")]
         for slot in self.node_slots.iter() {
             slot.store(0, Ordering::Relaxed);
@@ -566,49 +502,153 @@ impl VoteBuffers {
     }
 }
 
-pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
-    reader: R,
-    /// The output sink, shared with the search worker (which writes its own
-    /// `info` / `bestmove`). A `Mutex` serialises the worker's lines against any
-    /// the main thread emits concurrently.
-    writer: Arc<Mutex<W>>,
+/// What the engine plays, as the engine states it: the move it chose and the
+/// move it expects in reply, or one of the two token replies a shogi engine can
+/// give instead.
+///
+/// The protocol layer renders it; nothing about the wording of a reply is
+/// decided here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reply {
+    /// The chosen move, and the move the engine expects the opponent to answer
+    /// with when it has one.
+    BestMove { mv: Move, ponder: Option<Move> },
+    /// The position is lost — the reference's `ResignValue` verdict, a root with
+    /// no legal move, or a `go` with no network loaded.
+    Resign,
+    /// The entering-king declaration succeeds under a rule whose win is declared
+    /// rather than played.
+    Win,
+}
+
+/// What a `go` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GoOutcome {
+    /// A search is running, and its reply will reach the sink.
+    Started,
+    /// No evaluation network is loaded, so nothing was started and the caller
+    /// owes the host a reply.
+    NoNetwork,
+}
+
+/// The result of the heavy [`Engine::ready`] initialisation, produced inside
+/// whatever keep-alive scope the protocol layer wraps it in and consumed once
+/// that helper has stopped: the network is ready, the load failed, or the
+/// machine is not the one this binary plans its threads for.
+///
+/// Each failure carries its reason for the caller to render, and no build
+/// answers a failed one with a readiness reply.
+pub enum ReadyOutcome {
+    Ready,
+    LoadFailed(String),
+    LayoutMismatch(String),
+}
+
+/// Where an [`Engine`]'s output goes: the one protocol layer this build was
+/// compiled with, as a type rather than as a pointer.
+///
+/// Every method takes what the engine knows — a [`Reply`], a book hit, a PV
+/// line, a message body — and leaves the wording to the implementor. A build
+/// carries exactly one implementation, so each call is direct and monomorphised;
+/// there is no trait object anywhere on the game path.
+///
+/// The search runs on a thread of its own and emits from there, so a sink is
+/// cloned into each `go`'s coordinator — hence `Clone + Send + 'static`. A clone
+/// is a handle to the same output, not a second one.
+pub trait EngineSink: Clone + Send + 'static {
+    /// The per-iteration PV renderer this protocol layer installs on the main
+    /// worker — a concrete type, like the sink itself.
+    #[cfg(feature = "verbose2")]
+    type PvOutput: PvSink + 'static;
+
+    /// One initialisation-phase notice — where the table and the network went,
+    /// which CPUs the workers took, what the book load found. Present in every
+    /// build: they are how a failed startup is diagnosed at all.
+    fn notice(&self, msg: &str) -> io::Result<()>;
+
+    /// One diagnostic notice, the `verbose1` surface. Best-effort: it may be
+    /// produced on the search thread, where a broken pipe must not panic.
+    #[cfg(feature = "verbose1")]
+    fn diagnostic(&self, msg: &str);
+
+    /// The engine's reply to a search request.
+    ///
+    /// `sent` is raised before the output lock is released, so the reply
+    /// becoming visible and the search counting as finished are one indivisible
+    /// step downstream; its only reader is the `verbose3` table-inspection
+    /// commands' idle check.
+    fn reply(&self, reply: Reply, #[cfg(feature = "verbose3")] sent: &AtomicBool);
+
+    /// A book hit's surviving candidates, reported as the probe answers and
+    /// before any hold.
+    #[cfg(feature = "verbose2")]
+    fn book_candidates(&self, hit: &BookHit, hashfull: u32, time_ms: u64);
+
+    /// A book hit's terminal output: the summary of the chosen line, then the
+    /// reply itself, in one indivisible step for the same reason
+    /// [`Self::reply`]'s `sent` is.
+    fn book_reply(
+        &self,
+        hit: &BookHit,
+        #[cfg(feature = "verbose2")] hashfull: u32,
+        #[cfg(feature = "verbose2")] time_ms: u64,
+        #[cfg(feature = "verbose3")] sent: &AtomicBool,
+    );
+
+    /// The final PV block a completed search emits before its reply.
+    #[cfg(feature = "verbose2")]
+    fn pv_block(&self, infos: &[PvInfo]);
+
+    /// A renderer for the per-iteration PV lines, for the main worker to emit
+    /// through. Built once per `go`, and only in a build that prints them.
+    #[cfg(feature = "verbose2")]
+    fn pv_output(&self) -> Self::PvOutput;
+}
+
+/// The engine: the position, the pool, the search and everything they need,
+/// with the protocol layer as a type parameter rather than a dependency.
+pub struct Engine<P: EngineSink> {
+    /// Where replies, notices and diagnostics go. A concrete type, fixed when
+    /// the binary was built, and cloned into each `go`'s coordinator so the
+    /// search thread emits through the same output.
+    sink: P,
     /// Where every setting comes from: the compile-time constants generated
     /// from the TOML config, in every build. See [`crate::settings`].
     settings: Settings,
     pos: Position,
-    /// The loaded network holder, present only after a successful `isready`.
-    /// `go` before this is set replies `bestmove resign`.
+    /// The loaded network holder, present only after a successful
+    /// [`Self::ready`]. A `go` before this is set starts nothing.
     eval: Option<LoadedEval>,
     /// The shared transposition table the root search runs against: the one
     /// `static`, whose size this binary was built with.
     ///
-    /// Cleared on `usinewgame` and advanced per `go` by the search itself — the
-    /// driver never bumps the generation. Every worker holds this same
+    /// Cleared by [`Self::new_game`] and advanced per `go` by the search itself — the
+    /// engine never bumps the generation. Every worker holds this same
     /// reference, so there is nothing to hand out and nothing to reclaim.
     tt: &'static TranspositionTable,
-    /// Whether `isready` has placed the table's pages ([`Self::place_transposition_table`]).
+    /// Whether [`Self::ready`] has placed the table's pages ([`Self::place_transposition_table`]).
     /// Once per session: the policy and the huge-page hint are properties of the
     /// address range, and repeating them would say the same thing again.
     tt_placed: bool,
     /// Game-scoped worker histories. `None` only while a worker
     /// holds them mid-search.
     histories: Option<WorkerHistories>,
-    /// The loaded opening books, present only after an `isready` opened at least
+    /// The loaded opening books, present only after a [`Self::ready`] opened at least
     /// one readable `.ybb`. `None` means bookless (default `BookFile=no_book`, or
     /// every listed book failed / was unsupported). Behind an [`Arc`] so a `go`
     /// hands its coordinator a cheap clone.
     book: Option<Arc<LoadedBook>>,
     /// The `(resolved-name-list, on-the-fly, ignore-book-ply)` signature of the
     /// last book load — the Multiple Book priority list, not a single name.
-    /// `isready` reloads only when this changes — the reference's reload-skip.
+    /// [`Self::ready`] reloads only when this changes — the reference's reload-skip.
     book_signature: Option<(Vec<PathBuf>, bool, bool)>,
     /// A session-scoped seed advanced per `go`, driving both the book-selection
     /// PRNG and the `rtime` PRNG. Seeded from process entropy by default; tests
-    /// pin it via [`UsiDriver::with_book_seed`].
+    /// pin it via [`Engine::with_book_seed`].
     book_seed: u64,
     /// The evaluation-noise seed for the game in progress. Drawn from the
     /// operating system's randomness at construction and again at every
-    /// `usinewgame`, and handed unchanged to every worker of every `go` in
+    /// [`Self::new_game`], and handed unchanged to every worker of every `go` in
     /// between: one game evaluates a position the same way throughout, and the
     /// next game evaluates it differently. It sits beside the transposition
     /// table rather than inside the Zobrist tables, which stay fixed, so
@@ -618,30 +658,30 @@ pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
     /// The in-flight search worker, if any.
     search: Option<ActiveSearch>,
     /// Time-management state that persists across `go`s within a game and is
-    /// reset by `usinewgame`: the previous move's reported score / average score
+    /// reset by [`Self::new_game`]: the previous move's reported score / average score
     /// and its final `timeReduction`. Fed into each `go`'s [`TimeControl`] and
     /// refreshed on join.
     best_previous_score: Value,
     best_previous_average_score: Value,
     previous_time_reduction: f64,
     /// The root game ply of the last completed real search
-    /// (`main_manager()->lastGamePly`), reset to `0` on `usinewgame`.
+    /// (`main_manager()->lastGamePly`), reset to `0` by [`Self::new_game`].
     ///
     /// At the next search start an odd `last_game_ply - game_ply` means the side
     /// to move alternated, which flips the sign of the persisted previous scores
     /// before they seed the next search.
     last_game_ply: i32,
-    /// The last `position` command in parsed form (`last_position_cmd_string`),
+    /// The last position command in parsed form (`last_position_cmd_string`),
     /// retained so a Stochastic_Ponder `go ponder` can rewind it by one move
     /// and a Stochastic_Ponder `ponderhit` can re-apply the real position.
     last_position: RetainedPosition,
-    /// Where the `position` command being read is assembled. A malformed line
+    /// Where the position command being read is assembled. A malformed line
     /// must leave both the current position and the retained command exactly as
     /// they were, so nothing is written through until the whole line has been
     /// verified; the two are then swapped, which hands this the previous
     /// command's buffers for the next line.
     pending_position: RetainedPosition,
-    /// The position a `position` command is replayed into, holding whatever the
+    /// The position a command is replayed into, holding whatever the
     /// previous command left there. Swapped with [`Self::pos`] once the replay
     /// has succeeded, so neither position is ever rebuilt from an empty buffer.
     scratch_pos: Position,
@@ -650,12 +690,12 @@ pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
     /// Both are built once, to the widest position's move count.
     legal_buf: Vec<Move>,
     pseudo_buf: Vec<ExtMove>,
-    /// The last `go` command's limits (`last_go_cmd_string`), retained so a
+    /// The last `go` request (`last_go_cmd_string`), retained so a
     /// Stochastic_Ponder `ponderhit` can re-issue it with `ponder` stripped.
-    last_go: Option<GoLimits>,
+    last_go: Option<GoParams>,
     /// The worker thread pool: a main-worker slot plus `Threads − 1` persistent
     /// helper threads, each parked until a `go` dispatches it a job. The main
-    /// worker is the per-`go` coordinator thread [`Self::handle_go`] spawns.
+    /// worker is the per-`go` coordinator thread [`Self::go`] spawns.
     pool: ThreadPool,
     /// The pool size the next (re)build uses. Always the `threads` config
     /// constant, except while a `verbose3` `bench` runs its own thread count
@@ -686,43 +726,39 @@ pub struct UsiDriver<R: BufRead, W: Write + Send + 'static> {
     /// them, exactly like [`Self::histories`].
     vote_buffers: Option<VoteBuffers>,
     /// The directory a relative `eval_dir` resolves against — the running
-    /// executable's own, overridable via [`Self::with_eval_root`] so a test can
+    /// executable's own, overridable via [`Self::set_eval_root`] so a test can
     /// present a directory of its own rather than the one it runs from.
     eval_root: PathBuf,
-    /// Poll interval of the `isready` keep-alive helper thread ([`KeepAlive`]),
-    /// overridable via [`Self::with_keep_alive_poll`] so a test can drive the
-    /// mechanism with a short interval.
-    keep_alive_poll: Duration,
-    /// The sysfs root the `isready` layout check reads the running machine from
-    /// — `/sys`, overridable via [`Self::with_sysfs_root`] so a test can hold
+    /// The sysfs root the [`Self::ready`] layout check reads the running machine from
+    /// — `/sys`, overridable via [`Self::set_sysfs_root`] so a test can hold
     /// the binary against a machine other than the one it is running on.
     sysfs_root: PathBuf,
     /// The CPUs this process may run on, captured at startup and held against
-    /// the CPUs the compiled thread plan pins workers to by the `isready` check
+    /// the CPUs the compiled thread plan pins workers to by the [`Self::ready`] check
     /// — which asks nothing of a build that pins none. Overridable via
-    /// [`Self::with_startup_affinity`] so a test can present a confined process
+    /// [`Self::set_startup_affinity`] so a test can present a confined process
     /// without confining the test process itself.
     startup_affinity: BTreeSet<usize>,
 }
 
-impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
-    /// A driver whose book / `rtime` PRNG stream is seeded from process entropy,
-    /// so every process run differs. Tests wanting reproducible book selection
-    /// or `rtime` budgets construct via [`Self::with_book_seed`].
-    pub fn new(reader: R, writer: Arc<Mutex<W>>) -> Self {
-        Self::with_book_seed(reader, writer, Prng::random_seed())
+impl<P: EngineSink> Engine<P> {
+    /// An engine whose book / `rtime` PRNG stream is seeded from process
+    /// entropy, so every process run differs. Callers wanting reproducible book
+    /// selection or `rtime` budgets construct via [`Self::with_book_seed`].
+    pub fn new(sink: P) -> Self {
+        Self::with_book_seed(sink, Prng::random_seed())
     }
 
-    /// A driver with an explicit book-PRNG session seed. The entropy default
+    /// An engine with an explicit book-PRNG session seed. The entropy default
     /// ([`Self::new`]) delegates here with [`Prng::random_seed`]; tests inject a
     /// fixed seed for deterministic book / `rtime` behaviour.
-    pub fn with_book_seed(reader: R, writer: Arc<Mutex<W>>, book_seed: u64) -> Self {
+    pub fn with_book_seed(sink: P, book_seed: u64) -> Self {
         let settings = Settings::new();
         let threads = settings.threads();
         // Rebuild the machine's NUMA layout and the worker → CPU assignment from
         // the constants this binary was built with: both were decided when the
         // binary was, so nothing here reads `/sys` and nothing decides a
-        // topology. Whether the machine still matches is the `isready` check's
+        // topology. Whether the machine still matches is the readiness check's
         // question, asked once, before a game.
         let numa_layout =
             NumaLayout::from_const(settings.numa_node_cpus(), settings.numa_system_nodes());
@@ -741,12 +777,12 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         let worker_shared = build_worker_shared(&worker_plan);
         let helper_shared = helper_slice(&worker_shared);
         let histories = Some(WorkerHistories::with_shared(Arc::clone(&worker_shared[0])));
-        // The coordinator's bundle is built (and filled) right here, on the USI
-        // thread — so place it explicitly; see `place_coordinator_histories`.
+        // The coordinator's bundle is built (and filled) right here, on the
+        // command thread — so place it explicitly; see
+        // `place_coordinator_histories`.
         place_coordinator_histories(histories.as_ref(), worker_plan.system_nodes[0]);
         Self {
-            reader,
-            writer,
+            sink,
             settings,
             pos: Position::startpos(),
             eval: None,
@@ -778,19 +814,19 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             handles: SearchHandles::new(workers),
             vote_buffers: Some(VoteBuffers::for_pool(workers)),
             eval_root: network_file::executable_directory(),
-            keep_alive_poll: KEEP_ALIVE_POLL_INTERVAL,
             sysfs_root: PathBuf::from(SYSFS_ROOT),
             startup_affinity: yorkie_numa::startup_affinity().clone(),
         }
     }
 
-    /// Override the `isready` keep-alive poll interval, so a test can make a
-    /// deliberately slowed heavy job elapse at least one tick. The newline still
-    /// fires only after `KEEP_ALIVE_TICKS_PER_NEWLINE` polls, so this scales
-    /// the whole cadence.
-    pub fn with_keep_alive_poll(mut self, poll: Duration) -> Self {
-        self.keep_alive_poll = poll;
-        self
+    /// The position a search would run from.
+    pub fn position(&self) -> &Position {
+        &self.pos
+    }
+
+    /// The shared transposition table this session searches against.
+    pub fn transposition_table(&self) -> &'static TranspositionTable {
+        self.tt
     }
 
     /// Override the directory a relative `eval_dir` resolves against.
@@ -800,117 +836,80 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// an option surface to point it elsewhere. A test that has to drive a
     /// session against a network of its own — a synthetic one, or none at all —
     /// names the directory here, the same way it names a machine through
-    /// [`Self::with_sysfs_root`].
-    pub fn with_eval_root(mut self, root: PathBuf) -> Self {
+    /// [`Self::set_sysfs_root`].
+    pub fn set_eval_root(&mut self, root: PathBuf) {
         self.eval_root = root;
-        self
     }
 
-    /// Override the sysfs root the `isready` layout check reads, so a test can
-    /// present a machine other than the one it runs on and see the check refuse
-    /// it.
-    pub fn with_sysfs_root(mut self, root: PathBuf) -> Self {
+    /// Override the sysfs root the [`Self::ready`] layout check reads, so a test
+    /// can present a machine other than the one it runs on and see the check
+    /// refuse it.
+    pub fn set_sysfs_root(&mut self, root: PathBuf) {
         self.sysfs_root = root;
-        self
     }
 
-    /// Override the CPU set the `isready` layout check takes for this process's
-    /// startup affinity, so a test can drive a session as a confined process
-    /// while the test process itself stays where it is.
-    pub fn with_startup_affinity(mut self, cpus: BTreeSet<usize>) -> Self {
+    /// Override the CPU set the [`Self::ready`] layout check takes for this
+    /// process's startup affinity, so a test can drive a session as a confined
+    /// process while the test process itself stays where it is.
+    pub fn set_startup_affinity(&mut self, cpus: BTreeSet<usize>) {
         self.startup_affinity = cpus;
-        self
     }
 
-    pub fn run(mut self) -> io::Result<()> {
-        let mut buf = String::new();
-        loop {
-            buf.clear();
-            let n = self.reader.read_line(&mut buf)?;
-            if n == 0 {
-                // EOF: treat as quit — stop and join any running search first.
-                self.finish_search_join();
-                return Ok(());
-            }
-            match parse_line(&buf) {
-                Command::Usi => self.handle_usi()?,
-                Command::IsReady => self.handle_isready()?,
-                Command::SetOption { name, value } => self.handle_setoption(&name, &value)?,
-                Command::UsiNewGame => self.handle_usinewgame(),
-                Command::Position { sfen, moves } => self.handle_position(sfen, moves)?,
-                Command::Go(limits) => self.handle_go(limits)?,
-                #[cfg(not(feature = "verbose2"))]
-                Command::GoExtraClause(clause) => self.handle_go_extra_clause(&clause)?,
-                Command::Stop => self.handle_stop(),
-                Command::GameOver => self.handle_gameover(),
-                Command::PonderHit => self.handle_ponderhit()?,
-                #[cfg(feature = "verbose3")]
-                Command::Bench(tokens) => self.handle_bench(&tokens)?,
-                #[cfg(feature = "verbose3")]
-                Command::Tt(tokens) => self.handle_tt(&tokens)?,
-                Command::Quit => {
-                    self.finish_search_join();
-                    return Ok(());
-                }
-                #[cfg(feature = "verbose1")]
-                Command::Unknown(line) => self.handle_unknown(&line)?,
-                // The line is consumed and dropped either way; only the report
-                // of it is gated.
-                #[cfg(not(feature = "verbose1"))]
-                Command::Unknown => {}
-                Command::TooLong => self.handle_too_long()?,
-            }
+    /// Whether a search is still in flight.
+    pub fn search_is_running(&self) -> bool {
+        self.search.is_some()
+    }
+
+    /// Reclaim a search that has already replied but not yet been joined, so the
+    /// natural `go … → reply → inspect` sequence finds the session idle.
+    ///
+    /// "Already replied" is [`ActiveSearch::reply_sent`], not
+    /// [`JoinHandle::is_finished`]: the coordinator writes its reply and *then*
+    /// unwinds. `is_finished` still stands beside it for the searches that end
+    /// without a reply.
+    #[cfg(feature = "verbose3")]
+    pub fn reclaim_replied_search(&mut self) {
+        if self.search.as_ref().is_some_and(|active| {
+            active.reply_sent.load(Ordering::Relaxed) || active.handle.is_finished()
+        }) {
+            self.finish_search_join();
         }
     }
 
-    /// Lock the shared output sink, recovering from a poisoned mutex (a worker
-    /// panic must not wedge the main loop's own output).
-    fn lock_writer(&self) -> MutexGuard<'_, W> {
-        self.writer.lock().unwrap_or_else(|e| e.into_inner())
+    /// Install `pos` as the search root directly, for the measurement command
+    /// that walks a list of positions rather than replaying a game.
+    #[cfg(feature = "verbose3")]
+    pub fn set_search_position(&mut self, pos: Position) {
+        self.pos = pos;
     }
 
-    /// Emit one `info string <msg>` line.
-    ///
-    /// This is the unconditional sink, reserved for the initialisation phase and
-    /// for a `verbose3` command's response payload: those lines are how a
-    /// failed startup is diagnosed at all, so no feature may take them away.
-    /// Everything else goes through [`diag!`].
-    fn info_string(&self, msg: &str) -> io::Result<()> {
-        Formatter::new(&mut *self.lock_writer()).info_string(msg)
+    /// Fix the evaluation-noise seed for a measurement run, whose reported node
+    /// count two runs — and two processes — have to agree on.
+    #[cfg(all(feature = "verbose3", feature = "random"))]
+    pub fn set_bench_random_seed(&mut self) {
+        self.random_seed = BENCH_RANDOM_SEED;
     }
 
-    /// Emit one diagnostic `info string` line — the `verbose1` surface, which
-    /// carries every `info string` produced outside the initialisation phase.
-    ///
-    /// Callers pass `format_args!`, not a `String`, so the message is composed
-    /// only if it is going to be written. They reach this through [`diag!`],
-    /// which is what keeps the message text itself out of a build that cannot
-    /// print it.
-    #[cfg(feature = "verbose1")]
-    fn info_string_diag(&self, body: std::fmt::Arguments<'_>) -> io::Result<()> {
-        Formatter::new(&mut *self.lock_writer()).info_string_fmt(body)
+    /// Rebuild the worker pool at `threads` workers — the one value a
+    /// measurement command carries that still means something here.
+    #[cfg(feature = "verbose3")]
+    pub fn resize_pool(&mut self, threads: usize) {
+        self.pool_threads = threads;
+        self.rebuild_pool();
     }
 
-    /// Emit one `bestmove <mv>` line, preceded by the statistics of the interval
-    /// it ends.
-    fn bestmove(&self, mv: &str) -> io::Result<()> {
-        let mut guard = self.lock_writer();
-        #[cfg(feature = "verbose1")]
-        emit_stats(&mut *guard);
-        Formatter::new(&mut *guard).bestmove(mv)
-    }
-
-    /// Emit one `readyok` line.
-    fn readyok(&self) -> io::Result<()> {
-        Formatter::new(&mut *self.lock_writer()).readyok()
+    /// `"Using N thread[s] on CPUs <list>"` for the live pool.
+    #[cfg(feature = "verbose3")]
+    pub fn thread_allocation_information(&self) -> String {
+        thread_allocation_information_as_string(self.pool.size(), &self.worker_plan)
     }
 
     /// If a search worker is running, request its stop and join it, reclaiming
-    /// the session-owned histories. Idempotent: a no-op when idle.
+    /// the session-owned state. Idempotent: a no-op when idle.
     ///
     /// Joining is also what leaves this thread alone with the shared
-    /// transposition table, which is what a `usinewgame` clear wants.
-    fn finish_search_join(&mut self) {
+    /// transposition table, which is what a new game's clear wants.
+    pub fn finish_search_join(&mut self) {
         if let Some(active) = self.search.take() {
             active.stop.store(true, Ordering::Relaxed);
             let state = active
@@ -957,8 +956,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// process default policy and ordinary pages — slower, never wrong. The
     /// outcome is reported rather than assumed, since a tournament host silently
     /// falling back is exactly what an operator wants to see before the game and
-    /// not after it — so the line is an initialisation-phase `info string`,
-    /// present in every build like the rest of them. It names the size and the
+    /// not after it — so the line is an initialisation-phase notice, present in
+    /// every build like the rest of them. It names the size and the
     /// nodes but not the address, which differs from run to run and would make
     /// every transcript differ with it.
     fn place_transposition_table(&mut self) -> io::Result<()> {
@@ -985,7 +984,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         };
         let huge = yorkie_storage::advise_huge_pages(addr, span);
 
-        self.info_string(&format!(
+        self.sink.notice(&format!(
             "transposition table: {} MiB; {placement}; huge pages {}",
             yorkie_storage::TABLE_BYTES / (1024 * 1024),
             outcome(huge),
@@ -1016,7 +1015,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             h.set_shared(Arc::clone(&self.worker_shared[0]));
         }
         // The coordinator's per-worker tables outlive a pool rebuild and were
-        // faulted on the USI thread, so re-assert their placement for the fresh
+        // faulted on the command thread, so re-assert their placement for the fresh
         // assignment. Helpers need nothing here: they are respawned and each
         // allocates its own bundle on-thread after pinning.
         place_coordinator_histories(self.histories.as_ref(), self.worker_plan.system_nodes[0]);
@@ -1031,42 +1030,6 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         if let Some(buffers) = self.vote_buffers.as_mut() {
             buffers.fit_to_pool(size);
         }
-    }
-
-    /// Emit each non-blank line of `text` as `info string <line>` through the
-    /// single output sink, mirroring the reference `print_info_string`: the
-    /// text is split on `'\n'` and whitespace-only lines are skipped.
-    #[cfg(feature = "verbose3")]
-    fn emit_info_string_lines(&self, text: &str) -> io::Result<()> {
-        for line in text.split('\n') {
-            if !line.trim().is_empty() {
-                self.info_string(line)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Emit the `Using N thread[s] on CPUs ...` line.
-    #[cfg(feature = "verbose3")]
-    fn emit_thread_allocation_information(&self) -> io::Result<()> {
-        self.emit_info_string_lines(&thread_allocation_information_as_string(
-            self.pool.size(),
-            &self.worker_plan,
-        ))
-    }
-
-    /// The `usi` handshake: identity and `usiok`, with NO `option name ...`
-    /// lines — in every build.
-    ///
-    /// The engine has no runtime configuration to advertise. Every setting was
-    /// compiled in from the TOML config, and a GUI that saw an option list would
-    /// be shown a control it cannot actually operate.
-    fn handle_usi(&mut self) -> io::Result<()> {
-        let mut guard = self.lock_writer();
-        let mut f = Formatter::new(&mut *guard);
-        f.id_name(ENGINE_NAME)?;
-        f.id_author(ENGINE_AUTHOR)?;
-        f.usiok()
     }
 
     /// The absolute path a `<BookDir>/<BookFile>` pair resolves to.
@@ -1100,7 +1063,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 
         // Enumerate the priority series now: the resolved name list is half of
         // the reload-skip capture, so a numbered file appearing (or vanishing)
-        // between two `isready`s is itself a reason to reload.
+        // between two readiness handshakes is itself a reason to reload.
         let (names, notices) = book_names(&base);
 
         let signature = (names.clone(), on_the_fly, ignore_book_ply);
@@ -1119,7 +1082,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // The "priority book file exists twice" notices from the enumeration,
         // verbatim from the reference.
         for notice in &notices {
-            self.info_string(notice)?;
+            self.sink.notice(notice)?;
         }
 
         let mut books: Vec<Book> = Vec::new();
@@ -1130,7 +1093,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             // proved the file exists).
             let resolved = resolve_book_filename_with_ybb_fallback(name);
             if &resolved != name {
-                self.info_string(&format!(
+                self.sink.notice(&format!(
                     "book file fallback : {} -> {}",
                     name.display(),
                     resolved.display()
@@ -1143,7 +1106,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             // info-string notice, never a panic and never a SILENT skip: a
             // silent skip would hide a book the reference would have used.
             if !has_book_ext(&resolved, BOOK_EXT_YBB) {
-                self.info_string(&format!("unsupported book format : {}", resolved.display()))?;
+                self.sink
+                    .notice(&format!("unsupported book format : {}", resolved.display()))?;
                 continue;
             }
 
@@ -1156,12 +1120,13 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 Ok(book) => {
                     let count = book.record_count();
                     books.push(book);
-                    self.info_string(&format!("book loaded : {count} positions"))?;
+                    self.sink
+                        .notice(&format!("book loaded : {count} positions"))?;
                 }
                 Err(e) => {
                     // Mirrors the reference's open/validate failure → this name is left
                     // out of the priority list.
-                    self.info_string(&format!("book load failed : {e}"))?;
+                    self.sink.notice(&format!("book load failed : {e}"))?;
                 }
             }
         }
@@ -1175,67 +1140,28 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         Ok(())
     }
 
-    fn handle_isready(&mut self) -> io::Result<()> {
-        // Reclaim any worker before touching the table it may hold.
-        self.finish_search_join();
-        // The reference applies two option-override files here, before its own
-        // isready work (`USIEngine::isready`): `engine_options.txt` in the
-        // current directory and `<EvalDir>/eval_options.txt`. This engine opens
-        // neither, in any build. Its settings are compiled in, so a file that
-        // claims to override one of them would be a lie on disk — and reading a
-        // file only to ignore what it says would be worse than not reading it.
-
-        // Wrap the heavy initialisation in a keep-alive scope: a helper thread
-        // emits a bare newline every 5 s so a GUI does not time out. The guard's
-        // `Drop` stops and joins that helper whether the block returns normally
-        // or bails out early via `?`.
-        let outcome = {
-            let _keep_alive = KeepAlive::spawn(Arc::clone(&self.writer), self.keep_alive_poll);
-            self.isready_heavy_job()?
-            // `_keep_alive` dropped here: stop flag set, helper thread joined.
-        };
-
-        match outcome {
-            IsreadyOutcome::Ready => {
-                self.readyok()?;
-                // The initialisation phase allocates the table, the network and
-                // the pool, and none of that belongs to a reply: the first
-                // reported interval starts here.
-                #[cfg(feature = "verbose1")]
-                clear_alloc_count();
-                Ok(())
-            }
-            IsreadyOutcome::LoadFailed(reason) => {
-                // Contract: on a load failure, emit
-                // `info string eval load failed: <reason>` and do NOT emit
-                // `readyok`. There is no working network to lose here: one
-                // already read is reused by the idempotent path above, so the
-                // only session that reaches this had none to begin with.
-                self.info_string(&format!("eval load failed: {reason}"))
-            }
-            IsreadyOutcome::LayoutMismatch(reason) => {
-                self.info_string(&format!("NUMA layout mismatch: {reason}"))
-            }
-        }
-    }
-
-    /// The heavy `isready` initialisation, run inside the [`KeepAlive`] scope of
-    /// [`Self::handle_isready`]. Returns the outcome so the caller emits
-    /// `readyok` / the load-failure notice *after* the keep-alive helper has
-    /// stopped — the terminal reply never races the keep-alive newlines.
-    fn isready_heavy_job(&mut self) -> io::Result<IsreadyOutcome> {
+    /// Make the engine ready to play: hold the machine against the layout this
+    /// binary was built for, place the transposition table, load the opening
+    /// book and read the evaluation network into the memory the machine calls
+    /// for.
+    ///
+    /// The heavy half of a readiness handshake, and the caller is expected to
+    /// keep the host alive across it. Returning the outcome rather than
+    /// answering it is what lets the caller emit its terminal reply *after* any
+    /// keep-alive helper has stopped, so the reply never races it.
+    pub fn ready(&mut self) -> io::Result<ReadyOutcome> {
         // Before anything is allocated for a machine: is this the machine? The
         // whole thread plan was folded from the layout the binary was built on,
         // so a difference here is a wrong answer that is available now, and one
         // no later stage would report.
         if let Some(reason) = self.numa_layout_refusal() {
-            return Ok(IsreadyOutcome::LayoutMismatch(reason));
+            return Ok(ReadyOutcome::LayoutMismatch(reason));
         }
         // Which CPUs this binary plays on. An operator running several engines
         // on one machine has to be able to see, from the engine itself, that
         // each got the CPUs meant for it — so the line is an
-        // initialisation-phase `info string`, present in every build.
-        self.info_string(&format!(
+        // initialisation-phase notice, present in every build.
+        self.sink.notice(&format!(
             "workers on CPUs {}",
             yorkie_numa::format_cpu_list(self.worker_plan.distinct_cpus())
         ))?;
@@ -1244,32 +1170,32 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // here, so the policy is in force before the first page of it is
         // touched.
         self.place_transposition_table()?;
-        // Load / reload the opening book (the reference does this in isready).
+        // Load / reload the opening book (the reference does this in `isready`).
         self.reload_book()?;
         let path = self.evaluation_file_path();
 
-        // Idempotent: a repeat `isready` reuses what is already in memory — no
+        // Idempotent: a repeat reuses what is already in memory — no
         // second read of the file, and on a multi-node machine no second copy
         // into the regions the first one is being read from.
         if self.eval.as_ref().is_some_and(|e| e.path == path) {
-            return Ok(IsreadyOutcome::Ready);
+            return Ok(ReadyOutcome::Ready);
         }
 
         match self.place_evaluation_network(&path) {
             Ok((eval, warnings, placement)) => {
                 // Surface the complaints the conversion had about the source
-                // network (hash mismatches) as `info string` lines before
-                // `readyok`, mirroring the reference `LoadAndShare` /
+                // network (hash mismatches) as notices before the readiness
+                // reply, mirroring the reference `LoadAndShare` /
                 // `Detail::ReadParameters` diagnostics. A clean network carries
                 // none, so a correct one emits nothing new.
                 for warning in &warnings {
-                    self.info_string(warning)?;
+                    self.sink.notice(warning)?;
                 }
-                self.info_string(&placement)?;
+                self.sink.notice(&placement)?;
                 self.eval = Some(eval);
-                Ok(IsreadyOutcome::Ready)
+                Ok(ReadyOutcome::Ready)
             }
-            Err(e) => Ok(IsreadyOutcome::LoadFailed(e.to_string())),
+            Err(e) => Ok(ReadyOutcome::LoadFailed(e.to_string())),
         }
     }
 
@@ -1303,7 +1229,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     ) -> Result<(LoadedEval, Vec<String>, String), NnueError> {
         // Nothing may still be reading the regions when they are filled: they
         // are the process's only storage for the network. Any search has been
-        // joined by the caller; clearing this here is what leaves the driver in
+        // joined by the caller; clearing this here is what leaves the engine in
         // the "no network loaded" state until the fill succeeds.
         self.eval = None;
 
@@ -1312,8 +1238,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
 
         let placement = if network_file::SHARED_MAPPING {
             // SAFETY: nothing is pointed at the region — no search that could
-            // have read it survives, each one having been joined before this
-            // `isready` reached here.
+            // have read it survives, each one having been joined before the
+            // readiness handshake reached here.
             warnings = unsafe { network_file::map_shared(path)? };
             let (addr, span) = network_file::Region::<0>::new().parameter_region();
             let huge = yorkie_storage::advise_huge_pages(addr, span);
@@ -1369,37 +1295,16 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         )
     }
 
-    /// `setoption name <N> value <V>`: the USI minimum, in every build.
-    ///
-    /// There is no option to set — every setting was fixed at build time from
-    /// the TOML config, and the `usi` reply advertises no options at all. USI
-    /// requires no reply, so the line is parsed, consumed and dropped.
-    fn handle_setoption(&mut self, _name: &str, _value: &str) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn handle_position<'a>(&mut self, sfen: PositionSfen<'a>, moves: &'a str) -> io::Result<()> {
-        match self.replay_position(sfen, moves) {
-            Ok(()) => Ok(()),
-            Err(PositionRefusal::Sfen(e)) => diag!(self, "position parse error: {}", e),
-            Err(PositionRefusal::IllegalMove(mv)) => diag!(self, "illegal move: {}", mv),
-            Err(PositionRefusal::TooManyMoves) => diag!(
-                self,
-                "position error: more than {} moves; position unchanged",
-                MAX_POSITION_MOVES,
-            ),
-        }
-    }
-
-    /// Replay one `position` command into the scratch buffers and, if every
-    /// move of it was legal, install the result as the current position and the
+    /// Replay one position command into the scratch buffers and, if every move
+    /// of it was legal, install the result as the current position and the
     /// retained command.
     ///
     /// A refused command leaves both untouched — the input-validation contract:
-    /// the prior position must survive a malformed `position` line — which is
-    /// why the work happens in the scratch pair and the two installs are the
-    /// last thing done.
-    fn replay_position<'a>(
+    /// the prior position must survive a malformed line — which is why the work
+    /// happens in the scratch pair and the two installs are the last thing done.
+    /// The refusal names what it refused, borrowed from the caller's own text,
+    /// so a protocol layer can report it without copying anything.
+    pub fn set_position<'a>(
         &mut self,
         sfen: PositionSfen<'a>,
         moves: &'a str,
@@ -1457,7 +1362,10 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         std::mem::swap(&mut self.pos, &mut self.scratch_pos);
     }
 
-    fn handle_usinewgame(&mut self) {
+    /// Start a new game: reclaim any search, empty the table, rebuild the
+    /// history tables and the pool, and reset every per-game carry-forward (the
+    /// reference `search_clear`).
+    pub fn new_game(&mut self) {
         // Reclaim any running search, then reset the game state: startpos, an
         // emptied table, and fresh history tables (the reference
         // `search_clear`). Clearing the table also resets its generation; the next
@@ -1502,16 +1410,21 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         clear_alloc_count();
     }
 
-    fn handle_go(&mut self, limits: GoLimits) -> io::Result<()> {
+    /// Start a search under `params`.
+    ///
+    /// Returns as soon as the coordinator thread is running: the reply reaches
+    /// the sink from there. [`GoOutcome::NoNetwork`] means nothing was started,
+    /// and the caller owes the host the reply itself.
+    pub fn go(&mut self, params: GoParams) -> GoOutcome {
         // A new `go` supersedes any lingering search; reclaim its state first.
         self.finish_search_join();
 
         // Retain this `go` for a later Stochastic_Ponder re-issue.
-        self.last_go = Some(limits.clone());
+        self.last_go = Some(params.clone());
 
         // Stochastic_Ponder `go ponder`: ponder one move earlier than the
         // retained position (drop its last move); `ponderMode` stays set.
-        if limits.ponder && self.settings.stochastic_ponder() {
+        if params.ponder && self.settings.stochastic_ponder() {
             self.apply_stochastic_ponder_rewind();
         }
 
@@ -1520,14 +1433,14 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         let game_ply = self.pos.ply() as i32;
 
         // Build the coordinator job (option-seeded limits, all per-`go`
-        // snapshots). `None` means no network is loaded — notify and resign.
+        // snapshots). `None` means no network is loaded, which is the caller's
+        // to answer.
         let Some(job) = self.prepare_coordinator_job(
-            limits,
+            params,
             #[cfg(feature = "verbose2")]
             false,
         ) else {
-            diag!(self, "no eval network loaded; run isready")?;
-            return self.bestmove("resign");
+            return GoOutcome::NoNetwork;
         };
 
         // The handles the main loop signals on `stop` / `ponderhit` / a
@@ -1535,9 +1448,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // the worker thread.
         let stop_for_active = Arc::clone(&job.stop);
         let ponder_for_active = job.ponder.as_ref().map(Arc::clone);
-        let suppress_for_active = Arc::clone(&job.suppress_bestmove);
+        let suppress_for_active = Arc::clone(&job.suppress_reply);
         #[cfg(feature = "verbose3")]
-        let sent_for_active = Arc::clone(&job.bestmove_sent);
+        let sent_for_active = Arc::clone(&job.reply_sent);
         // The coordinator's own system node, resolved before the thread starts
         // so the network type it searches with is selected once per `go`.
         let node = self.worker_plan.system_nodes[0];
@@ -1556,25 +1469,10 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             ponder: ponder_for_active,
             suppress: suppress_for_active,
             #[cfg(feature = "verbose3")]
-            bestmove_sent: sent_for_active,
+            reply_sent: sent_for_active,
             game_ply,
         });
-        Ok(())
-    }
-
-    /// A `go` line carrying a clause that arrives with `verbose2`, seen by a
-    /// build without that feature: report it and start nothing.
-    ///
-    /// Failing loud is deliberate — ignoring the clause would silently change
-    /// the search's terms, turning `go depth 4` into a clock-less `go` in the
-    /// middle of a game. Any search already running is left alone.
-    #[cfg(not(feature = "verbose2"))]
-    fn handle_go_extra_clause(&mut self, clause: &str) -> io::Result<()> {
-        diag!(
-            self,
-            "go error: `{}` requires a verbose2 build; no search started",
-            clause
-        )
+        GoOutcome::Started
     }
 
     /// Stochastic_Ponder `go ponder` rewind: reconstruct the retained position
@@ -1598,9 +1496,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
     /// only by `bench`; there is no such interval to force below `verbose2`.
     fn prepare_coordinator_job(
         &mut self,
-        limits: GoLimits,
+        limits: GoParams,
         #[cfg(feature = "verbose2")] disable_pv_interval: bool,
-    ) -> Option<CoordinatorJob<W>> {
+    ) -> Option<CoordinatorJob<P>> {
         // Nothing propagates the NNUE fixed-point scale here: the reference's
         // mutable global `NNUE::FV_SCALE` is a compile-time constant in the
         // evaluation layer, generated from the same `fv_scale` config key, so
@@ -1631,8 +1529,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             limits
         };
 
-        // No network loaded (a non-compliant host `go`, or a `bench` whose
-        // `isready` never succeeded). The caller resigns for this position.
+        // No network loaded (a non-compliant host `go`, or a measurement run
+        // whose readiness handshake never succeeded). The caller answers for
+        // this position.
         self.eval.as_ref()?;
 
         // Map the `go` limits + time options onto the reference
@@ -1652,7 +1551,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             && limits.mate.is_none()
             && limits.movetime.is_none()
             && !limits.infinite;
-        // DELIBERATE DIVERGENCE (see `GoLimits::mate` in the parser): the reference
+        // DELIBERATE DIVERGENCE (see [`GoParams::mate`]): the reference
         // leaves `go mate`'s enforcement to a separate mate engine, but this port has
         // none, so a concrete `go mate <ms>` budget is mapped onto a `movetime`-style
         // time bound. A bare / `infinite` `go mate` (the `MATE_UNLIMITED_MS`
@@ -1720,8 +1619,10 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 #[cfg(feature = "verbose2")]
                 &mut prng,
             );
+            #[cfg(feature = "verbose1")]
             if tm.mtg_error {
-                let _ = diag!(self, "Error! : MaxMovesToDraw is too small.");
+                self.sink
+                    .diagnostic("Error! : MaxMovesToDraw is too small.");
             }
             Some(TimeControl {
                 tm,
@@ -1829,7 +1730,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             .vote_buffers
             .take()
             .expect("session collection buffers present when idle");
-        let writer = Arc::clone(&self.writer);
+        let sink = self.sink.clone();
         let stop = control
             .stop
             .clone()
@@ -1854,13 +1755,13 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         #[cfg(feature = "verbose2")]
         let infinite = limits.infinite;
         // The Stochastic_Ponder teardown flag: when set, the coordinator emits
-        // no `bestmove` (nor final PV) for this search. Raised alongside it, the
-        // flag saying this `go`'s reply reached the output sink; the `tt`
+        // no reply (nor final PV) for this search. Raised alongside it, the flag
+        // saying this `go`'s reply reached the output sink; the table-inspection
         // commands' idle check is that one's only reader, so only their feature
         // has it. Both were cleared for this search by `arm` above.
-        let suppress_bestmove = Arc::clone(&self.handles.suppress_bestmove);
+        let suppress_reply = Arc::clone(&self.handles.suppress_reply);
         #[cfg(feature = "verbose3")]
-        let bestmove_sent = Arc::clone(&self.handles.bestmove_sent);
+        let reply_sent = Arc::clone(&self.handles.reply_sent);
 
         // Precompute the entering-king thresholds from the root position,
         // mirroring the reference `set_ekr` on the root worker. The rule itself
@@ -1898,9 +1799,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             ponder,
             #[cfg(feature = "verbose2")]
             infinite,
-            suppress_bestmove,
+            suppress_reply,
             #[cfg(feature = "verbose3")]
-            bestmove_sent,
+            reply_sent,
             entering_king,
             #[cfg(feature = "verbose2")]
             mate_mode,
@@ -1910,24 +1811,21 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
             multi_pv,
             #[cfg(feature = "verbose2")]
             pv_config,
-            writer,
+            sink,
         })
     }
 
-    /// Run one `bench` position synchronously on the calling thread and return
-    /// its total searched node count across all workers.
+    /// Run one measurement position synchronously on the calling thread and
+    /// return its total searched node count across all workers.
     ///
-    /// Only the driving is synchronous — bench needs each position's node total
-    /// before moving on. A position with no network loaded resigns and
-    /// contributes 0 nodes.
+    /// Only the driving is synchronous — a measurement run needs each position's
+    /// node total before moving on. `None` means no network is loaded, which is
+    /// the caller's to answer, exactly as for [`Self::go`].
     #[cfg(feature = "verbose3")]
-    fn bench_run_one(&mut self, limits: GoLimits) -> io::Result<u64> {
-        // `bench` is `verbose3`, so the PV interval it disables always exists.
-        let Some(job) = self.prepare_coordinator_job(limits, true) else {
-            diag!(self, "no eval network loaded; run isready")?;
-            self.bestmove("resign")?;
-            return Ok(0);
-        };
+    pub fn bench_run_one(&mut self, params: GoParams) -> Option<u64> {
+        // The measurement command is `verbose3`, so the PV interval it disables
+        // always exists.
+        let job = self.prepare_coordinator_job(params, true)?;
         let node = self.worker_plan.system_nodes[0];
         let outcome = with_eval_network!(node, |net| run_coordinated(net, job));
         // Return the session state the job borrowed (the async path reclaims
@@ -1935,109 +1833,28 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // depth / nodes / movetime, so `time_state` is irrelevant to it.
         self.histories = Some(outcome.histories);
         self.vote_buffers = Some(outcome.vote_buffers);
-        Ok(outcome.nodes)
+        Some(outcome.nodes)
     }
 
-    /// `bench [ttSizeMB] [threads] [limit] [default|current|<fenFile>] [limitType]`
-    /// — a reproducible NPS benchmark ported from the reference's
-    /// `USIEngine::bench` and `setup_bench`.
+    /// Ask the running search to abort promptly, releasing a held reply.
     ///
-    /// Ends with one machine-parsable summary line. A parse failure is reported
-    /// as an `info string` and runs nothing, never a panic.
-    ///
-    /// The requested thread count and table size are the only ones in the engine
-    /// that do not come from the config constants, and they last as long as the
-    /// session.
-    #[cfg(feature = "verbose3")]
-    fn handle_bench(&mut self, tokens: &[String]) -> io::Result<()> {
-        // Reclaim any running search before touching the pool / the TT.
-        self.finish_search_join();
-
-        let current = bench::current_sfen(&self.pos);
-        let config = match bench::parse_bench(tokens, &current) {
-            Ok(c) => c,
-            Err(e) => return diag!(self, "bench: {}", e),
-        };
-
-        // The thread count is the one value the reference replays as a
-        // `setoption` line that still means something here — the table's size
-        // is the build's, not the command's. The pool rebuild reports itself
-        // exactly as the reference `Threads` on_change callback does.
-        self.pool_threads = config.threads.max(1) as usize;
-        self.rebuild_pool();
-        self.emit_thread_allocation_information()?;
-
-        // The `ucinewgame` (`search_clear`) the reference runs once before the
-        // positions: clears the TT, resets histories, and rebuilds the pool — the
-        // clean, identical starting state that makes two runs report equal nodes.
-        self.handle_usinewgame();
-        // That state covers the evaluation noise too: the seed a new game draws
-        // would give each run its own node count.
-        #[cfg(feature = "random")]
-        {
-            self.random_seed = BENCH_RANDOM_SEED;
-        }
-
-        // The reference resets `elapsed` right after `search_clear`, so the timing
-        // excludes the clear itself.
-        let start = Instant::now();
-        let mut total_nodes: u64 = 0;
-        let mut positions: u64 = 0;
-        for fen in &config.fens {
-            match parse_sfen(fen) {
-                Ok(p) => self.pos = p,
-                Err(e) => {
-                    // A malformed position in a `<fenFile>` is skipped loudly, not
-                    // fatal — the rest of the bench still runs.
-                    diag!(self, "bench: skipping bad position `{}`: {}", fen, e)?;
-                    continue;
-                }
-            }
-            positions += 1;
-            total_nodes += self.bench_run_one(config.limits.clone())?;
-        }
-
-        // `+1` mirrors the reference's divide-by-zero guard.
-        //
-        // The summary is `bench`'s RESULT, not a diagnostic: it is the whole
-        // point of the command, so it rides on `verbose3` alone and no other
-        // verbosity feature can silence it. (`verbose3` also brings the
-        // per-position `info` lines a measurement run reads, which is where a
-        // bad run shows itself.)
-        let time_ms = start.elapsed().as_millis() as u64 + 1;
-        let nps = 1000 * total_nodes / time_ms;
-        self.info_string(&format!(
-            "bench: positions={positions} nodes={total_nodes} time_ms={time_ms} nps={nps}"
-        ))
-    }
-
-    fn handle_stop(&mut self) {
-        // Signal the running search to abort promptly; it emits its `bestmove`
-        // and its state is reclaimed on the next command that needs it (or on
-        // `quit`). With no search running this is a silent no-op.
+    /// It emits its reply and its state is reclaimed on the next command that
+    /// needs it. With no search running this is a silent no-op.
+    pub fn stop(&mut self) {
         if let Some(active) = &self.search {
             active.stop.store(true, Ordering::Relaxed);
         }
     }
 
-    /// `gameover [win|lose|draw]`: the game ended. Treated exactly like `stop`:
-    /// set the same stop flag, releasing a held book reply
-    /// (`go ponder`/`go infinite`) or aborting a running search. Over a shogi
-    /// GUI an opponent resign during `go ponder` arrives as `gameover` without
-    /// a preceding `stop`; unhandled, pondering would never stop. A no-op when
-    /// idle.
-    fn handle_gameover(&mut self) {
-        self.handle_stop();
-    }
-
-    /// `ponderhit`: the opponent played the predicted move.
+    /// The opponent played the predicted move.
     ///
     /// Plain path: clear the ponder flag so the pondering search continues under
     /// time management; a held book reply's coordinator wait loop polls the same
     /// flag, so this releases it. Stochastic_Ponder path: tear the rewound
     /// ponder search down without emitting, restore the real position, and
-    /// re-issue the retained `go` with `ponder` stripped.
-    fn handle_ponderhit(&mut self) -> io::Result<()> {
+    /// re-issue the retained `go` with `ponder` stripped — which is the one way
+    /// this can report [`GoOutcome::NoNetwork`], from the re-issue.
+    pub fn ponderhit(&mut self) -> GoOutcome {
         let stochastic = self.settings.stochastic_ponder()
             && self.search.as_ref().is_some_and(|a| a.ponder.is_some());
         if stochastic {
@@ -2053,15 +1870,15 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
                 None => active.stop.store(true, Ordering::Relaxed),
             }
         }
-        Ok(())
+        GoOutcome::Started
     }
 
     /// Stochastic_Ponder `ponderhit`: suppress the rewound ponder search's
     /// output, stop and join it, re-apply the real current position, and
     /// re-issue the retained `go` without its `ponder` token — a normal timed
-    /// search of which exactly one `bestmove` reaches the GUI.
-    fn stochastic_ponderhit(&mut self) -> io::Result<()> {
-        // Suppress the rewound search's bestmove before stopping it.
+    /// search of which exactly one reply reaches the host.
+    fn stochastic_ponderhit(&mut self) -> GoOutcome {
+        // Suppress the rewound search's reply before stopping it.
         if let Some(active) = &self.search {
             active.suppress.store(true, Ordering::Relaxed);
         }
@@ -2073,325 +1890,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiDriver<R, W> {
         // Re-issue the retained `go` with `ponder` stripped.
         if let Some(mut go) = self.last_go.clone() {
             go.ponder = false;
-            return self.handle_go(go);
+            return self.go(go);
         }
-        Ok(())
-    }
-
-    // The `tt` command family exists only under the `verbose3` cargo feature.
-    // Its `info string` lines are the commands' response — a `tt probe` that
-    // printed nothing would be a command with no output — so they go through the
-    // unconditional [`Self::info_string`] rather than the `verbose1` sink.
-
-    /// Dispatch one `tt …` line.
-    ///
-    /// Refuses while a search is in flight — one `info string tt error: …` line,
-    /// never a panic. A worker that has already replied but not yet been joined
-    /// is reclaimed first rather than refused, so the natural
-    /// `go … → bestmove → tt probe` sequence works. The table itself is always
-    /// there to read: it is a `static`, empty rather than absent before a game.
-    ///
-    /// "Already replied" is [`ActiveSearch::bestmove_sent`], not
-    /// `JoinHandle::is_finished`: the coordinator writes `bestmove` and *then*
-    /// unwinds. `is_finished` still stands beside it for the searches that end
-    /// without a reply.
-    #[cfg(feature = "verbose3")]
-    fn handle_tt(&mut self, tokens: &[String]) -> io::Result<()> {
-        if self.search.as_ref().is_some_and(|active| {
-            active.bestmove_sent.load(Ordering::Relaxed) || active.handle.is_finished()
-        }) {
-            self.finish_search_join();
-        }
-        if self.search.is_some() {
-            return self.tt_error("a search is running; `stop` it first");
-        }
-
-        let command = match parse_tt(tokens) {
-            Ok(command) => command,
-            Err(e) => return self.tt_error(&e.to_string()),
-        };
-
-        match command {
-            TtCommand::Store(args) => self.tt_store(&args),
-            TtCommand::Probe(position) => self.tt_probe(&position),
-            TtCommand::Children(position) => self.tt_children(&position),
-        }
-    }
-
-    /// The single error channel for the `tt` commands.
-    #[cfg(feature = "verbose3")]
-    fn tt_error(&self, msg: &str) -> io::Result<()> {
-        self.info_string(&format!("tt error: {msg}"))
-    }
-
-    /// Build the [`Position`] a `tt` command names.
-    ///
-    /// The extra king check is this surface's own: `parse_sfen` accepts a
-    /// kingless board, but the move generators these commands then run assume
-    /// both kings are present.
-    #[cfg(feature = "verbose3")]
-    fn tt_position(&self, position: &TtPosition) -> Result<Position, String> {
-        use yorkie_state::Color;
-
-        let pos = match position {
-            TtPosition::StartPos => Position::startpos(),
-            TtPosition::Sfen(sfen) => parse_sfen(sfen).map_err(|e| e.to_string())?,
-        };
-        if pos.king_square(Color::Black).is_none() || pos.king_square(Color::White).is_none() {
-            return Err("position has no king for one or both sides".to_string());
-        }
-        Ok(pos)
-    }
-
-    /// `tt store …` — write one entry for the named position.
-    ///
-    /// The write goes through the ordinary probe-then-write path at the table's
-    /// current generation, exactly as a search storing that value at that depth
-    /// would. That includes the replacement policy, which may decline the write,
-    /// so the command re-probes afterwards and reports which happened.
-    #[cfg(feature = "verbose3")]
-    fn tt_store(&self, args: &TtStoreArgs) -> io::Result<()> {
-        let pos = match self.tt_position(&args.position) {
-            Ok(pos) => pos,
-            Err(e) => return self.tt_error(&e),
-        };
-        let mut legal: Vec<Move> = Vec::new();
-        pos.generate_legal_all(&mut legal);
-
-        // `none` stores the `MOVE_NONE` fragment, which `TTEntry::save` reads as
-        // "keep whatever move this entry already holds for this position".
-        let move16 = if args.mv == "none" {
-            0
-        } else {
-            match parse_usi_move(&args.mv, &pos) {
-                Ok(mv) if legal.contains(&mv) => mv.move16(),
-                Ok(_) => return self.tt_error(&format!("move `{}` is not legal here", args.mv)),
-                Err(e) => {
-                    return self.tt_error(&format!("move `{}` is not a USI move: {e:?}", args.mv));
-                }
-            }
-        };
-
-        let key = pos.key();
-        let side = pos.side_to_move().index() as u8;
-        let stored_value = value_to_tt(args.value, 0);
-        let generation = self.tt.generation();
-
-        let (_, _, writer) = self.tt.probe(key, side);
-        writer.write(
-            key,
-            stored_value,
-            args.pv,
-            args.bound,
-            args.depth,
-            move16,
-            args.eval,
-            generation,
-            args.path_dep,
-        );
-
-        // Verify rather than assume. `move16 == 0` is excluded from the
-        // comparison on purpose: `save` deliberately preserves the pre-existing
-        // move for a `move none` write, so a mismatch there is the documented
-        // behaviour, not a declined write.
-        let (found, data, _) = self.tt.probe(key, side);
-        let stored = found
-            && data.value == stored_value
-            && data.eval == args.eval
-            && data.depth == args.depth
-            && data.bound == args.bound
-            && data.is_pv == args.pv
-            && data.path_dep == args.path_dep
-            && (move16 == 0 || data.move16 == move16);
-        if stored {
-            self.info_string("tt store ok")
-        } else {
-            self.info_string("tt store skipped (replacement policy kept the existing entry)")
-        }
-    }
-
-    /// `tt probe …` — read the entry for the named position (`ply == 0`, so the
-    /// reported value is exactly the stored one).
-    #[cfg(feature = "verbose3")]
-    fn tt_probe(&self, position: &TtPosition) -> io::Result<()> {
-        let pos = match self.tt_position(position) {
-            Ok(pos) => pos,
-            Err(e) => return self.tt_error(&e),
-        };
-        let (found, data, _) = self.tt.probe(pos.key(), pos.side_to_move().index() as u8);
-        if !found {
-            return self.info_string("tt probe miss");
-        }
-        let mut legal: Vec<Move> = Vec::new();
-        pos.generate_legal_all(&mut legal);
-        self.info_string(&format!(
-            "tt probe hit {}",
-            tt_entry_fields(&data, &legal, 0)
-        ))
-    }
-
-    /// `tt children …` — probe every legal child of the named position, one ply
-    /// deep.
-    ///
-    /// Children are reported at `ply == 1`, so their values are expressed
-    /// relative to the *named* position: a child holding "mate in 5 from the
-    /// child" prints as `mate 6`, one ply further out than a `tt probe` of that
-    /// child's own SFEN would. A child with no entry produces no line, and the
-    /// closing `tt children end <n>` line marks the list complete.
-    #[cfg(feature = "verbose3")]
-    fn tt_children(&self, position: &TtPosition) -> io::Result<()> {
-        let mut pos = match self.tt_position(position) {
-            Ok(pos) => pos,
-            Err(e) => return self.tt_error(&e),
-        };
-        let mut legal: Vec<Move> = Vec::new();
-        pos.generate_legal_all(&mut legal);
-
-        let mut child_legal: Vec<Move> = Vec::new();
-        let mut hits = 0usize;
-        for mv in &legal {
-            let undo = pos.do_move(*mv);
-            let (found, data, _) = self.tt.probe(pos.key(), pos.side_to_move().index() as u8);
-            let line = found.then(|| {
-                child_legal.clear();
-                pos.generate_legal_all(&mut child_legal);
-                format!(
-                    "tt child {} {}",
-                    format_usi_move(*mv),
-                    tt_entry_fields(&data, &child_legal, 1)
-                )
-            });
-            pos.undo_move(*mv, undo);
-            if let Some(line) = line {
-                hits += 1;
-                self.info_string(&line)?;
-            }
-        }
-        self.info_string(&format!("tt children end {hits}"))
-    }
-
-    #[cfg(feature = "verbose1")]
-    fn handle_unknown(&mut self, line: &str) -> io::Result<()> {
-        diag!(self, "unknown command: {}", line)
-    }
-
-    fn handle_too_long(&mut self) -> io::Result<()> {
-        diag!(self, "command too long")
-    }
-}
-
-/// The labelled body shared by `tt probe hit` and `tt child` lines:
-/// `move <usi|none> value <score> depth <d> bound <b> eval <score> pv <bool>
-/// pathdep <0|1>`.
-///
-/// `legal` is the legal-move list of the position the entry belongs to, used to
-/// widen the stored 16-bit fragment exactly as the search does: a fragment with
-/// no matching legal move prints as `none` rather than being decoded into a
-/// nonsense square. That is also what a **key16 false positive** looks like from
-/// here — the table matches entries on the low 16 bits of the key, so a hit may
-/// belong to a different position sharing those bits.
-///
-/// `ply` is the entry's distance from the position the command named, so the
-/// value is reported in that position's frame.
-#[cfg(feature = "verbose3")]
-fn tt_entry_fields(data: &TTData, legal: &[Move], ply: i32) -> String {
-    let mv = legal
-        .iter()
-        .copied()
-        .find(|m| m.move16() == data.move16)
-        .map_or_else(|| "none".to_string(), format_usi_move);
-    format!(
-        "move {mv} value {} depth {} bound {} eval {} pv {} pathdep {}",
-        tt_score_field(value_from_tt(data.value, ply)),
-        data.depth,
-        bound_name(data.bound),
-        tt_score_field(data.eval),
-        data.is_pv,
-        data.path_dep as u8,
-    )
-}
-
-/// One score field of a `tt` output line: `cp <n>` / `mate <n>` in the same USI
-/// scale [`format_score`] gives an `info … score` line, or the literal `none`
-/// for the `VALUE_NONE` sentinel (which the search writes into `eval16`
-/// whenever a node has no static eval — `tt store` cannot produce it).
-#[cfg(feature = "verbose3")]
-fn tt_score_field(v: Value) -> String {
-    if v == VALUE_NONE {
-        "none".to_string()
-    } else {
-        format_score(v)
-    }
-}
-
-/// Write one PV `info` line from a [`PvInfo`] — the reference's
-/// `on_update_full` as this port surfaces it, carrying every field the
-/// reference prints and in its order: `nodes nps hashfull time pv`. `seldepth`
-/// is emitted only when it is non-zero, as the reference does — a line with no
-/// search behind it (a book hit, a root with no legal move) reads badly with a
-/// ` seldepth 0` on it.
-///
-/// `verbose2` only: the default build renders no PV line.
-#[cfg(feature = "verbose2")]
-fn write_pv_info<W: Write + ?Sized>(w: &mut W, info: &PvInfo) -> io::Result<()> {
-    let mut ply_digits = NumBuffer::new();
-    let mut index_digits = NumBuffer::new();
-    let mut node_digits = NumBuffer::new();
-    let mut permille_digits = NumBuffer::new();
-    let mut clock_digits = NumBuffer::new();
-
-    // Comfortably past the fixed part of the line, so only a long PV regrows.
-    let mut body = String::with_capacity(64);
-    body.push_str("depth ");
-    body.push_str(info.depth.format_into(&mut ply_digits));
-    if info.sel_depth != 0 {
-        body.push_str(" seldepth ");
-        body.push_str(info.sel_depth.format_into(&mut ply_digits));
-    }
-    body.push_str(" multipv ");
-    body.push_str(info.multipv.format_into(&mut index_digits));
-    body.push_str(" score ");
-    push_score(&mut body, info.score);
-    match info.bound {
-        PvBound::Lower => body.push_str(" lowerbound"),
-        PvBound::Upper => body.push_str(" upperbound"),
-        PvBound::Exact => {}
-    }
-    body.push_str(" nodes ");
-    body.push_str(info.nodes.format_into(&mut node_digits));
-    body.push_str(" nps ");
-    body.push_str(info.nps.format_into(&mut clock_digits));
-    body.push_str(" hashfull ");
-    body.push_str(info.hashfull.format_into(&mut permille_digits));
-    body.push_str(" time ");
-    body.push_str(info.time_ms.format_into(&mut clock_digits));
-    if !info.pv.is_empty() {
-        body.push_str(" pv");
-        for m in &info.pv {
-            body.push(' ');
-            body.push_str(&format_usi_move(*m));
-        }
-    }
-    Formatter::new(w).info(&body)
-}
-
-/// A [`PvSink`] that writes each per-iteration / fail-high-low PV line straight
-/// to the shared USI output. Installed on the main worker only; helpers and the
-/// fixed-depth path get no sink and emit nothing.
-///
-/// `verbose2` only. Without that feature the main worker is given no sink either,
-/// which is what keeps the tournament build's search free of PV work: the
-/// search's emission sites are all behind `pv_sink.is_some()`.
-#[cfg(feature = "verbose2")]
-struct WriterPvSink<W: Write + Send> {
-    writer: Arc<Mutex<W>>,
-}
-
-#[cfg(feature = "verbose2")]
-impl<W: Write + Send> PvSink for WriterPvSink<W> {
-    fn emit(&mut self, info: &PvInfo) {
-        let mut guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = write_pv_info(&mut *guard, info);
+        GoOutcome::Started
     }
 }
 
@@ -2502,134 +2003,6 @@ fn resolve_book_filename_with_ybb_fallback(requested: &Path) -> PathBuf {
     requested.to_path_buf()
 }
 
-/// Emit a bare `bestmove <mv>` for the resign / declaration-win short-circuits,
-/// which produce no `info` line, preceded by the statistics of the interval it
-/// ends. Best-effort: a broken pipe must not panic the coordinator.
-///
-/// `sent` is raised before the lock is released, so the reply becoming visible
-/// and this search counting as finished are one indivisible step downstream.
-/// Only the `verbose3` `tt` commands ask that question, so only they carry the
-/// flag; the `bestmove` itself is written identically in every build.
-fn emit_bestmove<W: Write>(
-    writer: &Arc<Mutex<W>>,
-    #[cfg(feature = "verbose3")] sent: &AtomicBool,
-    mv: &str,
-) {
-    let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
-    #[cfg(feature = "verbose1")]
-    emit_stats(&mut *guard);
-    let _ = Formatter::new(&mut *guard).bestmove(mv);
-    #[cfg(feature = "verbose3")]
-    sent.store(true, Ordering::Relaxed);
-}
-
-/// Take the statistics of the interval that ends here and write their line into
-/// an already-locked sink, so it lands directly before the `bestmove` the caller
-/// writes next and after any final PV line already out.
-///
-/// Taking the counters is what starts the next interval, so every reply calls
-/// this — including one whose statistics are all zero and therefore print
-/// nothing, which would otherwise carry its interval into the following reply.
-/// The caller composes its `bestmove` text *before* calling, so the composing's
-/// own allocations stay inside the interval being reported.
-///
-/// Best-effort, like the `bestmove` itself: a broken pipe must not panic the
-/// coordinator.
-#[cfg(feature = "verbose1")]
-fn emit_stats<W: Write + ?Sized>(w: &mut W) {
-    let mut buf = StatsBuf::new();
-    if let Some(line) = crate::stats::render(&mut buf, take_alloc_count()) {
-        let _ = Formatter::new(w).composed_line(line);
-    }
-}
-
-/// Emit one diagnostic `info string <msg>` from the coordinator (best-effort) —
-/// the book-probe notices, which are produced on the search thread and so cannot
-/// use the driver's own [`UsiDriver::info_string_diag`].
-#[cfg(feature = "verbose1")]
-fn emit_info_string_diag<W: Write>(writer: &Arc<Mutex<W>>, msg: &str) {
-    let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = Formatter::new(&mut *guard).info_string(msg);
-}
-
-/// A running keep-alive: a helper thread that emits a bare newline every
-/// [`KEEP_ALIVE_TICKS_PER_NEWLINE`] polls so a GUI does not time out while the
-/// heavy `isready` initialisation runs — the reference's
-/// `Engine::run_heavy_job`. Dropping the guard stops and joins the thread, so
-/// the join runs whether the wrapped work returns normally or bails out early
-/// via `?`.
-struct KeepAlive {
-    /// Set on drop to stop the helper (`thread_end`).
-    stop: Arc<AtomicBool>,
-    /// `Some` until the guard is dropped; taken to join exactly once.
-    handle: Option<JoinHandle<()>>,
-}
-
-impl KeepAlive {
-    /// Spawn the helper thread and block until it has actually started, then
-    /// return the guard. The heavy work must run *after* this returns so a
-    /// CPU-bound job cannot delay the helper's first tick; the reference spins
-    /// on a `thread_started` flag for the same reason.
-    ///
-    /// The guard holds the shared writer lock for the whole newline, so a
-    /// keep-alive tick can never interleave mid-line with an `info string …` the
-    /// heavy work emits concurrently.
-    fn spawn<W: Write + Send + 'static>(writer: Arc<Mutex<W>>, poll: Duration) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let started = Arc::new(AtomicBool::new(false));
-        let handle = thread::spawn({
-            let stop = Arc::clone(&stop);
-            let started = Arc::clone(&started);
-            move || {
-                started.store(true, Ordering::Release);
-                let mut count: u32 = 0;
-                while !stop.load(Ordering::Acquire) {
-                    thread::sleep(poll);
-                    count += 1;
-                    if count >= KEEP_ALIVE_TICKS_PER_NEWLINE {
-                        count = 0;
-                        // A BARE newline (empty line, no `info string` prefix),
-                        // routed through the single output sink so it cannot
-                        // interleave mid-line with the heavy work's own output.
-                        let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
-                        let _ = Formatter::new(&mut *guard).raw_line("");
-                    }
-                }
-            }
-        });
-        // Wait until the helper is running (reference `Tools::sleep` spin on
-        // `thread_started`). We poll finer than the reference's 100 ms so
-        // wrapping a *fast* `isready` adds no perceptible latency; the 5 s
-        // keep-alive cadence itself is unaffected.
-        while !started.load(Ordering::Acquire) {
-            thread::sleep(Duration::from_millis(1));
-        }
-        Self {
-            stop,
-            handle: Some(handle),
-        }
-    }
-}
-
-impl Drop for KeepAlive {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-/// Join book PV moves into a USI ` `-separated string. `verbose2` only — the
-/// book `info` lines are its only caller.
-#[cfg(feature = "verbose2")]
-fn pv_string(pv: &[Move]) -> String {
-    pv.iter()
-        .map(|m| format_usi_move(*m))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// The SKIP_SEARCH hold condition, shared by the book-hit and the searched
 /// reply: a `go ponder` holds until its flag clears, a `go infinite` until
 /// `stop`. `go infinite` arrives with `verbose2`, so without that feature the
@@ -2644,49 +2017,32 @@ fn reply_is_held(
     held
 }
 
-/// Emit a book hit's output the way the reference does on `search_skipped`: one
-/// `info` line per surviving candidate, then — after the ponder/infinite hold —
-/// a final depth-0 `info` line and the `bestmove [ponder]`.
+/// Answer a book hit the way the reference does on `search_skipped`: the
+/// surviving candidates first, then — after the ponder/infinite hold — the
+/// terminal reply.
 ///
-/// Under `go ponder` / `go infinite` the final line and `bestmove` are held
-/// until `stop` or `ponderhit`, reusing the async-stop machinery rather than
-/// busy-waiting. `time_ms` is stamped once, when the book answered, so the hold
-/// does not inflate the elapsed time attributed to the reply; no search ran, so
-/// both `nodes` and `nps` are 0 on every line and none of them carries a
-/// `seldepth` (the reference's zero `selDepth`, which it omits).
+/// Under `go ponder` / `go infinite` the reply is held until `stop` or a
+/// `ponderhit`, reusing the async-stop machinery rather than busy-waiting.
+/// `time_ms` is stamped once, when the book answered, so the hold does not
+/// inflate the elapsed time attributed to the reply.
 ///
-/// Both `info` blocks are `verbose2`; the hold and the `bestmove` are not, so
-/// a default build answers a book hit with the move and nothing else.
+/// The candidate report is `verbose2`; the hold and the reply are not, so a
+/// default build answers a book hit with the move and nothing else.
 #[allow(clippy::too_many_arguments)]
-fn emit_book_hit<W: Write>(
-    writer: &Arc<Mutex<W>>,
+fn emit_book_hit<P: EngineSink>(
+    sink: &P,
     hit: &BookHit,
     #[cfg(feature = "verbose2")] hashfull: u32,
     #[cfg(feature = "verbose2")] time_ms: u64,
     ponder: Option<&Arc<PonderSignal>>,
     #[cfg(feature = "verbose2")] infinite: bool,
     stop: &AtomicBool,
-    suppress_bestmove: &AtomicBool,
+    suppress_reply: &AtomicBool,
     #[cfg(feature = "verbose3")] sent: &AtomicBool,
 ) {
-    // Per-candidate multipv info lines (emitted immediately, like the reference's
-    // in-probe isRoot block).
+    // Reported immediately, like the reference's in-probe isRoot block.
     #[cfg(feature = "verbose2")]
-    {
-        let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
-        let mut f = Formatter::new(&mut *guard);
-        for line in &hit.info_lines {
-            let body = format!(
-                "depth {} multipv {} score {} nodes 0 nps 0 \
-                 hashfull {hashfull} time {time_ms} pv {}",
-                line.depth,
-                line.multipv,
-                format_score(Value::from(line.score)),
-                pv_string(&line.pv),
-            );
-            let _ = f.info(&body);
-        }
-    }
+    sink.book_candidates(hit, hashfull, time_ms);
 
     // `go ponder` / `go infinite`: hold the reply until `stop`, or until a
     // `ponderhit` clears the ponder flag (the SKIP_SEARCH wait loop).
@@ -2701,36 +2057,19 @@ fn emit_book_hit<W: Write>(
     }
 
     // A Stochastic_Ponder teardown suppresses all output for this reply.
-    if suppress_bestmove.load(Ordering::Relaxed) {
+    if suppress_reply.load(Ordering::Relaxed) {
         return;
     }
 
-    // Final depth-0 info line + bestmove.
-    #[cfg(feature = "verbose2")]
-    let pv = {
-        let mut pv = format_usi_move(hit.best);
-        if let Some(p) = hit.ponder {
-            pv.push(' ');
-            pv.push_str(&format_usi_move(p));
-        }
-        pv
-    };
-    let mut reply = BestmoveBuf::new();
-    let bm = reply.compose(hit.best, hit.ponder);
-    let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
-    #[cfg(feature = "verbose2")]
-    let _ = Formatter::new(&mut *guard).info(&format!(
-        "depth 0 multipv 1 score {} nodes 0 nps 0 \
-         hashfull {hashfull} time {time_ms} pv {pv}",
-        format_score(Value::from(hit.value)),
-    ));
-    // After that line, so the statistics cover composing it too, and directly
-    // before the reply.
-    #[cfg(feature = "verbose1")]
-    emit_stats(&mut *guard);
-    let _ = Formatter::new(&mut *guard).bestmove(bm);
-    #[cfg(feature = "verbose3")]
-    sent.store(true, Ordering::Relaxed);
+    sink.book_reply(
+        hit,
+        #[cfg(feature = "verbose2")]
+        hashfull,
+        #[cfg(feature = "verbose2")]
+        time_ms,
+        #[cfg(feature = "verbose3")]
+        sent,
+    );
 }
 
 /// Everything one helper needs to run its own iterative deepening for a single
@@ -2754,7 +2093,7 @@ struct HelperJob {
     /// [`CoordinatorJob::depth`], which this copies.
     #[cfg(feature = "verbose2")]
     limit_depth: i32,
-    /// The one shared stop flag every worker polls (the driver installs it).
+    /// The one shared stop flag every worker polls (the engine installs it).
     stop: Arc<AtomicBool>,
     /// Per-worker node counters; the helper publishes `nodes` to
     /// `node_slots[index]`. The aggregate they form is read by the node ceiling
@@ -2786,7 +2125,7 @@ struct HelperJob {
     multi_pv: usize,
     /// This helper's node-shared correction / pawn tables — a cheap
     /// [`Arc`] clone of `worker_shared[index]`. Stable across `go`s within a pool
-    /// lifetime (the driver rebuilds it only on a pool rebuild, which recreates
+    /// lifetime (the engine rebuilds it only on a pool rebuild, which recreates
     /// the helper threads), so the helper attaches it once to its persistent
     /// per-worker tables.
     shared: Arc<SharedHistories>,
@@ -3046,7 +2385,7 @@ impl ThreadPool {
 }
 
 impl Drop for ThreadPool {
-    /// `quit` / EOF drop the driver, which drops the pool; join every helper so
+    /// A session ending drops the engine, which drops the pool; join every helper so
     /// no OS thread is leaked.
     fn drop(&mut self) {
         self.shutdown();
@@ -3196,8 +2535,8 @@ enum TablePlacement {
 /// — keeps its table on the part it uses, so every probe stays on a node a
 /// worker runs on.
 ///
-/// Reading the answer off the compiled constants keeps `isready` from asking the
-/// machine a second time.
+/// Reading the answer off the compiled constants keeps the readiness handshake
+/// from asking the machine a second time.
 fn table_placement(plan: &WorkerPlan) -> TablePlacement {
     let nodes = plan.distinct_system_nodes();
     match nodes.as_slice() {
@@ -3209,7 +2548,7 @@ fn table_placement(plan: &WorkerPlan) -> TablePlacement {
 /// Move the coordinator's session-owned history tables onto worker 0's node.
 ///
 /// This is the one per-worker bundle the engine does **not** allocate inside the
-/// worker that uses it: it is built and filled on the USI thread and only then
+/// worker that uses it: it is built and filled on the command thread and only then
 /// lent to the per-`go` coordinator. Its pages are therefore already faulted
 /// wherever the process policy put them, and no per-thread policy can move them
 /// retroactively — `mbind(MPOL_BIND | MPOL_MF_MOVE)` can, so that is what this
@@ -3299,9 +2638,9 @@ fn thread_allocation_information_as_string(threads_size: usize, plan: &WorkerPla
     )
 }
 
-/// The bundle [`UsiDriver::handle_go`] hands its coordinator thread — grouped
+/// The bundle [`Engine::go`] hands its coordinator thread — grouped
 /// into one struct so [`run_coordinated`] stays a single-argument call.
-struct CoordinatorJob<W: Write + Send + 'static> {
+struct CoordinatorJob<P: EngineSink> {
     tt: &'static TranspositionTable,
     pos: Position,
     /// The iterative-deepening ceiling for this `go`, below the search's own
@@ -3320,15 +2659,15 @@ struct CoordinatorJob<W: Write + Send + 'static> {
     control: SearchControl,
     /// The one shared stop flag.
     stop: Arc<AtomicBool>,
-    /// The main worker's game-scoped histories, returned to the driver on join.
+    /// The main worker's game-scoped histories, returned to the engine on join.
     histories: WorkerHistories,
-    /// The session's collection buffers, returned to the driver on join beside
+    /// The session's collection buffers, returned to the engine on join beside
     /// the histories. What the last search left is cleared before this one
     /// fills them; nothing here resizes them, since their room is the pool's
     /// property.
     vote_buffers: VoteBuffers,
     /// Per-worker node counters (index 0 = main, `1..` = helpers), zeroed for
-    /// this `go` by the driver. The aggregate node ceiling and the final
+    /// this `go` by the engine. The aggregate node ceiling and the final
     /// aggregated `info ... nodes` are the readers, both `verbose2`.
     #[cfg(feature = "verbose2")]
     node_slots: Arc<Vec<AtomicU64>>,
@@ -3353,8 +2692,8 @@ struct CoordinatorJob<W: Write + Send + 'static> {
     /// The seed for this `go`'s book PRNG (deterministic within a session).
     book_seed: u64,
     /// The shared `go ponder` signal (`Some` only for a `go ponder`): the
-    /// coordinator's hold loop runs while it is active, and `bestmove` is withheld
-    /// until a `ponderhit` clears it (or `stop` fires).
+    /// coordinator's hold loop runs while it is active, and the reply is withheld
+    /// until a ponderhit clears it (or the stop flag fires).
     ponder: Option<Arc<PonderSignal>>,
     /// `limits.infinite` — hold the reply until `stop` regardless of the clock
     /// (the SKIP_SEARCH wait loop). Only a `verbose2` build can parse the
@@ -3362,14 +2701,14 @@ struct CoordinatorJob<W: Write + Send + 'static> {
     #[cfg(feature = "verbose2")]
     infinite: bool,
     /// The Stochastic_Ponder teardown flag: when set the coordinator emits no
-    /// `bestmove` (nor final PV) for this search.
-    suppress_bestmove: Arc<AtomicBool>,
+    /// reply (nor final PV) for this search.
+    suppress_reply: Arc<AtomicBool>,
     /// Stamped `true` in the same output-lock critical section that writes this
-    /// search's `bestmove`, so the driver can tell "reply is out" from "thread
-    /// has exited" (see [`ActiveSearch::bestmove_sent`]). A suppressed reply
+    /// search's reply, so the engine can tell "reply is out" from "thread
+    /// has exited" (see [`ActiveSearch::reply_sent`]). A suppressed reply
     /// never sets it — nothing went out. `verbose3`, like the reader.
     #[cfg(feature = "verbose3")]
-    bestmove_sent: Arc<AtomicBool>,
+    reply_sent: Arc<AtomicBool>,
     /// The entering-king declaration thresholds snapshot for this `go`.
     entering_king: EnteringKingConfig,
     /// `go mate` mode — disables the early mate break and enables the mate-found
@@ -3389,14 +2728,15 @@ struct CoordinatorJob<W: Write + Send + 'static> {
     /// prints anything.
     #[cfg(feature = "verbose2")]
     pv_config: PvOutputConfig,
-    /// The shared output sink for the per-iteration / final `info` / `bestmove`.
-    writer: Arc<Mutex<W>>,
+    /// Where this search's progress and reply go: a handle to the session's own
+    /// output, cloned for the thread that will emit through it.
+    sink: P,
 }
 
 /// The Lazy-SMP coordinator — the reference main worker's `start_searching`,
-/// running on the per-`go` thread the driver spawns.
+/// running on the per-`go` thread [`Engine::go`] spawns.
 ///
-/// Hands back the main worker's histories for the driver to reclaim, the
+/// Hands back the main worker's histories for the engine to reclaim, the
 /// aggregate searched-node total (0 for the short-circuits, and what `bench`
 /// accumulates), and the time-management carry-forward, whose third element is
 /// `None` for a short-circuited `go`.
@@ -3424,9 +2764,9 @@ fn skip_search_carry() -> Option<(Value, Value, Option<f64>)> {
     Some((-VALUE_INFINITE, -VALUE_INFINITE, None))
 }
 
-fn run_coordinated<W: Write + Send + 'static, N: NetworkParams>(
+fn run_coordinated<P: EngineSink, N: NetworkParams>(
     net: N,
-    job: CoordinatorJob<W>,
+    job: CoordinatorJob<P>,
 ) -> CoordinatedOutcome {
     let CoordinatorJob {
         tt,
@@ -3451,9 +2791,9 @@ fn run_coordinated<W: Write + Send + 'static, N: NetworkParams>(
         ponder,
         #[cfg(feature = "verbose2")]
         infinite,
-        suppress_bestmove,
+        suppress_reply,
         #[cfg(feature = "verbose3")]
-        bestmove_sent,
+        reply_sent,
         entering_king,
         #[cfg(feature = "verbose2")]
         mate_mode,
@@ -3463,7 +2803,7 @@ fn run_coordinated<W: Write + Send + 'static, N: NetworkParams>(
         multi_pv,
         #[cfg(feature = "verbose2")]
         pv_config,
-        writer,
+        sink,
     } = job;
     #[cfg(feature = "verbose2")]
     let multi_pv = multi_pv.max(1);
@@ -3473,7 +2813,7 @@ fn run_coordinated<W: Write + Send + 'static, N: NetworkParams>(
     // allocates from here on stays node-local instead of following the
     // launcher's process-wide interleave. Idempotent across the per-`go`
     // coordinator respawns. The bundle in `histories` is placed separately, at
-    // pool (re)build time, because it was already faulted on the USI thread.
+    // pool (re)build time, because it was already faulted on the command thread.
     yorkie_numa::pin_current_thread_to_cpu_with_local_memory(
         worker_plan.cpus[0],
         worker_plan.system_nodes[0],
@@ -3489,11 +2829,10 @@ fn run_coordinated<W: Write + Send + 'static, N: NetworkParams>(
     // dispatched, exactly as `start_searching` exits before `threads.start_searching()`.
     let root_moves = generate_root_moves(&pos);
     if root_moves.is_empty() {
-        emit_bestmove(
-            &writer,
+        sink.reply(
+            Reply::Resign,
             #[cfg(feature = "verbose3")]
-            &bestmove_sent,
-            "resign",
+            &reply_sent,
         );
         return CoordinatedOutcome {
             histories,
@@ -3503,26 +2842,22 @@ fn run_coordinated<W: Write + Send + 'static, N: NetworkParams>(
             time_state: skip_search_carry(),
         };
     }
+
     // Rule-aware declaration shortcut. Point / `None` rules yield
     // `Move::win()` (emitted as the bare `win` token); `TryRule`
     // yields the actual king move onto the try square, which must be emitted
     // verbatim so the host plays it.
     if let Some(mv) = declaration_win(&pos, &entering_king) {
-        if mv == Move::win() {
-            emit_bestmove(
-                &writer,
-                #[cfg(feature = "verbose3")]
-                &bestmove_sent,
-                "win",
-            );
+        let declared = if mv == Move::win() {
+            Reply::Win
         } else {
-            emit_bestmove(
-                &writer,
-                #[cfg(feature = "verbose3")]
-                &bestmove_sent,
-                BestmoveBuf::new().compose(mv, None),
-            );
-        }
+            Reply::BestMove { mv, ponder: None }
+        };
+        sink.reply(
+            declared,
+            #[cfg(feature = "verbose3")]
+            &reply_sent,
+        );
         return CoordinatedOutcome {
             histories,
             vote_buffers,
@@ -3548,7 +2883,7 @@ fn run_coordinated<W: Write + Send + 'static, N: NetworkParams>(
         );
         #[cfg(feature = "verbose1")]
         for diag in &probed.diagnostics {
-            emit_info_string_diag(&writer, diag);
+            sink.diagnostic(diag);
         }
         if let Some(hit) = probed.hit {
             // `tm.elapsed_time()` at the moment the book answered, floored at 1
@@ -3559,7 +2894,7 @@ fn run_coordinated<W: Write + Send + 'static, N: NetworkParams>(
                 .as_millis() as u64)
                 .max(1);
             emit_book_hit(
-                &writer,
+                &sink,
                 &hit,
                 #[cfg(feature = "verbose2")]
                 tt.hashfull(0),
@@ -3569,9 +2904,9 @@ fn run_coordinated<W: Write + Send + 'static, N: NetworkParams>(
                 #[cfg(feature = "verbose2")]
                 infinite,
                 &stop,
-                &suppress_bestmove,
+                &suppress_reply,
                 #[cfg(feature = "verbose3")]
-                &bestmove_sent,
+                &reply_sent,
             );
             return CoordinatedOutcome {
                 histories,
@@ -3626,12 +2961,7 @@ fn run_coordinated<W: Write + Send + 'static, N: NetworkParams>(
     #[cfg(feature = "verbose2")]
     qs.set_multi_pv(multi_pv);
     #[cfg(feature = "verbose2")]
-    qs.set_pv_output(
-        pv_config,
-        Box::new(WriterPvSink {
-            writer: Arc::clone(&writer),
-        }),
-    );
+    qs.set_pv_output(pv_config, Box::new(sink.pv_output()));
     // As in the helper loop: without `verbose2` no `go` carries a ceiling below
     // the search's own maximum, because neither source of one exists.
     #[cfg(not(feature = "verbose2"))]
@@ -3639,7 +2969,7 @@ fn run_coordinated<W: Write + Send + 'static, N: NetworkParams>(
     let main_result = qs.run_worker(&pos, root_moves, depth);
 
     // Ponder / infinite hold (the SKIP_SEARCH wait loop): do not emit
-    // `bestmove` while still pondering or under `go infinite`. A plain
+    // the reply while still pondering or under `go infinite`. A plain
     // `ponderhit` clears the ponder flag mid-search, so the main worker usually
     // returns already un-pondering; this catches the case where the search
     // finished (mate found / depth ceiling) while a `ponderhit` had not yet
@@ -3736,7 +3066,7 @@ fn run_coordinated<W: Write + Send + 'static, N: NetworkParams>(
         to_cp(resign_score) <= -RESIGN_VALUE
     };
 
-    // Final PV output before `bestmove`. `pv_idx == lines.len()` makes every
+    // Final PV output before the reply. `pv_idx == lines.len()` makes every
     // line exact, matching the reference's `pv()` after the MultiPV loop.
     //
     // `verbose2` only; `resign_by_value` above is not gated, since it decides
@@ -3750,44 +3080,42 @@ fn run_coordinated<W: Write + Send + 'static, N: NetworkParams>(
         let uci_pv_sent = results[0].uci_pv_sent && !ponder_extended && chosen == 0;
         if !uci_pv_sent || resign_by_value {
             // Reflect the (possibly ponder-extended) chosen line back into line 0
-            // so this re-emits the exact PV that `bestmove [ponder]` will play.
+            // so this re-emits the exact PV the reply will play.
             if let Some(line0) = pv_lines.get_mut(0) {
                 *line0 = best.clone();
             }
             let n = pv_lines.len();
             let infos = qs.build_pv_infos(&pos, &pv_lines, n, completed_depth, n, total_nodes);
-            let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
-            for info in &infos {
-                let _ = write_pv_info(&mut *guard, info);
-            }
+            sink.pv_block(&infos);
         }
     }
 
-    // `bestmove [ponder]` — the ponder move is the chosen line's second PV move.
+    // The reply — the ponder move is the chosen line's second PV move.
     // Resigning replaces the whole reply (the reference makes the search look
     // skipped and stacks `Move::resign()`), so it carries no ponder move.
-    let mut reply = BestmoveBuf::new();
-    let bm = if resign_by_value {
-        "resign"
+    let reply = if resign_by_value {
+        Reply::Resign
     } else {
-        reply.compose(best.mv, (best.pv.len() >= 2).then(|| best.pv[1]))
+        Reply::BestMove {
+            mv: best.mv,
+            ponder: (best.pv.len() >= 2).then(|| best.pv[1]),
+        }
     };
 
     // A Stochastic_Ponder teardown stops the rewound search without emitting
-    // its `bestmove`; the fresh re-issued `go` produces the single reply the
+    // its reply; the fresh re-issued `go` produces the single reply the
     // GUI sees. The `time_state` below is still returned so the rewound
     // search's score / ply seed the re-issue's side-flip continuity.
-    if !suppress_bestmove.load(Ordering::Relaxed) {
-        emit_bestmove(
-            &writer,
+    if !suppress_reply.load(Ordering::Relaxed) {
+        sink.reply(
+            reply,
             #[cfg(feature = "verbose3")]
-            &bestmove_sent,
-            bm,
+            &reply_sent,
         );
     }
 
-    // Consume the driver (ending the `&tt` / `&net` borrows) and reclaim the main
-    // worker's histories for the driver, paired with the aggregate node total for
+    // Consume the search (ending the `&tt` / `&net` borrows) and reclaim the main
+    // worker's histories for the engine, paired with the aggregate node total for
     // the `bench` accumulation and the time-management carry-forward.
     CoordinatedOutcome {
         histories: qs.into_histories(),
@@ -3808,571 +3136,51 @@ fn run_coordinated<W: Write + Send + 'static, N: NetworkParams>(
 mod tests {
     use super::*;
 
-    /// Serialises the tests that drive a session.
-    ///
-    /// The transposition table is one `static` per process, and every session
-    /// that reaches `usinewgame` empties the whole of it. Two such tests running
-    /// as threads of one binary would clear the table under each other. Under
-    /// `cargo nextest` each test is its own process and the lock is never
-    /// contended; under a plain `cargo test` it is what keeps them apart.
-    static TT_LOCK: Mutex<()> = Mutex::new(());
+    use crate::usi::UsiSink;
+    use crate::{king_shuffle, serial_tt};
 
-    /// Exclusive use of the process's transposition table, held until the
-    /// returned guard goes out of scope. A panicking test leaves the lock
-    /// poisoned; the next test wants the table, not the panic, and the session
-    /// it drives empties the table before searching anything.
-    fn serial_tt() -> std::sync::MutexGuard<'static, ()> {
-        TT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    /// An engine writing into a buffer nothing reads back — for the state a test
+    /// drives directly rather than through a session.
+    fn idle_engine() -> Engine<UsiSink<Vec<u8>>> {
+        Engine::new(UsiSink::new(Arc::new(Mutex::new(Vec::new()))))
     }
 
-    /// Drive a full canned session in-process and return everything written.
-    ///
-    /// The output sink is an `Arc<Mutex<Vec<u8>>>` shared with the driver (and,
-    /// during a `go`, its search worker); after `run` returns — which joins any
-    /// worker — the buffer holds the complete transcript.
-    fn run_with(input: &str) -> String {
-        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let driver = UsiDriver::new(input.as_bytes(), Arc::clone(&output));
-        driver.run().expect("driver run");
-        let bytes = output.lock().expect("output lock").clone();
-        String::from_utf8(bytes).expect("utf-8")
-    }
-
-    /// A driver with nothing to read, for the handlers a test drives directly
-    /// rather than through a canned session.
-    fn idle_driver() -> UsiDriver<&'static [u8], Vec<u8>> {
-        UsiDriver::new(b"".as_slice(), Arc::new(Mutex::new(Vec::new())))
-    }
-
-    /// `n` legal moves from the initial position: both kings stepping onto the
-    /// square in front of them and back, for as long as asked.
-    fn king_shuffle(n: usize) -> String {
-        const CYCLE: [&str; 4] = ["5i5h", "5a5b", "5h5i", "5b5a"];
-        let mut line = String::new();
-        for i in 0..n {
-            if i > 0 {
-                line.push(' ');
-            }
-            line.push_str(CYCLE[i % CYCLE.len()]);
-        }
-        line
-    }
-
-    /// The transcript a diagnostic `info string <body>` contributes in THIS
-    /// build: the line with `verbose1`, nothing without it. Lets a pinned
-    /// transcript stay byte-exact in both builds instead of being asserted in
-    /// only one of them.
-    fn diag(body: &str) -> String {
-        if cfg!(feature = "verbose1") {
-            format!("info string {body}\n")
-        } else {
-            String::new()
-        }
-    }
-
-    /// Render one PV line exactly as [`write_pv_info`] would put it on the wire.
-    #[cfg(feature = "verbose2")]
-    fn pv_line(info: &PvInfo) -> String {
-        let mut buf = Vec::<u8>::new();
-        write_pv_info(&mut buf, info).expect("write to Vec cannot fail");
-        String::from_utf8(buf).expect("utf-8")
-    }
-
-    #[cfg(feature = "verbose2")]
-    fn pv_info_fixture(score: Value, bound: PvBound, pv: &[&str]) -> PvInfo {
-        let pos = Position::startpos();
-        PvInfo {
-            depth: 12,
-            sel_depth: 19,
-            multipv: 2,
-            score,
-            bound,
-            nodes: 1_234_567_890,
-            nps: 2_469_135_780,
-            hashfull: 314,
-            time_ms: 500,
-            pv: pv
-                .iter()
-                .map(|s| parse_usi_move(s, &pos).expect("fixture move parses"))
-                .collect(),
-        }
-    }
-
-    /// The `info` PV line is byte-exact. `write_pv_info` assembles it from
-    /// `NumBuffer`-backed digits rather than `format!` temporaries, so pin the
-    /// full wire bytes for every branch of the line (cp / mate, both signs, the
-    /// three bounds, and an empty PV) rather than just the fields' presence.
-    #[cfg(feature = "verbose2")]
-    #[test]
-    fn pv_info_line_is_byte_exact() {
-        assert_eq!(
-            pv_line(&pv_info_fixture(90, PvBound::Exact, &["7g7f", "3c3d"])),
-            "info depth 12 seldepth 19 multipv 2 score cp 100 nodes 1234567890 nps 2469135780 hashfull 314 time 500 pv 7g7f 3c3d\n"
-        );
-        // Truncating division toward zero, negative side.
-        assert_eq!(
-            pv_line(&pv_info_fixture(-95, PvBound::Lower, &["7g7f"])),
-            "info depth 12 seldepth 19 multipv 2 score cp -105 lowerbound nodes 1234567890 nps 2469135780 hashfull 314 time 500 pv 7g7f\n"
-        );
-        assert_eq!(
-            pv_line(&pv_info_fixture(0, PvBound::Upper, &[])),
-            "info depth 12 seldepth 19 multipv 2 score cp 0 upperbound nodes 1234567890 nps 2469135780 hashfull 314 time 500\n"
-        );
-        // Decisive scores switch to `mate <distance>`, signed by the side.
-        assert_eq!(
-            pv_line(&pv_info_fixture(VALUE_MATE - 5, PvBound::Exact, &["7g7f"])),
-            "info depth 12 seldepth 19 multipv 2 score mate 5 nodes 1234567890 nps 2469135780 hashfull 314 time 500 pv 7g7f\n"
-        );
-        assert_eq!(
-            pv_line(&pv_info_fixture(
-                -(VALUE_MATE - 5),
-                PvBound::Exact,
-                &["7g7f"]
-            )),
-            "info depth 12 seldepth 19 multipv 2 score mate -5 nodes 1234567890 nps 2469135780 hashfull 314 time 500 pv 7g7f\n"
-        );
-    }
-
-    /// A drop move, the `depth 0` / `nodes 0` / `nps 0` extremes, the floored
-    /// `time 1`, and both ends of the `hashfull` permille range still round-trip
-    /// byte-for-byte (the digit paths that `NumBuffer` owns). A zero
-    /// `sel_depth` drops the field entirely, which is what the reference prints.
-    #[cfg(feature = "verbose2")]
-    #[test]
-    fn pv_info_line_covers_zero_and_drop_extremes() {
-        let mut info = pv_info_fixture(0, PvBound::Exact, &[]);
-        info.depth = 0;
-        info.sel_depth = 0;
-        info.multipv = 1;
-        info.nodes = 0;
-        info.nps = 0;
-        info.hashfull = 0;
-        info.time_ms = 1;
-        assert_eq!(
-            pv_line(&info),
-            "info depth 0 multipv 1 score cp 0 nodes 0 nps 0 hashfull 0 time 1\n"
-        );
-
-        let pos = yorkie_state::parse_sfen("4k4/9/9/9/9/9/9/9/4K4 b P 1").expect("sfen parses");
-        info.pv = vec![parse_usi_move("P*5e", &pos).expect("drop parses")];
-        info.hashfull = 1000;
-        assert_eq!(
-            pv_line(&info),
-            "info depth 0 multipv 1 score cp 0 nodes 0 nps 0 hashfull 1000 time 1 pv P*5e\n"
-        );
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn quit_returns_immediately() {
-        let _tt = serial_tt();
-        assert_eq!(run_with("quit\n"), "");
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn eof_returns_ok() {
-        let _tt = serial_tt();
-        assert_eq!(run_with(""), "");
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn isready_without_network_reports_load_failure() {
-        let _tt = serial_tt();
-        // Nothing staged an evaluation file where this driver looks — beside
-        // the running executable — so the load fails: the contract is an
-        // `info string eval load failed:` notice and NO `readyok`. The process
-        // stays alive (the `quit` returns).
-        let out = run_with("isready\nquit\n");
-        assert!(
-            out.contains("info string eval load failed:"),
-            "expected eval-load-failure notice, got: {out:?}"
-        );
-        assert!(
-            !out.contains("readyok"),
-            "readyok must not appear on a failed load: {out:?}"
-        );
-        // A fast `isready` (default keep-alive cadence: a bare newline only every
-        // 5 s) emits no keep-alive newline — the first tick never elapses. The
-        // load-failure notice is a single line with a trailing `\n`; no *empty*
-        // line (bare keep-alive newline) may appear.
-        assert_eq!(
-            bare_newline_count(&out),
-            0,
-            "a fast isready must emit no keep-alive newline: {out:?}"
-        );
-    }
-
-    /// Count bare keep-alive newlines: empty lines produced by the helper
-    /// thread's `raw_line("")`. Splitting on `\n` yields one trailing empty
-    /// segment for the final terminator, which is not a bare newline; every
-    /// other empty segment is.
-    fn bare_newline_count(out: &str) -> usize {
-        let parts: Vec<&str> = out.split('\n').collect();
-        // Drop the trailing terminator segment before counting empties.
-        parts
-            .iter()
-            .take(parts.len().saturating_sub(1))
-            .filter(|s| s.is_empty())
-            .count()
-    }
-
-    /// Everything written to a shared test writer so far.
-    fn writer_snapshot(writer: &Arc<Mutex<Vec<u8>>>) -> String {
-        let bytes = writer.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        String::from_utf8(bytes).expect("utf-8")
-    }
-
-    /// Block until the shared writer holds at least `want` bare keep-alive
-    /// newlines, failing the test if that has not happened within `DEADLINE`.
-    ///
-    /// A test must wait for this rather than sleep a fixed time: the helper
-    /// promises a newline every [`KEEP_ALIVE_TICKS_PER_NEWLINE`] *polls*, not
-    /// every N ms of wall time, and each of those polls is a `thread::sleep`
-    /// that runs long on a loaded machine. A fixed sleep sized off the nominal
-    /// cadence therefore expires before the newline lands whenever the machine
-    /// is busy; this loop only bounds how long the helper may take to write
-    /// anything at all.
-    fn wait_for_bare_newlines(writer: &Arc<Mutex<Vec<u8>>>, want: usize) {
-        // Generous versus the ~50 ms nominal cadence of a 1 ms poll: this is a
-        // liveness backstop for a helper that never writes, not a cadence check.
-        const DEADLINE: Duration = Duration::from_secs(5);
-        let start = Instant::now();
-        loop {
-            let out = writer_snapshot(writer);
-            if bare_newline_count(&out) >= want {
-                return;
-            }
-            assert!(
-                start.elapsed() < DEADLINE,
-                "expected {want} bare keep-alive newline(s) within {DEADLINE:?}, got: {out:?}"
-            );
-            thread::sleep(Duration::from_millis(2));
-        }
-    }
-
-    #[test]
-    fn keep_alive_emits_bare_newline_through_shared_writer() {
-        // Drive the keep-alive mechanism directly with a short poll interval and
-        // a "heavy job" that stands in for slow initialisation by waiting for the
-        // helper to tick. The job also writes a real line through the *same*
-        // shared writer, between two ticks, so this asserts both that bare
-        // newlines are emitted while the job runs and that none of them
-        // interleaves mid-line with that output.
-        let writer = Arc::new(Mutex::new(Vec::<u8>::new()));
-        {
-            // 1 ms poll → a bare newline every 50 polls (KEEP_ALIVE_TICKS_PER_NEWLINE).
-            let keep_alive = KeepAlive::spawn(Arc::clone(&writer), Duration::from_millis(1));
-            // Heavy job, part one: run until the helper has ticked at least once.
-            wait_for_bare_newlines(&writer, 1);
-            // Then emit a real line partway through, to probe for interleaving.
-            // Straight through the shared writer, not through a gated sink: this
-            // test is about the keep-alive helper's interleaving, and must run in
-            // every build. Count under the same lock, so the count cannot miss a
-            // tick that lands between the write and the read.
-            let seen = {
-                let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
-                Formatter::new(&mut *guard)
-                    .info_string("busy")
-                    .expect("write to Vec cannot fail");
-                bare_newline_count(&String::from_utf8(guard.clone()).expect("utf-8"))
-            };
-            // Heavy job, part two: run until one *further* tick has landed, so the
-            // interleaving assertion has a keep-alive newline after that line too.
-            wait_for_bare_newlines(&writer, seen + 1);
-            drop(keep_alive); // stop flag set + helper joined here.
-        }
-        let out = writer_snapshot(&writer);
-
-        assert!(
-            bare_newline_count(&out) >= 1,
-            "expected at least one bare keep-alive newline, got: {out:?}"
-        );
-        // No interleaving: every non-empty line is the intact `info string busy`.
-        for line in out.split('\n') {
-            assert!(
-                line.is_empty() || line == "info string busy",
-                "keep-alive newline interleaved with output: {out:?}"
-            );
-        }
-        assert!(
-            out.contains("info string busy\n"),
-            "the heavy job's line must survive intact: {out:?}"
-        );
-    }
-
-    #[test]
-    fn keep_alive_stops_and_joins_when_job_finishes() {
-        // A short-lived scope with a short poll: the guard's Drop must set the
-        // stop flag and join the helper without hanging, and (the job being
-        // near-instant) emit no bare newline. There is nothing to wait for here —
-        // the assertion is that the helper has *not* ticked — so the bound comes
-        // from measured wall time instead: the helper cannot have written before
-        // KEEP_ALIVE_TICKS_PER_NEWLINE polls elapsed, and on a machine loaded
-        // enough that this near-instant scope itself took that long, the count is
-        // allowed to rise exactly as far as the stolen time justifies. On an idle
-        // machine the scope takes a millisecond or two and the bound is zero.
-        let writer = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let poll = Duration::from_millis(1);
-        let start = Instant::now();
-        {
-            let _keep_alive = KeepAlive::spawn(Arc::clone(&writer), poll);
-            // No wait: the "job" finishes before the first newline tick.
-        }
-        // Returning from the scope at all is the stop-and-join property: a Drop
-        // that failed to set the stop flag would hang forever in the join.
-        let elapsed = start.elapsed();
-        let out = writer_snapshot(&writer);
-        let max_newlines =
-            (elapsed.as_nanos() / poll.as_nanos()) / u128::from(KEEP_ALIVE_TICKS_PER_NEWLINE);
-        assert!(
-            bare_newline_count(&out) as u128 <= max_newlines,
-            "a job that finishes before the first tick emits no newline \
-             ({elapsed:?} of polls allows at most {max_newlines}): {out:?}"
-        );
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn usinewgame_is_no_op() {
-        let _tt = serial_tt();
-        assert_eq!(run_with("usinewgame\nquit\n"), "");
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn unknown_command_echoes_back() {
-        let _tt = serial_tt();
-        assert_eq!(
-            run_with("frobnicate\nquit\n"),
-            diag("unknown command: frobnicate")
-        );
-    }
-
-    /// There is no option to set in any build, and USI requires no reply to
-    /// `setoption`, so every one of them is consumed in silence: a name the
-    /// reference implementation registers, a nonexistent one and an ill-typed
-    /// one all take the same path and all emit nothing.
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn setoption_is_consumed_silently() {
-        let _tt = serial_tt();
-        for line in [
-            "setoption name USI_Hash value 256",
-            "setoption name Nonexistent value foo",
-            "setoption name USI_Hash value not-a-number",
-            "setoption name Threads value 8",
-            // No `value` token at all — still consumed.
-            "setoption name Threads",
-        ] {
-            assert_eq!(run_with(&format!("{line}\nquit\n")), "", "line {line:?}");
-        }
-    }
-
-    /// A transcript with the per-reply statistics line dropped.
-    ///
-    /// That line counts what the *process* allocated since the previous reply,
-    /// so two runs of one session do not agree on it, and neither would two
-    /// sessions being compared for the decisions they took. Without `verbose1`
-    /// there is no such line and this is the identity.
-    fn without_stats(out: &str) -> String {
-        out.lines()
-            .filter(|l| !l.starts_with("info string stats "))
-            .map(|l| format!("{l}\n"))
-            .collect()
-    }
-
-    /// Consuming the line really is inert: a `setoption name Threads` an older
-    /// build would have acted on leaves the pool exactly as it was, so the
-    /// following `go` behaves as if the line had never arrived — and the
-    /// transcript is byte-identical to the one without the lines.
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn a_consumed_setoption_changes_nothing() {
-        let _tt = serial_tt();
-        let with_setoption = run_with(
-            "setoption name Threads value 1\n\
-             setoption name USI_Hash value 1\n\
-             position startpos\n\
-             go btime 1000 wtime 1000\n\
-             quit\n",
-        );
-        let without = run_with("position startpos\ngo btime 1000 wtime 1000\nquit\n");
-        assert_eq!(without_stats(&with_setoption), without_stats(&without));
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn position_startpos_silent() {
-        let _tt = serial_tt();
-        assert_eq!(run_with("position startpos\nquit\n"), "");
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn position_sfen_startpos_silent() {
-        let _tt = serial_tt();
-        let sfen = yorkie_state::STARTPOS_SFEN;
-        assert_eq!(run_with(&format!("position sfen {sfen}\nquit\n")), "");
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn position_startpos_moves_silent() {
-        let _tt = serial_tt();
-        assert_eq!(run_with("position startpos moves 7g7f\nquit\n"), "");
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn position_sfen_malformed_emits_info_string() {
-        let _tt = serial_tt();
-        let out = run_with("position sfen not-a-board b - 1\nquit\n");
-        if cfg!(feature = "verbose1") {
-            assert!(
-                out.starts_with("info string position parse error:"),
-                "unexpected output: {out:?}",
-            );
-        } else {
-            // The rejection itself is unchanged (the position is not adopted —
-            // `position_parse_error_leaves_prior_state_intact` covers that); the
-            // default build just does not say so.
-            assert_eq!(out, "", "unexpected output: {out:?}");
-        }
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn position_with_illegal_move_emits_info_string() {
-        let _tt = serial_tt();
-        // 1a1b would move a non-existent piece (square 1a empty at startpos).
-        let out = run_with("position startpos moves 1a1b\nquit\n");
-        if cfg!(feature = "verbose1") {
-            assert!(
-                out.starts_with("info string illegal move:"),
-                "unexpected output: {out:?}",
-            );
-        } else {
-            assert_eq!(out, "", "unexpected output: {out:?}");
-        }
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn position_with_pseudo_legal_but_illegal_move_emits_info_string() {
-        let _tt = serial_tt();
-        // 1a1b' shape — pick a syntactically valid move that is not a legal
-        // generated move from startpos. Pawn on 7g cannot jump to 5g.
-        let out = run_with("position startpos moves 7g5g\nquit\n");
-        if cfg!(feature = "verbose1") {
-            assert!(
-                out.starts_with("info string illegal move:"),
-                "unexpected output: {out:?}",
-            );
-        } else {
-            assert_eq!(out, "", "unexpected output: {out:?}");
-        }
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn position_parse_error_leaves_prior_state_intact() {
-        let _tt = serial_tt();
-        // Apply a legal move; then send a malformed sfen; then `go`. The reply
-        // must be a legal move from the *post-7g7f* position, not from startpos
-        // — proving the malformed line did not clobber the driver's state.
-        // (`go` here has no network loaded, so it resigns; the check is that the
-        // parse error is reported and exactly one bestmove is emitted.)
-        let session = "position startpos moves 7g7f\n\
-                       position sfen not-a-board b - 1\n\
-                       go\n\
-                       quit\n";
-        let out = run_with(session);
-        if cfg!(feature = "verbose1") {
-            assert!(
-                out.contains("info string position parse error:"),
-                "missing parse-error info string in: {out}"
-            );
-        }
-        let bestmoves: Vec<&str> = out.lines().filter(|l| l.starts_with("bestmove ")).collect();
-        assert_eq!(
-            bestmoves.len(),
-            1,
-            "expected one bestmove line, got {bestmoves:?}"
-        );
-    }
-
-    /// A `position` line carrying more moves than the retained command can hold
-    /// is refused by name, and the position the last accepted line named stands.
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn a_move_list_past_the_bound_is_refused() {
-        let _tt = serial_tt();
-        let session = format!(
-            "position startpos moves 7g7f\n\
-             position startpos moves {}\n\
-             go\n\
-             quit\n",
-            king_shuffle(MAX_POSITION_MOVES + 1)
-        );
-        let out = run_with(&session);
-        if cfg!(feature = "verbose1") {
-            assert!(
-                out.contains(&format!(
-                    "info string position error: more than {MAX_POSITION_MOVES} moves"
-                )),
-                "missing the refusal in: {out}"
-            );
-        }
-        let bestmoves: Vec<&str> = out.lines().filter(|l| l.starts_with("bestmove ")).collect();
-        assert_eq!(
-            bestmoves.len(),
-            1,
-            "expected one bestmove line, got {bestmoves:?}"
-        );
-    }
-
-    /// What a refused line must leave behind, read off the driver itself: the
-    /// position of the last accepted command, and that command still retained
-    /// for the Stochastic_Ponder paths that replay it.
+    /// What a refused command must leave behind, read off the engine itself: the
+    /// position of the last accepted one, and that command still retained for
+    /// the Stochastic_Ponder paths that replay it.
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_refused_position_leaves_the_accepted_one_in_place() {
         let _tt = serial_tt();
-        let mut driver = idle_driver();
-        driver
-            .handle_position(PositionSfen::StartPos, "7g7f 3c3d")
-            .expect("write");
-        let accepted_ply = driver.pos.ply();
+        let mut engine = idle_engine();
+        engine
+            .set_position(PositionSfen::StartPos, "7g7f 3c3d")
+            .expect("both moves are legal");
+        let accepted_ply = engine.pos.ply();
 
         for refused in [
             "7g7f 1a1b",                                   // an illegal move mid-list
             king_shuffle(MAX_POSITION_MOVES + 1).as_str(), // past the bound
         ] {
-            driver
-                .handle_position(PositionSfen::StartPos, refused)
-                .expect("write");
-            assert_eq!(driver.pos.ply(), accepted_ply);
-            assert_eq!(driver.last_position.moves.len(), 2);
+            let _ = engine.set_position(PositionSfen::StartPos, refused);
+            assert_eq!(engine.pos.ply(), accepted_ply);
+            assert_eq!(engine.last_position.moves.len(), 2);
         }
 
         // A malformed SFEN is refused before any move is looked at.
-        driver
-            .handle_position(PositionSfen::Sfen(["not-a-board", "b", "-", "1"]), "")
-            .expect("write");
-        assert_eq!(driver.pos.ply(), accepted_ply);
-        assert_eq!(driver.last_position.moves.len(), 2);
+        let _ = engine.set_position(PositionSfen::Sfen(["not-a-board", "b", "-", "1"]), "");
+        assert_eq!(engine.pos.ply(), accepted_ply);
+        assert_eq!(engine.last_position.moves.len(), 2);
     }
 
-    /// A game's `position` commands are written into the buffers the driver was
+    /// A game's position commands are written into the buffers the engine was
     /// built with: whatever the game's length, none of them is regrown, which is
     /// what keeps the command path away from the allocator.
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_games_position_commands_reuse_the_buffers() {
         let _tt = serial_tt();
-        let mut driver = idle_driver();
+        let mut engine = idle_engine();
         let sfen = [
             "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL",
             "b",
@@ -4380,152 +3188,19 @@ mod tests {
             "1",
         ];
         for plies in 0..64 {
-            driver
-                .handle_position(PositionSfen::StartPos, &king_shuffle(plies))
-                .expect("write");
-            driver
-                .handle_position(PositionSfen::Sfen(sfen), &king_shuffle(plies))
-                .expect("write");
+            engine
+                .set_position(PositionSfen::StartPos, &king_shuffle(plies))
+                .expect("a king shuffle is legal");
+            engine
+                .set_position(PositionSfen::Sfen(sfen), &king_shuffle(plies))
+                .expect("a king shuffle is legal");
         }
-        assert_eq!(driver.last_position.moves.len(), 63);
-        for retained in [&driver.last_position, &driver.pending_position] {
+        assert_eq!(engine.last_position.moves.len(), 63);
+        for retained in [&engine.last_position, &engine.pending_position] {
             assert_eq!(retained.moves.capacity(), MAX_POSITION_MOVES);
             assert_eq!(retained.sfen.capacity(), SFEN_CAPACITY);
         }
-        assert_eq!(driver.legal_buf.capacity(), MAX_LEGAL_MOVES);
-    }
-
-    /// The SFEN fields arrive split, and the driver joins them back into the one
-    /// string the parser reads — whatever ran between them on the wire.
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn a_position_sfen_is_accepted_however_its_fields_were_spaced() {
-        let _tt = serial_tt();
-        let sfen = yorkie_state::STARTPOS_SFEN;
-        assert_eq!(
-            run_with(&format!("position   sfen  {sfen}   moves   7g7f\nquit\n")),
-            ""
-        );
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn go_without_network_resigns_with_notice() {
-        let _tt = serial_tt();
-        // No successful `isready`, so no network is loaded. `go` must not crash;
-        // it emits the notice and `bestmove resign`. (The positive path — a
-        // legal, search-chosen move — is covered in tests/eval_session.rs with a
-        // synthetic network, and in tests/real_network_selfplay against the
-        // network the build laid out.)
-        let out = run_with("go\nquit\n");
-        if cfg!(feature = "verbose1") {
-            assert!(
-                out.contains("info string no eval network loaded; run isready"),
-                "expected the no-network notice, got: {out:?}"
-            );
-        }
-        let bestmoves: Vec<&str> = out.lines().filter(|l| l.starts_with("bestmove ")).collect();
-        assert_eq!(bestmoves, vec!["bestmove resign"]);
-    }
-
-    #[cfg(feature = "verbose2")]
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn go_with_limit_subtokens_still_emits_one_bestmove() {
-        let _tt = serial_tt();
-        // Whatever subset of GoLimits the host provides, the driver parses and
-        // accepts them and still emits exactly one bestmove line (resign here,
-        // as no network is loaded).
-        let session = "go depth 8 wtime 60000 btime 60000 byoyomi 5000\nquit\n";
-        let out = run_with(session);
-        let bestmoves: Vec<&str> = out.lines().filter(|l| l.starts_with("bestmove ")).collect();
-        assert_eq!(bestmoves.len(), 1);
-    }
-
-    /// Below `verbose2` — the default (tournament) build: the same line is
-    /// refused by name and starts nothing, so there is no `bestmove` at all. The
-    /// clock clauses riding along on it do not rescue it: a `go` whose terms the
-    /// build cannot honour is not silently downgraded to one it can.
-    #[cfg(not(feature = "verbose2"))]
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn go_with_gated_limit_subtokens_is_refused_and_starts_no_search() {
-        let _tt = serial_tt();
-        let session = "go depth 8 wtime 60000 btime 60000 byoyomi 5000\nquit\n";
-        // The refusal is what matters — no `bestmove`, so no search started. The
-        // line that names it is `verbose1`.
-        assert_eq!(
-            run_with(session),
-            diag("go error: `depth` requires a verbose2 build; no search started")
-        );
-    }
-
-    /// Below `verbose2`: the match clauses are untouched — a clock-bounded `go`
-    /// still runs and emits one `bestmove` (resign here, as no network is
-    /// loaded).
-    #[cfg(not(feature = "verbose2"))]
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn go_with_match_subtokens_still_emits_one_bestmove() {
-        let _tt = serial_tt();
-        let session = "go wtime 60000 btime 60000 byoyomi 5000\nquit\n";
-        let out = run_with(session);
-        let bestmoves: Vec<&str> = out.lines().filter(|l| l.starts_with("bestmove ")).collect();
-        assert_eq!(bestmoves, vec!["bestmove resign"]);
-    }
-
-    /// Below `verbose3`: `bench` is not a command, so it lands in the ordinary
-    /// unknown-command path — the same line any stray input produces.
-    #[cfg(not(feature = "verbose3"))]
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn bench_is_an_unknown_command_below_verbose3() {
-        let _tt = serial_tt();
-        assert_eq!(
-            run_with("bench 16 1 6 default depth\nquit\n"),
-            diag("unknown command: bench 16 1 6 default depth")
-        );
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn stop_is_silent() {
-        let _tt = serial_tt();
-        assert_eq!(run_with("stop\nquit\n"), "");
-        // `stop` with no network resolves the same as `go` alone: the no-network
-        // notice plus a single `bestmove resign`, and nothing more.
-        assert_eq!(
-            without_stats(&run_with("go\nstop\nquit\n")),
-            without_stats(&run_with("go\nquit\n"))
-        );
-    }
-
-    /// `bench` is the one command that resizes the worker pool, and a pool
-    /// rebuild emits the reference allocation info line. Each cycle joins its
-    /// helpers first, so repeated rebuilds never wedge the main loop or leak
-    /// threads. No network is loaded, so every bench position resigns
-    /// immediately and the run is fast.
-    #[cfg(feature = "verbose3")]
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn a_bench_thread_count_emits_the_allocation_line() {
-        let _tt = serial_tt();
-        let out = run_with(
-            "bench 1 1 1 current movetime\n\
-             bench 1 4 1 current movetime\n\
-             bench 1 2 1 current movetime\n\
-             quit\n",
-        );
-        // Prefix matches: the CPU list the line ends with is the host's.
-        assert!(out.contains("info string Using 1 thread on CPUs "), "{out}");
-        assert!(
-            out.contains("info string Using 4 threads on CPUs "),
-            "{out}"
-        );
-        assert!(
-            out.contains("info string Using 2 threads on CPUs "),
-            "{out}"
-        );
+        assert_eq!(engine.legal_buf.capacity(), MAX_LEGAL_MOVES);
     }
 
     // -- the compiled layout, and the machine it is held against ---------
@@ -4702,7 +3377,7 @@ mod tests {
         let stop = Arc::clone(&handles.stop);
         let bmc = Arc::clone(&handles.bmc_slots);
         handles.stop.store(true, Ordering::Relaxed);
-        handles.suppress_bestmove.store(true, Ordering::Relaxed);
+        handles.suppress_reply.store(true, Ordering::Relaxed);
         handles.bmc_slots[2].store(9, Ordering::Relaxed);
         #[cfg(feature = "verbose2")]
         handles.node_slots[1].store(9, Ordering::Relaxed);
@@ -4713,7 +3388,7 @@ mod tests {
         );
 
         assert!(!handles.stop.load(Ordering::Relaxed));
-        assert!(!handles.suppress_bestmove.load(Ordering::Relaxed));
+        assert!(!handles.suppress_reply.load(Ordering::Relaxed));
         assert!(
             handles
                 .bmc_slots
@@ -4764,7 +3439,7 @@ mod tests {
 
     #[test]
     fn thread_pool_zero_is_clamped_to_one() {
-        // The driver never passes 0 (the option min is 1), but the pool clamps
+        // The engine never passes 0 (the option min is 1), but the pool clamps
         // defensively so `size − 1` never underflows.
         let pool = ThreadPool::new(0);
         assert_eq!(pool.size(), 1);
@@ -4864,12 +3539,11 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_pool_rebuild_places_the_coordinator_histories_on_worker_zero_node() {
-        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let mut driver = UsiDriver::new(&b""[..], Arc::clone(&output));
-        driver.rebuild_pool();
+        let mut engine = idle_engine();
+        engine.rebuild_pool();
 
-        let node = driver.worker_plan.system_nodes[0];
-        let regions = driver
+        let node = engine.worker_plan.system_nodes[0];
+        let regions = engine
             .histories
             .as_ref()
             .expect("the coordinator bundle survives a pool rebuild")
@@ -4910,13 +3584,12 @@ mod tests {
             "the short-circuit carry is the -VALUE_INFINITE sentinel with no tr"
         );
 
-        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let mut driver = UsiDriver::new(&b""[..], Arc::clone(&output));
+        let mut engine = idle_engine();
         // Seed distinctive "previous real search" state.
-        driver.best_previous_score = 123;
-        driver.best_previous_average_score = 456;
-        driver.previous_time_reduction = 0.42;
-        driver.last_game_ply = 7;
+        engine.best_previous_score = 123;
+        engine.best_previous_average_score = 456;
+        engine.previous_time_reduction = 0.42;
+        engine.last_game_ply = 7;
 
         // A synthetic short-circuited search that "ran" at ply 20 and hands back
         // the book / declaration / resign carry.
@@ -4925,25 +3598,25 @@ mod tests {
             time_state: skip_search_carry(),
             vote_buffers: VoteBuffers::for_pool(1),
         });
-        driver.search = Some(ActiveSearch {
+        engine.search = Some(ActiveSearch {
             handle,
             stop: Arc::new(AtomicBool::new(false)),
             ponder: None,
             suppress: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "verbose3")]
-            bestmove_sent: Arc::new(AtomicBool::new(true)),
+            reply_sent: Arc::new(AtomicBool::new(true)),
             game_ply: 20,
         });
-        driver.finish_search_join();
+        engine.finish_search_join();
 
-        assert_eq!(driver.best_previous_score, -VALUE_INFINITE);
-        assert_eq!(driver.best_previous_average_score, -VALUE_INFINITE);
+        assert_eq!(engine.best_previous_score, -VALUE_INFINITE);
+        assert_eq!(engine.best_previous_average_score, -VALUE_INFINITE);
         assert_eq!(
-            driver.last_game_ply, 20,
+            engine.last_game_ply, 20,
             "ply advances to the short-circuit's"
         );
         assert_eq!(
-            driver.previous_time_reduction, 0.42,
+            engine.previous_time_reduction, 0.42,
             "previousTimeReduction is left untouched on a short-circuit"
         );
     }
@@ -4953,30 +3626,29 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn real_search_carry_overwrites_time_reduction() {
-        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let mut driver = UsiDriver::new(&b""[..], Arc::clone(&output));
-        driver.previous_time_reduction = 0.42;
+        let mut engine = idle_engine();
+        engine.previous_time_reduction = 0.42;
 
         let handle = std::thread::spawn(|| SearchState {
             histories: WorkerHistories::new(),
             time_state: Some((10, 20, Some(1.25))),
             vote_buffers: VoteBuffers::for_pool(1),
         });
-        driver.search = Some(ActiveSearch {
+        engine.search = Some(ActiveSearch {
             handle,
             stop: Arc::new(AtomicBool::new(false)),
             ponder: None,
             suppress: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "verbose3")]
-            bestmove_sent: Arc::new(AtomicBool::new(true)),
+            reply_sent: Arc::new(AtomicBool::new(true)),
             game_ply: 3,
         });
-        driver.finish_search_join();
+        engine.finish_search_join();
 
-        assert_eq!(driver.best_previous_score, 10);
-        assert_eq!(driver.best_previous_average_score, 20);
-        assert_eq!(driver.previous_time_reduction, 1.25);
-        assert_eq!(driver.last_game_ply, 3);
+        assert_eq!(engine.best_previous_score, 10);
+        assert_eq!(engine.best_previous_average_score, 20);
+        assert_eq!(engine.previous_time_reduction, 1.25);
+        assert_eq!(engine.last_game_ply, 3);
     }
 
     // The evaluation regions this binary declares, and which of them a worker

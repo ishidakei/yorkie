@@ -37,7 +37,7 @@ impl<'w, W: Write + ?Sized> Formatter<'w, W> {
     /// The lazy form of [`Self::info_string`]: the caller passes `format_args!`
     /// instead of a `String`, so an interpolated message costs no allocation —
     /// and a build whose sink drops the line (the `verbose1` gate in
-    /// [`crate::driver`]) never formats it at all.
+    /// [`crate::usi`]) never formats it at all.
     ///
     /// The diagnostics are its only caller, so it exists only with their feature.
     #[cfg(feature = "verbose1")]
@@ -47,7 +47,7 @@ impl<'w, W: Write + ?Sized> Formatter<'w, W> {
 
     /// Emit a generic `info <body>` line. The caller composes everything after
     /// the `info ` keyword (e.g. `depth 1 score cp 12 nodes 30 pv 7g7f`); the
-    /// search-progress reports the driver relays go through here.
+    /// search-progress reports the session relays go through here.
     ///
     /// Those reports are the `verbose2` surface, and nothing else emits a bare
     /// `info` line, so this exists only with that feature.

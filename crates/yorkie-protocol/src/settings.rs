@@ -5,17 +5,17 @@
 //! option surface — no declaration table, no `setoption`, no option-override
 //! file, no profile file.
 //!
-//! The accessors stay because the driver reads settings by name, and keeping the
+//! The accessors stay because the engine reads settings by name, and keeping the
 //! name → constant mapping in one file is what makes "which constant does
 //! `MultiPV` mean" answerable in one place.
 //!
-//! Only the settings the driver still asks for by name are here. A setting the
+//! Only the settings the engine still asks for by name are here. A setting the
 //! search or the storage layer reads has no accessor: those layers compile the
 //! same constant in for themselves, so nothing hands the value over at run time.
 //! `usi_hash` is the clearest case — the transposition table is a `static` whose
 //! length is that value — and the book-selection group, the draw and resign
 //! values, the entering-king rule and the time-management settings are the same
-//! shape, folded into the driver's `BOOK_CONFIG`, its other constants and the
+//! shape, folded into the engine's `BOOK_CONFIG`, its other constants and the
 //! search layer's.
 
 /// The evaluation-noise amplitude, in the unit the search scores in.
@@ -27,12 +27,12 @@
 /// binary is built, like every other setting here.
 #[cfg(feature = "random")]
 pub(crate) const RANDOM_AMPLITUDE: yorkie_storage::Value =
-    (crate::config::RANDOM * crate::driver::PAWN_VALUE as i64 / 100) as yorkie_storage::Value;
+    (crate::config::RANDOM * crate::engine::PAWN_VALUE as i64 / 100) as yorkie_storage::Value;
 
 /// The engine's settings: the generated constants, addressed by name.
 ///
 /// A zero-sized type — there is no settings state to hold. It exists so the
-/// driver has one object to ask, and so the name → constant mapping lives in
+/// engine has one object to ask, and so the name → constant mapping lives in
 /// one file rather than being spelled out at each call site.
 pub(crate) struct Settings;
 

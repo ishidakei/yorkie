@@ -1,4 +1,4 @@
-//! Multi-cycle session tests over `UsiDriver` with an in-memory byte sequence.
+//! Multi-cycle session tests over `UsiEngine` with an in-memory byte sequence.
 //!
 //! These cover the driver's behaviour when **no** evaluation network is loaded:
 //! the session must survive, `isready` must report the load failure, and every
@@ -15,11 +15,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use yorkie_protocol::UsiDriver;
+use yorkie_protocol::UsiEngine;
 
 fn drive(input: &str) -> String {
     let output = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let driver = UsiDriver::new(input.as_bytes(), Arc::clone(&output));
+    let driver = UsiEngine::new(input.as_bytes(), Arc::clone(&output));
     driver.run().expect("driver run");
     let bytes = output.lock().expect("output lock").clone();
     String::from_utf8(bytes).expect("utf-8")

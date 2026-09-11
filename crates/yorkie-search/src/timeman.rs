@@ -22,10 +22,10 @@ use crate::book::Prng;
 /// planning the time budget.
 const MOVE_HORIZON: i32 = 160;
 
-/// The raw inputs [`TimeManagement::init`] needs, extracted by the USI driver
-/// from the `go` limits and the root position. Keeping the input primitive
-/// (rather than the protocol `GoLimits`) preserves the layering rule that Search
-/// never depends on Protocol.
+/// The raw inputs [`TimeManagement::init`] needs, extracted by the Protocol
+/// layer from a `go` request and the root position. Keeping the input primitive
+/// (rather than that layer's own `GoParams`) preserves the layering rule that
+/// Search never depends on Protocol.
 ///
 /// Only what a `go` brings is here. The settings the budget also depends on —
 /// the two network delays, the minimum think time, the slow-mover percentage,

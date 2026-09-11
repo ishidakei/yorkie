@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use common::stage_configured_eval_dir;
-use yorkie_protocol::{UsiDriver, config};
+use yorkie_protocol::{UsiEngine, config};
 
 /// The CPUs this build's workers are pinned to.
 fn worker_cpus() -> BTreeSet<usize> {
@@ -38,7 +38,7 @@ fn compiled_cpus() -> BTreeSet<usize> {
 /// `eval_root` holds.
 fn drive_confined(input: &str, cpus: BTreeSet<usize>, eval_root: PathBuf) -> String {
     let output = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let driver = UsiDriver::new(input.as_bytes(), Arc::clone(&output))
+    let driver = UsiEngine::new(input.as_bytes(), Arc::clone(&output))
         .with_startup_affinity(cpus)
         .with_eval_root(eval_root);
     driver.run().expect("driver run");

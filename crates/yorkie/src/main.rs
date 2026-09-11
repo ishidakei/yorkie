@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use yorkie::perft;
-use yorkie_protocol::UsiDriver;
+use yorkie_protocol::UsiEngine;
 use yorkie_state::{Position, parse_sfen, parse_usi_move};
 
 const USAGE: &str = "\
@@ -32,9 +32,9 @@ fn dispatch(args: &[String]) -> Result<(), String> {
         // search worker, so it must be `Send + 'static` — use the owned `Stdout`
         // handle (a `StdoutLock` is not `Send`) behind an `Arc<Mutex<_>>`.
         let writer = Arc::new(Mutex::new(stdout()));
-        return UsiDriver::new(BufReader::new(stdin()), writer)
+        return UsiEngine::new(BufReader::new(stdin()), writer)
             .run()
-            .map_err(|e| format!("usi driver i/o error: {e}"));
+            .map_err(|e| format!("usi session i/o error: {e}"));
     }
     let mut it = args.iter().map(String::as_str);
     let cmd = it.next().ok_or("missing subcommand")?;

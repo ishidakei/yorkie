@@ -1,60 +1,16 @@
+//! The USI command parser: one line of text in, one typed request out.
+//!
+//! What a `position` or a `go` line *means* — the start position and the moves
+//! that reached it, the bounds on a search — is the engine's vocabulary, so the
+//! types this fills are [`crate::engine`]'s. This module owns only the reading.
+
+#[cfg(feature = "verbose2")]
+use crate::engine::MATE_UNLIMITED_MS;
+use crate::engine::{GoParams, PositionSfen};
+
 /// Input-validation limit: lines longer than this become
 /// `Command::TooLong` and are not parsed further.
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
-
-/// `position` command's first argument: either the implicit start position or
-/// an explicit SFEN, whose four fields — board, side to move, hands, ply — are
-/// borrowed from the command line rather than copied out of it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PositionSfen<'a> {
-    StartPos,
-    Sfen([&'a str; 4]),
-}
-
-/// All USI `go` sub-tokens captured verbatim, including the ones the driver does
-/// not act on, so the parse is lossless.
-///
-/// Six clauses are `verbose2`, together with the parser arms that fill them:
-/// `depth`, `nodes`, `movetime`, `infinite`, `mate` and `rtime`. A `go` line is
-/// their only source — the `DepthLimit` / `NodesLimit` config keys that also
-/// seed the first two need the same feature — so without it no input could make
-/// them anything but their default, and the fields carry the feature rather than
-/// standing unfillable.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct GoLimits {
-    #[cfg(feature = "verbose2")]
-    pub depth: Option<u32>,
-    #[cfg(feature = "verbose2")]
-    pub nodes: Option<u64>,
-    #[cfg(feature = "verbose2")]
-    pub movetime: Option<u64>,
-    pub wtime: Option<u64>,
-    pub btime: Option<u64>,
-    pub winc: Option<u64>,
-    pub binc: Option<u64>,
-    pub byoyomi: Option<u64>,
-    #[cfg(feature = "verbose2")]
-    pub infinite: bool,
-    /// `go ponder` — think on the predicted position; hold the reply until
-    /// `ponderhit` or `stop`.
-    pub ponder: bool,
-    /// `go mate [ms|infinite]` — mate-search mode. In USI, unlike UCI, the
-    /// token after `mate` is a time budget in milliseconds, not a move count.
-    /// `Some(ms)` carries the budget, with [`MATE_UNLIMITED_MS`] standing for
-    /// unlimited.
-    #[cfg(feature = "verbose2")]
-    pub mate: Option<u64>,
-    /// `go rtime <ms>` — a randomised minimum-thinking-time budget used for
-    /// self-play variety. `init_` seeds all three time bounds to `rtime` (plus
-    /// a decaying random bump) and returns early. `None` means no `rtime`.
-    #[cfg(feature = "verbose2")]
-    pub rtime: Option<u64>,
-}
-
-/// The `go mate` unlimited-budget sentinel (`limits.mate = INT32_MAX`):
-/// `go mate infinite` and a bare `go mate` both map here.
-#[cfg(feature = "verbose2")]
-pub const MATE_UNLIMITED_MS: u64 = i32::MAX as u64;
 
 /// The `go` clauses that arrive with `verbose2`: everything here is analysis
 /// or tooling, not the clock clauses and `ponder` a game bridge sends.
@@ -82,9 +38,9 @@ pub enum Command<'a> {
         /// command carried none.
         moves: &'a str,
     },
-    Go(GoLimits),
+    Go(GoParams),
     /// A `go` line carrying one of the [`EXTRA_GO_CLAUSES`], parsed by a build
-    /// without `verbose2`. Holds the offending clause token so the driver can
+    /// without `verbose2`. Holds the offending clause token so the session can
     /// name it; **no search is started**. The variant exists only without that
     /// feature — with `verbose2`, every one of those clauses parses into
     /// [`Command::Go`].
@@ -205,7 +161,7 @@ fn parse_position<'a>(line: &'a str, args: &'a str) -> Command<'a> {
         "startpos" => (PositionSfen::StartPos, rest),
         "sfen" => {
             // The four SFEN fields are: board, side-to-move, hands, ply. The
-            // driver hands them to `yorkie_state::parse_sfen` and surfaces any
+            // engine hands them to `yorkie_state::parse_sfen` and surfaces any
             // per-field error from there.
             let (board, rest) = split_token(rest);
             let (side_to_move, rest) = split_token(rest);
@@ -235,7 +191,7 @@ fn u64_arg(value: &str) -> Option<u64> {
 }
 
 fn parse_go<'a>(line: &'a str, args: &'a str) -> Command<'a> {
-    let mut limits = GoLimits::default();
+    let mut limits = GoParams::default();
     let mut rest = args;
     while !rest.is_empty() {
         let (key, after_key) = split_token(rest);
@@ -531,13 +487,13 @@ mod tests {
 
     #[test]
     fn parses_bare_go() {
-        assert_eq!(parse_line("go"), Command::Go(GoLimits::default()));
+        assert_eq!(parse_line("go"), Command::Go(GoParams::default()));
     }
 
     #[cfg(feature = "verbose2")]
     #[test]
     fn parses_go_depth() {
-        let expected = GoLimits {
+        let expected = GoParams {
             depth: Some(8),
             ..Default::default()
         };
@@ -547,7 +503,7 @@ mod tests {
     #[cfg(feature = "verbose2")]
     #[test]
     fn parses_go_nodes_movetime_combined() {
-        let expected = GoLimits {
+        let expected = GoParams {
             nodes: Some(1000),
             movetime: Some(250),
             ..Default::default()
@@ -561,7 +517,7 @@ mod tests {
     #[cfg(feature = "verbose2")]
     #[test]
     fn parses_go_infinite() {
-        let expected = GoLimits {
+        let expected = GoParams {
             infinite: true,
             ..Default::default()
         };
@@ -570,7 +526,7 @@ mod tests {
 
     #[test]
     fn parses_go_time_controls() {
-        let expected = GoLimits {
+        let expected = GoParams {
             wtime: Some(60000),
             btime: Some(60000),
             byoyomi: Some(5000),
@@ -584,7 +540,7 @@ mod tests {
 
     #[test]
     fn parses_go_winc_binc() {
-        let expected = GoLimits {
+        let expected = GoParams {
             winc: Some(1000),
             binc: Some(2000),
             ..Default::default()
@@ -658,7 +614,7 @@ mod tests {
 
     #[test]
     fn parses_go_ponder() {
-        let expected = GoLimits {
+        let expected = GoParams {
             ponder: true,
             ..Default::default()
         };
@@ -667,7 +623,7 @@ mod tests {
 
     #[test]
     fn parses_go_ponder_with_time() {
-        let expected = GoLimits {
+        let expected = GoParams {
             ponder: true,
             btime: Some(1000),
             wtime: Some(1000),
@@ -682,7 +638,7 @@ mod tests {
     #[cfg(feature = "verbose2")]
     #[test]
     fn parses_go_mate_with_budget() {
-        let expected = GoLimits {
+        let expected = GoParams {
             mate: Some(5000),
             ..Default::default()
         };
@@ -692,7 +648,7 @@ mod tests {
     #[cfg(feature = "verbose2")]
     #[test]
     fn parses_go_mate_bare_is_unlimited() {
-        let expected = GoLimits {
+        let expected = GoParams {
             mate: Some(MATE_UNLIMITED_MS),
             ..Default::default()
         };
@@ -702,7 +658,7 @@ mod tests {
     #[cfg(feature = "verbose2")]
     #[test]
     fn parses_go_mate_infinite_is_unlimited() {
-        let expected = GoLimits {
+        let expected = GoParams {
             mate: Some(MATE_UNLIMITED_MS),
             ..Default::default()
         };
@@ -771,10 +727,10 @@ mod tests {
     #[cfg(not(feature = "verbose2"))]
     #[test]
     fn match_go_clauses_still_parse_below_verbose2() {
-        assert_eq!(parse_line("go"), Command::Go(GoLimits::default()));
+        assert_eq!(parse_line("go"), Command::Go(GoParams::default()));
         assert_eq!(
             parse_line("go btime 60000 wtime 60000 binc 1000 winc 1000 byoyomi 5000"),
-            Command::Go(GoLimits {
+            Command::Go(GoParams {
                 btime: Some(60000),
                 wtime: Some(60000),
                 binc: Some(1000),
@@ -785,7 +741,7 @@ mod tests {
         );
         assert_eq!(
             parse_line("go ponder btime 1000 wtime 1000"),
-            Command::Go(GoLimits {
+            Command::Go(GoParams {
                 ponder: true,
                 btime: Some(1000),
                 wtime: Some(1000),

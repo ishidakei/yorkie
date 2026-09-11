@@ -11,11 +11,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use yorkie_protocol::UsiDriver;
+use yorkie_protocol::UsiEngine;
 
 fn drive(input: &str) -> String {
     let output = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let driver = UsiDriver::new(input.as_bytes(), Arc::clone(&output));
+    let driver = UsiEngine::new(input.as_bytes(), Arc::clone(&output));
     driver.run().expect("driver run");
     let bytes = output.lock().expect("output lock").clone();
     String::from_utf8(bytes).expect("utf-8")
@@ -86,7 +86,7 @@ fn isready_refuses_a_machine_that_is_not_the_one_the_binary_was_built_for() {
 
     let output = Arc::new(Mutex::new(Vec::<u8>::new()));
     let driver =
-        UsiDriver::new(&b"isready\nquit\n"[..], Arc::clone(&output)).with_sysfs_root(root.clone());
+        UsiEngine::new(&b"isready\nquit\n"[..], Arc::clone(&output)).with_sysfs_root(root.clone());
     driver.run().expect("driver run");
     let out = String::from_utf8(output.lock().expect("output lock").clone()).expect("utf-8");
 

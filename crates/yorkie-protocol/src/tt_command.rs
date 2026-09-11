@@ -11,7 +11,7 @@
 //!
 //! This module owns only what can be decided from the tokens alone: the
 //! subcommand, the position clause kept as a string, the scalar fields, and
-//! their range validation. Anything needing a `Position` is the driver's.
+//! their range validation. Anything needing a `Position` is the command's.
 //!
 //! Every value on the command surface is expressed relative to the named
 //! position as root, which is also how the transposition table stores it: the
@@ -32,7 +32,8 @@
 
 use yorkie_storage::{Bound, DEPTH_NONE, Depth, Value};
 
-use crate::driver::{PAWN_VALUE, VALUE_MATE, VALUE_TB_WIN_IN_MAX_PLY};
+use crate::engine::PAWN_VALUE;
+use crate::usi::{VALUE_MATE, VALUE_TB_WIN_IN_MAX_PLY};
 
 /// Largest mate distance the value encoding can carry: `VALUE_MATE - n` must
 /// stay decisive (`|v| >= VALUE_TB_WIN_IN_MAX_PLY`), and that threshold is
@@ -48,7 +49,7 @@ pub const MIN_STORE_DEPTH: Depth = DEPTH_NONE + 1;
 /// Largest `depth` an entry can carry (see [`MIN_STORE_DEPTH`]).
 pub const MAX_STORE_DEPTH: Depth = DEPTH_NONE + 255;
 
-/// A `tt` argument-parse failure, surfaced by the driver as one
+/// A `tt` argument-parse failure, surfaced by the command as one
 /// `info string tt error: <msg>` line so a garbage argument fails loudly
 /// without panicking.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,16 +65,16 @@ fn err(msg: impl Into<String>) -> TtParseError {
     TtParseError(msg.into())
 }
 
-/// The position clause, kept verbatim: the driver turns it into a `Position` so
+/// The position clause, kept verbatim: the command turns it into a `Position` so
 /// SFEN diagnostics come from the one parser the `position` command uses.
 ///
 /// `startpos` is a shorthand for the four-field `sfen` clause, spelled out here
-/// rather than expanded so the driver can use `Position::startpos()` directly.
+/// rather than expanded so the command can use `Position::startpos()` directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TtPosition {
     StartPos,
     /// The four SFEN fields (board, side-to-move, hands, ply) joined by single
-    /// spaces, exactly as [`crate::parser::PositionSfen::Sfen`] carries them.
+    /// spaces, exactly as [`crate::engine::PositionSfen::Sfen`] carries them.
     Sfen(String),
 }
 

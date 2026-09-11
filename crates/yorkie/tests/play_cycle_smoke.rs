@@ -1,7 +1,7 @@
 //! Cross-crate smoke test: spawn the built `yorkie` binary, drive a multi-
 //! cycle USI session through stdin, capture stdout, assert each `bestmove`
 //! line is well-formed and the binary exits 0. Confirms the `main` ↔
-//! `UsiDriver` wiring carries the new position/go path end-to-end.
+//! `UsiEngine` wiring carries the new position/go path end-to-end.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -90,7 +90,7 @@ fn multi_cycle_play_via_spawned_binary() {
     } else {
         // A build that had no network to convert wrote no evaluation file, so
         // the load fails, `readyok` is withheld, and each `go` resigns. The
-        // wiring this proves — `main` ↔ `UsiDriver`, end to end — is the same
+        // wiring this proves — `main` ↔ `UsiEngine`, end to end — is the same
         // either way.
         assert!(
             stdout.contains("info string eval load failed:"),
