@@ -37,7 +37,7 @@ use yorkie_state::{Position, parse_sfen, parse_usi_move};
 #[cfg(feature = "verbose2")]
 use yorkie_storage::Value;
 #[cfg(feature = "verbose3")]
-use yorkie_storage::{TTData, VALUE_NONE};
+use yorkie_storage::{TTData, TranspositionTable, VALUE_NONE};
 // The per-reply allocation tally: raised by the counting global allocator this
 // feature installs, and read by the statistics line that reports it.
 #[cfg(feature = "verbose1")]
@@ -798,9 +798,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
         let key = pos.key();
         let side = pos.side_to_move().index() as u8;
         let stored_value = value_to_tt(args.value, 0);
-        let generation = self.engine.transposition_table().generation();
+        let generation = TranspositionTable::shared().generation();
 
-        let (_, _, writer) = self.engine.transposition_table().probe(key, side);
+        let (_, _, writer) = TranspositionTable::shared().probe(key, side);
         writer.write(
             key,
             stored_value,
@@ -817,7 +817,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
         // comparison on purpose: `save` deliberately preserves the pre-existing
         // move for it, so a mismatch there is the documented behaviour, not a
         // declined write.
-        let (found, data, _) = self.engine.transposition_table().probe(key, side);
+        let (found, data, _) = TranspositionTable::shared().probe(key, side);
         let stored = found
             && data.value == stored_value
             && data.eval == args.eval
@@ -842,10 +842,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
             Ok(pos) => pos,
             Err(e) => return self.tt_error(&e),
         };
-        let (found, data, _) = self
-            .engine
-            .transposition_table()
-            .probe(pos.key(), pos.side_to_move().index() as u8);
+        let (found, data, _) =
+            TranspositionTable::shared().probe(pos.key(), pos.side_to_move().index() as u8);
         if !found {
             return self.out.info_string("tt probe miss");
         }
@@ -878,10 +876,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
         let mut hits = 0usize;
         for mv in &legal {
             let undo = pos.do_move(*mv);
-            let (found, data, _) = self
-                .engine
-                .transposition_table()
-                .probe(pos.key(), pos.side_to_move().index() as u8);
+            let (found, data, _) =
+                TranspositionTable::shared().probe(pos.key(), pos.side_to_move().index() as u8);
             let line = found.then(|| {
                 child_legal.clear();
                 pos.generate_legal_all(&mut child_legal);

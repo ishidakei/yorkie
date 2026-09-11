@@ -421,20 +421,18 @@ pub struct TimeControl {
     pub previous_time_reduction: f64,
 }
 
-/// The search driver, owning the network, the transposition table, the search
-/// stack and the one live set of worker history tables.
+/// The search driver, owning the network, the search stack and the one live
+/// set of worker history tables. The transposition table is not among them: it
+/// is one `static` whose size the build fixed, so every probe and write reaches
+/// it through [`TranspositionTable::shared`] at the point of use rather than
+/// through a field this struct would have to load.
 ///
 /// Despite the name it drives the whole search: [`Self::run_root`] is iterative
 /// deepening, `search` the interior body, and `qsearch` the leaf they recurse
 /// into.
 ///
-pub struct QSearch<'a, N: NetworkParams> {
+pub struct QSearch<N: NetworkParams> {
     net: N,
-    /// The shared transposition table, borrowed `&self`: it is one `static`
-    /// whose size the build fixed, and every probe / write goes through its
-    /// atomics, so each worker holds this same reference.
-    tt: &'a TranspositionTable,
-
     /// `nodes` counter — bumped once per `do_move`. A search input in every
     /// build, not an output: the repetition returns dither their draw value on
     /// bit 1 of it (`value_draw`), the interior search's root bookkeeping runs on
@@ -797,31 +795,30 @@ pub fn noise(key: u64, seed: u64, amplitude: Value) -> Value {
     (mix(key ^ seed) % amplitude as u64) as Value - amplitude / 2
 }
 
-impl<'a, N: NetworkParams> QSearch<'a, N> {
-    /// Create a driver over `net` and a **pre-sized** `tt` with fresh history
-    /// tables. The reference re-fills `lowPlyHistory` to 98 per `go`;
-    /// [`WorkerHistories::new`] leaves it zero, so it is seeded here so a bare
-    /// [`Self::run`] / [`Self::run_search`] (which do not run the per-`go`
-    /// refill) sees the reference value.
-    pub fn new(net: N, tt: &'a TranspositionTable) -> Self {
+impl<N: NetworkParams> QSearch<N> {
+    /// Create a driver over `net` with fresh history tables. The reference
+    /// re-fills `lowPlyHistory` to 98 per `go`; [`WorkerHistories::new`] leaves
+    /// it zero, so it is seeded here so a bare [`Self::run`] /
+    /// [`Self::run_search`] (which do not run the per-`go` refill) sees the
+    /// reference value.
+    pub fn new(net: N) -> Self {
         let histories = {
             let mut h = WorkerHistories::new();
             h.low_ply.fill(98);
             h
         };
-        Self::with_histories(net, tt, histories)
+        Self::with_histories(net, histories)
     }
 
-    /// Create a driver over `net` and a **pre-sized** `tt`, taking ownership of
-    /// externally-held `histories`.
+    /// Create a driver over `net`, taking ownership of externally-held
+    /// `histories`.
     ///
     /// The game-scoped path: histories persist across `go`s within a game, as
     /// the reference's do, and are reclaimed afterwards with
     /// [`Self::into_histories`].
-    pub fn with_histories(net: N, tt: &'a TranspositionTable, histories: WorkerHistories) -> Self {
+    pub fn with_histories(net: N, histories: WorkerHistories) -> Self {
         Self {
             net,
-            tt,
             nodes: 0,
             sel_depth: 0,
             nmp_min_ply: 0,
@@ -1300,7 +1297,7 @@ impl<'a, N: NetworkParams> QSearch<'a, N> {
         // reach the TT, so the hint goes here instead — the accumulator seam
         // every real-search `do_move` funnels through, later than the reference
         // but still well before the child probes.
-        self.tt
+        TranspositionTable::shared()
             .prefetch(post_pos.key(), post_pos.side_to_move().index() as u8);
 
         let net = self.net;
@@ -1371,8 +1368,8 @@ impl<'a, N: NetworkParams> QSearch<'a, N> {
         mv: Option<NonZeroU16>,
         eval: Value,
     ) {
-        let generation = self.tt.generation();
-        self.tt.write_at(
+        let generation = TranspositionTable::shared().generation();
+        TranspositionTable::shared().write_at(
             slot,
             key,
             value,
@@ -1485,7 +1482,7 @@ impl<'a, N: NetworkParams> QSearch<'a, N> {
         let side = us.index() as u8;
         // Capture the entry location once (like the reference's Step-3
         // `ttWriter`); every write below targets this exact slot.
-        let (found, tt_data, tt_slot) = self.tt.locate(pos_key, side);
+        let (found, tt_data, tt_slot) = TranspositionTable::shared().locate(pos_key, side);
         let tt_hit = found && self.reads_tt();
         // Widened O(1), without legal-move generation; the MovePicker's TT
         // stage re-validates with `pseudo_legal` + `is_legal`.
@@ -1754,7 +1751,7 @@ impl<'a, N: NetworkParams> QSearch<'a, N> {
 // re-search. It reuses the same `QSearch`, so the interior search and the child
 // qsearch it recurses into share all of that state.
 
-impl<N: NetworkParams> QSearch<'_, N> {
+impl<N: NetworkParams> QSearch<N> {
     /// Run the single-threaded, `MultiPV == 1`, book-free root path on `pos` to
     /// `limit_depth`, reproducing the reference's `start_searching` →
     /// `iterative_deepening` control flow. The caller must have sized the
@@ -1771,7 +1768,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
         // hoists this bump out — one per `go`, before any helper launches — and
         // calls [`Self::run_worker`] directly; on this single-worker path it
         // stays inline.
-        self.tt.new_search();
+        TranspositionTable::shared().new_search();
 
         // The root-move list is built once from the legal moves (the reference's
         // `start_thinking`). No legal move ⇒ `bestmove resign` with mated_in(1).
@@ -2417,7 +2414,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
         // The reference reads the occupancy again for each line it prints, but
         // no search runs between the lines of one call, so one read serves them
         // all. The clock is read once for the same reason.
-        let hashfull = self.tt.hashfull(0);
+        let hashfull = TranspositionTable::shared().hashfull(0);
         // `tm.elapsed_time()`, floored at 1 ms so a search that answered inside
         // one tick still has a divisor for `nps`. The origin is the PV
         // configuration's `limits.startTime`, the instant the `go` arrived and
@@ -2500,7 +2497,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
             } else {
                 let key = pos.key();
                 let side = pos.side_to_move().index() as u8;
-                let (found, data, _writer) = self.tt.probe(key, side);
+                let (found, data, _writer) = TranspositionTable::shared().probe(key, side);
                 if !found {
                     break;
                 }
@@ -2554,7 +2551,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
         let undo = pos.do_move(pv0);
         let key = pos.key();
         let side = pos.side_to_move().index() as u8;
-        let (found, data, _writer) = self.tt.probe(key, side);
+        let (found, data, _writer) = TranspositionTable::shared().probe(key, side);
         if found {
             // Push the child TT move only if it is playable here.
             if let Some(m) = data.move16.and_then(|m16| pos.to_move(m16))
@@ -2584,7 +2581,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
 /// the null-move sentinel plane, index `0` in this port's flat layout.
 const NULL_MOVE_CONT_PLANE: usize = 0;
 
-impl<N: NetworkParams> QSearch<'_, N> {
+impl<N: NetworkParams> QSearch<N> {
     /// Whether `m` is a plain capture in `pos`. In this engine the
     /// reference's `capture_stage` and `capture` coincide.
     fn is_capture(pos: &Position, m: Move) -> bool {
@@ -2859,7 +2856,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
         let side = us.index() as u8;
         // Capture the entry location once (the reference's Step-4 `ttWriter`);
         // every write in this node targets this slot, not a re-probe.
-        let (tt_hit, tt_data, tt_slot) = self.tt.locate(pos_key, side);
+        let (tt_hit, tt_data, tt_slot) = TranspositionTable::shared().locate(pos_key, side);
         self.stack[s].tt_hit = tt_hit;
         // At the root the current PV line's move is treated as the TT move
         // regardless of what the probe returned; the rest of `tt_data` is still
@@ -3091,8 +3088,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
                 // A null move touches no accumulator, so it bypasses
                 // `push_accumulator`'s prefetch and needs this one, matching
                 // the reference's prefetch inside `do_null_move`.
-                self.tt
-                    .prefetch(pos.key(), pos.side_to_move().index() as u8);
+                TranspositionTable::shared().prefetch(pos.key(), pos.side_to_move().index() as u8);
                 #[cfg(feature = "verbose3")]
                 let node_path_dep = self.path_dep;
                 let null_value = -self.search(
@@ -3878,7 +3874,7 @@ mod tests {
     /// address is chosen while they run. The associated functions that read no
     /// network at all still have to be named through some instantiation, and
     /// this is the one.
-    type TestQSearch<'a> = QSearch<'a, PtrNetwork>;
+    type TestQSearch = QSearch<PtrNetwork>;
 
     const LANE_A: usize = 0;
     const LANE_B: usize = HIDDEN_SIZE / 2;
@@ -4001,7 +3997,7 @@ mod tests {
             return;
         }
         let net = yorkie_eval::load_network(&path).expect("real nn.bin loads");
-        let tt = fresh_tt();
+        let _tt = fresh_tt();
 
         // Start position plus hand-heavy / sparse fixtures that exercise drops,
         // promoted pieces, and frequent king moves (the refresh path).
@@ -4012,7 +4008,7 @@ mod tests {
         ];
         for sfen in FIXTURES {
             let mut p = pos(sfen);
-            let mut q = QSearch::new(net.network(), &tt);
+            let mut q = QSearch::new(net.network());
             q.set_verify_accumulator(true);
             // A small fixed depth is enough to cover qsearch, the interior move
             // loop, null moves, and ProbCut — every one of the six eval sites.
@@ -4067,8 +4063,8 @@ mod tests {
     #[test]
     fn draw_value_table_rows_other_than_the_draw_are_fixed() {
         let net = zero_net();
-        let table = fresh_tt();
-        let mut q = QSearch::new(net.network(), &table);
+        let _tt = fresh_tt();
+        let mut q = QSearch::new(net.network());
         // Emulate a root search with Black to move.
         q.root_us = Color::Black;
 
@@ -4101,8 +4097,8 @@ mod tests {
         );
 
         let net = zero_net();
-        let table = fresh_tt();
-        let mut q = QSearch::new(net.network(), &table);
+        let _tt = fresh_tt();
+        let mut q = QSearch::new(net.network());
 
         q.root_us = Color::Black;
         let black = DRAW_CONTEMPT_BLACK;
@@ -4130,7 +4126,7 @@ mod tests {
 
         // best_value == eval == 0 >= beta (-4); not decisive → (0 + -4)/2 = -2.
         let out = {
-            let mut q = QSearch::new(net.network(), &table);
+            let mut q = QSearch::new(net.network());
             q.run(&mut p.clone(), -5, -4, false, true)
         };
         assert_eq!(out.value, -2);
@@ -4182,9 +4178,9 @@ mod tests {
         // alpha == 418 == futilityBase + PawnValue(90): the first futility
         // test `futilityValue <= alpha` fires, flooring bestValue at 418.
         let net = zero_net();
-        let table = fresh_tt();
+        let _tt = fresh_tt();
         let out = {
-            let mut q = QSearch::new(net.network(), &table);
+            let mut q = QSearch::new(net.network());
             q.run(&mut pos(LANCE_SEE), 418, 419, false, true)
         };
         assert_eq!(out.value, 418);
@@ -4198,9 +4194,9 @@ mod tests {
         // futilityBase (== -128), so the SEE branch fires with the floor
         // `min(alpha, futilityBase) == min == 200`.
         let net = zero_net();
-        let table = fresh_tt();
+        let _tt = fresh_tt();
         let out = {
-            let mut q = QSearch::new(net.network(), &table);
+            let mut q = QSearch::new(net.network());
             q.run(&mut pos(LANCE_SEE), 200, 201, false, true)
         };
         assert_eq!(out.value, 200);
@@ -4214,9 +4210,9 @@ mod tests {
         // alpha - base == -328), so the capture reaches the `!see_ge(m, -73)`
         // gate and is skipped there (SEE -225 < -73). No node is searched.
         let net = zero_net();
-        let table = fresh_tt();
+        let _tt = fresh_tt();
         let out = {
-            let mut q = QSearch::new(net.network(), &table);
+            let mut q = QSearch::new(net.network());
             q.run(&mut pos(LANCE_SEE), 0, 1, false, true)
         };
         assert_eq!(out.value, 0);
@@ -4240,9 +4236,9 @@ mod tests {
         assert_eq!(captures(&p).len(), 3, "fixture must offer three captures");
 
         let net = zero_net();
-        let table = fresh_tt();
+        let _tt = fresh_tt();
         let out = {
-            let mut q = QSearch::new(net.network(), &table);
+            let mut q = QSearch::new(net.network());
             q.run(&mut p.clone(), 0, 1, false, true)
         };
         // Two captures searched (each child stand-pats: no deeper do_move); the
@@ -4261,9 +4257,9 @@ mod tests {
         // then a "recapture" (to == prevSq), exempt from the moveCount block, so
         // it is searched too: `nodes == 3` rather than 2.
         let net = zero_net();
-        let table = fresh_tt();
+        let _tt = fresh_tt();
         let mut p = pos(THREE_CAPTURES);
-        let mut q = QSearch::new(net.network(), &table);
+        let mut q = QSearch::new(net.network());
         q.root_us = p.side_to_move();
         q.pv_node = false;
         q.nodes = 0;
@@ -4284,8 +4280,8 @@ mod tests {
         // Checked both at ply 0, where the previous move is not ok, and at a
         // deeper ply with a real previous move.
         let net = zero_net();
-        let table = fresh_tt();
-        let mut q = QSearch::new(net.network(), &table);
+        let _tt = fresh_tt();
+        let mut q = QSearch::new(net.network());
 
         const SFENS: &[&str] = &[
             "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
@@ -4338,8 +4334,8 @@ mod tests {
         // live worker correction table *before* the call — there is
         // no qsearch-private correction duplicate to fall out of sync.
         let net = zero_net();
-        let table = fresh_tt();
-        let mut q = QSearch::new(net.network(), &table);
+        let _tt = fresh_tt();
+        let mut q = QSearch::new(net.network());
         let p = pos("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1");
         q.stack[TestQSearch::si(0) - 1].current_move = None;
 
@@ -4369,15 +4365,15 @@ mod tests {
         let p = pos("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1");
 
         let base = {
-            let table = fresh_tt();
-            let mut q = QSearch::new(net.network(), &table);
+            let _tt = fresh_tt();
+            let mut q = QSearch::new(net.network());
             q.run(&mut p.clone(), -VALUE_INFINITE, VALUE_INFINITE, true, true)
                 .value
         };
 
         let bumped = {
-            let table = fresh_tt();
-            let mut q = QSearch::new(net.network(), &table);
+            let _tt = fresh_tt();
+            let mut q = QSearch::new(net.network());
             let us = p.side_to_move();
             // Saturate the pawn channel so `cv / 131072` is a nonzero shift.
             for _ in 0..64 {
@@ -4423,7 +4419,7 @@ mod tests {
         let table = fresh_tt();
         prewrite(&table, &p, 0, false, Bound::None, DEPTH_UNSEARCHED, None, 0);
         let out = {
-            let mut q = QSearch::new(net.network(), &table);
+            let mut q = QSearch::new(net.network());
             q.run(&mut p.clone(), 418, 419, false, true)
         };
         assert_eq!(out.value, mate_in(1), "the checking capture mates");
@@ -4463,7 +4459,7 @@ mod tests {
             0,
         );
         let out = {
-            let mut q = QSearch::new(net.network(), &table);
+            let mut q = QSearch::new(net.network());
             q.run(&mut p.clone(), 0, 1, false, true)
         };
         // The MovePicker yields the quiet check first; givesCheck skips the
@@ -4485,9 +4481,9 @@ mod tests {
         assert!(legal_moves(&p).is_empty(), "fixture must be checkmate");
 
         let net = zero_net();
-        let table = fresh_tt();
+        let _tt = fresh_tt();
         let out = {
-            let mut q = QSearch::new(net.network(), &table);
+            let mut q = QSearch::new(net.network());
             q.run(&mut p.clone(), -VALUE_INFINITE, VALUE_INFINITE, true, true)
         };
         assert_eq!(out.value, mated_in(0)); // -VALUE_MATE
@@ -4507,7 +4503,7 @@ mod tests {
         let net = zero_net();
         let table = fresh_tt();
         let out = {
-            let mut q = QSearch::new(net.network(), &table);
+            let mut q = QSearch::new(net.network());
             q.run(&mut p.clone(), -VALUE_INFINITE, VALUE_INFINITE, true, true)
         };
         assert_eq!(out.value, mate_in(1)); // mate_in(ss->ply + 1) at ply 0
@@ -4528,9 +4524,9 @@ mod tests {
     #[test]
     fn max_ply_returns_draw_with_dither() {
         let net = zero_net();
-        let table = fresh_tt();
+        let _tt = fresh_tt();
         let mut p = pos(TWO_KINGS);
-        let mut q = QSearch::new(net.network(), &table);
+        let mut q = QSearch::new(net.network());
         q.root_us = p.side_to_move(); // Black
         q.pv_node = false;
 
@@ -4545,7 +4541,7 @@ mod tests {
     #[test]
     fn repetition_draw_is_detected_with_dither() {
         let net = zero_net();
-        let table = fresh_tt();
+        let _tt = fresh_tt();
         // Shuffling both kings gives a period-4 cycle, so the position after
         // six plies repeats the one after two — an earlier occurrence strictly
         // *after* the search root, which the reference scores as an ordinary
@@ -4578,7 +4574,7 @@ mod tests {
             "the same repetition reaching to the root (ply == distance) is not a draw"
         );
 
-        let mut q = QSearch::new(net.network(), &table);
+        let mut q = QSearch::new(net.network());
         q.root_us = p.side_to_move(); // Black
         q.pv_node = false;
         q.nodes = 0;
@@ -4659,12 +4655,12 @@ mod tests {
         #[test]
         fn a_repetition_judgement_marks_the_value_it_produces() {
             let net = zero_net();
-            let table = fresh_tt();
+            let _tt = fresh_tt();
             let mut p = shuffled_two_kings();
             assert_eq!(p.is_repetition(6), RepetitionState::Draw);
             assert_eq!(p.is_repetition(4), RepetitionState::None);
 
-            let mut q = QSearch::new(net.network(), &table);
+            let mut q = QSearch::new(net.network());
             q.root_us = p.side_to_move();
             q.pv_node = false;
 
@@ -4697,7 +4693,7 @@ mod tests {
             seed_every_child(&table, &p, -500, Bound::Upper, true);
 
             let (value, marked) = {
-                let mut q = QSearch::new(net.network(), &table);
+                let mut q = QSearch::new(net.network());
                 let out = q.run(&mut p.clone(), 0, 1, false, true);
                 (out.value, q.path_dep)
             };
@@ -4723,7 +4719,7 @@ mod tests {
             seed_every_child(&table, &p, 500, Bound::Lower, true);
 
             let (value, marked) = {
-                let mut q = QSearch::new(net.network(), &table);
+                let mut q = QSearch::new(net.network());
                 let out = q.run(&mut p.clone(), 0, 1, false, true);
                 (out.value, q.path_dep)
             };
@@ -4749,14 +4745,14 @@ mod tests {
         prewrite(&table, &p, 500, false, Bound::Lower, DEPTH_QS, None, 0);
 
         let with_tt = {
-            let mut q = QSearch::new(net.network(), &table);
+            let mut q = QSearch::new(net.network());
             q.run(&mut p.clone(), 399, 400, false, true)
         };
         assert_eq!(with_tt.value, 500, "TT cutoff returns the stored bound");
         assert_eq!(with_tt.nodes, 0);
 
         let without_tt = {
-            let mut q = QSearch::new(net.network(), &table);
+            let mut q = QSearch::new(net.network());
             q.run(&mut p.clone(), 399, 400, false, false)
         };
         assert_eq!(without_tt.value, 0, "ReadTT=false ignores the entry");
@@ -4767,8 +4763,8 @@ mod tests {
     fn search_is_deterministic_across_runs() {
         let net = zero_net();
         let run_once = || {
-            let table = fresh_tt();
-            let mut q = QSearch::new(net.network(), &table);
+            let _tt = fresh_tt();
+            let mut q = QSearch::new(net.network());
             let out = q.run(&mut pos(THREE_CAPTURES), 0, 1, false, true);
             (out.value, out.nodes)
         };
@@ -4781,7 +4777,7 @@ mod tests {
     #[test]
     fn fold_best_move_changes_sums_and_zeroes_every_slot() {
         let net = zero_net();
-        let table = fresh_tt();
+        let _tt = fresh_tt();
 
         // Four workers; the main worker (slot 0) folds them all.
         let slots: Arc<Vec<AtomicU64>> = Arc::new((0..4).map(|_| AtomicU64::new(0)).collect());
@@ -4790,7 +4786,7 @@ mod tests {
         slots[2].store(0, Ordering::Relaxed);
         slots[3].store(5, Ordering::Relaxed);
 
-        let mut main = QSearch::new(net.network(), &table);
+        let mut main = QSearch::new(net.network());
         main.set_best_move_tally(Arc::clone(&slots), 0);
         let mut tot = 1.0; // a pre-existing aged statistic is added to, not replaced
         main.fold_best_move_changes(&mut tot);
@@ -4801,7 +4797,7 @@ mod tests {
 
         // A helper (slot != 0) neither folds nor resets — the main worker owns that.
         slots[1].store(7, Ordering::Relaxed);
-        let mut helper = QSearch::new(net.network(), &table);
+        let mut helper = QSearch::new(net.network());
         helper.set_best_move_tally(Arc::clone(&slots), 1);
         let mut htot = 4.0;
         helper.fold_best_move_changes(&mut htot);
@@ -4814,7 +4810,7 @@ mod tests {
 
         // The single-worker path (no tally) folds its own scalar and zeroes it,
         // reaching the same total as the multi-worker fold.
-        let mut solo = QSearch::new(net.network(), &table);
+        let mut solo = QSearch::new(net.network());
         solo.best_move_changes = 6.0;
         let mut stot = 2.0;
         solo.fold_best_move_changes(&mut stot);
@@ -4829,7 +4825,7 @@ mod tests {
     #[test]
     fn sync_ponderhit_copies_the_stamped_instant_before_the_budget_decision() {
         let net = zero_net();
-        let table = fresh_tt();
+        let _tt = fresh_tt();
         let start = Instant::now();
 
         // A ponderhit has arrived (flag cleared, instant stamped) but no checkpoint
@@ -4862,7 +4858,7 @@ mod tests {
             "unsynced: the rounding origin is still go-time"
         );
 
-        let mut q = QSearch::new(net.network(), &table);
+        let mut q = QSearch::new(net.network());
         q.set_control(SearchControl {
             stop: None,
             ponder: Some(Arc::clone(&sig)),
@@ -4901,11 +4897,11 @@ mod tests {
     #[test]
     fn run_root_resigns_with_no_legal_move() {
         let net = zero_net();
-        let table = fresh_tt();
+        let _tt = fresh_tt();
         // Black is checkmated: no legal move ⇒ bestmove resign.
         let p = pos("4K4/3ggg3/4k4/9/9/9/9/9/9 b - 1");
         let out = {
-            let mut q = QSearch::new(net.network(), &table);
+            let mut q = QSearch::new(net.network());
             q.run_root(&p, 1)
         };
         assert_eq!(out.kind, RootKind::Resign);
@@ -4918,12 +4914,12 @@ mod tests {
     #[test]
     fn run_root_declares_a_nyugyoku_win() {
         let net = zero_net();
-        let table = fresh_tt();
+        let _tt = fresh_tt();
         // Black king on 5b inside the enemy field with a 32-point entering-king
         // score and legal moves available (so resign does not take precedence).
         let p = pos("+R+R+B+B5/3GKG3/2SGGGS2/9/9/9/9/9/4k4 b R 1");
         let out = {
-            let mut q = QSearch::new(net.network(), &table);
+            let mut q = QSearch::new(net.network());
             q.run_root(&p, 1)
         };
         assert_eq!(out.kind, RootKind::DeclarationWin);
@@ -4961,10 +4957,10 @@ mod tests {
         // on the zero-eval network.
         const GAME_PLY: i32 = 60;
         let net = zero_net();
-        let table = fresh_tt();
+        let _tt = fresh_tt();
         let mut p = pos("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 60");
         let out = {
-            let mut q = QSearch::new(net.network(), &table);
+            let mut q = QSearch::new(net.network());
             q.run(&mut p, -VALUE_INFINITE, VALUE_INFINITE, true, true)
         };
         if GAME_PLY > MAX_MOVES_TO_DRAW {
@@ -4992,9 +4988,9 @@ mod tests {
         const GAME_PLY: i32 = 100;
         let net = zero_net();
         let p = pos("k8/9/G1N6/9/9/9/9/9/8K b G 100");
-        let table = fresh_tt();
+        let _tt = fresh_tt();
         let out = {
-            let mut q = QSearch::new(net.network(), &table);
+            let mut q = QSearch::new(net.network());
             q.run_root(&p, 2)
         };
         if GAME_PLY > MAX_MOVES_TO_DRAW {
@@ -5025,8 +5021,8 @@ mod tests {
     #[test]
     fn reductions_table_and_reduction_formula() {
         let net = zero_net();
-        let table = fresh_tt();
-        let mut q = QSearch::new(net.network(), &table);
+        let _tt = fresh_tt();
+        let mut q = QSearch::new(net.network());
 
         // REDUCTIONS[i] == int(2763/128.0 * ln(i)), REDUCTIONS[0] == 0.
         assert_eq!(REDUCTIONS[0], 0);
@@ -5068,8 +5064,8 @@ mod tests {
     #[test]
     fn move_stat_score_capture_and_quiet() {
         let net = zero_net();
-        let table = fresh_tt();
-        let q = QSearch::new(net.network(), &table);
+        let _tt = fresh_tt();
+        let q = QSearch::new(net.network());
         let s = TestQSearch::si(2); // sentinels (ss-1)/(ss-2) below it exist.
 
         // Quiet: 2*mainHistory(0) + contHist[0] + contHist[1]. Both continuation
@@ -5101,7 +5097,7 @@ mod tests {
         // no do_move.
         let tt = fresh_tt();
         let fired_nodes = {
-            let mut q = QSearch::new(net.network(), &tt);
+            let mut q = QSearch::new(net.network());
             q.run_search(&mut pos(TWO_KINGS), 809, 810, 1, false, false);
             q.nodes
         };
@@ -5112,7 +5108,7 @@ mod tests {
         // second half must start where the first did.
         tt.clear();
         let not_nodes = {
-            let mut q = QSearch::new(net.network(), &tt);
+            let mut q = QSearch::new(net.network());
             q.run_search(&mut pos(TWO_KINGS), 808, 809, 1, false, false);
             q.nodes
         };
@@ -5129,7 +5125,7 @@ mod tests {
         // (2*beta + eval)/3.
         let tt = fresh_tt();
         let (v, n) = {
-            let mut q = QSearch::new(net.network(), &tt);
+            let mut q = QSearch::new(net.network());
             let v = q.run_search(&mut pos(TWO_KINGS), -37, -36, 1, false, false);
             (v, q.nodes)
         };
@@ -5140,7 +5136,7 @@ mod tests {
         // The same table, emptied.
         tt.clear();
         let n2 = {
-            let mut q = QSearch::new(net.network(), &tt);
+            let mut q = QSearch::new(net.network());
             q.run_search(&mut pos(TWO_KINGS), -36, -35, 1, false, false);
             q.nodes
         };
@@ -5175,7 +5171,7 @@ mod tests {
             VALUE_NONE,
         );
         let (v, n) = {
-            let mut q = QSearch::new(net.network(), &tt);
+            let mut q = QSearch::new(net.network());
             let v = q.run_search(&mut p.clone(), -363, -362, 1, true, false);
             (v, q.nodes)
         };
@@ -5196,7 +5192,7 @@ mod tests {
             VALUE_NONE,
         );
         let n2 = {
-            let mut q = QSearch::new(net.network(), &tt);
+            let mut q = QSearch::new(net.network());
             q.run_search(&mut p.clone(), -362, -361, 1, true, false);
             q.nodes
         };
@@ -5231,7 +5227,7 @@ mod tests {
         // qsearch value is 0 >= -61, so ProbCut returns value - (probCutBeta -
         // beta) = 0 - (-61 - (-224)) = -163, having made exactly one do_move.
         let (v, n) = {
-            let mut q = QSearch::new(net.network(), &tt);
+            let mut q = QSearch::new(net.network());
             let v = q.run_search(&mut p.clone(), -225, -224, 4, false, false);
             (v, q.nodes)
         };
@@ -5243,8 +5239,8 @@ mod tests {
     #[test]
     fn fail_low_writes_the_documented_bonuses() {
         let net = zero_net();
-        let tt = fresh_tt();
-        let mut q = QSearch::new(net.network(), &tt);
+        let _tt = fresh_tt();
+        let mut q = QSearch::new(net.network());
 
         // Drive `search` directly at ply 1 with a hand-set (ss-1) cell so the
         // fail-low branch (bestMove none, prevSq real, !priorCapture) fires. White
@@ -5310,7 +5306,7 @@ mod tests {
             let mut work = orig.clone();
             let tt = fresh_tt();
             let (v, nodes) = {
-                let mut q = QSearch::new(net.network(), &tt);
+                let mut q = QSearch::new(net.network());
                 let v = q.run_search(
                     &mut work,
                     -VALUE_INFINITE,
@@ -5723,8 +5719,8 @@ mod tests {
             let net = zero_net();
             let p = pos("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1");
             let run = |amplitude: Value, seed: u64| {
-                let table = fresh_tt();
-                let mut q = QSearch::new(net.network(), &table);
+                let _tt = fresh_tt();
+                let mut q = QSearch::new(net.network());
                 q.set_random(amplitude, seed);
                 let mut work = p.clone();
                 q.run(&mut work, -VALUE_INFINITE, VALUE_INFINITE, true, true)

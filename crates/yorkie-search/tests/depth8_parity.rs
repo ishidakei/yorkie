@@ -153,16 +153,16 @@ fn format_score(v: i32) -> ScoreJson {
     }
 }
 
-fn assert_fixture<N: yorkie_eval::NetworkParams>(name: &str, net: N, tt: &TranspositionTable) {
+fn assert_fixture<N: yorkie_eval::NetworkParams>(name: &str, net: N) {
     let json = load_fixture(name);
     assert_eq!(json.depth, 8, "{name}: depth-8 fixtures only");
 
     // usinewgame: clear the table (also resets the generation to 0).
-    tt.clear();
+    TranspositionTable::shared().clear();
     let pos = setup(&json);
 
     let outcome = {
-        let mut search = QSearch::new(net, tt);
+        let mut search = QSearch::new(net);
         search.run_root(&pos, json.depth)
     };
 
@@ -216,10 +216,7 @@ fn depth8_search_matches_reference_fixtures() {
     let owned = yorkie_eval::load_network(&path).expect("real nn.bin should load and validate");
     let net = owned.network();
 
-    // The one shared table, cleared per fixture (the usinewgame equivalent).
-    let tt = TranspositionTable::shared();
-
     for name in FIXTURES {
-        assert_fixture(name, net, tt);
+        assert_fixture(name, net);
     }
 }

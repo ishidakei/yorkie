@@ -130,15 +130,14 @@ fn depth2_startpos_7g7f_matches_reference() {
     let owned = yorkie_eval::load_network(&path).expect("real nn.bin should load and validate");
     let net = owned.network();
     // usinewgame: the shared table, emptied.
-    let tt = TranspositionTable::shared();
-    tt.clear();
+    TranspositionTable::shared().clear();
 
     let json = load_fixture("startpos-7g7f.json");
     assert_eq!(json.depth, 2, "depth-2 fixture only");
     let pos = setup(&json);
 
     let outcome = {
-        let mut search = QSearch::new(net, tt);
+        let mut search = QSearch::new(net);
         search.run_root(&pos, json.depth)
     };
 

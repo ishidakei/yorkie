@@ -695,16 +695,12 @@ core::arch::global_asm!(
     bytes = const TABLE_STORAGE_BYTES,
 );
 
-// The typed view of that storage. Zero at process start, which is an empty
-// table — the first game finds it ready without anything clearing or faulting
-// it in.
-#[cfg(not(miri))]
-unsafe extern "C" {
-    #[link_name = "yorkie_transposition_table"]
-    static TABLE: TranspositionTable;
-}
-
-/// The same table for a miri build, which cannot see the symbol above.
+/// The same table for a miri build, which can neither assemble the storage
+/// above nor take its address.
+///
+/// The assembled storage is zero at process start, which is an empty table —
+/// the first game finds it ready without anything clearing or faulting it in —
+/// so this one starts from empty clusters to match.
 #[cfg(miri)]
 static TABLE: TranspositionTable = TranspositionTable {
     clusters: [const { Cluster::empty() }; CLUSTER_COUNT],
@@ -729,19 +725,37 @@ const _: () = assert!(TABLE_STORAGE_BYTES.is_multiple_of(TT_ALIGN));
 const _: () = assert!(TABLE_STORAGE_BYTES >= TABLE_BYTES);
 
 impl TranspositionTable {
-    /// The one table. Every worker, and the driver, hold this same reference.
+    /// The one table. Every worker, and the driver, reach it through here
+    /// rather than carrying a reference to it, because its address is a
+    /// link-time constant that costs one `lea` to name.
+    ///
+    /// The address is taken in assembly rather than as `&TABLE`. A Rust
+    /// `extern` static is a declaration the compiler assumes some other object
+    /// might define, so naming it emits a load from the global offset table;
+    /// the symbol is in fact defined right above and hidden, so the `lea` is
+    /// what the address actually costs. Written with `nomem` and `pure` so it
+    /// is hoisted and folded like any other constant.
     #[inline]
     pub fn shared() -> &'static TranspositionTable {
         #[cfg(not(miri))]
         {
+            let table: *const TranspositionTable;
             // SAFETY: the symbol is defined in this binary, by the
             // `global_asm!` above, as `size_of::<TranspositionTable>()` zero
-            // bytes aligned to the type's alignment. Every byte of that type is
-            // an atomic or padding, so any bit pattern — the zeros BSS starts
-            // as included — is a valid value of it, and every access to it goes
-            // through a shared reference. Nothing else in the process names the
-            // symbol, so no `&mut` to it can exist.
-            unsafe { &TABLE }
+            // bytes aligned to the type's alignment, so the `lea` yields a
+            // pointer to that many initialised, correctly aligned bytes. Every
+            // byte of the type is an atomic or padding, so any bit pattern —
+            // the zeros BSS starts as included — is a valid value of it, and
+            // every access to it goes through a shared reference. Nothing else
+            // in the process names the symbol, so no `&mut` to it can exist.
+            unsafe {
+                core::arch::asm!(
+                    "lea {table}, [rip + yorkie_transposition_table]",
+                    table = out(reg) table,
+                    options(nomem, nostack, preserves_flags, pure),
+                );
+                &*table
+            }
         }
         #[cfg(miri)]
         {

@@ -139,18 +139,16 @@ fn depth16_search_matches_reference_fixture() {
     let owned = yorkie_eval::load_network(&path).expect("real nn.bin should load and validate");
     let net = owned.network();
 
-    let tt = TranspositionTable::shared();
-
     let name = "startpos.json";
     let json = load_fixture(name);
     assert_eq!(json.depth, 16, "{name}: depth-16 fixtures only");
 
     // usinewgame: clear the table (also resets the generation to 0).
-    tt.clear();
+    TranspositionTable::shared().clear();
     let pos = setup(&json);
 
     let outcome = {
-        let mut qs = QSearch::new(net, tt);
+        let mut qs = QSearch::new(net);
         qs.run_root(&pos, json.depth)
     };
 

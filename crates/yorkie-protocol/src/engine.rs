@@ -621,13 +621,6 @@ pub struct Engine<P: EngineSink> {
     /// The loaded network holder, present only after a successful
     /// [`Self::ready`]. A `go` before this is set starts nothing.
     eval: Option<LoadedEval>,
-    /// The shared transposition table the root search runs against: the one
-    /// `static`, whose size this binary was built with.
-    ///
-    /// Cleared by [`Self::new_game`] and advanced per `go` by the search itself — the
-    /// engine never bumps the generation. Every worker holds this same
-    /// reference, so there is nothing to hand out and nothing to reclaim.
-    tt: &'static TranspositionTable,
     /// Whether [`Self::ready`] has placed the table's pages ([`Self::place_transposition_table`]).
     /// Once per session: the policy and the huge-page hint are properties of the
     /// address range, and repeating them would say the same thing again.
@@ -788,7 +781,6 @@ impl<P: EngineSink> Engine<P> {
             settings,
             pos: Position::startpos(),
             eval: None,
-            tt: TranspositionTable::shared(),
             tt_placed: false,
             histories,
             book: None,
@@ -824,11 +816,6 @@ impl<P: EngineSink> Engine<P> {
     /// The position a search would run from.
     pub fn position(&self) -> &Position {
         &self.pos
-    }
-
-    /// The shared transposition table this session searches against.
-    pub fn transposition_table(&self) -> &'static TranspositionTable {
-        self.tt
     }
 
     /// Override the directory a relative `eval_dir` resolves against.
@@ -971,7 +958,7 @@ impl<P: EngineSink> Engine<P> {
         // The span handed to the kernel is the whole `static`, alignment tail
         // included; the size reported is the clusters, which is what the
         // `usi_hash` setting asked for.
-        let (addr, span) = self.tt.backing_region();
+        let (addr, span) = TranspositionTable::shared().backing_region();
         let outcome = |accepted: bool| if accepted { "applied" } else { "refused" };
         let placement = match table_placement(&self.worker_plan) {
             TablePlacement::OnNode(node) => format!(
@@ -1376,7 +1363,7 @@ impl<P: EngineSink> Engine<P> {
         self.pos.reset_startpos();
         // The join above left this thread as the only one touching the table,
         // so the clear races nothing.
-        self.tt.clear();
+        TranspositionTable::shared().clear();
         // Fresh per-worker tables. The shared correction / pawn handle is swapped
         // to the freshly (re)built node table set by `rebuild_pool` below, so a
         // cheap clone of the current handle here avoids a throwaway allocation.
@@ -1724,11 +1711,9 @@ impl<P: EngineSink> Engine<P> {
         // whole search.
         let helper_shared = Arc::clone(&self.helper_shared);
 
-        // The shared table is a `static`, so the coordinator gets the same
-        // reference and nothing is handed over; the main histories are still
-        // lent take-and-return and reclaimed on join. Helper histories live in
-        // the pool threads.
-        let tt = self.tt;
+        // The shared table is a `static`, so nothing is handed over for it; the
+        // main histories are still lent take-and-return and reclaimed on join.
+        // Helper histories live in the pool threads.
         let histories = self
             .histories
             .take()
@@ -1784,7 +1769,6 @@ impl<P: EngineSink> Engine<P> {
         let worker_plan = Arc::clone(&self.worker_plan);
 
         Some(CoordinatorJob {
-            tt,
             pos,
             #[cfg(feature = "verbose2")]
             depth,
@@ -2088,9 +2072,6 @@ fn emit_book_hit<P: EngineSink>(
 /// copies (the reference `start_thinking` copies the root-move list to every
 /// worker).
 struct HelperJob {
-    /// The shared transposition table — the one `static`, so this is a
-    /// reference rather than a handle the helper has to release.
-    tt: &'static TranspositionTable,
     /// The root position.
     pos: Position,
     /// This helper's own copy of the root-move list.
@@ -2236,7 +2217,7 @@ fn helper_loop<N: NetworkParams>(net: N, slot: Arc<HelperSlot>) {
         let histories_in =
             histories.unwrap_or_else(|| WorkerHistories::with_shared(Arc::clone(&job.shared)));
         let (result, reclaimed) = {
-            let mut qs = QSearch::with_histories(net, job.tt, histories_in);
+            let mut qs = QSearch::with_histories(net, histories_in);
             qs.set_control(SearchControl {
                 stop: Some(Arc::clone(&job.stop)),
                 // Helpers never run `check_time` (only the main worker ponders), so
@@ -2648,7 +2629,6 @@ fn thread_allocation_information_as_string(threads_size: usize, plan: &WorkerPla
 /// The bundle [`Engine::go`] hands its coordinator thread — grouped
 /// into one struct so [`run_coordinated`] stays a single-argument call.
 struct CoordinatorJob<P: EngineSink> {
-    tt: &'static TranspositionTable,
     pos: Position,
     /// The iterative-deepening ceiling for this `go`, below the search's own
     /// maximum. `go depth` and the `DepthLimit` key, its only two sources, are
@@ -2776,7 +2756,6 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     job: CoordinatorJob<P>,
 ) -> CoordinatedOutcome {
     let CoordinatorJob {
-        tt,
         pos,
         #[cfg(feature = "verbose2")]
         depth,
@@ -2829,7 +2808,7 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     // One TT generation bump per `go`, on the main worker, BEFORE any helper
     // starts, so the observable single-thread sequence is the reference's:
     // bump, then search.
-    tt.new_search();
+    TranspositionTable::shared().new_search();
 
     // Build the root-move list once (the reference `start_thinking`). The resign
     // and declaration-win short-circuits emit and return before any helper is
@@ -2904,7 +2883,7 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
                 &sink,
                 &hit,
                 #[cfg(feature = "verbose2")]
-                tt.hashfull(0),
+                TranspositionTable::shared().hashfull(0),
                 #[cfg(feature = "verbose2")]
                 book_time_ms,
                 ponder.as_ref(),
@@ -2928,7 +2907,6 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     // Dispatch a job to every helper (index h in `helper_slots` → worker h + 1).
     for (h, slot) in helper_slots.iter().enumerate() {
         slot.assign(HelperJob {
-            tt,
             pos: pos.clone(),
             root_moves: root_moves.clone(),
             #[cfg(feature = "verbose2")]
@@ -2955,7 +2933,7 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     // reportable only through the `info` lines that feature brings. Without it
     // the root is single-line and the emission sites are not compiled at all, so
     // the search of the first line is identical in all three build shapes.
-    let mut qs = QSearch::with_histories(net, tt, histories);
+    let mut qs = QSearch::with_histories(net, histories);
     qs.set_control(control);
     #[cfg(feature = "verbose2")]
     qs.set_node_tally(Arc::clone(&node_slots), 0);

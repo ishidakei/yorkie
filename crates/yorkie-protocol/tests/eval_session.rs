@@ -34,10 +34,8 @@ use yorkie_storage::TranspositionTable;
 /// The table is a `static`, so the direct search below and the session that
 /// follows it use the very same one; only clearing between them makes the two
 /// searches comparable.
-fn cleared_tt() -> &'static TranspositionTable {
-    let tt = TranspositionTable::shared();
-    tt.clear();
-    tt
+fn cleared_tt() {
+    TranspositionTable::shared().clear();
 }
 
 /// Put the evaluation file at `path` in the region the engine reads it from,
@@ -104,7 +102,8 @@ fn synthetic_network_session_matches_direct_search_choice() {
     let startpos = parse_sfen(yorkie_state::STARTPOS_SFEN).expect("startpos SFEN");
     let expected_usi = {
         let net = place_network(&path);
-        let outcome = QSearch::new(net, cleared_tt()).run_root(&startpos, 1);
+        cleared_tt();
+        let outcome = QSearch::new(net).run_root(&startpos, 1);
         bestmove_usi(&outcome)
     };
     // The session below starts from an empty table, as this search just did.
@@ -226,10 +225,10 @@ fn synthetic_network_reuse_reset_and_mate_resign() {
     // (tt.clear) before `go` #2 (startpos).
     let (expected_after_7g7f, expected_startpos) = {
         let net = place_network(&file);
-        let tt = cleared_tt();
-        let e1 = bestmove_usi(&QSearch::new(net, tt).run_root(&post_7g7f, 1));
-        tt.clear(); // usinewgame equivalent.
-        let e2 = bestmove_usi(&QSearch::new(net, tt).run_root(&startpos, 1));
+        cleared_tt();
+        let e1 = bestmove_usi(&QSearch::new(net).run_root(&post_7g7f, 1));
+        cleared_tt(); // usinewgame equivalent.
+        let e2 = bestmove_usi(&QSearch::new(net).run_root(&startpos, 1));
         (e1, e2)
     };
     // The session below starts from an empty table, as the first search did.
