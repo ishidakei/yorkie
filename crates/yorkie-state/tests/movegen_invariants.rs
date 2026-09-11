@@ -126,7 +126,7 @@ fn check_uniqueness_and_shape(pos: &Position) -> TestCaseResult {
             format_sfen(pos),
         );
         prop_assert_eq!(
-            pos.to_move(mv.move16()),
+            mv.move16_stored().and_then(|m16| pos.to_move(m16)),
             Some(mv),
             "`{}` at {} did not survive a move16 round trip",
             format_usi_move(mv),

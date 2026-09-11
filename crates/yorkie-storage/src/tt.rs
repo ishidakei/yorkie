@@ -117,6 +117,7 @@
 //! store.
 
 use std::mem::{offset_of, size_of};
+use std::num::NonZeroU16;
 #[cfg(feature = "tt-entry16")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicI16, AtomicU8, AtomicU16, Ordering};
@@ -263,8 +264,10 @@ impl Bound {
 /// nothing here borrows the table.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TTData {
-    /// Best move for this position, as a 16-bit fragment (`0` = none).
-    pub move16: u16,
+    /// Best move for this position, as a 16-bit fragment. The stored `0` is
+    /// the reference's "no move", so the fragment arrives as an [`Option`]
+    /// that the niche keeps two bytes wide.
+    pub move16: Option<NonZeroU16>,
     /// Search value returned at this node.
     pub value: Value,
     /// Static / qsearch evaluation at this node.
@@ -289,7 +292,7 @@ impl TTData {
     #[inline]
     fn none() -> TTData {
         TTData {
-            move16: 0,
+            move16: None,
             value: VALUE_NONE,
             eval: VALUE_NONE,
             depth: DEPTH_NONE,
@@ -358,7 +361,7 @@ impl TTEntry {
     fn read(&self) -> TTData {
         let gen_bound8 = self.gen_bound8.load(REL);
         TTData {
-            move16: self.move16.load(REL),
+            move16: NonZeroU16::new(self.move16.load(REL)),
             value: self.value16.load(REL) as Value,
             eval: self.eval16.load(REL) as Value,
             depth: DEPTH_NONE + self.depth8.load(REL) as Depth,
@@ -477,7 +480,7 @@ impl Cluster {
         pv: bool,
         b: Bound,
         d: Depth,
-        m: u16,
+        m: Option<NonZeroU16>,
         ev: Value,
         curr_generation: u8,
         #[cfg(feature = "verbose3")] path_dep: bool,
@@ -493,8 +496,8 @@ impl Cluster {
         let old_gen_bound8 = entry.gen_bound8.load(REL);
 
         // Preserve the old move if we don't have a new one for this position.
-        if m != 0 || !key_matches(old_key, k) {
-            entry.move16.store(m, REL);
+        if m.is_some() || !key_matches(old_key, k) {
+            entry.move16.store(m.map_or(0, NonZeroU16::get), REL);
         }
 
         // The depth comparison is in `i32` to match the reference's `int`
@@ -569,6 +572,10 @@ const _: () = assert!(CLUSTER_SIZE == if cfg!(feature = "tt-entry16") { 2 } else
 // The payload fields pack against the key with no interior padding in either
 // layout: under `tt-entry16` the `u64` key already leaves `move16` 2-aligned,
 // so `#[repr(C)]` inserts nothing.
+// The move a probe hands back costs no more than the two bytes the entry
+// stores: the niche of `NonZeroU16` carries the "no move" case.
+const _: () = assert!(size_of::<Option<NonZeroU16>>() == 2);
+
 const _: () = assert!(offset_of!(TTEntry, key) == 0);
 const _: () = assert!(offset_of!(TTEntry, depth8) == KEY_SIZE);
 const _: () = assert!(offset_of!(TTEntry, gen_bound8) == KEY_SIZE + 1);
@@ -921,7 +928,7 @@ impl TranspositionTable {
         pv: bool,
         bound: Bound,
         depth: Depth,
-        mv: u16,
+        mv: Option<NonZeroU16>,
         eval: Value,
         generation: u8,
         #[cfg(feature = "verbose3")] path_dep: bool,
@@ -1008,7 +1015,7 @@ impl<'a> TTWriter<'a> {
         pv: bool,
         bound: Bound,
         depth: Depth,
-        mv: u16,
+        mv: Option<NonZeroU16>,
         eval: Value,
         generation: u8,
         #[cfg(feature = "verbose3")] path_dep: bool,

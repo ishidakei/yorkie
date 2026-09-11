@@ -18,6 +18,8 @@
 
 use std::collections::BTreeSet;
 use std::io;
+#[cfg(feature = "verbose2")]
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -1643,8 +1645,13 @@ impl<P: EngineSink> Engine<P> {
         let control = SearchControl {
             stop: Some(Arc::clone(&self.handles.stop)),
             ponder: ponder.as_ref().map(Arc::clone),
+            // A ceiling of zero nodes and a ceiling of one end the same
+            // search: the first completed iteration precedes the first
+            // consultation of the ceiling either way.
             #[cfg(feature = "verbose2")]
-            node_limit: limits.nodes,
+            node_limit: limits
+                .nodes
+                .map(|n| NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN)),
             time,
         };
         // `go depth N` fixes the depth (clamped to the search's own maximum); any

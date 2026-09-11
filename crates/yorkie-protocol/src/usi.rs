@@ -784,10 +784,10 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
         // `none` stores the `MOVE_NONE` fragment, which `TTEntry::save` reads as
         // "keep whatever move this entry already holds for this position".
         let move16 = if args.mv == "none" {
-            0
+            None
         } else {
             match parse_usi_move(&args.mv, &pos) {
-                Ok(mv) if legal.contains(&mv) => mv.move16(),
+                Ok(mv) if legal.contains(&mv) => mv.move16_stored(),
                 Ok(_) => return self.tt_error(&format!("move `{}` is not legal here", args.mv)),
                 Err(e) => {
                     return self.tt_error(&format!("move `{}` is not a USI move: {e:?}", args.mv));
@@ -813,10 +813,10 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
             args.path_dep,
         );
 
-        // Verify rather than assume. `move16 == 0` is excluded from the
+        // Verify rather than assume. A `move none` write is excluded from the
         // comparison on purpose: `save` deliberately preserves the pre-existing
-        // move for a `move none` write, so a mismatch there is the documented
-        // behaviour, not a declined write.
+        // move for it, so a mismatch there is the documented behaviour, not a
+        // declined write.
         let (found, data, _) = self.engine.transposition_table().probe(key, side);
         let stored = found
             && data.value == stored_value
@@ -825,7 +825,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
             && data.bound == args.bound
             && data.is_pv == args.pv
             && data.path_dep == args.path_dep
-            && (move16 == 0 || data.move16 == move16);
+            && (move16.is_none() || data.move16 == move16);
         if stored {
             self.out.info_string("tt store ok")
         } else {
@@ -928,7 +928,7 @@ fn tt_entry_fields(data: &TTData, legal: &[Move], ply: i32) -> String {
     let mv = legal
         .iter()
         .copied()
-        .find(|m| m.move16() == data.move16)
+        .find(|m| m.move16_stored() == data.move16)
         .map_or_else(|| "none".to_string(), format_usi_move);
     format!(
         "move {mv} value {} depth {} bound {} eval {} pv {} pathdep {}",

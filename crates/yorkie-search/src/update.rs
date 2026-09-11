@@ -39,14 +39,14 @@ pub const SEARCHED_LIST_CAPACITY: usize = 32;
 /// `move_count <= SEARCHED_LIST_CAPACITY`, so it never overflows.
 #[derive(Clone)]
 pub struct SearchedList {
-    moves: [Move; SEARCHED_LIST_CAPACITY],
+    moves: [Option<Move>; SEARCHED_LIST_CAPACITY],
     len: usize,
 }
 
 impl Default for SearchedList {
     fn default() -> Self {
         SearchedList {
-            moves: [Move::none(); SEARCHED_LIST_CAPACITY],
+            moves: [None; SEARCHED_LIST_CAPACITY],
             len: 0,
         }
     }
@@ -63,12 +63,12 @@ impl SearchedList {
     /// reference's bounded `push_back`.
     pub fn push(&mut self, mv: Move) {
         debug_assert!(self.len < SEARCHED_LIST_CAPACITY, "searched list overflow");
-        self.moves[self.len] = mv;
+        self.moves[self.len] = Some(mv);
         self.len += 1;
     }
 
     /// The pushed moves in order.
-    pub fn as_slice(&self) -> &[Move] {
+    pub fn as_slice(&self) -> &[Option<Move>] {
         &self.moves[..self.len]
     }
 }
@@ -176,9 +176,9 @@ impl WorkerHistories {
 /// default to the sentinel planes.
 #[derive(Clone, Debug)]
 pub struct SearchStackCell {
-    /// `ss->currentMove` — the move played from this ply (`Move::none()` when
-    /// unset; a null move counts as not-`is_ok`).
-    pub current_move: Move,
+    /// `ss->currentMove` — the move played from this ply (`None` when unset; a
+    /// null move counts as not-`is_ok`).
+    pub current_move: Option<Move>,
     /// `ss->inCheck` — whether the side to move at this ply is in check.
     pub in_check: bool,
     /// `ss->ttHit` — whether the TT probe at this ply hit.
@@ -203,7 +203,7 @@ pub struct SearchStackCell {
     /// reads `(ss+1)->cutoffCnt` when scaling reductions.
     pub cutoff_cnt: i32,
     /// `ss->excludedMove` — the singular-extension excluded move.
-    pub excluded_move: Move,
+    pub excluded_move: Option<Move>,
     /// `ss->followPV` — whether this ply follows the previous iteration's PV.
     pub follow_pv: bool,
     /// `ss->pv` — the principal variation collected from this ply.
@@ -219,7 +219,7 @@ pub struct SearchStackCell {
 impl Default for SearchStackCell {
     fn default() -> Self {
         Self {
-            current_move: Move::none(),
+            current_move: None,
             in_check: false,
             tt_hit: false,
             tt_pv: false,
@@ -230,7 +230,7 @@ impl Default for SearchStackCell {
             static_eval: 32002,
             reduction: 0,
             cutoff_cnt: 0,
-            excluded_move: Move::none(),
+            excluded_move: None,
             follow_pv: false,
             pv: Vec::new(),
             cont_hist: 0,
@@ -273,7 +273,7 @@ pub fn update_continuation_histories(
             break;
         }
         let prev = &stack[ss - i];
-        if prev.current_move.is_ok() {
+        if prev.current_move.is_some_and(Move::is_ok) {
             let value = (bonus * weight / 1024) + 88 * (i < 2) as i32;
             hist.continuation.update_at(prev.cont_hist, pc, to, value);
         }
@@ -324,16 +324,16 @@ pub fn update_all_stats(
     ss: usize,
     best_move: Move,
     prev_sq: Option<Square>,
-    quiets_searched: &[Move],
-    captures_searched: &[Move],
+    quiets_searched: &[Option<Move>],
+    captures_searched: &[Option<Move>],
     depth: i32,
-    tt_move: Move,
+    tt_move: Option<Move>,
     prior_capture: bool,
 ) {
     let moved_piece = best_move.moved_piece_after();
 
     let bonus = (128 * depth - 77).min(1529)
-        + 353 * (best_move == tt_move) as i32
+        + 353 * (Some(best_move) == tt_move) as i32
         + stack[ss - 1].stat_score / 32;
     let malus = (882 * depth - 204).min(2122);
 
@@ -342,9 +342,9 @@ pub fn update_all_stats(
 
         // Decrease stats for all non-best quiet moves.
         let mut actual_malus = malus * 1113 / 1024;
-        for &mv in quiets_searched {
+        for mv in quiets_searched.iter().flatten() {
             actual_malus = actual_malus * 977 / 1024;
-            update_quiet_histories(hist, pos, stack, ss, mv, -actual_malus);
+            update_quiet_histories(hist, pos, stack, ss, *mv, -actual_malus);
         }
     } else if let Some(captured) = pos.board().get(best_move.to_sq()) {
         // Increase stats for the best move when it was a capture. A capture's
@@ -376,7 +376,7 @@ pub fn update_all_stats(
     }
 
     // Decrease stats for all non-best capture moves.
-    for &mv in captures_searched {
+    for &mv in captures_searched.iter().flatten() {
         let moved = mv.moved_piece_after();
         if let Some(captured) = pos.board().get(mv.to_sq()) {
             hist.capture
@@ -417,8 +417,9 @@ pub fn update_correction_history(
         bonus * 187 / 128,
     );
 
-    let m = stack[ss - 1].current_move;
-    if m.is_ok() {
+    if let Some(m) = stack[ss - 1].current_move
+        && m.is_ok()
+    {
         let to = m.to_sq();
         if let Some(pc) = pos.board().get(to) {
             hist.continuation_correction.update_at(
@@ -682,7 +683,7 @@ mod tests {
         let dummy = Move::make(Square::new(4, 4).unwrap(), Square::new(4, 3).unwrap(), pawn);
         // Give each of the six previous plies an ok move and a unique plane.
         for i in 1..=6 {
-            stack[ss - i].current_move = dummy;
+            stack[ss - i].current_move = Some(dummy);
             stack[ss - i].cont_hist = i; // distinct planes 1..=6
         }
         stack[ss].in_check = false;
@@ -720,7 +721,7 @@ mod tests {
         let pawn = Piece::new(PieceKind::Pawn, Color::Black);
         let dummy = Move::make(Square::new(4, 4).unwrap(), Square::new(4, 3).unwrap(), pawn);
         for i in 1..=6 {
-            stack[ss - i].current_move = dummy;
+            stack[ss - i].current_move = Some(dummy);
             stack[ss - i].cont_hist = i;
         }
         stack[ss].in_check = true;
@@ -754,10 +755,13 @@ mod tests {
         let mut hist = WorkerHistories::new();
         let ss = 7usize;
         let mut stack = fresh_stack(ss + 1);
-        // Only (ss-1) has an ok move; the rest keep Move::none().
+        // Only (ss-1) has an ok move; the rest keep `None`.
         let pawn = Piece::new(PieceKind::Pawn, Color::Black);
-        stack[ss - 1].current_move =
-            Move::make(Square::new(4, 4).unwrap(), Square::new(4, 3).unwrap(), pawn);
+        stack[ss - 1].current_move = Some(Move::make(
+            Square::new(4, 4).unwrap(),
+            Square::new(4, 3).unwrap(),
+            pawn,
+        ));
         stack[ss - 1].cont_hist = 1;
 
         let pc = Piece::new(PieceKind::Silver, Color::Black);
@@ -787,8 +791,11 @@ mod tests {
         stack[ss].ply = 2; // < LOW_PLY_HISTORY_SIZE, so lowPlyHistory updates.
         // Give (ss-1) an ok move + plane so a continuation write lands.
         let bp = Piece::new(PieceKind::Pawn, Color::Black);
-        stack[ss - 1].current_move =
-            Move::make(Square::new(0, 6).unwrap(), Square::new(0, 5).unwrap(), bp);
+        stack[ss - 1].current_move = Some(Move::make(
+            Square::new(0, 6).unwrap(),
+            Square::new(0, 5).unwrap(),
+            bp,
+        ));
         stack[ss - 1].cont_hist = 3;
 
         // The quiet move under test: black pawn 5e->5d (quiet, no capture).
@@ -884,7 +891,7 @@ mod tests {
             &[],
             &[],
             depth,
-            Move::none(),
+            None,
             false,
         );
 
@@ -926,10 +933,10 @@ mod tests {
             ss,
             best,
             None,
-            &[other],
+            &[Some(other)],
             &[],
             depth,
-            tt_move,
+            Some(tt_move),
             false,
         );
 
@@ -981,9 +988,9 @@ mod tests {
             best,
             None,
             &[],
-            &[cap],
+            &[Some(cap)],
             depth,
-            Move::none(),
+            None,
             false,
         );
 
@@ -1014,8 +1021,11 @@ mod tests {
         // update_continuation_histories(ss-1, ...) reads (ss-1).in_check and
         // (ss-1-i).currentMove/cont_hist. Give (ss-2) an ok move + plane.
         let bp = Piece::new(PieceKind::Pawn, Color::Black);
-        stack[ss - 2].current_move =
-            Move::make(Square::new(0, 6).unwrap(), Square::new(0, 5).unwrap(), bp);
+        stack[ss - 2].current_move = Some(Move::make(
+            Square::new(0, 6).unwrap(),
+            Square::new(0, 5).unwrap(),
+            bp,
+        ));
         stack[ss - 2].cont_hist = 5;
 
         // Best is a quiet so the quiet branch runs; depth for malus.
@@ -1038,7 +1048,7 @@ mod tests {
             &[],
             &[],
             depth,
-            Move::none(),
+            None,
             false,
         );
 
@@ -1069,7 +1079,7 @@ mod tests {
             Some(bp),
             "fixture places a pawn on 5d"
         );
-        stack[ss - 1].current_move = Move::make(Square::new(4, 4).unwrap(), to, bp);
+        stack[ss - 1].current_move = Some(Move::make(Square::new(4, 4).unwrap(), to, bp));
         stack[ss - 2].cont_corr = ContinuationCorrectionHistory::plane_index(bp, to);
         stack[ss - 4].cont_corr = ContinuationCorrectionHistory::plane_index(bp, to);
 

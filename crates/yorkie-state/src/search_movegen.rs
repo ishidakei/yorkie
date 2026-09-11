@@ -9,6 +9,8 @@
 //! [`Position::generate_legal_all`] is the engine's only legal-move generator,
 //! and is repetition-blind like the reference (no sennichite term).
 
+use core::num::NonZeroU16;
+
 use crate::bitboard::Bitboard;
 use crate::board::Board;
 use crate::board::pat;
@@ -1047,11 +1049,10 @@ impl Position {
     ///
     /// The TT admits torn fragments, so unlike the reference this is total: an
     /// out-of-range field returns `None` rather than indexing a table.
-    pub fn to_move(&self, m16: u16) -> Option<Move> {
-        if m16 == 0 {
-            return None;
-        }
-        let m = Move::from_bits(m16 as u32);
+    pub fn to_move(&self, fragment: NonZeroU16) -> Option<Move> {
+        let m16 = fragment.get();
+        // A non-zero fragment is a non-zero packed move.
+        let m = Move::from_bits(m16 as u32)?;
         if !m.is_ok() {
             return Some(m);
         }

@@ -38,6 +38,7 @@
 //! build fixes. What the `static` itself has to be is covered there by the
 //! crate's own unit tests, which only read it.
 
+use std::num::NonZeroU16;
 use std::ops::Deref;
 use std::sync::{Mutex, MutexGuard};
 
@@ -119,7 +120,7 @@ fn store(
         pv,
         bound,
         depth,
-        mv,
+        NonZeroU16::new(mv),
         eval,
         generation,
         #[cfg(feature = "verbose3")]
@@ -145,7 +146,7 @@ fn store_probe_round_trip_every_field() {
         true,
         Bound::Lower,
         17,
-        0x0abc,
+        NonZeroU16::new(0x0abc),
         -654,
         tt_generation_zero(),
         #[cfg(feature = "verbose3")]
@@ -160,7 +161,7 @@ fn store_probe_round_trip_every_field() {
     assert_eq!(data.depth, 17);
     assert_eq!(data.bound, Bound::Lower);
     assert!(data.is_pv);
-    assert_eq!(data.move16, 0x0abc);
+    assert_eq!(data.move16, NonZeroU16::new(0x0abc));
 }
 
 #[cfg_attr(miri, ignore)]
@@ -454,7 +455,8 @@ fn save_preserves_move_when_new_move_absent() {
     let (found, data, _) = tt.probe(k, side);
     assert!(found);
     assert_eq!(
-        data.move16, 0x0777,
+        data.move16,
+        NonZeroU16::new(0x0777),
         "old move retained when new move is absent"
     );
     assert_eq!(data.value, 2, "value refreshed");
@@ -645,7 +647,7 @@ fn thp_uptake_diagnostic() {
 /// The `TTData` a miss returns.
 fn miss_sentinel() -> TTData {
     TTData {
-        move16: 0,
+        move16: None,
         value: yorkie_storage::VALUE_NONE,
         eval: yorkie_storage::VALUE_NONE,
         depth: DEPTH_NONE,
@@ -717,13 +719,13 @@ mod wide_key_identity {
         let (found_a, data_a, _) = tt.probe(a, side);
         assert!(found_a, "a survives — b took the cluster's other entry");
         assert_eq!(data_a.value, 111);
-        assert_eq!(data_a.move16, 0x11);
+        assert_eq!(data_a.move16, NonZeroU16::new(0x11));
         assert_eq!(data_a.depth, 9);
 
         let (found_b, data_b, _) = tt.probe(b, side);
         assert!(found_b);
         assert_eq!(data_b.value, 222);
-        assert_eq!(data_b.move16, 0x22);
+        assert_eq!(data_b.move16, NonZeroU16::new(0x22));
         assert_eq!(data_b.depth, 12);
     }
 
@@ -804,7 +806,7 @@ mod narrow_key_identity {
         let (found_a, data_a, _) = tt.probe(a, side);
         assert!(found_a);
         assert_eq!(data_a.value, 222, "the two share one entry");
-        assert_eq!(data_a.move16, 0x22);
+        assert_eq!(data_a.move16, NonZeroU16::new(0x22));
     }
 }
 
@@ -833,7 +835,17 @@ mod path_dependence_mark {
     ) {
         let generation = tt.generation();
         let (_, _, w) = tt.probe(k, side);
-        w.write(k, value, pv, bound, depth, mv, eval, generation, path_dep);
+        w.write(
+            k,
+            value,
+            pv,
+            bound,
+            depth,
+            NonZeroU16::new(mv),
+            eval,
+            generation,
+            path_dep,
+        );
     }
 
     /// `CLUSTER_ENTRIES` keys that share one cluster, spaced so no two of them

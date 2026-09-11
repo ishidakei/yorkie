@@ -585,7 +585,7 @@ impl MovePicker {
 
                 // BAD_QUIET: yield quiets at or below the threshold (legal,
                 // non-TT). With `skip_quiets` set the reference returns
-                // `Move::none()` here.
+                // `MOVE_NONE` here.
                 Stage::BadQuiet => {
                     if self.skip_quiets {
                         self.stage = Stage::Done;

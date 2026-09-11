@@ -24,6 +24,7 @@
 //! inverse `REF_TO_PIECE_KIND` translate between them.
 
 use core::fmt;
+use core::num::{NonZeroU16, NonZeroU32};
 
 use crate::color::Color;
 use crate::piece::{Piece, PieceKind};
@@ -84,28 +85,44 @@ const fn piece_to_ref_code(piece: Piece) -> u32 {
 }
 
 /// Packed 32-bit move whose bit layout matches the YaneuraOu reference.
+///
+/// The reference's `MOVE_NONE` is the all-zero pattern and every other value
+/// it defines — a real move, `MOVE_NULL`, `MOVE_RESIGN`, `MOVE_WIN` — sets at
+/// least one bit, so "no move" is spelled `Option<Move>` here rather than as a
+/// sentinel value. The wrapper is transparent over [`NonZeroU32`], which makes
+/// `Option<Move>` four bytes wide and its `is_none()` the same
+/// compare-against-zero the reference writes by hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Move(u32);
+#[repr(transparent)]
+pub struct Move(NonZeroU32);
+
+const _: () = assert!(size_of::<Move>() == 4);
+const _: () = assert!(size_of::<Option<Move>>() == 4);
+
+/// The packed value of a constructed move. Every constructor sets the
+/// piece-code field (bits 16..20), whose `PieceType` part is at least `PAWN`,
+/// so the result is never the zero pattern the niche claims.
+const fn packed(bits: u32) -> NonZeroU32 {
+    match NonZeroU32::new(bits) {
+        Some(v) => v,
+        None => panic!("a constructed move always sets its piece-code field"),
+    }
+}
 
 impl Move {
-    /// `MOVE_NONE` — invalid / unset move.
-    pub const fn none() -> Self {
-        Self(0)
-    }
-
     /// `MOVE_NULL` — null-move sentinel (`(1 << 7) + 1`).
     pub const fn null() -> Self {
-        Self((1 << 7) + 1)
+        Self(packed((1 << 7) + 1))
     }
 
     /// `MOVE_RESIGN` — resignation sentinel (`(2 << 7) + 2`).
     pub const fn resign() -> Self {
-        Self((2 << 7) + 2)
+        Self(packed((2 << 7) + 2))
     }
 
     /// `MOVE_WIN` — declaration-of-win sentinel (`(3 << 7) + 3`).
     pub const fn win() -> Self {
-        Self((3 << 7) + 3)
+        Self(packed((3 << 7) + 3))
     }
 
     /// Construct a board move (no promotion). `piece` is the piece on `from`
@@ -113,7 +130,7 @@ impl Move {
     pub fn make(from: Square, to: Square, piece: Piece) -> Self {
         let bits =
             (to.index() as u32) | ((from.index() as u32) << 7) | (piece_to_ref_code(piece) << 16);
-        Self(bits)
+        Self(packed(bits))
     }
 
     /// Construct a board move with promotion. `piece` is the unpromoted piece
@@ -124,7 +141,7 @@ impl Move {
             | ((from.index() as u32) << 7)
             | FLAG_PROMOTE
             | (promoted_code << 16);
-        Self(bits)
+        Self(packed(bits))
     }
 
     /// Construct a drop. A king drop is illegal in shogi, but the encoding
@@ -136,40 +153,56 @@ impl Move {
             Color::White => PIECE_WHITE,
         };
         let bits = (to.index() as u32) | (pt << 7) | FLAG_DROP | ((pt | color_bit) << 16);
-        Self(bits)
+        Self(packed(bits))
     }
 
     /// Wrap a raw u32 (e.g. one read from a TT entry) without translation.
-    pub const fn from_bits(bits: u32) -> Self {
-        Self(bits)
+    /// `0` is `MOVE_NONE` and so has no [`Move`] to wrap.
+    pub const fn from_bits(bits: u32) -> Option<Self> {
+        match NonZeroU32::new(bits) {
+            Some(v) => Some(Self(v)),
+            None => None,
+        }
     }
 
     /// Raw 32-bit representation.
     pub const fn to_bits(self) -> u32 {
-        self.0
+        self.0.get()
     }
 
     /// The 16-bit move fragment (`Move16`): the packed move without its upper
     /// piece-code bits. This is what a `.ybb` opening book stores per move.
+    ///
+    /// The fragment of a move whose `from` and `to` fields differ — every move
+    /// the generators produce, and every sentinel the reference defines — is
+    /// itself non-zero; the raw form is what the file and table formats hold,
+    /// so it is what this returns.
     pub const fn move16(self) -> u16 {
-        (self.0 & 0xFFFF) as u16
+        (self.to_bits() & 0xFFFF) as u16
+    }
+
+    /// [`Self::move16`] as the storable fragment, `None` where the low half is
+    /// all zeros and so indistinguishable from "no move" in a table.
+    pub const fn move16_stored(self) -> Option<NonZeroU16> {
+        NonZeroU16::new(self.move16())
     }
 
     /// Drop flag (bit 14).
     pub const fn is_drop(self) -> bool {
-        (self.0 & FLAG_DROP) != 0
+        (self.to_bits() & FLAG_DROP) != 0
     }
 
     /// Promote flag (bit 15).
     pub const fn is_promote(self) -> bool {
-        (self.0 & FLAG_PROMOTE) != 0
+        (self.to_bits() & FLAG_PROMOTE) != 0
     }
 
-    /// Reference's `is_ok` predicate. False for `MOVE_NONE/NULL/RESIGN/WIN`,
+    /// Reference's `is_ok` predicate. False for `MOVE_NULL/RESIGN/WIN` (and,
+    /// where the reference would hold `MOVE_NONE`, there is no `Move` at all),
     /// true for any move constructed via [`make`](Self::make),
     /// [`make_promote`](Self::make_promote), or [`make_drop`](Self::make_drop).
     pub const fn is_ok(self) -> bool {
-        (self.0 >> 7) != (self.0 & 0x7f)
+        (self.to_bits() >> 7) != (self.to_bits() & 0x7f)
     }
 
     /// Destination square. Always present.
@@ -178,7 +211,7 @@ impl Move {
     /// Panics if the encoded `to` index is out of range; this cannot happen
     /// for a `Move` produced by the constructors in this module.
     pub fn to_sq(self) -> Square {
-        Square::from_index((self.0 & 0x7f) as u8).expect("Move::to_sq: malformed move data")
+        Square::from_index((self.to_bits() & 0x7f) as u8).expect("Move::to_sq: malformed move data")
     }
 
     /// Origin square. Only valid for non-drop moves.
@@ -188,7 +221,7 @@ impl Move {
     /// square) or if the encoded `from` index is out of range.
     pub fn from_sq(self) -> Square {
         debug_assert!(!self.is_drop(), "Move::from_sq called on a drop");
-        Square::from_index(((self.0 >> 7) & 0x7f) as u8)
+        Square::from_index(((self.to_bits() >> 7) & 0x7f) as u8)
             .expect("Move::from_sq: malformed move data")
     }
 
@@ -203,7 +236,7 @@ impl Move {
         if !self.is_drop() {
             return None;
         }
-        let field = ((self.0 >> 7) & 0x7f) as usize;
+        let field = ((self.to_bits() >> 7) & 0x7f) as usize;
         if !(1..=7).contains(&field) {
             return None;
         }
@@ -219,7 +252,7 @@ impl Move {
             self.is_drop(),
             "Move::dropped_piece_kind called on a non-drop"
         );
-        let code = ((self.0 >> 7) & 0x7f) as usize;
+        let code = ((self.to_bits() >> 7) & 0x7f) as usize;
         REF_TO_PIECE_KIND[code & 0x0F]
             .expect("Move::dropped_piece_kind: malformed move data")
             .0
@@ -232,7 +265,7 @@ impl Move {
     /// Panics if the upper 5 bits encode an invalid piece (e.g. on
     /// `MOVE_NONE`, where they are zero).
     pub fn moved_piece_after(self) -> Piece {
-        let code = (self.0 >> 16) & 0x1F;
+        let code = (self.to_bits() >> 16) & 0x1F;
         let color = if (code & PIECE_WHITE) != 0 {
             Color::White
         } else {
@@ -597,7 +630,7 @@ mod tests {
     #[test]
     fn fixture_decodes_to_components() {
         for fx in fixtures() {
-            let m = Move::from_bits(fx.bits);
+            let m = Move::from_bits(fx.bits).expect("fixture bits are a real move");
             assert_eq!(
                 m.is_drop(),
                 fx.is_drop,
@@ -745,12 +778,11 @@ mod tests {
         let piece = Piece::new(PieceKind::Silver, Color::White);
         let m = Move::make(from, to, piece);
         let bits = m.to_bits();
-        assert_eq!(Move::from_bits(bits), m);
+        assert_eq!(Move::from_bits(bits), Some(m));
     }
 
     #[test]
     fn is_ok_rejects_sentinels_and_accepts_normal_moves() {
-        assert!(!Move::none().is_ok());
         assert!(!Move::null().is_ok());
         assert!(!Move::resign().is_ok());
         assert!(!Move::win().is_ok());
@@ -775,7 +807,7 @@ mod tests {
 
     #[test]
     fn sentinel_bit_values_match_reference() {
-        assert_eq!(Move::none().to_bits(), 0);
+        assert_eq!(Move::from_bits(0), None);
         assert_eq!(Move::null().to_bits(), (1 << 7) + 1);
         assert_eq!(Move::resign().to_bits(), (2 << 7) + 2);
         assert_eq!(Move::win().to_bits(), (3 << 7) + 3);

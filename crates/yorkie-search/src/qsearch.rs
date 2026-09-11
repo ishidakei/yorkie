@@ -17,6 +17,7 @@
 //! replacement selection against a cluster a child has since churned, and could
 //! pick a different slot.
 
+use std::num::{NonZeroU16, NonZeroU64};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -219,8 +220,10 @@ fn to_corrected_static_eval(v: Value, cv: i32) -> Value {
 
 /// The low-16-bit move fragment stored in the TT (`Move16`): the reference
 /// stores `Move::to_move16()`, which is the low 16 bits of the packed move.
-fn move16_of(m: Move) -> u16 {
-    (m.to_bits() & 0xFFFF) as u16
+/// `None` is what the entry holds as its zero, so an absent best move and a
+/// fragment that is all zeros land on the same stored value.
+fn move16_of(m: Option<Move>) -> Option<NonZeroU16> {
+    m.and_then(Move::move16_stored)
 }
 
 /// `ttData.bound & (want_lower ? BOUND_LOWER : BOUND_UPPER)` as a bool
@@ -339,14 +342,14 @@ impl PonderSignal {
     }
 
     /// The stamped ponderhit instant, if a `ponderhit` has arrived. A stamp of
-    /// `0` means none has; the `max(1)` above keeps that value free, at the cost
-    /// of reporting a ponderhit in the same nanosecond as the `go` one
-    /// nanosecond late.
+    /// `0` means none has, which is what makes the field's
+    /// [`NonZeroU64`] reading an [`Option`] with no room
+    /// of its own; the `max(1)` above keeps that value free, at the cost of
+    /// reporting a ponderhit in the same nanosecond as the `go` one nanosecond
+    /// late.
     fn hit_at(&self) -> Option<Instant> {
-        match self.hit_at_nanos.load(Ordering::Acquire) {
-            0 => None,
-            nanos => Some(self.start + Duration::from_nanos(nanos)),
-        }
+        NonZeroU64::new(self.hit_at_nanos.load(Ordering::Acquire))
+            .map(|nanos| self.start + Duration::from_nanos(nanos.get()))
     }
 }
 
@@ -370,14 +373,21 @@ pub struct SearchControl {
     /// both `verbose2`; without that feature a search is bounded by its clock,
     /// its depth and `stop` alone. The counter the ceiling reads is not gated —
     /// the search decides with it (`QSearch::nodes`) — only the ceiling is.
+    /// A ceiling of zero is not a distinguishable search — the first iteration
+    /// completes before the ceiling is ever consulted — so the zero pattern is
+    /// free to carry the absent case.
     #[cfg(feature = "verbose2")]
-    pub node_limit: Option<u64>,
+    pub node_limit: Option<NonZeroU64>,
     /// The reference `TimeManagement` state plus the limit classification the
     /// search-side time control needs. `Some` only on the main worker of a `go`
     /// that has a time budget — which, without `verbose2`, is every `go`, since
     /// the six clauses that bound a search any other way all need that feature.
     pub time: Option<TimeControl>,
 }
+
+// The node ceiling is a bare `u64` in the struct, not a tagged one.
+#[cfg(feature = "verbose2")]
+const _: () = assert!(size_of::<Option<NonZeroU64>>() == 8);
 
 /// The main worker's time-management state for one `go`: the reference
 /// `TimeManagement` (mutated in place — its `search_end` is written by the
@@ -634,7 +644,7 @@ pub struct WorkerResult {
     pub completed_depth: i32,
     /// The previous iteration's `pv[1]` — the `extract_ponder_from_tt` fallback
     /// applied to the chosen worker's length-1 PV.
-    pub ponder_candidate: Move,
+    pub ponder_candidate: Option<Move>,
     /// This worker's own node count (`do_move` calls). The driver sums every
     /// worker's count for the aggregated `info ... nodes` output.
     pub nodes: u64,
@@ -1013,7 +1023,7 @@ impl<'a, N: NetworkParams> QSearch<'a, N> {
         // checkpoint rate there.
         #[cfg(feature = "verbose2")]
         if let Some(n) = self.control.node_limit {
-            return CHECK_INTERVAL.min((n / 1024) as i32).max(1);
+            return CHECK_INTERVAL.min((n.get() / 1024) as i32).max(1);
         }
         CHECK_INTERVAL
     }
@@ -1131,7 +1141,7 @@ impl<'a, N: NetworkParams> QSearch<'a, N> {
         // 3./4. movetime elapsed or node ceiling reached ⇒ stop immediately.
         #[cfg(feature = "verbose2")]
         if let Some(limit) = self.control.node_limit
-            && self.counted_nodes() >= limit
+            && self.counted_nodes() >= limit.get()
         {
             self.request_abort();
             return;
@@ -1210,7 +1220,7 @@ impl<'a, N: NetworkParams> QSearch<'a, N> {
         self.calls_cnt = CHECK_INTERVAL;
 
         for cell in self.stack.iter_mut() {
-            cell.current_move = Move::none();
+            cell.current_move = None;
             cell.tt_pv = false;
             cell.pv.clear();
         }
@@ -1358,7 +1368,7 @@ impl<'a, N: NetworkParams> QSearch<'a, N> {
         pv: bool,
         bound: Bound,
         depth: i32,
-        mv: u16,
+        mv: Option<NonZeroU16>,
         eval: Value,
     ) {
         let generation = self.tt.generation();
@@ -1394,10 +1404,7 @@ impl<'a, N: NetworkParams> QSearch<'a, N> {
     /// widens through. Both are repetition-blind, so the two agree on every
     /// move, including one that continues a perpetual check.
     #[cfg(test)]
-    fn widen_tt_move(pos: &Position, move16: u16) -> Option<Move> {
-        if move16 == 0 {
-            return None;
-        }
+    fn widen_tt_move(pos: &Position, move16: NonZeroU16) -> Option<Move> {
         let mut legal: Vec<Move> = Vec::new();
         pos.generate_legal_all(&mut legal);
         Self::select_tt_move(&legal, move16)
@@ -1410,8 +1417,11 @@ impl<'a, N: NetworkParams> QSearch<'a, N> {
     /// torn-entry totality test can drive all 65536 fragments
     /// against one generated list without re-generating per pattern.
     #[cfg(test)]
-    fn select_tt_move(legal: &[Move], move16: u16) -> Option<Move> {
-        legal.iter().copied().find(|&m| move16_of(m) == move16)
+    fn select_tt_move(legal: &[Move], move16: NonZeroU16) -> Option<Move> {
+        legal
+            .iter()
+            .copied()
+            .find(|&m| m.move16_stored() == Some(move16))
     }
 
     /// The core recursive qsearch.
@@ -1480,7 +1490,7 @@ impl<'a, N: NetworkParams> QSearch<'a, N> {
         // Widened O(1), without legal-move generation; the MovePicker's TT
         // stage re-validates with `pseudo_legal` + `is_legal`.
         let tt_move = if tt_hit {
-            pos.to_move(tt_data.move16)
+            tt_data.move16.and_then(|m16| pos.to_move(m16))
         } else {
             None
         };
@@ -1548,7 +1558,7 @@ impl<'a, N: NetworkParams> QSearch<'a, N> {
                         tt_pv,
                         Bound::Exact,
                         DEPTH_QS,
-                        move16_of(mate_move),
+                        move16_of(Some(mate_move)),
                         unadjusted_static_eval,
                     );
                     return best_value;
@@ -1570,7 +1580,7 @@ impl<'a, N: NetworkParams> QSearch<'a, N> {
                         false,
                         Bound::Lower,
                         DEPTH_UNSEARCHED,
-                        0,
+                        None,
                         unadjusted_static_eval,
                     );
                 }
@@ -1589,12 +1599,10 @@ impl<'a, N: NetworkParams> QSearch<'a, N> {
         }
 
         // Step 5-8. Move loop.
-        let prev_move = self.stack[Self::si(ply) - 1].current_move;
-        let prev_sq = if prev_move.is_ok() {
-            Some(prev_move.to_sq())
-        } else {
-            None
-        };
+        let prev_sq = self.stack[Self::si(ply) - 1]
+            .current_move
+            .filter(|m| m.is_ok())
+            .map(Move::to_sq);
 
         // `contHist[] = {(ss-1)->continuationHistory}`. The qsearch evasion
         // score reads plane `[0]`, the previous ply's REAL continuation plane;
@@ -1604,7 +1612,7 @@ impl<'a, N: NetworkParams> QSearch<'a, N> {
             std::array::from_fn(|i| self.stack[Self::si(ply) - 1 - i].cont_hist);
         let mut mp = MovePicker::new_qsearch(pos, tt_move, cont_planes);
 
-        let mut best_move = Move::none();
+        let mut best_move: Option<Move> = None;
 
         while let Some(mv) = mp.next_move(pos, &self.histories) {
             let gives_check = pos.gives_check(mv);
@@ -1651,7 +1659,7 @@ impl<'a, N: NetworkParams> QSearch<'a, N> {
             // qsearch ply that left them stale would feed a wrong `cntcv` — and
             // through it a wrong corrected eval — once the tables warm up.
             let moved = mv.moved_piece_after();
-            self.stack[Self::si(ply)].current_move = mv;
+            self.stack[Self::si(ply)].current_move = Some(mv);
             self.stack[Self::si(ply)].cont_hist =
                 ContinuationHistory::plane_index(in_check, capture, moved, mv.to_sq());
             self.stack[Self::si(ply)].cont_corr =
@@ -1683,7 +1691,7 @@ impl<'a, N: NetworkParams> QSearch<'a, N> {
                     {
                         self.path_dep |= child_path_dep;
                     }
-                    best_move = mv;
+                    best_move = Some(mv);
                     if pv_node {
                         self.update_pv(ply, mv);
                     }
@@ -1929,7 +1937,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
 
         // `ponder_candidate` — the previous iteration's `pv[1]`, a fallback
         // for `extract_ponder_from_tt` on a length-1 final PV.
-        let mut ponder_candidate = Move::none();
+        let mut ponder_candidate: Option<Move> = None;
 
         // The reference's Skill-driven `max(multiPV, 4)` bump is skipped:
         // Skill is disabled in the non-Stockfish build.
@@ -2086,7 +2094,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
             }
 
             if root_moves[0].pv.len() > 1 {
-                ponder_candidate = root_moves[0].pv[1];
+                ponder_candidate = Some(root_moves[0].pv[1]);
             }
 
             self.fold_best_move_changes(&mut tot_best_move_changes);
@@ -2498,7 +2506,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
                 }
                 // A hit only extends the PV when the stored move is playable
                 // here.
-                match pos.to_move(data.move16) {
+                match data.move16.and_then(|m16| pos.to_move(m16)) {
                     Some(mm)
                         if mm.is_ok()
                             && pos.pseudo_legal::<GENERATE_ALL_LEGAL_MOVES>(mm)
@@ -2534,7 +2542,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
         &mut self,
         pos: &mut Position,
         best: &mut RootMove,
-        ponder_candidate: Move,
+        ponder_candidate: Option<Move>,
     ) {
         if best.pv.len() != 1 {
             return;
@@ -2549,19 +2557,19 @@ impl<N: NetworkParams> QSearch<'_, N> {
         let (found, data, _writer) = self.tt.probe(key, side);
         if found {
             // Push the child TT move only if it is playable here.
-            if let Some(m) = pos.to_move(data.move16)
+            if let Some(m) = data.move16.and_then(|m16| pos.to_move(m16))
                 && m.is_ok()
                 && pos.pseudo_legal::<GENERATE_ALL_LEGAL_MOVES>(m)
                 && pos.is_legal(m)
             {
                 best.pv.push(m);
             }
-        } else if ponder_candidate.is_ok() {
+        } else if let Some(candidate) = ponder_candidate.filter(|m| m.is_ok()) {
             // Fall back to the previous iteration's pv[1].
             let mut legal: Vec<Move> = Vec::new();
             pos.generate_legal_all(&mut legal);
-            if legal.contains(&ponder_candidate) {
-                best.pv.push(ponder_candidate);
+            if legal.contains(&candidate) {
+                best.pv.push(candidate);
             }
         }
         pos.undo_move(pv0, undo);
@@ -2595,8 +2603,12 @@ impl<N: NetworkParams> QSearch<'_, N> {
             return false;
         }
         let s = Self::si(ply);
-        let move2 = self.stack[s - 2].current_move;
-        let move4 = self.stack[s - 4].current_move;
+        let (Some(move2), Some(move4)) = (
+            self.stack[s - 2].current_move,
+            self.stack[s - 4].current_move,
+        ) else {
+            return false;
+        };
         if !move2.is_ok() || !move4.is_ok() || move2.is_drop() || move4.is_drop() {
             return false;
         }
@@ -2675,8 +2687,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
         );
 
         let s = Self::si(ply);
-        let prev_move = self.stack[s - 1].current_move;
-        let cntcv = if prev_move.is_ok() {
+        let cntcv = if let Some(prev_move) = self.stack[s - 1].current_move.filter(|m| m.is_ok()) {
             let to = prev_move.to_sq();
             match pos.board().get(to) {
                 Some(pc) => {
@@ -2792,7 +2803,8 @@ impl<N: NetworkParams> QSearch<'_, N> {
             || (ply >= 1
                 && self.stack[s - 1].follow_pv
                 && ((ply - 1) as usize) < self.last_iteration_pv.len()
-                && self.stack[s - 1].current_move == self.last_iteration_pv[(ply - 1) as usize]);
+                && self.stack[s - 1].current_move
+                    == Some(self.last_iteration_pv[(ply - 1) as usize]));
         self.stack[s].follow_pv = follow_pv;
 
         if pv_node && self.sel_depth < ply + 1 {
@@ -2831,13 +2843,11 @@ impl<N: NetworkParams> QSearch<'_, N> {
             }
         }
 
-        let prev_move = self.stack[s - 1].current_move;
-        let prev_sq = if prev_move.is_ok() {
-            Some(prev_move.to_sq())
-        } else {
-            None
-        };
-        let mut best_move = Move::none();
+        let prev_sq = self.stack[s - 1]
+            .current_move
+            .filter(|m| m.is_ok())
+            .map(Move::to_sq);
+        let mut best_move: Option<Move> = None;
         let prior_reduction = self.stack[s - 1].reduction;
         self.stack[s - 1].reduction = 0;
         self.stack[s].stat_score = 0;
@@ -2864,7 +2874,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
             Some(rms[line].pv[0])
         } else if tt_hit {
             // The MovePicker's TT stage re-validates this.
-            pos.to_move(tt_data.move16)
+            tt_data.move16.and_then(|m16| pos.to_move(m16))
         } else {
             None
         };
@@ -2873,7 +2883,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
         } else {
             VALUE_NONE
         };
-        if !excluded_move.is_ok() {
+        if !excluded_move.is_some_and(Move::is_ok) {
             self.stack[s].tt_pv = pv_node || (tt_hit && tt_data.is_pv);
         }
         // Snapshot of `ss->ttPv` for the pre-move-loop readers, refreshed
@@ -2883,7 +2893,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
         let tt_capture = tt_move.is_some_and(|m| Self::is_capture(pos, m));
 
         if !pv_node
-            && !excluded_move.is_ok()
+            && !excluded_move.is_some_and(Move::is_ok)
             && tt_data.depth > depth - (tt_value <= beta) as i32
             && is_valid(tt_value)
             && bound_matches(tt_data.bound, tt_value >= beta)
@@ -2930,7 +2940,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
         let mut unadjusted_static_eval = VALUE_NONE;
         if !root_node
             && !tt_hit
-            && !excluded_move.is_ok()
+            && !excluded_move.is_some_and(Move::is_ok)
             && !in_check
             && let Some(mate_move) = pos.mate_1ply()
         {
@@ -2942,7 +2952,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
                 ttpv,
                 Bound::Exact,
                 (MAX_PLY - 1).min(depth + 6),
-                move16_of(mate_move),
+                move16_of(Some(mate_move)),
                 unadjusted_static_eval,
             );
             return best_value;
@@ -2967,7 +2977,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
             // The reference's `goto moves_loop`: Steps 6b-11, the only
             // readers of `eval`, are skipped in check.
         } else {
-            if excluded_move.is_ok() {
+            if excluded_move.is_some_and(Move::is_ok) {
                 // The reference uses the outer search's `ss->staticEval`.
                 static_eval = self.stack[s].static_eval;
                 unadjusted_static_eval = static_eval;
@@ -2998,29 +3008,27 @@ impl<N: NetworkParams> QSearch<'_, N> {
                     ttpv,
                     Bound::None,
                     DEPTH_UNSEARCHED,
-                    0,
+                    None,
                     unadjusted_static_eval,
                 );
             }
             self.stack[s].static_eval = static_eval;
 
-            if self.stack[s - 1].current_move.is_ok()
+            if let Some(prev_move) = self.stack[s - 1].current_move.filter(|m| m.is_ok())
                 && !self.stack[s - 1].in_check
                 && !prior_capture
             {
                 let eval_diff =
                     (-(self.stack[s - 1].static_eval + static_eval)).clamp(-214, 171) + 60;
-                self.histories.main.update(
-                    us.flip(),
-                    self.stack[s - 1].current_move,
-                    eval_diff * 10,
-                );
+                self.histories
+                    .main
+                    .update(us.flip(), prev_move, eval_diff * 10);
                 if !tt_hit
                     && let Some(psq) = prev_sq
                     && let Some(pc) = pos.board().get(psq)
                 {
                     let not_pawn = pc.kind != PieceKind::Pawn || pc.promoted;
-                    if not_pawn && !self.stack[s - 1].current_move.is_promote() {
+                    if not_pawn && !prev_move.is_promote() {
                         self.histories
                             .shared
                             .pawn_update(pos.pawn_key(), pc, psq, eval_diff * 12);
@@ -3071,12 +3079,12 @@ impl<N: NetworkParams> QSearch<'_, N> {
             // what disables the pass while a verification search is in flight.
             if cut_node
                 && static_eval >= beta - 16 * depth - 53 * improving as i32 + 378
-                && !excluded_move.is_ok()
+                && !excluded_move.is_some_and(Move::is_ok)
                 && ply >= self.nmp_min_ply
                 && !is_loss(beta)
             {
                 let r = 7 + depth / 3;
-                self.stack[s].current_move = Move::null();
+                self.stack[s].current_move = Some(Move::null());
                 self.stack[s].cont_hist = NULL_MOVE_CONT_PLANE;
                 self.stack[s].cont_corr = ContinuationCorrectionHistory::SENTINEL_PLANE;
                 pos.do_null_move();
@@ -3176,14 +3184,14 @@ impl<N: NetworkParams> QSearch<'_, N> {
                 let prob_cut_depth = depth - 4;
                 let mut mp = MovePicker::new_probcut(pos, tt_move, prob_cut_beta - static_eval);
                 while let Some(mv) = mp.next_move(pos, &self.histories) {
-                    if mv == excluded_move || !pos.is_legal(mv) {
+                    if Some(mv) == excluded_move || !pos.is_legal(mv) {
                         continue;
                     }
                     let acc_delta = MoveDelta::from_move(pos, mv);
                     self.nodes += 1;
                     let undo = pos.do_move(mv);
                     let moved = mv.moved_piece_after();
-                    self.stack[s].current_move = mv;
+                    self.stack[s].current_move = Some(mv);
                     self.stack[s].cont_hist =
                         ContinuationHistory::plane_index(in_check, true, moved, mv.to_sq());
                     self.stack[s].cont_corr =
@@ -3226,7 +3234,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
                             ttpv,
                             Bound::Lower,
                             prob_cut_depth + 1,
-                            move16_of(mv),
+                            move16_of(Some(mv)),
                             unadjusted_static_eval,
                         );
                         if !is_decisive(value) {
@@ -3263,7 +3271,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
 
         // Step 13. Loop through the moves.
         while let Some(mv) = mp.next_move(pos, &self.histories) {
-            if mv == excluded_move {
+            if Some(mv) == excluded_move {
                 continue;
             }
             // The MovePicker has already applied the reference's legality
@@ -3351,7 +3359,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
                     lmr_depth += history / 3220;
                     let futility_value = static_eval
                         + 42
-                        + 151 * (!best_move.is_ok()) as i32
+                        + 151 * (!best_move.is_some_and(Move::is_ok)) as i32
                         + 120 * lmr_depth
                         + 86 * (static_eval > alpha) as i32;
                     if !in_check && lmr_depth < 13 && futility_value <= alpha {
@@ -3376,7 +3384,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
             // `ttData.value` here is `tt_value`, not the raw `tt_data.value`.
             if !root_node
                 && Some(mv) == tt_move
-                && !excluded_move.is_ok()
+                && !excluded_move.is_some_and(Move::is_ok)
                 && depth >= 6 + self.stack[s].tt_pv as i32
                 && is_valid(tt_value)
                 && !is_decisive(tt_value)
@@ -3391,7 +3399,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
                 // Re-enter on the *same* node with `move` excluded. Any `ss`
                 // field the inner search overwrites is intentionally shared,
                 // exactly as the reference's re-entry does.
-                self.stack[s].excluded_move = mv;
+                self.stack[s].excluded_move = Some(mv);
                 self.pv_node = false;
                 self.set_read_tt(true);
                 #[cfg(feature = "verbose3")]
@@ -3411,7 +3419,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
                 // and folded in only where `s_value` becomes this node's value.
                 #[cfg(feature = "verbose3")]
                 let singular_path_dep = self.child_path_dep(node_path_dep);
-                self.stack[s].excluded_move = Move::none();
+                self.stack[s].excluded_move = None;
 
                 if s_value < singular_beta {
                     let corr_val_adj = correction_value.abs() / 210590;
@@ -3461,7 +3469,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
             let acc_delta = MoveDelta::from_move(pos, mv);
             self.nodes += 1;
             let undo = pos.do_move_with_check(mv, gives_check);
-            self.stack[s].current_move = mv;
+            self.stack[s].current_move = Some(mv);
             self.stack[s].cont_hist =
                 ContinuationHistory::plane_index(in_check, capture, moved_piece, mv.to_sq());
             self.stack[s].cont_corr =
@@ -3702,7 +3710,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
                     {
                         self.path_dep |= child_path_dep;
                     }
-                    best_move = mv;
+                    best_move = Some(mv);
                     // Update the node PV even on a fail high, but not at the
                     // root, whose PV is the RootMove's.
                     if pv_node && !root_node {
@@ -3718,7 +3726,7 @@ impl<N: NetworkParams> QSearch<'_, N> {
                     alpha = value;
                 }
             }
-            if mv != best_move && move_count <= SEARCHED_LIST_CAPACITY as i32 {
+            if Some(mv) != best_move && move_count <= SEARCHED_LIST_CAPACITY as i32 {
                 if capture {
                     captures_searched.push(mv);
                 } else {
@@ -3733,33 +3741,29 @@ impl<N: NetworkParams> QSearch<'_, N> {
         }
 
         if move_count == 0 {
-            best_value = if excluded_move.is_ok() {
+            best_value = if excluded_move.is_some_and(Move::is_ok) {
                 alpha
             } else {
                 mated_in(ply)
             };
-        } else if best_move.is_ok() {
+        } else if let Some(best) = best_move.filter(|m| m.is_ok()) {
             update_all_stats(
                 &mut self.histories,
                 pos,
                 &self.stack[..],
                 s,
-                best_move,
+                best,
                 prev_sq,
                 quiets_searched.as_slice(),
                 captures_searched.as_slice(),
                 depth,
-                tt_move.unwrap_or(Move::none()),
+                tt_move,
                 prior_capture,
             );
             if !pv_node {
                 self.histories
                     .tt_move
-                    .update(if Some(best_move) == tt_move {
-                        805
-                    } else {
-                        -787
-                    });
+                    .update(if Some(best) == tt_move { 805 } else { -787 });
             }
         } else if !prior_capture && let Some(psq) = prev_sq {
             let mut bonus_scale = -232;
@@ -3781,13 +3785,13 @@ impl<N: NetworkParams> QSearch<'_, N> {
                     psq,
                     scaled_bonus * 221 / 16384,
                 );
-                self.histories.main.update(
-                    us.flip(),
-                    self.stack[s - 1].current_move,
-                    scaled_bonus * 235 / 32768,
-                );
+                if let Some(prev_move) = self.stack[s - 1].current_move {
+                    self.histories
+                        .main
+                        .update(us.flip(), prev_move, scaled_bonus * 235 / 32768);
+                }
                 let not_pawn = pc.kind != PieceKind::Pawn || pc.promoted;
-                if not_pawn && !self.stack[s - 1].current_move.is_promote() {
+                if not_pawn && !self.stack[s - 1].current_move.is_some_and(Move::is_promote) {
                     self.histories.shared.pawn_update(
                         pos.pawn_key(),
                         pc,
@@ -3812,13 +3816,14 @@ impl<N: NetworkParams> QSearch<'_, N> {
         // their reduced windows would poison the entry the first line wrote.
         // Below `verbose2` the root has no line beyond the first.
         #[cfg(feature = "verbose2")]
-        let skip_tt_write = excluded_move.is_ok() || (root_node && self.pv_idx != 0);
+        let skip_tt_write =
+            excluded_move.is_some_and(Move::is_ok) || (root_node && self.pv_idx != 0);
         #[cfg(not(feature = "verbose2"))]
-        let skip_tt_write = excluded_move.is_ok();
+        let skip_tt_write = excluded_move.is_some_and(Move::is_ok);
         if !skip_tt_write {
             let bound = if best_value >= beta {
                 Bound::Lower
-            } else if pv_node && best_move.is_ok() {
+            } else if pv_node && best_move.is_some_and(Move::is_ok) {
                 Bound::Exact
             } else {
                 Bound::Upper
@@ -3841,10 +3846,11 @@ impl<N: NetworkParams> QSearch<'_, N> {
         }
 
         // The clamp bound is `CORRECTION_HISTORY_LIMIT / 4`.
-        if !(in_check || (best_move.is_ok() && Self::is_capture(pos, best_move)))
-            && (best_value > static_eval) == best_move.is_ok()
+        let best_move_ok = best_move.is_some_and(Move::is_ok);
+        if !(in_check || best_move.is_some_and(|m| m.is_ok() && Self::is_capture(pos, m)))
+            && (best_value > static_eval) == best_move_ok
         {
-            let sign = if best_move.is_ok() { 12 } else { 17 };
+            let sign = if best_move_ok { 12 } else { 17 };
             let bonus = ((best_value - static_eval) * depth * sign / 128).clamp(-256, 256);
             update_correction_history(
                 &mut self.histories,
@@ -3949,7 +3955,7 @@ mod tests {
         pv: bool,
         bound: Bound,
         depth: i32,
-        mv: u16,
+        mv: Option<NonZeroU16>,
         eval: Value,
     ) {
         let key = p.key();
@@ -4267,7 +4273,7 @@ mod tests {
             Square::new(4, 6).unwrap(),
             Piece::new(PieceKind::Pawn, Color::White),
         );
-        q.stack[STACK_BASE - 1].current_move = prev;
+        q.stack[STACK_BASE - 1].current_move = Some(prev);
         let _ = q.qsearch(&mut p, 0, 0, 1);
         assert_eq!(q.nodes, 3, "the recapture is exempt from moveCount pruning");
     }
@@ -4290,7 +4296,7 @@ mod tests {
             let p = pos(sfen);
 
             // Ply 0: (ss-1) has no move ⇒ cntcv == 8.
-            q.stack[TestQSearch::si(0) - 1].current_move = Move::none();
+            q.stack[TestQSearch::si(0) - 1].current_move = None;
             let cv0 = q.correction_value(&p, 0);
             assert_eq!(cv0 / 131072, 0, "cv/131072 must be 0 at ply 0 (`{sfen}`)");
 
@@ -4305,7 +4311,7 @@ mod tests {
                 .find(|&sq| p.board().get(sq).is_none())
                 .unwrap();
             let prev = Move::make(from, occupied, piece);
-            q.stack[TestQSearch::si(2) - 1].current_move = prev;
+            q.stack[TestQSearch::si(2) - 1].current_move = Some(prev);
             let cv2 = q.correction_value(&p, 2);
             assert_eq!(cv2 / 131072, 0, "cv/131072 must be 0 at ply 2 (`{sfen}`)");
 
@@ -4335,7 +4341,7 @@ mod tests {
         let table = fresh_tt();
         let mut q = QSearch::new(net.network(), &table);
         let p = pos("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1");
-        q.stack[TestQSearch::si(0) - 1].current_move = Move::none();
+        q.stack[TestQSearch::si(0) - 1].current_move = None;
 
         let before = q.correction_value(&p, 0);
         let us = p.side_to_move();
@@ -4415,7 +4421,7 @@ mod tests {
         // the givesCheck exemption is what lets the capture through.
         let net = zero_net();
         let table = fresh_tt();
-        prewrite(&table, &p, 0, false, Bound::None, DEPTH_UNSEARCHED, 0, 0);
+        prewrite(&table, &p, 0, false, Bound::None, DEPTH_UNSEARCHED, None, 0);
         let out = {
             let mut q = QSearch::new(net.network(), &table);
             q.run(&mut p.clone(), 418, 419, false, true)
@@ -4453,7 +4459,7 @@ mod tests {
             false,
             Bound::None,
             DEPTH_UNSEARCHED,
-            move16_of(quiet_check),
+            move16_of(Some(quiet_check)),
             0,
         );
         let out = {
@@ -4513,7 +4519,7 @@ mod tests {
         assert_eq!(data.depth, DEPTH_QS);
         assert_eq!(data.value, mate_in(1), "raw mate score, not value_to_tt'd");
         assert_eq!(data.eval, VALUE_NONE, "unadjustedStaticEval is still NONE");
-        assert_eq!(data.move16, move16_of(p.mate_1ply().unwrap()));
+        assert_eq!(data.move16, move16_of(p.mate_1ply()));
     }
 
     // Repetition draws + the ±1 dither.
@@ -4605,7 +4611,7 @@ mod tests {
             let generation = table.generation();
             let (_f, _d, w) = table.probe(key, side);
             w.write(
-                key, value, false, bound, DEPTH_QS, 0, 0, generation, path_dep,
+                key, value, false, bound, DEPTH_QS, None, 0, generation, path_dep,
             );
         }
 
@@ -4740,7 +4746,7 @@ mod tests {
         let p = pos(TWO_KINGS);
         // A lower-bound entry at DEPTH_QS with value 500 >= beta triggers the
         // non-PV early cutoff when ReadTT is honoured.
-        prewrite(&table, &p, 500, false, Bound::Lower, DEPTH_QS, 0, 0);
+        prewrite(&table, &p, 500, false, Bound::Lower, DEPTH_QS, None, 0);
 
         let with_tt = {
             let mut q = QSearch::new(net.network(), &table);
@@ -5165,7 +5171,7 @@ mod tests {
             false,
             Bound::None,
             DEPTH_UNSEARCHED,
-            move16_of(quiet),
+            move16_of(Some(quiet)),
             VALUE_NONE,
         );
         let (v, n) = {
@@ -5186,7 +5192,7 @@ mod tests {
             false,
             Bound::None,
             DEPTH_UNSEARCHED,
-            move16_of(quiet),
+            move16_of(Some(quiet)),
             VALUE_NONE,
         );
         let n2 = {
@@ -5217,7 +5223,7 @@ mod tests {
             true, // is_pv ⇒ ss->ttPv true
             Bound::None,
             DEPTH_UNSEARCHED,
-            0,
+            None,
             VALUE_NONE,
         );
         // depth 4 ⇒ probCutDepth 0 (no verification search); improving becomes
@@ -5255,7 +5261,7 @@ mod tests {
         let prev_sq = Square::new(4, 0).unwrap(); // 5a, where the black king sits
         let prev = Move::make(Square::new(3, 0).unwrap(), prev_sq, bk);
         let s0 = TestQSearch::si(0);
-        q.stack[s0].current_move = prev;
+        q.stack[s0].current_move = Some(prev);
         q.stack[s0].in_check = true; // suppresses the Step-6 eval-diff main update
         q.stack[s0].stat_score = -20000;
         q.stack[s0].move_count = 0;
@@ -5329,8 +5335,15 @@ mod tests {
     // Torn-entry totality: under Lazy SMP several workers share the TT through
     // relaxed atomics, so a decoded `TTData` can pair a stale key fragment with
     // a `move16` written for a different position — leaving the stored `move16`
-    // an arbitrary `u16`. These tests drive all 65536 patterns through the widen
-    // gate and require no panic and every accepted move to be legal.
+    // an arbitrary `u16`. These tests drive every pattern the widen gate can
+    // receive — all but zero, which the entry reads as "no move" and which
+    // therefore never reaches the gate — and require no panic and every
+    // accepted move to be legal.
+
+    /// The 65535 fragments a torn entry can hand the widen gate.
+    fn torn_fragments() -> impl Iterator<Item = NonZeroU16> {
+        (1u32..=0xFFFF).map(|bits| NonZeroU16::new(bits as u16).expect("the range starts at one"))
+    }
 
     /// The 6 parity-fixture SFENs, covering an in-check position and several
     /// hand-heavy ones; the test asserts that coverage explicitly below.
@@ -5392,16 +5405,15 @@ mod tests {
             // generation, so sweeping it over one generated list covers every
             // pattern.
             let mut accepted: std::collections::HashSet<Move> = std::collections::HashSet::new();
-            for bits in 0u32..=0xFFFF {
-                let m16 = bits as u16;
+            for m16 in torn_fragments() {
                 if let Some(m) = TestQSearch::select_tt_move(&legal, m16) {
                     assert!(
                         legal_set.contains(&m),
                         "{sfen}: select_tt_move accepted {m:?} for move16={m16:#06x}, not legal"
                     );
                     assert_eq!(
-                        move16_of(m),
-                        m16,
+                        move16_of(Some(m)),
+                        Some(m16),
                         "{sfen}: select_tt_move({m16:#06x}) returned a move with a different fragment"
                     );
                     accepted.insert(m);
@@ -5409,12 +5421,12 @@ mod tests {
             }
 
             // Generation is pattern-independent, so agreeing with the real
-            // `widen_tt_move` on fragment 0, every accepted fragment and a
-            // strided sample of rejecting ones transfers the sweep's totality
-            // to the real decode without 65536 re-generations.
-            let mut sample: Vec<u16> = vec![0];
-            sample.extend(accepted.iter().map(|&m| move16_of(m)));
-            sample.extend((0u32..=0xFFFF).step_by(97).map(|b| b as u16));
+            // `widen_tt_move` on every accepted fragment and a strided sample
+            // of rejecting ones transfers the sweep's totality to the real
+            // decode without 65535 re-generations.
+            let mut sample: Vec<NonZeroU16> =
+                accepted.iter().filter_map(|&m| m.move16_stored()).collect();
+            sample.extend(torn_fragments().step_by(97));
             for m16 in sample {
                 assert_eq!(
                     TestQSearch::widen_tt_move(p, m16),
@@ -5475,7 +5487,9 @@ mod tests {
     /// `pseudo_legal(all=false)`, and the production chain accepts exactly it.
     fn legal_move_chain_oracle(p: &Position, ctx: &str) {
         for m in strict_search_legal(p) {
-            let f = move16_of(m);
+            let f = m
+                .move16_stored()
+                .expect("a real move has a non-zero fragment");
             assert_eq!(
                 p.to_move(f),
                 Some(m),
@@ -5517,9 +5531,9 @@ mod tests {
         // clean drop, so `move16` is not asserted to round-trip over the full
         // sweep — only over real moves, in `legal_move_chain_oracle`.
         fn acceptances<const ALL: bool>(p: &Position) -> usize {
-            (0u32..=0xFFFF)
-                .filter(|&bits| {
-                    p.to_move(bits as u16)
+            torn_fragments()
+                .filter(|&m16| {
+                    p.to_move(m16)
                         .is_some_and(|m| m.is_ok() && p.pseudo_legal::<ALL>(m) && p.is_legal(m))
                 })
                 .count()
@@ -5537,8 +5551,7 @@ mod tests {
 
         // `select_tt_move` accepts perft-legal moves, under lenient promotion
         // rules, so the comparison runs under `all == true`.
-        for bits in 0u32..=0xFFFF {
-            let m16 = bits as u16;
+        for m16 in torn_fragments() {
             if let Some(old) = TestQSearch::select_tt_move(&perft_legal, m16) {
                 let new = p
                     .to_move(m16)
