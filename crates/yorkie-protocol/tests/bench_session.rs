@@ -7,7 +7,7 @@
 //!
 //! Gated on `verbose3`, so without that feature this file compiles to nothing.
 //! The complementary "command absent" assertions live in `src/parser.rs` and
-//! `src/driver.rs`, compiled only without it.
+//! `src/usi.rs`, compiled only without it.
 //!
 //! The `bench:` summary line is the command's result, not a diagnostic, so it is
 //! asserted unconditionally; the argument-rejection lines are diagnostics and
