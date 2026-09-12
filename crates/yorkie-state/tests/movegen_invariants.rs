@@ -13,7 +13,10 @@ use std::collections::HashSet;
 
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseResult;
-use yorkie_state::{ExtMove, Move, Position, format_sfen, format_usi_move, parse_sfen};
+mod text_str;
+
+use text_str::{format_sfen, format_usi_move, parse_sfen};
+use yorkie_state::{ExtMove, Move, Position};
 
 /// Roots the random lines start from: `startpos`, plus already-sharp positions
 /// so the evasion, drop and promotion branches are sampled from ply 0.

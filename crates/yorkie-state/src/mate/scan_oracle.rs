@@ -337,7 +337,7 @@ fn pinned_pieces_avoid_scan(board: &Board, c: Color, avoid: Option<Square>) -> B
 }
 
 use crate::position::Position;
-use crate::sfen::parse_sfen;
+use crate::text::test_text::parse_sfen_str as parse_sfen;
 
 const FIXTURE_SFENS: &[&str] = &[
     "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
@@ -618,7 +618,7 @@ fn filtered_mate_matches_unfiltered_twin_over_playouts() {
                         p.mate_1ply(),
                         p.mate_1ply_unfiltered(),
                         "seed {fi} stream {stream} ply {plies}: filtered != unfiltered\n{}",
-                        crate::sfen::format_sfen(&p),
+                        crate::text::test_text::sfen_string(&p),
                     );
                 }
                 let mut legal: Vec<Move> = Vec::new();

@@ -38,6 +38,14 @@ mod nnue_layout;
 #[allow(dead_code)]
 mod nnue_source;
 mod simd;
+/// The text forms this crate's own unit tests read through.
+///
+/// The engine speaks bytes: an SFEN and a USI move are `&[u8]` everywhere it
+/// handles them. Fixtures and assertion messages here are written as text
+/// instead, so this is the one place a fixture becomes the bytes a parser takes
+/// and a formatted move becomes a string an assertion can print.
+#[cfg(test)]
+mod text_str;
 mod transformer;
 mod types;
 

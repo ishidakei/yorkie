@@ -6,9 +6,6 @@
 //! `usiok`, `readyok`, `info`, `info string` and `bestmove` — through
 //! [`UsiSink`], the [`EngineSink`] this build compiles.
 
-// Only the score / PV renderers use it, and both are optional surfaces.
-#[cfg(feature = "verbose2")]
-use core::fmt::NumBuffer;
 use std::collections::BTreeSet;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -24,16 +21,17 @@ use yorkie_search::BookHit;
 // the line's data type, its bound marker and the sink trait.
 #[cfg(feature = "verbose2")]
 use yorkie_search::{PvBound, PvInfo, PvSink};
-// A move's text as a `String`: what is left of it are the optional surfaces that
-// interpolate a move into a longer line. A `bestmove` reply, which every build
-// writes, composes its text in a stack buffer instead.
+use yorkie_state::TextWriter;
+// A move's text inside a longer line: what is left of it are the optional
+// surfaces that interpolate a move into one. A `bestmove` reply, which every
+// build writes, composes its text in a stack buffer instead.
 #[cfg(feature = "verbose2")]
-use yorkie_state::{Move, format_usi_move};
-// A whole SFEN string is parsed only by the `verbose3` commands that carry one
-// as an argument; the `position` command's own is read field by field, into the
+use yorkie_state::{Move, write_usi_move};
+// A whole SFEN is parsed only by the `verbose3` commands that carry one as an
+// argument; the `position` command's own is read field by field, into the
 // position the engine already holds.
 #[cfg(feature = "verbose3")]
-use yorkie_state::{Position, parse_sfen, parse_usi_move};
+use yorkie_state::{Position, SfenBuf, parse_sfen, parse_sfen_fields_into, parse_usi_move};
 #[cfg(feature = "verbose2")]
 use yorkie_storage::Value;
 #[cfg(feature = "verbose3")]
@@ -46,14 +44,16 @@ use yorkie_storage::{clear_alloc_count, take_alloc_count};
 #[cfg(feature = "verbose3")]
 use crate::bench;
 use crate::bestmove::BestmoveBuf;
+#[cfg(feature = "verbose1")]
+use crate::engine::MAX_POSITION_MOVES;
 #[cfg(feature = "verbose2")]
 use crate::engine::PAWN_VALUE;
 use crate::engine::{
-    Engine, EngineSink, GoOutcome, GoParams, MAX_POSITION_MOVES, PositionRefusal, PositionSfen,
+    Engine, EngineSink, GoOutcome, GoParams, NOTICE_BYTES, PositionRefusal, PositionSfen,
     ReadyOutcome, Reply,
 };
 use crate::formatter::Formatter;
-use crate::parser::{Command, parse_line};
+use crate::parser::{Command, MAX_LINE_BYTES, parse_line};
 #[cfg(feature = "verbose1")]
 use crate::stats::StatsBuf;
 #[cfg(feature = "verbose3")]
@@ -61,43 +61,30 @@ use crate::tt_command::{
     TtCommand, TtPosition, TtStoreArgs, bound_name, parse_tt, value_from_tt, value_to_tt,
 };
 
-/// Emit one diagnostic `info string` line through a [`UsiEngine`] — the
-/// `verbose1` surface — and compile the message only into a build that has that
-/// surface.
-///
-/// A macro rather than a plain method call because the message text is part of
-/// the surface: below `verbose1` the expansion drops the format string and the
-/// formatting with it, keeping the text out of the binary, and yields the same
-/// `Ok(())` so every call site's `?` / `return` shape is identical in both
-/// builds. Arguments are still named once each, so a value computed only for the
-/// message cannot be left behind as an unused binding.
-///
-/// Pass interpolated values as trailing arguments (`"illegal move: {}", s`)
-/// rather than as inline captures at any call site a build below `verbose1`
-/// still compiles: an inline capture is invisible to the expansion that drops
-/// the message, so the binding it names would go unused there.
-macro_rules! diag {
-    ($session:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
-        #[cfg(feature = "verbose1")]
-        {
-            $session.info_string_diag(format_args!($fmt $(, $arg)*))
-        }
-        #[cfg(not(feature = "verbose1"))]
-        {
-            let _ = &$session;
-            $(let _ = &$arg;)*
-            Ok::<(), io::Error>(())
-        }
-    }};
-}
-
 /// The public values used in the `id name` / `id author` lines.
 ///
 /// The version part is this project's own generation number (see
 /// `CHANGELOG.md`), not an upstream-tracking number; the upstream YaneuraOu
 /// baseline is documented in `README.md` instead.
-pub const ENGINE_NAME: &str = "Yorkie 3.1.0";
-pub const ENGINE_AUTHOR: &str = "Kei Ishida <ishida.kei@gmail.com>";
+pub const ENGINE_NAME: &[u8] = b"Yorkie 3.1.0";
+pub const ENGINE_AUTHOR: &[u8] = b"Kei Ishida <ishida.kei@gmail.com>";
+
+/// Room a diagnostic `info string` body is composed in.
+///
+/// A body quoting a token the host sent can be wider than this, and is
+/// truncated to fit: a diagnostic about a garbage token is worth cutting short,
+/// and the two that echo a whole command line write their pieces straight out
+/// instead of gathering them here.
+///
+/// Nothing below `verbose1` writes a diagnostic, so neither the room nor any of
+/// the wording is compiled there.
+#[cfg(feature = "verbose1")]
+const DIAG_BYTES: usize = 1024;
+
+/// Room the `verbose2` PV / book `info` body is composed in: the fixed fields,
+/// then a principal variation as deep as the search can return.
+#[cfg(feature = "verbose2")]
+const INFO_BYTES: usize = 128 + (yorkie_state::MAX_USI_MOVE_LEN + 1) * 256;
 // --- isready keep-alive (reference `Engine::run_heavy_job`).
 /// How often the keep-alive helper thread polls the stop flag while the heavy
 /// `isready` initialisation runs (reference: `sleep_for(100ms)`).
@@ -125,30 +112,15 @@ pub(crate) const VALUE_MATE: Value = 32000;
 pub(crate) const VALUE_TB_WIN_IN_MAX_PLY: Value = VALUE_MATE - 246;
 /// Append a search value to `out` the way the reference USI layer formats it: a
 /// mate distance for decisive scores, else centipawns.
-///
-/// Appending in place keeps the `info` PV path free of the `String` temporary
-/// [`format_score`] hands back; [`format_score`] itself stays for the two book
-/// call sites that need an owned value.
 #[cfg(feature = "verbose2")]
-fn push_score(out: &mut String, v: Value) {
-    let mut digits = NumBuffer::new();
+pub(crate) fn write_score(out: &mut TextWriter<'_>, v: Value) {
     if v.abs() >= VALUE_TB_WIN_IN_MAX_PLY {
         let distance = VALUE_MATE - v.abs();
         let mate = if v > 0 { distance } else { -distance };
-        out.push_str("mate ");
-        out.push_str(mate.format_into(&mut digits));
+        out.bytes(b"mate ").i64(i64::from(mate));
     } else {
-        out.push_str("cp ");
-        out.push_str((100 * v / PAWN_VALUE).format_into(&mut digits));
+        out.bytes(b"cp ").i64(i64::from(100 * v / PAWN_VALUE));
     }
-}
-
-/// [`push_score`] into a fresh `String`.
-#[cfg(feature = "verbose2")]
-pub(crate) fn format_score(v: Value) -> String {
-    let mut out = String::new();
-    push_score(&mut out, v);
-    out
 }
 
 /// The USI renderer: every line this engine writes is composed here.
@@ -185,30 +157,29 @@ impl<W: Write + Send + 'static> UsiSink<W> {
     /// This is the unconditional sink, reserved for the initialisation phase and
     /// for a `verbose3` command's response payload: those lines are how a
     /// failed startup is diagnosed at all, so no feature may take them away.
-    /// Everything else goes through [`diag!`].
-    fn info_string(&self, msg: &str) -> io::Result<()> {
+    fn info_string(&self, msg: &[u8]) -> io::Result<()> {
         Formatter::new(&mut *self.lock()).info_string(msg)
     }
 
-    /// Emit one diagnostic `info string` line — the `verbose1` surface, which
-    /// carries every `info string` produced outside the initialisation phase.
+    /// Emit one `info string <parts…>` line, the parts joined with nothing
+    /// between them — for a message whose pieces are a literal and something
+    /// borrowed from the command line, which is written whole rather than
+    /// gathered into a buffer that might be narrower than it.
     ///
-    /// Callers pass `format_args!`, not a `String`, so the message is composed
-    /// only if it is going to be written. They reach this through [`diag!`],
-    /// which is what keeps the message text itself out of a build that cannot
-    /// print it.
+    /// Every such message is a diagnostic, so this exists only with their
+    /// feature.
     #[cfg(feature = "verbose1")]
-    fn info_string_diag(&self, body: std::fmt::Arguments<'_>) -> io::Result<()> {
-        Formatter::new(&mut *self.lock()).info_string_fmt(body)
+    fn info_string_parts(&self, parts: &[&[u8]]) -> io::Result<()> {
+        Formatter::new(&mut *self.lock()).info_string_parts(parts)
     }
 
     /// Emit each non-blank line of `text` as `info string <line>`, mirroring the
     /// reference `print_info_string`: the text is split on `'\n'` and
     /// whitespace-only lines are skipped.
     #[cfg(feature = "verbose3")]
-    fn info_string_lines(&self, text: &str) -> io::Result<()> {
-        for line in text.split('\n') {
-            if !line.trim().is_empty() {
+    fn info_string_lines(&self, text: &[u8]) -> io::Result<()> {
+        for line in text.split(|&b| b == b'\n') {
+            if !yorkie_state::text::trim_ascii_whitespace(line).is_empty() {
                 self.info_string(line)?;
             }
         }
@@ -253,16 +224,16 @@ impl<W: Write + Send + 'static> UsiSink<W> {
     /// initialisation's own output.
     fn keep_alive_newline(&self) {
         let mut guard = self.lock();
-        let _ = Formatter::new(&mut *guard).raw_line("");
+        let _ = Formatter::new(&mut *guard).raw_line(b"");
     }
 }
 
 /// The USI text of a [`Reply`]: the two token replies are constants, and a move
 /// reply is composed in the caller's stack buffer.
-fn render_reply(payload: &mut BestmoveBuf, reply: Reply) -> &str {
+fn render_reply(payload: &mut BestmoveBuf, reply: Reply) -> &[u8] {
     match reply {
-        Reply::Resign => "resign",
-        Reply::Win => "win",
+        Reply::Resign => b"resign",
+        Reply::Win => b"win",
         Reply::BestMove { mv, ponder } => payload.compose(mv, ponder),
     }
 }
@@ -273,12 +244,12 @@ impl<W: Write + Send + 'static> EngineSink for UsiSink<W> {
     #[cfg(feature = "verbose2")]
     type PvOutput = Self;
 
-    fn notice(&self, msg: &str) -> io::Result<()> {
+    fn notice(&self, msg: &[u8]) -> io::Result<()> {
         self.info_string(msg)
     }
 
     #[cfg(feature = "verbose1")]
-    fn diagnostic(&self, msg: &str) {
+    fn diagnostic(&self, msg: &[u8]) {
         let _ = self.info_string(msg);
     }
 
@@ -297,18 +268,19 @@ impl<W: Write + Send + 'static> EngineSink for UsiSink<W> {
 
     #[cfg(feature = "verbose2")]
     fn book_candidates(&self, hit: &BookHit, hashfull: u32, time_ms: u64) {
+        let mut bytes = [0u8; INFO_BYTES];
         let mut guard = self.lock();
         let mut f = Formatter::new(&mut *guard);
         for line in &hit.info_lines {
-            let body = format!(
-                "depth {} multipv {} score {} nodes 0 nps 0 \
-                 hashfull {hashfull} time {time_ms} pv {}",
-                line.depth,
-                line.multipv,
-                format_score(Value::from(line.score)),
-                pv_string(&line.pv),
-            );
-            let _ = f.info(&body);
+            let mut body = TextWriter::new(&mut bytes);
+            body.bytes(b"depth ")
+                .u64(u64::from(line.depth))
+                .bytes(b" multipv ")
+                .u64(line.multipv as u64)
+                .bytes(b" score ");
+            write_score(&mut body, Value::from(line.score));
+            write_book_tail(&mut body, hashfull, time_ms, &line.pv);
+            let _ = f.info(body.as_bytes());
         }
     }
 
@@ -320,23 +292,28 @@ impl<W: Write + Send + 'static> EngineSink for UsiSink<W> {
         #[cfg(feature = "verbose3")] sent: &AtomicBool,
     ) {
         #[cfg(feature = "verbose2")]
-        let pv = {
-            let mut pv = format_usi_move(hit.best);
-            if let Some(p) = hit.ponder {
-                pv.push(' ');
-                pv.push_str(&format_usi_move(p));
-            }
-            pv
+        let mut bytes = [0u8; INFO_BYTES];
+        #[cfg(feature = "verbose2")]
+        let info = {
+            let mut body = TextWriter::new(&mut bytes);
+            body.bytes(b"depth 0 multipv 1 score ");
+            write_score(&mut body, Value::from(hit.value));
+            let mut pv = [hit.best; 2];
+            let pv = match hit.ponder {
+                Some(p) => {
+                    pv[1] = p;
+                    &pv[..2]
+                }
+                None => &pv[..1],
+            };
+            write_book_tail(&mut body, hashfull, time_ms, pv);
+            body.len()
         };
         let mut payload = BestmoveBuf::new();
         let text = payload.compose(hit.best, hit.ponder);
         let mut guard = self.lock();
         #[cfg(feature = "verbose2")]
-        let _ = Formatter::new(&mut *guard).info(&format!(
-            "depth 0 multipv 1 score {} nodes 0 nps 0 \
-             hashfull {hashfull} time {time_ms} pv {pv}",
-            format_score(Value::from(hit.value)),
-        ));
+        let _ = Formatter::new(&mut *guard).info(&bytes[..info]);
         // After that line, so the statistics cover composing it too, and directly
         // before the reply.
         #[cfg(feature = "verbose1")]
@@ -451,32 +428,37 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
         self
     }
 
-    /// Emit one diagnostic `info string` line. [`diag!`]'s target.
-    #[cfg(feature = "verbose1")]
-    fn info_string_diag(&self, body: std::fmt::Arguments<'_>) -> io::Result<()> {
-        self.out.info_string_diag(body)
-    }
-
     /// Read USI lines until `quit` or end of input, dispatching each one.
+    ///
+    /// One buffer serves the whole session: a line is read into it as the bytes
+    /// that arrived, nothing validates or decodes them, and the typed command a
+    /// line parses into borrows its tokens from it. Input can therefore not end
+    /// a session — a `setoption` value spelling a path in a Windows code page is
+    /// read like any other line — and no line costs an allocation.
     pub fn run(mut self) -> io::Result<()> {
-        let mut buf = String::new();
+        let mut line = vec![0u8; MAX_LINE_BYTES];
         loop {
-            buf.clear();
-            let n = self.reader.read_line(&mut buf)?;
-            if n == 0 {
-                // EOF: treat as quit — stop and join any running search first.
-                self.engine.finish_search_join();
-                return Ok(());
-            }
-            match parse_line(&buf) {
+            let filled = match read_command_line(&mut self.reader, &mut line)? {
+                LineRead::Line(filled) => filled,
+                LineRead::TooLong => {
+                    self.handle_too_long()?;
+                    continue;
+                }
+                LineRead::Eof => {
+                    // EOF: treat as quit — stop and join any running search first.
+                    self.engine.finish_search_join();
+                    return Ok(());
+                }
+            };
+            match parse_line(&line[..filled]) {
                 Command::Usi => self.handle_usi()?,
                 Command::IsReady => self.handle_isready()?,
-                Command::SetOption { name, value } => self.handle_setoption(&name, &value)?,
+                Command::SetOption { name, value } => self.handle_setoption(name, value)?,
                 Command::UsiNewGame => self.handle_usinewgame(),
                 Command::Position { sfen, moves } => self.handle_position(sfen, moves)?,
                 Command::Go(params) => self.handle_go(params)?,
                 #[cfg(not(feature = "verbose2"))]
-                Command::GoExtraClause(clause) => self.handle_go_extra_clause(&clause)?,
+                Command::GoExtraClause(clause) => self.handle_go_extra_clause(clause)?,
                 Command::Stop => self.handle_stop(),
                 Command::GameOver => self.handle_gameover(),
                 Command::PonderHit => self.handle_ponderhit()?,
@@ -489,7 +471,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
                     return Ok(());
                 }
                 #[cfg(feature = "verbose1")]
-                Command::Unknown(line) => self.handle_unknown(&line)?,
+                Command::Unknown(text) => self.handle_unknown(text)?,
                 // The line is consumed and dropped either way; only the report
                 // of it is gated.
                 #[cfg(not(feature = "verbose1"))]
@@ -535,11 +517,19 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
                 // `readyok`. There is no working network to lose here: one
                 // already read is reused by the idempotent path above, so the
                 // only session that reaches this had none to begin with.
-                self.out.info_string(&format!("eval load failed: {reason}"))
+                let mut bytes = [0u8; NOTICE_BYTES];
+                let mut out = TextWriter::new(&mut bytes);
+                out.bytes(b"eval load failed: ");
+                reason.write_message(&mut out);
+                self.out.info_string(out.as_bytes())
             }
-            ReadyOutcome::LayoutMismatch(reason) => self
-                .out
-                .info_string(&format!("NUMA layout mismatch: {reason}")),
+            ReadyOutcome::LayoutMismatch(reason) => {
+                let mut bytes = [0u8; NOTICE_BYTES];
+                let mut out = TextWriter::new(&mut bytes);
+                out.bytes(b"NUMA layout mismatch: ");
+                reason.write_message(&mut out);
+                self.out.info_string(out.as_bytes())
+            }
         }
     }
 
@@ -558,21 +548,50 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
     /// There is no option to set — every setting was fixed at build time from
     /// the TOML config, and the `usi` reply advertises no options at all. USI
     /// requires no reply, so the line is parsed, consumed and dropped.
-    fn handle_setoption(&mut self, _name: &str, _value: &str) -> io::Result<()> {
+    fn handle_setoption(&mut self, _name: &[u8], _value: &[u8]) -> io::Result<()> {
         Ok(())
     }
 
-    fn handle_position<'a>(&mut self, sfen: PositionSfen<'a>, moves: &'a str) -> io::Result<()> {
+    fn handle_position(&mut self, sfen: PositionSfen<'_>, moves: &[u8]) -> io::Result<()> {
         match self.engine.set_position(sfen, moves) {
             Ok(()) => Ok(()),
-            Err(PositionRefusal::Sfen(e)) => diag!(self, "position parse error: {}", e),
-            Err(PositionRefusal::IllegalMove(mv)) => diag!(self, "illegal move: {}", mv),
-            Err(PositionRefusal::TooManyMoves) => diag!(
-                self,
-                "position error: more than {} moves; position unchanged",
-                MAX_POSITION_MOVES,
-            ),
+            Err(refusal) => self.report_position_refusal(refusal),
         }
+    }
+
+    /// Report a refused `position` line — the `verbose1` surface.
+    ///
+    /// The illegal-move report quotes a token from the command line and writes
+    /// it whole, so a garbage token arrives back as it came however wide it was.
+    #[cfg(feature = "verbose1")]
+    fn report_position_refusal(&self, refusal: PositionRefusal<'_>) -> io::Result<()> {
+        match refusal {
+            PositionRefusal::Sfen(e) => {
+                let mut bytes = [0u8; DIAG_BYTES];
+                let mut out = TextWriter::new(&mut bytes);
+                out.bytes(b"position parse error: ");
+                e.write_message(&mut out);
+                self.out.info_string(out.as_bytes())
+            }
+            PositionRefusal::IllegalMove(mv) => {
+                self.out.info_string_parts(&[b"illegal move: ", mv])
+            }
+            PositionRefusal::TooManyMoves => {
+                let mut bytes = [0u8; DIAG_BYTES];
+                let mut out = TextWriter::new(&mut bytes);
+                out.bytes(b"position error: more than ")
+                    .u64(MAX_POSITION_MOVES as u64)
+                    .bytes(b" moves; position unchanged");
+                self.out.info_string(out.as_bytes())
+            }
+        }
+    }
+
+    /// A build below `verbose1` prints no diagnostic, so the refusal is
+    /// consumed and dropped; the command was refused either way.
+    #[cfg(not(feature = "verbose1"))]
+    fn report_position_refusal(&self, _refusal: PositionRefusal<'_>) -> io::Result<()> {
+        Ok(())
     }
 
     /// `go …`: start a search, or answer the one thing the engine cannot.
@@ -607,7 +626,9 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
         match outcome {
             GoOutcome::Started => Ok(()),
             GoOutcome::NoNetwork => {
-                diag!(self, "no eval network loaded; run isready")?;
+                #[cfg(feature = "verbose1")]
+                self.out
+                    .info_string(b"no eval network loaded; run isready")?;
                 self.out.reply_now(Reply::Resign)
             }
         }
@@ -619,13 +640,21 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
     /// Failing loud is deliberate — ignoring the clause would silently change
     /// the search's terms, turning `go depth 4` into a clock-less `go` in the
     /// middle of a game. Any search already running is left alone.
-    #[cfg(not(feature = "verbose2"))]
-    fn handle_go_extra_clause(&mut self, clause: &str) -> io::Result<()> {
-        diag!(
-            self,
-            "go error: `{}` requires a verbose2 build; no search started",
-            clause
-        )
+    ///
+    /// The refusal itself happens in every build; `verbose1` is where it is
+    /// also reported, so a build below it consumes the clause and says nothing.
+    #[cfg(all(not(feature = "verbose2"), feature = "verbose1"))]
+    fn handle_go_extra_clause(&mut self, clause: &[u8]) -> io::Result<()> {
+        self.out.info_string_parts(&[
+            b"go error: `",
+            clause,
+            b"` requires a verbose2 build; no search started",
+        ])
+    }
+
+    #[cfg(all(not(feature = "verbose2"), not(feature = "verbose1")))]
+    fn handle_go_extra_clause(&mut self, _clause: &[u8]) -> io::Result<()> {
+        Ok(())
     }
 
     /// `bench [ttSizeMB] [threads] [limit] [default|current|<fenFile>] [limitType]`
@@ -639,14 +668,21 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
     /// that do not come from the config constants, and they last as long as the
     /// session.
     #[cfg(feature = "verbose3")]
-    fn handle_bench(&mut self, tokens: &[String]) -> io::Result<()> {
+    fn handle_bench(&mut self, tokens: &[&[u8]]) -> io::Result<()> {
         // Reclaim any running search before touching the pool / the TT.
         self.engine.finish_search_join();
 
-        let current = bench::current_sfen(self.engine.position());
-        let config = match bench::parse_bench(tokens, &current) {
+        let mut sfen_buf = SfenBuf::new();
+        let current = bench::current_sfen(self.engine.position(), &mut sfen_buf);
+        let config = match bench::parse_bench(tokens, current) {
             Ok(c) => c,
-            Err(e) => return diag!(self, "bench: {}", e),
+            Err(e) => {
+                let mut bytes = [0u8; DIAG_BYTES];
+                let mut out = TextWriter::new(&mut bytes);
+                out.bytes(b"bench: ");
+                e.write_message(&mut out);
+                return self.out.info_string(out.as_bytes());
+            }
         };
 
         // The thread count is the one value the reference replays as a
@@ -654,8 +690,12 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
         // is the build's, not the command's. The pool rebuild reports itself
         // exactly as the reference `Threads` on_change callback does.
         self.engine.resize_pool(config.threads.max(1) as usize);
-        self.out
-            .info_string_lines(&self.engine.thread_allocation_information())?;
+        {
+            let mut bytes = [0u8; DIAG_BYTES];
+            let mut out = TextWriter::new(&mut bytes);
+            self.engine.write_thread_allocation_information(&mut out);
+            self.out.info_string_lines(out.as_bytes())?;
+        }
 
         // The `ucinewgame` (`search_clear`) the reference runs once before the
         // positions: clears the TT, resets histories, and rebuilds the pool — the
@@ -677,7 +717,15 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
                 Err(e) => {
                     // A malformed position in a `<fenFile>` is skipped loudly, not
                     // fatal — the rest of the bench still runs.
-                    diag!(self, "bench: skipping bad position `{}`: {}", fen, e)?;
+                    let mut bytes = [0u8; DIAG_BYTES];
+                    let mut reason = TextWriter::new(&mut bytes);
+                    e.write_message(&mut reason);
+                    self.out.info_string_parts(&[
+                        b"bench: skipping bad position `",
+                        fen,
+                        b"`: ",
+                        reason.as_bytes(),
+                    ])?;
                     continue;
                 }
             }
@@ -702,9 +750,17 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
         // bad run shows itself.)
         let time_ms = start.elapsed().as_millis() as u64 + 1;
         let nps = 1000 * total_nodes / time_ms;
-        self.out.info_string(&format!(
-            "bench: positions={positions} nodes={total_nodes} time_ms={time_ms} nps={nps}"
-        ))
+        let mut bytes = [0u8; DIAG_BYTES];
+        let mut out = TextWriter::new(&mut bytes);
+        out.bytes(b"bench: positions=")
+            .u64(positions)
+            .bytes(b" nodes=")
+            .u64(total_nodes)
+            .bytes(b" time_ms=")
+            .u64(time_ms)
+            .bytes(b" nps=")
+            .u64(nps);
+        self.out.info_string(out.as_bytes())
     }
 
     // The `tt` command family exists only under the `verbose3` cargo feature.
@@ -723,15 +779,20 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
     /// What counts as "already replied" is [`Engine::reclaim_replied_search`]'s
     /// question, not this one's.
     #[cfg(feature = "verbose3")]
-    fn handle_tt(&mut self, tokens: &[String]) -> io::Result<()> {
+    fn handle_tt(&mut self, tokens: &[&[u8]]) -> io::Result<()> {
         self.engine.reclaim_replied_search();
         if self.engine.search_is_running() {
-            return self.tt_error("a search is running; `stop` it first");
+            return self.tt_error(&[b"a search is running; `stop` it first"]);
         }
 
         let command = match parse_tt(tokens) {
             Ok(command) => command,
-            Err(e) => return self.tt_error(&e.to_string()),
+            Err(e) => {
+                let mut bytes = [0u8; DIAG_BYTES];
+                let mut out = TextWriter::new(&mut bytes);
+                e.write_message(&mut out);
+                return self.tt_error(&[out.as_bytes()]);
+            }
         };
 
         match command {
@@ -743,25 +804,45 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
 
     /// The single error channel for the `tt` commands.
     #[cfg(feature = "verbose3")]
-    fn tt_error(&self, msg: &str) -> io::Result<()> {
-        self.out.info_string(&format!("tt error: {msg}"))
+    fn tt_error(&self, parts: &[&[u8]]) -> io::Result<()> {
+        let mut all: Vec<&[u8]> = Vec::with_capacity(parts.len() + 1);
+        all.push(b"tt error: ");
+        all.extend_from_slice(parts);
+        self.out.info_string_parts(&all)
     }
 
     /// Build the [`Position`] a `tt` command names.
     ///
-    /// The extra king check is this surface's own: `parse_sfen` accepts a
+    /// The extra king check is this surface's own: the SFEN parser accepts a
     /// kingless board, but the move generators these commands then run assume
     /// both kings are present.
+    ///
+    /// A refusal is written into `reason`, which the caller owns, and the
+    /// returned `Err` says only that there is one.
     #[cfg(feature = "verbose3")]
-    fn tt_position(&self, position: &TtPosition) -> Result<Position, String> {
+    fn tt_position(
+        &self,
+        position: &TtPosition<'_>,
+        reason: &mut TextWriter<'_>,
+    ) -> Result<Position, ()> {
         use yorkie_state::Color;
 
         let pos = match position {
             TtPosition::StartPos => Position::startpos(),
-            TtPosition::Sfen(sfen) => parse_sfen(sfen).map_err(|e| e.to_string())?,
+            TtPosition::Sfen(fields) => {
+                let mut pos = Position::empty();
+                match parse_sfen_fields_into(&mut pos, *fields) {
+                    Ok(()) => pos,
+                    Err(e) => {
+                        e.write_message(reason);
+                        return Err(());
+                    }
+                }
+            }
         };
         if pos.king_square(Color::Black).is_none() || pos.king_square(Color::White).is_none() {
-            return Err("position has no king for one or both sides".to_string());
+            reason.bytes(b"position has no king for one or both sides");
+            return Err(());
         }
         Ok(pos)
     }
@@ -773,24 +854,35 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
     /// would. That includes the replacement policy, which may decline the write,
     /// so the command re-probes afterwards and reports which happened.
     #[cfg(feature = "verbose3")]
-    fn tt_store(&self, args: &TtStoreArgs) -> io::Result<()> {
-        let pos = match self.tt_position(&args.position) {
+    fn tt_store(&self, args: &TtStoreArgs<'_>) -> io::Result<()> {
+        let mut reason_bytes = [0u8; DIAG_BYTES];
+        let mut reason = TextWriter::new(&mut reason_bytes);
+        let pos = match self.tt_position(&args.position, &mut reason) {
             Ok(pos) => pos,
-            Err(e) => return self.tt_error(&e),
+            Err(()) => return self.tt_error(&[reason.as_bytes()]),
         };
         let mut legal: Vec<Move> = Vec::new();
         pos.generate_legal_all(&mut legal);
 
         // `none` stores the `MOVE_NONE` fragment, which `TTEntry::save` reads as
         // "keep whatever move this entry already holds for this position".
-        let move16 = if args.mv == "none" {
+        let move16 = if args.mv == b"none" {
             None
         } else {
-            match parse_usi_move(&args.mv, &pos) {
+            match parse_usi_move(args.mv, &pos) {
                 Ok(mv) if legal.contains(&mv) => mv.move16_stored(),
-                Ok(_) => return self.tt_error(&format!("move `{}` is not legal here", args.mv)),
+                Ok(_) => {
+                    return self.tt_error(&[b"move `", args.mv, b"` is not legal here"]);
+                }
                 Err(e) => {
-                    return self.tt_error(&format!("move `{}` is not a USI move: {e:?}", args.mv));
+                    reason.clear();
+                    e.write_message(&mut reason);
+                    return self.tt_error(&[
+                        b"move `",
+                        args.mv,
+                        b"` is not a USI move: ",
+                        reason.as_bytes(),
+                    ]);
                 }
             }
         };
@@ -827,32 +919,34 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
             && data.path_dep == args.path_dep
             && (move16.is_none() || data.move16 == move16);
         if stored {
-            self.out.info_string("tt store ok")
+            self.out.info_string(b"tt store ok")
         } else {
             self.out
-                .info_string("tt store skipped (replacement policy kept the existing entry)")
+                .info_string(b"tt store skipped (replacement policy kept the existing entry)")
         }
     }
 
     /// `tt probe …` — read the entry for the named position (`ply == 0`, so the
     /// reported value is exactly the stored one).
     #[cfg(feature = "verbose3")]
-    fn tt_probe(&self, position: &TtPosition) -> io::Result<()> {
-        let pos = match self.tt_position(position) {
+    fn tt_probe(&self, position: &TtPosition<'_>) -> io::Result<()> {
+        let mut bytes = [0u8; DIAG_BYTES];
+        let mut out = TextWriter::new(&mut bytes);
+        let pos = match self.tt_position(position, &mut out) {
             Ok(pos) => pos,
-            Err(e) => return self.tt_error(&e),
+            Err(()) => return self.tt_error(&[out.as_bytes()]),
         };
         let (found, data, _) =
             TranspositionTable::shared().probe(pos.key(), pos.side_to_move().index() as u8);
         if !found {
-            return self.out.info_string("tt probe miss");
+            return self.out.info_string(b"tt probe miss");
         }
         let mut legal: Vec<Move> = Vec::new();
         pos.generate_legal_all(&mut legal);
-        self.out.info_string(&format!(
-            "tt probe hit {}",
-            tt_entry_fields(&data, &legal, 0)
-        ))
+        out.clear();
+        out.bytes(b"tt probe hit ");
+        write_tt_entry_fields(&mut out, &data, &legal, 0);
+        self.out.info_string(out.as_bytes())
     }
 
     /// `tt children …` — probe every legal child of the named position, one ply
@@ -864,10 +958,12 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
     /// child's own SFEN would. A child with no entry produces no line, and the
     /// closing `tt children end <n>` line marks the list complete.
     #[cfg(feature = "verbose3")]
-    fn tt_children(&self, position: &TtPosition) -> io::Result<()> {
-        let mut pos = match self.tt_position(position) {
+    fn tt_children(&self, position: &TtPosition<'_>) -> io::Result<()> {
+        let mut bytes = [0u8; DIAG_BYTES];
+        let mut out = TextWriter::new(&mut bytes);
+        let mut pos = match self.tt_position(position, &mut out) {
             Ok(pos) => pos,
-            Err(e) => return self.tt_error(&e),
+            Err(()) => return self.tt_error(&[out.as_bytes()]),
         };
         let mut legal: Vec<Move> = Vec::new();
         pos.generate_legal_all(&mut legal);
@@ -878,31 +974,40 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
             let undo = pos.do_move(*mv);
             let (found, data, _) =
                 TranspositionTable::shared().probe(pos.key(), pos.side_to_move().index() as u8);
-            let line = found.then(|| {
+            if found {
                 child_legal.clear();
                 pos.generate_legal_all(&mut child_legal);
-                format!(
-                    "tt child {} {}",
-                    format_usi_move(*mv),
-                    tt_entry_fields(&data, &child_legal, 1)
-                )
-            });
+                out.clear();
+                out.bytes(b"tt child ");
+                write_usi_move(*mv, &mut out);
+                out.byte(b' ');
+                write_tt_entry_fields(&mut out, &data, &child_legal, 1);
+            }
             pos.undo_move(*mv, undo);
-            if let Some(line) = line {
+            if found {
                 hits += 1;
-                self.out.info_string(&line)?;
+                self.out.info_string(out.as_bytes())?;
             }
         }
-        self.out.info_string(&format!("tt children end {hits}"))
+        out.clear();
+        out.bytes(b"tt children end ").u64(hits as u64);
+        self.out.info_string(out.as_bytes())
     }
 
     #[cfg(feature = "verbose1")]
-    fn handle_unknown(&mut self, line: &str) -> io::Result<()> {
-        diag!(self, "unknown command: {}", line)
+    fn handle_unknown(&mut self, line: &[u8]) -> io::Result<()> {
+        self.out.info_string_parts(&[b"unknown command: ", line])
     }
 
+    /// Report a line past the input limit — the `verbose1` surface.
+    #[cfg(feature = "verbose1")]
     fn handle_too_long(&mut self) -> io::Result<()> {
-        diag!(self, "command too long")
+        self.out.info_string(b"command too long")
+    }
+
+    #[cfg(not(feature = "verbose1"))]
+    fn handle_too_long(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -920,33 +1025,46 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
 /// `ply` is the entry's distance from the position the command named, so the
 /// value is reported in that position's frame.
 #[cfg(feature = "verbose3")]
-fn tt_entry_fields(data: &TTData, legal: &[Move], ply: i32) -> String {
-    let mv = legal
+fn write_tt_entry_fields(out: &mut TextWriter<'_>, data: &TTData, legal: &[Move], ply: i32) {
+    out.bytes(b"move ");
+    match legal
         .iter()
         .copied()
         .find(|m| m.move16_stored() == data.move16)
-        .map_or_else(|| "none".to_string(), format_usi_move);
-    format!(
-        "move {mv} value {} depth {} bound {} eval {} pv {} pathdep {}",
-        tt_score_field(value_from_tt(data.value, ply)),
-        data.depth,
-        bound_name(data.bound),
-        tt_score_field(data.eval),
-        data.is_pv,
-        data.path_dep as u8,
-    )
+    {
+        Some(mv) => write_usi_move(mv, out),
+        None => {
+            out.bytes(b"none");
+        }
+    }
+    out.bytes(b" value ");
+    write_tt_score_field(out, value_from_tt(data.value, ply));
+    out.bytes(b" depth ")
+        .i64(i64::from(data.depth))
+        .bytes(b" bound ")
+        .bytes(bound_name(data.bound))
+        .bytes(b" eval ");
+    write_tt_score_field(out, data.eval);
+    out.bytes(b" pv ")
+        .bytes(if data.is_pv {
+            &b"true"[..]
+        } else {
+            &b"false"[..]
+        })
+        .bytes(b" pathdep ")
+        .u64(u64::from(data.path_dep));
 }
 
 /// One score field of a `tt` output line: `cp <n>` / `mate <n>` in the same USI
-/// scale [`format_score`] gives an `info … score` line, or the literal `none`
+/// scale [`write_score`] gives an `info … score` line, or the literal `none`
 /// for the `VALUE_NONE` sentinel (which the search writes into `eval16`
 /// whenever a node has no static eval — `tt store` cannot produce it).
 #[cfg(feature = "verbose3")]
-fn tt_score_field(v: Value) -> String {
+fn write_tt_score_field(out: &mut TextWriter<'_>, v: Value) {
     if v == VALUE_NONE {
-        "none".to_string()
+        out.bytes(b"none");
     } else {
-        format_score(v)
+        write_score(out, v);
     }
 }
 
@@ -960,45 +1078,40 @@ fn tt_score_field(v: Value) -> String {
 /// `verbose2` only: the default build renders no PV line.
 #[cfg(feature = "verbose2")]
 fn write_pv_info<W: Write + ?Sized>(w: &mut W, info: &PvInfo) -> io::Result<()> {
-    let mut ply_digits = NumBuffer::new();
-    let mut index_digits = NumBuffer::new();
-    let mut node_digits = NumBuffer::new();
-    let mut permille_digits = NumBuffer::new();
-    let mut clock_digits = NumBuffer::new();
-
-    // Comfortably past the fixed part of the line, so only a long PV regrows.
-    let mut body = String::with_capacity(64);
-    body.push_str("depth ");
-    body.push_str(info.depth.format_into(&mut ply_digits));
+    let mut bytes = [0u8; INFO_BYTES];
+    let mut body = TextWriter::new(&mut bytes);
+    body.bytes(b"depth ").i64(i64::from(info.depth));
     if info.sel_depth != 0 {
-        body.push_str(" seldepth ");
-        body.push_str(info.sel_depth.format_into(&mut ply_digits));
+        body.bytes(b" seldepth ").i64(i64::from(info.sel_depth));
     }
-    body.push_str(" multipv ");
-    body.push_str(info.multipv.format_into(&mut index_digits));
-    body.push_str(" score ");
-    push_score(&mut body, info.score);
+    body.bytes(b" multipv ").u64(info.multipv as u64);
+    body.bytes(b" score ");
+    write_score(&mut body, info.score);
     match info.bound {
-        PvBound::Lower => body.push_str(" lowerbound"),
-        PvBound::Upper => body.push_str(" upperbound"),
+        PvBound::Lower => {
+            body.bytes(b" lowerbound");
+        }
+        PvBound::Upper => {
+            body.bytes(b" upperbound");
+        }
         PvBound::Exact => {}
     }
-    body.push_str(" nodes ");
-    body.push_str(info.nodes.format_into(&mut node_digits));
-    body.push_str(" nps ");
-    body.push_str(info.nps.format_into(&mut clock_digits));
-    body.push_str(" hashfull ");
-    body.push_str(info.hashfull.format_into(&mut permille_digits));
-    body.push_str(" time ");
-    body.push_str(info.time_ms.format_into(&mut clock_digits));
+    body.bytes(b" nodes ")
+        .u64(info.nodes)
+        .bytes(b" nps ")
+        .u64(info.nps)
+        .bytes(b" hashfull ")
+        .u64(u64::from(info.hashfull))
+        .bytes(b" time ")
+        .u64(info.time_ms);
     if !info.pv.is_empty() {
-        body.push_str(" pv");
+        body.bytes(b" pv");
         for m in &info.pv {
-            body.push(' ');
-            body.push_str(&format_usi_move(*m));
+            body.byte(b' ');
+            write_usi_move(*m, &mut body);
         }
     }
-    Formatter::new(w).info(&body)
+    Formatter::new(w).info(body.as_bytes())
 }
 
 #[cfg(feature = "verbose1")]
@@ -1007,6 +1120,65 @@ fn emit_stats<W: Write + ?Sized>(w: &mut W) {
     if let Some(line) = crate::stats::render(&mut buf, take_alloc_count()) {
         let _ = Formatter::new(w).composed_line(line);
     }
+}
+
+/// What one read of the input produced.
+enum LineRead {
+    /// A line, filling that many bytes of the buffer.
+    Line(usize),
+    /// A line that filled the buffer without reaching a newline. The rest of
+    /// it is consumed, so the stream is on a line boundary again.
+    TooLong,
+    /// End of input.
+    Eof,
+}
+
+/// Read the next line's bytes into `buf`, without the `'\n'` that ended it or
+/// the `'\r'` a host with Windows line endings sent before it.
+///
+/// The bytes arrive as they came: nothing is validated as UTF-8, so a line
+/// spelling a path in a code page the host happens to use is read like any
+/// other and cannot fail the read. A line wider than `buf` is reported as
+/// [`LineRead::TooLong`] and consumed to its end, leaving the stream where the
+/// next line starts.
+fn read_command_line<R: BufRead>(reader: &mut R, buf: &mut [u8]) -> io::Result<LineRead> {
+    let mut filled = 0usize;
+    let mut too_long = false;
+    let mut saw_any = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        saw_any = true;
+        let (chunk_len, done) = match available.iter().position(|&b| b == b'\n') {
+            Some(i) => (i, true),
+            None => (available.len(), false),
+        };
+        let room = buf.len() - filled;
+        let take = chunk_len.min(room);
+        buf[filled..filled + take].copy_from_slice(&available[..take]);
+        filled += take;
+        if take != chunk_len {
+            too_long = true;
+        }
+        // The newline itself is consumed with the chunk it ended.
+        reader.consume(chunk_len + usize::from(done));
+        if done {
+            break;
+        }
+    }
+    if !saw_any {
+        return Ok(LineRead::Eof);
+    }
+    if too_long {
+        return Ok(LineRead::TooLong);
+    }
+    // A `\r\n` host sends the carriage return as part of the line.
+    if filled > 0 && buf[filled - 1] == b'\r' {
+        filled -= 1;
+    }
+    Ok(LineRead::Line(filled))
 }
 
 /// A running keep-alive: a helper thread that emits a bare newline every
@@ -1073,14 +1245,21 @@ impl Drop for KeepAlive {
     }
 }
 
-/// Join book PV moves into a USI ` `-separated string. `verbose2` only — the
-/// book `info` lines are its only caller.
+/// The fields every book `info` line ends with: the counters a book hit has no
+/// numbers for, the occupancy and the clock, then the book PV.
+///
+/// `verbose2` only — the book `info` lines are its only caller.
 #[cfg(feature = "verbose2")]
-fn pv_string(pv: &[Move]) -> String {
-    pv.iter()
-        .map(|m| format_usi_move(*m))
-        .collect::<Vec<_>>()
-        .join(" ")
+fn write_book_tail(out: &mut TextWriter<'_>, hashfull: u32, time_ms: u64, pv: &[Move]) {
+    out.bytes(b" nodes 0 nps 0 hashfull ")
+        .u64(u64::from(hashfull))
+        .bytes(b" time ")
+        .u64(time_ms)
+        .bytes(b" pv");
+    for m in pv {
+        out.byte(b' ');
+        write_usi_move(*m, out);
+    }
 }
 
 #[cfg(test)]
@@ -1092,6 +1271,7 @@ mod tests {
     #[cfg(feature = "verbose2")]
     use yorkie_state::{Position, parse_usi_move};
 
+    use crate::engine::MAX_POSITION_MOVES;
     use crate::{king_shuffle, serial_tt};
 
     /// Drive a full canned session in-process and return everything written.
@@ -1105,6 +1285,11 @@ mod tests {
         session.run().expect("session run");
         let bytes = output.lock().expect("output lock").clone();
         String::from_utf8(bytes).expect("utf-8")
+    }
+
+    /// The initial position's SFEN as text, for the command lines below.
+    fn startpos_sfen() -> String {
+        String::from_utf8(yorkie_state::STARTPOS_SFEN.to_vec()).expect("an SFEN is ASCII")
     }
 
     /// The transcript a diagnostic `info string <body>` contributes in THIS
@@ -1142,7 +1327,7 @@ mod tests {
             time_ms: 500,
             pv: pv
                 .iter()
-                .map(|s| parse_usi_move(s, &pos).expect("fixture move parses"))
+                .map(|s| parse_usi_move(s.as_bytes(), &pos).expect("fixture move parses"))
                 .collect(),
         }
     }
@@ -1202,8 +1387,8 @@ mod tests {
             "info depth 0 multipv 1 score cp 0 nodes 0 nps 0 hashfull 0 time 1\n"
         );
 
-        let pos = yorkie_state::parse_sfen("4k4/9/9/9/9/9/9/9/4K4 b P 1").expect("sfen parses");
-        info.pv = vec![parse_usi_move("P*5e", &pos).expect("drop parses")];
+        let pos = yorkie_state::parse_sfen(b"4k4/9/9/9/9/9/9/9/4K4 b P 1").expect("sfen parses");
+        info.pv = vec![parse_usi_move(b"P*5e", &pos).expect("drop parses")];
         info.hashfull = 1000;
         assert_eq!(
             pv_line(&info),
@@ -1324,7 +1509,7 @@ mod tests {
             let seen = {
                 let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
                 Formatter::new(&mut *guard)
-                    .info_string("busy")
+                    .info_string(b"busy")
                     .expect("write to Vec cannot fail");
                 bare_newline_count(&String::from_utf8(guard.clone()).expect("utf-8"))
             };
@@ -1463,7 +1648,7 @@ mod tests {
     #[test]
     fn position_sfen_startpos_silent() {
         let _tt = serial_tt();
-        let sfen = yorkie_state::STARTPOS_SFEN;
+        let sfen = startpos_sfen();
         assert_eq!(run_with(&format!("position sfen {sfen}\nquit\n")), "");
     }
 
@@ -1589,7 +1774,7 @@ mod tests {
     #[test]
     fn a_position_sfen_is_accepted_however_its_fields_were_spaced() {
         let _tt = serial_tt();
-        let sfen = yorkie_state::STARTPOS_SFEN;
+        let sfen = startpos_sfen();
         assert_eq!(
             run_with(&format!("position   sfen  {sfen}   moves   7g7f\nquit\n")),
             ""

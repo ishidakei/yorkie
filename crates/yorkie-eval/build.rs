@@ -340,11 +340,16 @@ fn exe_dir(out_dir: &Path) -> PathBuf {
 fn machine_nodes() -> usize {
     let opts = match yorkie_numa::machine_sysfs_options(Path::new("/sys")) {
         Ok(opts) => opts,
-        Err(e) => fail(&format!(
-            "cannot read this host's NUMA topology: {e}\n       \
-             the engine compiles the layout of the machine it is built on into the \
-             binary, so building it needs a Linux host whose sysfs reports one"
-        )),
+        Err(e) => {
+            let mut reason = Vec::new();
+            e.write_message(|fragment| reason.extend_from_slice(fragment));
+            let reason = String::from_utf8(reason).expect("a refusal is ASCII");
+            fail(&format!(
+                "cannot read this host's NUMA topology: {reason}\n       \
+                 the engine compiles the layout of the machine it is built on into the \
+                 binary, so building it needs a Linux host whose sysfs reports one"
+            ))
+        }
     };
     yorkie_numa::NumaLayout::of_machine(&opts)
         .num_nodes()

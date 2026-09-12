@@ -14,7 +14,10 @@ use std::path::PathBuf;
 use yorkie_eval::{Accumulator, NetworkParams, evaluate, evaluate_with};
 
 mod common;
-use yorkie_state::{Color, Move, Position, Undo, format_usi_move, parse_sfen, parse_usi_move};
+mod text_str;
+
+use text_str::{format_usi_move, parse_sfen, parse_usi_move};
+use yorkie_state::{Color, Move, Position, Undo};
 
 /// The six eval-fixture SFENs the playout driver seeds from.
 const FIXTURE_SFENS: &[&str] = &[

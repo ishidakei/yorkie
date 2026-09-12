@@ -135,9 +135,24 @@ fn machine_options_refuse_a_root_without_sysfs() {
     // all, rather than the guessed single node the detection path falls back to.
     let err =
         yorkie_numa::machine_sysfs_options(&fixture("missing_cpulist")).expect_err("no cpu list");
-    assert!(err.contains("devices/system/cpu/online"), "message: {err}");
+    let message = refusal_message(&err);
+    assert!(
+        message.contains("devices/system/cpu/online"),
+        "message: {message}"
+    );
     let err = yorkie_numa::machine_sysfs_options(&fixture("no_online")).expect_err("no node list");
-    assert!(err.contains("devices/system/node/online"), "message: {err}");
+    let message = refusal_message(&err);
+    assert!(
+        message.contains("devices/system/node/online"),
+        "message: {message}"
+    );
+}
+
+/// A refusal's message as a string, for the assertions above.
+fn refusal_message(err: &yorkie_numa::SysfsError) -> String {
+    let mut out = Vec::new();
+    err.write_message(|fragment| out.extend_from_slice(fragment));
+    String::from_utf8(out).expect("a message is ASCII")
 }
 
 // -- best-effort Linux smoke ----------------------------------------------

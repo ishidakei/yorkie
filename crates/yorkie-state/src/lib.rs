@@ -15,14 +15,15 @@ pub mod search_movegen;
 pub mod see;
 pub mod sfen;
 pub mod square;
+pub mod text;
 
 pub use bitboard::Bitboard;
 pub use board::Board;
 pub use color::Color;
 pub use hand::Hand;
 pub use move_::{
-    MAX_USI_MOVE_LEN, Move, UsiMoveBuf, UsiMoveParseError, flip_move16, format_usi_move,
-    parse_usi_move,
+    MAX_USI_MOVE_LEN, Move, UsiMoveBuf, UsiMoveParseError, flip_move16, parse_usi_move,
+    write_usi_move,
 };
 pub use packed_sfen::{
     PACKED_SFEN_LEN, PackedSfen, PackedSfenError, position_from_packed_sfen, sfen_pack,
@@ -31,5 +32,9 @@ pub use piece::{Piece, PieceKind};
 pub use position::{Position, RepetitionState, Undo};
 pub use search_movegen::{CheckSquares, ExtMove, MoveSink};
 pub use see::piece_value;
-pub use sfen::{STARTPOS_SFEN, SfenError, format_sfen, parse_sfen, parse_sfen_into};
+pub use sfen::{
+    SFEN_CAPACITY, STARTPOS_SFEN, SfenBuf, SfenError, format_sfen, parse_sfen,
+    parse_sfen_fields_into, parse_sfen_into, write_sfen,
+};
 pub use square::Square;
+pub use text::TextWriter;

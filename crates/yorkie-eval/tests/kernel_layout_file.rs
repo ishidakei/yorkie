@@ -5,11 +5,15 @@
 //! of mebibytes and are never re-hashed — so what it records, and what a
 //! difference in it produces, is worth pinning on its own.
 
+mod text_str;
+
 use std::io::Write as _;
 use std::path::PathBuf;
 
 use yorkie_eval::network_file::{self, Header, NetDims, Source};
 use yorkie_eval::{NetworkParams, Region};
+
+use text_str::nnue_error_message;
 
 /// A header describing exactly the file this build reads.
 fn matching_header() -> Header {
@@ -33,7 +37,7 @@ fn matching_header() -> Header {
 ///
 /// One test executable is one process, and nothing else in it is reading the
 /// region, so filling it here asks nothing of the caller.
-fn place(path: &std::path::Path) -> Result<Vec<String>, yorkie_eval::NnueError> {
+fn place(path: &std::path::Path) -> Result<Vec<Vec<u8>>, yorkie_eval::NnueError> {
     // SAFETY: no search exists in a test executable that has not started one,
     // so nothing is reading the region being filled.
     unsafe {
@@ -173,7 +177,12 @@ fn a_matching_file_opens_and_carries_its_warnings_forward() {
     assert_eq!(header.warnings, matching_header().warnings);
 
     let warnings = place(&path).expect("the file opens");
-    assert_eq!(warnings, matching_header().warnings);
+    let expected: Vec<Vec<u8>> = matching_header()
+        .warnings
+        .iter()
+        .map(|w| w.as_bytes().to_vec())
+        .collect();
+    assert_eq!(warnings, expected);
     let net = Region::<0>::new();
     assert_eq!(
         net.ft_weights().len(),
@@ -203,9 +212,10 @@ fn a_file_from_another_build_is_refused_when_it_is_opened() {
     write_file(&path, &header);
 
     let err = place(&path).expect_err("must refuse");
+    let message = nnue_error_message(&err);
     assert!(
-        format!("{err}").contains("not the one this build reads"),
-        "got: {err}"
+        message.contains("not the one this build reads"),
+        "got: {message}"
     );
 
     let _ = std::fs::remove_file(&path);
@@ -217,7 +227,7 @@ fn an_absent_file_is_reported_as_the_missing_network_it_is() {
     let path = temp_path("absent");
     let _ = std::fs::remove_file(&path);
     let err = place(&path).expect_err("must fail");
-    let message = format!("{err}");
+    let message = nnue_error_message(&err);
     assert!(
         message.contains("failed to open NNUE file"),
         "got: {message}"

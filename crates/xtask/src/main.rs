@@ -955,7 +955,8 @@ fn parse_db(text: &str) -> Result<Vec<BookRecordSrc>, String> {
                 records.push(finalize(prev));
             }
             let sfen = sfen.trim().to_string();
-            let pos = parse_sfen(&sfen).map_err(|e| format!("bad sfen {sfen:?}: {e}"))?;
+            let pos =
+                parse_sfen(sfen.as_bytes()).map_err(|e| format!("bad sfen {sfen:?}: {e:?}"))?;
             current = Some(Pending {
                 sfen,
                 pos,
@@ -972,8 +973,8 @@ fn parse_db(text: &str) -> Result<Vec<BookRecordSrc>, String> {
             let depth = parse_opt::<u16>(toks.next(), "depth")?.unwrap_or(0);
             // The remaining `count` token is intentionally dropped: the .ybb move
             // record has no per-move count field.
-            let mv = parse_usi_move(best, &pending.pos)
-                .map_err(|e| format!("bad move {best:?} in {}: {e}", pending.sfen))?;
+            let mv = parse_usi_move(best.as_bytes(), &pending.pos)
+                .map_err(|e| format!("bad move {best:?} in {}: {e:?}", pending.sfen))?;
             pending.moves.push(BookMoveSrc {
                 usi: best.to_string(),
                 move16: mv.move16(),

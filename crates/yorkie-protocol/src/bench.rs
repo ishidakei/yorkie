@@ -26,39 +26,91 @@
 //! both parse to a loud [`BenchParseError`] rather than panicking.
 
 use std::fs;
+use std::path::Path;
 
-use yorkie_state::format_sfen;
+use yorkie_state::TextWriter;
+use yorkie_state::text::{atoi_i64, atoi_u64};
 
 use crate::engine::GoParams;
 
 /// The reference `Defaults` position list, transcribed verbatim (every SFEN,
 /// same order). Used when the position source is `default` (or omitted).
-pub const BENCH_DEFAULT_POSITIONS: [&str; 4] = [
+pub const BENCH_DEFAULT_POSITIONS: [&[u8]; 4] = [
     // 初期局面に近い曲面。
-    "lnsgkgsnl/1r7/p1ppp1bpp/1p3pp2/7P1/2P6/PP1PPPP1P/1B3S1R1/LNSGKG1NL b - 9",
+    b"lnsgkgsnl/1r7/p1ppp1bpp/1p3pp2/7P1/2P6/PP1PPPP1P/1B3S1R1/LNSGKG1NL b - 9",
     // 読めば読むほど後手悪いような局面
-    "l4S2l/4g1gs1/5p1p1/pr2N1pkp/4Gn3/PP3PPPP/2GPP4/1K7/L3r+s2L w BS2N5Pb 1",
+    b"l4S2l/4g1gs1/5p1p1/pr2N1pkp/4Gn3/PP3PPPP/2GPP4/1K7/L3r+s2L w BS2N5Pb 1",
     // 57同銀は詰み、みたいな。読めば読むほど先手が悪いことがわかってくる局面。
-    "6n1l/2+S1k4/2lp4p/1np1B2b1/3PP4/1N1S3rP/1P2+pPP+p1/1p1G5/3KG2r1 b GSN2L4Pgs2p 1",
+    b"6n1l/2+S1k4/2lp4p/1np1B2b1/3PP4/1N1S3rP/1P2+pPP+p1/1p1G5/3KG2r1 b GSN2L4Pgs2p 1",
     // 指し手生成祭りの局面 cf. http://d.hatena.ne.jp/ak11/20110508/p1
-    "l6nl/5+P1gk/2np1S3/p1p4Pp/3P2Sp1/1PPb2P1P/P5GS1/R8/LN4bKL w RGgsn5p 1",
+    b"l6nl/5+P1gk/2np1S3/p1p4Pp/3P2Sp1/1PPb2P1P/P5GS1/R8/LN4bKL w RGgsn5p 1",
 ];
 
 /// The reference non-Stockfish defaults.
-const DEFAULT_TT_MB: &str = "1024";
-const DEFAULT_THREADS: &str = "1";
-const DEFAULT_LIMIT: &str = "15000";
-const DEFAULT_FEN_SOURCE: &str = "default";
-const DEFAULT_LIMIT_TYPE: &str = "movetime";
+const DEFAULT_TT_MB: &[u8] = b"1024";
+const DEFAULT_THREADS: &[u8] = b"1";
+const DEFAULT_LIMIT: &[u8] = b"15000";
+const DEFAULT_FEN_SOURCE: &[u8] = b"default";
+const DEFAULT_LIMIT_TYPE: &[u8] = b"movetime";
 
-/// A `bench` argument-parse failure, surfaced as an `info string`
-/// so a garbage argument fails loudly without panicking.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BenchParseError(pub String);
+/// A `bench` argument-parse failure, surfaced as an `info string` so a garbage
+/// argument fails loudly without panicking.
+///
+/// Each variant carries what it refused — borrowed from the command line, so
+/// nothing is copied out of it — and [`Self::write_message`] spells it where
+/// the notice is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchParseError<'a> {
+    InvalidTtSize(&'a [u8]),
+    InvalidThreads(&'a [u8]),
+    InvalidLimit(&'a [u8]),
+    DepthOutOfRange(u64),
+    UnsupportedLimitType(&'a [u8]),
+    /// A `<fenFile>` that could not be read. The operating system's own
+    /// description is not this project's text, so its error number is named.
+    UnreadableFile {
+        path: &'a [u8],
+        errno: Option<i32>,
+    },
+    NoPositions(&'a [u8]),
+}
 
-impl std::fmt::Display for BenchParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+impl BenchParseError<'_> {
+    /// Append this failure's message to `out`.
+    pub fn write_message(&self, out: &mut TextWriter<'_>) {
+        match self {
+            Self::InvalidTtSize(token) => {
+                out.bytes(b"invalid ttSizeMB `").bytes(token).bytes(b"`");
+            }
+            Self::InvalidThreads(token) => {
+                out.bytes(b"invalid threads `").bytes(token).bytes(b"`");
+            }
+            Self::InvalidLimit(token) => {
+                out.bytes(b"invalid limit `").bytes(token).bytes(b"`");
+            }
+            Self::DepthOutOfRange(limit) => {
+                out.bytes(b"depth limit out of range `")
+                    .u64(*limit)
+                    .bytes(b"`");
+            }
+            Self::UnsupportedLimitType(token) => {
+                out.bytes(b"unsupported limit type `")
+                    .bytes(token)
+                    .bytes(b"` (supported: depth, nodes, movetime)");
+            }
+            Self::UnreadableFile { path, errno } => {
+                out.bytes(b"unable to open file `")
+                    .bytes(path)
+                    .bytes(b"`: errno ");
+                match errno {
+                    Some(errno) => out.i64(i64::from(*errno)),
+                    None => out.bytes(b"unknown"),
+                };
+            }
+            Self::NoPositions(path) => {
+                out.bytes(b"no positions in file `").bytes(path).bytes(b"`");
+            }
+        }
     }
 }
 
@@ -71,8 +123,8 @@ pub struct BenchConfig {
     /// The per-position search limit, applied to every position exactly as a
     /// normal `go` would consume it.
     pub limits: GoParams,
-    /// The positions to search, as SFEN strings (each parsed by the caller).
-    pub fens: Vec<String>,
+    /// The positions to search, as SFENs (each parsed by the caller).
+    pub fens: Vec<Vec<u8>>,
 }
 
 /// Parse the `bench` argument tokens into a [`BenchConfig`], filling missing
@@ -83,13 +135,12 @@ pub struct BenchConfig {
 /// - a non-integer `ttSizeMB`, `threads`, or `limit`;
 /// - an unsupported `limitType` (see the scope-divergence note above);
 /// - a `<fenFile>` that cannot be opened.
-pub fn parse_bench(tokens: &[String], current_sfen: &str) -> Result<BenchConfig, BenchParseError> {
-    let arg = |i: usize, default: &str| -> String {
-        tokens
-            .get(i)
-            .map(String::as_str)
-            .unwrap_or(default)
-            .to_string()
+pub fn parse_bench<'a>(
+    tokens: &[&'a [u8]],
+    current_sfen: &[u8],
+) -> Result<BenchConfig, BenchParseError<'a>> {
+    let arg = |i: usize, default: &'static [u8]| -> &'a [u8] {
+        tokens.get(i).copied().unwrap_or(default)
     };
     let tt_arg = arg(0, DEFAULT_TT_MB);
     let threads_arg = arg(1, DEFAULT_THREADS);
@@ -100,49 +151,40 @@ pub fn parse_bench(tokens: &[String], current_sfen: &str) -> Result<BenchConfig,
     // Parsed for its shape and then dropped: nothing can resize the table, but
     // a garbage argument still has to fail loudly rather than shift the
     // positional arguments behind it.
-    let _tt_mb: i64 = tt_arg
-        .parse()
-        .map_err(|_| BenchParseError(format!("invalid ttSizeMB `{tt_arg}`")))?;
-    let threads: i64 = threads_arg
-        .parse()
-        .map_err(|_| BenchParseError(format!("invalid threads `{threads_arg}`")))?;
-    let limit: u64 = limit_arg
-        .parse()
-        .map_err(|_| BenchParseError(format!("invalid limit `{limit_arg}`")))?;
+    let _tt_mb: i64 = atoi_i64(tt_arg).ok_or(BenchParseError::InvalidTtSize(tt_arg))?;
+    let threads: i64 = atoi_i64(threads_arg).ok_or(BenchParseError::InvalidThreads(threads_arg))?;
+    let limit: u64 = atoi_u64(limit_arg).ok_or(BenchParseError::InvalidLimit(limit_arg))?;
 
     let mut limits = GoParams::default();
-    match limit_type.as_str() {
-        "depth" => {
-            let d = u32::try_from(limit)
-                .map_err(|_| BenchParseError(format!("depth limit out of range `{limit}`")))?;
+    match limit_type {
+        b"depth" => {
+            let d = u32::try_from(limit).map_err(|_| BenchParseError::DepthOutOfRange(limit))?;
             limits.depth = Some(d);
         }
-        "nodes" => limits.nodes = Some(limit),
-        "movetime" => limits.movetime = Some(limit),
-        other => {
-            return Err(BenchParseError(format!(
-                "unsupported limit type `{other}` (supported: depth, nodes, movetime)"
-            )));
-        }
+        b"nodes" => limits.nodes = Some(limit),
+        b"movetime" => limits.movetime = Some(limit),
+        other => return Err(BenchParseError::UnsupportedLimitType(other)),
     }
 
-    let fens = match fen_source.as_str() {
-        "default" => BENCH_DEFAULT_POSITIONS
+    let fens = match fen_source {
+        b"default" => BENCH_DEFAULT_POSITIONS
             .iter()
-            .map(|s| s.to_string())
+            .map(|sfen| sfen.to_vec())
             .collect(),
-        "current" => vec![current_sfen.to_string()],
+        b"current" => vec![current_sfen.to_vec()],
         path => {
-            let text = fs::read_to_string(path)
-                .map_err(|e| BenchParseError(format!("unable to open file `{path}`: {e}")))?;
-            let fens: Vec<String> = text
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
+            let text = fs::read(path_of(path)).map_err(|e| BenchParseError::UnreadableFile {
+                path,
+                errno: e.raw_os_error(),
+            })?;
+            let fens: Vec<Vec<u8>> = text
+                .split(|&b| b == b'\n')
+                .map(yorkie_state::text::trim_ascii_whitespace)
+                .filter(|line| !line.is_empty())
+                .map(<[u8]>::to_vec)
                 .collect();
             if fens.is_empty() {
-                return Err(BenchParseError(format!("no positions in file `{path}`")));
+                return Err(BenchParseError::NoPositions(path));
             }
             fens
         }
@@ -155,20 +197,45 @@ pub fn parse_bench(tokens: &[String], current_sfen: &str) -> Result<BenchConfig,
     })
 }
 
-/// The SFEN of a position, for the `current` position source. A thin re-export
-/// of [`yorkie_state::format_sfen`] so the caller expresses intent at the call
-/// site (`bench::current_sfen(&self.pos)`).
-pub fn current_sfen(pos: &yorkie_state::Position) -> String {
-    format_sfen(pos)
+/// A `<fenFile>` argument as a path: its bytes are the path's own.
+#[cfg(unix)]
+fn path_of(bytes: &[u8]) -> &Path {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    Path::new(OsStr::from_bytes(bytes))
+}
+
+/// Write `pos`'s SFEN into `buf` — the position source `current` names.
+///
+/// A thin re-export of [`yorkie_state::format_sfen`] so the caller expresses
+/// intent at the call site (`bench::current_sfen(engine.position(), &mut buf)`).
+pub fn current_sfen<'b>(
+    pos: &yorkie_state::Position,
+    buf: &'b mut yorkie_state::SfenBuf,
+) -> &'b [u8] {
+    yorkie_state::format_sfen(pos, buf)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A failure's message, so the assertions below can read it as text.
+    fn rendered(err: &BenchParseError<'_>) -> Vec<u8> {
+        let mut bytes = [0u8; 512];
+        let mut out = TextWriter::new(&mut bytes);
+        err.write_message(&mut out);
+        out.as_bytes().to_vec()
+    }
+
+    fn message(err: &BenchParseError<'_>) -> String {
+        String::from_utf8(rendered(err)).expect("a message is ASCII")
+    }
+
     #[test]
     fn defaults_when_no_args() {
-        let cfg = parse_bench(&[], "startsfen").expect("defaults parse");
+        let cfg = parse_bench(&[], b"startsfen").expect("defaults parse");
         assert_eq!(cfg.threads, 1);
         // Default limit type is movetime 15000 (yaneuraou's one-minute bench).
         assert_eq!(cfg.limits.movetime, Some(15000));
@@ -179,43 +246,63 @@ mod tests {
 
     #[test]
     fn depth_limit_type() {
-        let tokens = ["16", "1", "6", "default", "depth"].map(String::from);
-        let cfg = parse_bench(&tokens, "x").expect("parse");
+        let tokens: [&[u8]; 5] = [b"16", b"1", b"6", b"default", b"depth"];
+        let cfg = parse_bench(&tokens, b"x").expect("parse");
         assert_eq!(cfg.limits.depth, Some(6));
         assert_eq!(cfg.limits.movetime, None);
     }
 
     #[test]
     fn nodes_limit_type() {
-        let tokens = ["16", "1", "100000", "default", "nodes"].map(String::from);
-        let cfg = parse_bench(&tokens, "x").expect("parse");
+        let tokens: [&[u8]; 5] = [b"16", b"1", b"100000", b"default", b"nodes"];
+        let cfg = parse_bench(&tokens, b"x").expect("parse");
         assert_eq!(cfg.limits.nodes, Some(100000));
     }
 
     #[test]
     fn current_source_uses_given_sfen() {
-        let tokens = ["16", "1", "4", "current", "depth"].map(String::from);
-        let cfg = parse_bench(&tokens, "my-sfen").expect("parse");
-        assert_eq!(cfg.fens, vec!["my-sfen".to_string()]);
+        let tokens: [&[u8]; 5] = [b"16", b"1", b"4", b"current", b"depth"];
+        let cfg = parse_bench(&tokens, b"my-sfen").expect("parse");
+        assert_eq!(cfg.fens, vec![b"my-sfen".to_vec()]);
     }
 
     #[test]
     fn garbage_tt_size_errors() {
-        let tokens = ["notanumber"].map(String::from);
-        assert!(parse_bench(&tokens, "x").is_err());
+        let tokens: [&[u8]; 1] = [b"notanumber"];
+        let err = parse_bench(&tokens, b"x").expect_err("not an integer");
+        assert_eq!(message(&err), "invalid ttSizeMB `notanumber`");
+    }
+
+    /// An argument carrying bytes no `bench` line is spelled in parses as no
+    /// number, which is the malformed-argument path — and the message quoting
+    /// it is written out as it arrived.
+    #[test]
+    fn a_non_ascii_argument_errors() {
+        let tokens: [&[u8]; 1] = [b"\x82\xa0"];
+        let err = parse_bench(&tokens, b"x").expect_err("not an integer");
+        assert_eq!(rendered(&err), b"invalid ttSizeMB `\x82\xa0`");
     }
 
     #[test]
     fn unsupported_limit_type_errors() {
-        let tokens = ["16", "1", "5", "default", "perft"].map(String::from);
-        let err = parse_bench(&tokens, "x").expect_err("perft unsupported");
-        assert!(err.0.contains("perft"), "message names the type: {err}");
+        let tokens: [&[u8]; 5] = [b"16", b"1", b"5", b"default", b"perft"];
+        let err = parse_bench(&tokens, b"x").expect_err("perft unsupported");
+        let message = message(&err);
+        assert!(
+            message.contains("perft"),
+            "message names the type: {message}"
+        );
     }
 
     #[cfg_attr(miri, ignore)]
     #[test]
     fn missing_file_errors() {
-        let tokens = ["16", "1", "5", "/no/such/bench/file", "depth"].map(String::from);
-        assert!(parse_bench(&tokens, "x").is_err());
+        let tokens: [&[u8]; 5] = [b"16", b"1", b"5", b"/no/such/bench/file", b"depth"];
+        let err = parse_bench(&tokens, b"x").expect_err("the file is absent");
+        let message = message(&err);
+        assert!(
+            message.starts_with("unable to open file `/no/such/bench/file`"),
+            "got: {message}"
+        );
     }
 }

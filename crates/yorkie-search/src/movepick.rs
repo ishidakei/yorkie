@@ -1061,7 +1061,9 @@ mod twin {
 mod tests {
     use super::*;
     use crate::history::ContinuationHistory;
-    use yorkie_state::{Color, Piece, PieceKind, Square, format_usi_move, parse_sfen};
+    use yorkie_state::{Color, Piece, PieceKind, Square};
+
+    use crate::text_str::{format_usi_move, parse_sfen};
 
     fn pos(sfen: &str) -> Position {
         parse_sfen(sfen).expect("valid SFEN")

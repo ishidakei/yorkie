@@ -18,9 +18,9 @@ use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 
-// `NumaLayout` and `format_cpu_list` are spelled out at each use: `build.rs`
-// includes this file beside `build_numa.rs`, which imports both under the same
-// names.
+// `NumaLayout` is spelled out at each use, and `format_cpu_list` is the helper
+// beside it: `build.rs` includes this file beside `build_numa.rs`, which
+// imports the one and defines the other.
 use yorkie_numa::{CpuIndex, L3Domain, NumaIndex};
 
 /// The machine a build assigns CPUs on: every online CPU, the L3 domains they
@@ -111,7 +111,7 @@ fn render_ledger(entries: &[LedgerEntry]) -> String {
         let _ = writeln!(
             out,
             "{}{LEDGER_SEP}{}{LEDGER_SEP}{}{LEDGER_SEP}{}",
-            yorkie_numa::format_cpu_list(e.cpus.iter().copied()),
+            format_cpu_list(e.cpus.iter().copied()),
             e.identity.out_dir,
             e.identity.config,
             e.identity.version
@@ -223,7 +223,7 @@ fn explicit_cpus(
             return Err(format!(
                 "`cpu_assignment` names CPU {cpu}, which the machine does not report online \
                  (online: {})",
-                yorkie_numa::format_cpu_list(machine.online.iter().copied())
+                format_cpu_list(machine.online.iter().copied())
             ));
         }
     }
@@ -361,7 +361,7 @@ pub const WORKER_CPUS: &[usize] = &[{cpus}];
 /// by, and `isready` holds it against the running machine before a game.
 pub const WORKER_SYSTEM_NODES: &[usize] = &[{nodes}];
 {regions}",
-        shape = yorkie_numa::format_cpu_list({
+        shape = format_cpu_list({
             let mut sorted = cpus.to_vec();
             sorted.sort_unstable();
             sorted

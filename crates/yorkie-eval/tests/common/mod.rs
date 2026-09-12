@@ -53,6 +53,6 @@ pub fn engine_network() -> Option<Region<0>> {
             );
             None
         }
-        Err(e) => panic!("the evaluation file this build wrote must open: {e}"),
+        Err(e) => panic!("the evaluation file this build wrote must open: {e:?}"),
     }
 }

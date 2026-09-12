@@ -357,10 +357,10 @@ fn assert_legal_move_after(setup: &[String], best: &str) {
     );
     let mut pos = yorkie_state::parse_sfen(yorkie_state::STARTPOS_SFEN).expect("startpos SFEN");
     for m in setup {
-        let mv = yorkie_state::parse_usi_move(m, &pos).expect("legal setup move");
+        let mv = yorkie_state::parse_usi_move(m.as_bytes(), &pos).expect("legal setup move");
         pos.do_move(mv);
     }
-    let mv = yorkie_state::parse_usi_move(best, &pos)
+    let mv = yorkie_state::parse_usi_move(best.as_bytes(), &pos)
         .unwrap_or_else(|_| panic!("bestmove {best:?} is not a well-formed USI move"));
     let mut legal = Vec::new();
     pos.generate_legal_all(&mut legal);

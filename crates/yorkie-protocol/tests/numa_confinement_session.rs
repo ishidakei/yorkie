@@ -102,8 +102,15 @@ fn a_start_confined_to_exactly_the_workers_cpus_readies() {
     assert!(
         out.contains(&format!(
             "info string workers on CPUs {}",
-            yorkie_numa::format_cpu_list(worker_cpus())
+            cpu_list(worker_cpus())
         )),
         "the session names the CPUs it plays on, got: {out:?}"
     );
+}
+
+/// A CPU list in the shortened sysfs form, as the notice above writes it.
+fn cpu_list(cpus: impl IntoIterator<Item = usize>) -> String {
+    let mut out = Vec::new();
+    yorkie_numa::write_cpu_list(cpus, |fragment| out.extend_from_slice(fragment));
+    String::from_utf8(out).expect("a CPU list is ASCII")
 }

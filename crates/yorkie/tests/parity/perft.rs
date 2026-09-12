@@ -10,9 +10,13 @@
 
 use std::path::PathBuf;
 
+#[path = "../text_str/mod.rs"]
+mod text_str;
+
 use serde::Deserialize;
 use yorkie::perft::perft;
-use yorkie_state::{parse_sfen, parse_usi_move};
+
+use text_str::{parse_sfen, parse_usi_move};
 
 #[derive(Debug, Deserialize)]
 struct Fixture {
@@ -62,7 +66,7 @@ fn assert_fixture_depth(name: &str, depth: u32) {
     let mut pos = parse_sfen(&fixture.sfen).expect("fixture sfen parses");
     for m in &fixture.moves {
         let parsed = parse_usi_move(m, &pos)
-            .unwrap_or_else(|e| panic!("fixture {name} prefix move {m:?}: {e}"));
+            .unwrap_or_else(|e| panic!("fixture {name} prefix move {m:?}: {e:?}"));
         pos.do_move(parsed);
     }
     let actual = perft(&mut pos, depth);

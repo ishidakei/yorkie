@@ -31,7 +31,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::{engine_cwd, engine_has_network, engine_network_path};
-use yorkie_state::{Move, Position, parse_usi_move};
+mod text_str;
+
+use text_str::parse_usi_move;
+use yorkie_state::{Move, Position};
 
 /// Default soak duration when `SOAK_SECS` is unset (~10 minutes).
 const DEFAULT_SOAK_SECS: u64 = 600;
@@ -205,7 +208,7 @@ fn threads2_self_play_soak_stays_legal_and_stable() {
             }
 
             let mv = parse_usi_move(&mv_str, &pos).unwrap_or_else(|e| {
-                panic!("game {games} ply {ply}: malformed bestmove {mv_str:?}: {e}")
+                panic!("game {games} ply {ply}: malformed bestmove {mv_str:?}: {e:?}")
             });
             assert!(
                 legal_moves(&pos).contains(&mv),

@@ -13,7 +13,10 @@ use std::path::{Path, PathBuf};
 use yorkie_eval::{Backend, active_backend, evaluate};
 
 mod common;
-use yorkie_state::{Position, parse_sfen, parse_usi_move};
+mod text_str;
+
+use text_str::{parse_sfen, parse_usi_move};
+use yorkie_state::Position;
 
 /// Exact match: a single point of divergence is a failure, not a warning.
 const TOLERANCE: i32 = 0;

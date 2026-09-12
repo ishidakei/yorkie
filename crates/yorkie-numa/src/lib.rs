@@ -20,11 +20,13 @@
 //! run against fixture directories rather than the live `/sys` tree.
 
 pub mod mempolicy;
+mod text;
 
 use std::collections::BTreeSet;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+use text::{Decimal, atoi_usize, path_segment};
 
 /// A processor (CPU) index, as numbered by the operating system.
 pub type CpuIndex = usize;
@@ -48,27 +50,68 @@ pub struct SysfsOptions {
     pub online_cpus: BTreeSet<CpuIndex>,
 }
 
+/// Why a sysfs tree does not describe a machine whose layout can be read.
+///
+/// Each variant names the file it read, so a refusal says which one to look at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SysfsError {
+    /// The file could not be read at all.
+    Unreadable(PathBuf),
+    /// The online-CPU file named no CPU.
+    NoOnlineCpu(PathBuf),
+}
+
+impl SysfsError {
+    /// Append this refusal's message to `push`, one fragment at a time.
+    ///
+    /// The message arrives as byte fragments rather than in a buffer because
+    /// the layer that composes a notice owns the buffer it goes into, and this
+    /// one sits below it.
+    pub fn write_message(&self, mut push: impl FnMut(&[u8])) {
+        match self {
+            SysfsError::Unreadable(path) => {
+                push(b"cannot read `");
+                push(path_bytes(path));
+                push(b"`");
+            }
+            SysfsError::NoOnlineCpu(path) => {
+                push(b"`");
+                push(path_bytes(path));
+                push(b"` lists no online CPU");
+            }
+        }
+    }
+}
+
+/// A path's own bytes on Unix, and nothing off it, where a path is not bytes.
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> &[u8] {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    path.as_os_str().as_bytes()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(_path: &Path) -> &[u8] {
+    b"<path>"
+}
+
 /// The [`SysfsOptions`] describing the whole machine under `root`.
 ///
 /// Fail-loud: a tree without the two `online` files is not a machine whose
 /// layout can be read, and answering "one node" for it would be a wrong answer
 /// where a missing one is called for.
-pub fn machine_sysfs_options(root: &Path) -> Result<SysfsOptions, String> {
-    let missing = |rel: &str| format!("cannot read `{}`", root.join(rel).display());
-    let cpu_online = "devices/system/cpu/online";
-    let node_online = "devices/system/node/online";
-    let online = read_sysfs(root, cpu_online).ok_or_else(|| missing(cpu_online))?;
+pub fn machine_sysfs_options(root: &Path) -> Result<SysfsOptions, SysfsError> {
+    let cpu_online = Path::new("devices/system/cpu/online");
+    let node_online = Path::new("devices/system/node/online");
+    let online = read_sysfs(root, cpu_online)
+        .ok_or_else(|| SysfsError::Unreadable(root.join(cpu_online)))?;
     if read_sysfs(root, node_online).is_none() {
-        return Err(missing(node_online));
+        return Err(SysfsError::Unreadable(root.join(node_online)));
     }
-    let online_cpus: BTreeSet<CpuIndex> = parse_cpu_list(&remove_whitespace(&online))
-        .into_iter()
-        .collect();
+    let online_cpus: BTreeSet<CpuIndex> = parse_cpu_list(&online).into_iter().collect();
     if online_cpus.is_empty() {
-        return Err(format!(
-            "`{}` lists no online CPU",
-            root.join(cpu_online).display()
-        ));
+        return Err(SysfsError::NoOnlineCpu(root.join(cpu_online)));
     }
     Ok(SysfsOptions {
         root: root.to_path_buf(),
@@ -104,17 +147,19 @@ impl NumaLayout {
             system_nodes: vec![0],
         };
 
-        let Some(node_ids) = read_sysfs(&opts.root, "devices/system/node/online") else {
+        let Some(node_ids) = read_sysfs(&opts.root, Path::new("devices/system/node/online")) else {
             return single();
         };
         let mut nodes: Vec<Vec<CpuIndex>> = Vec::new();
         let mut system_nodes: Vec<NumaIndex> = Vec::new();
-        for n in parse_cpu_list(&remove_whitespace(&node_ids)) {
-            let path = format!("devices/system/node/node{n}/cpulist");
+        for n in parse_cpu_list(&node_ids) {
+            let Some(path) = node_cpulist_path(n) else {
+                return single();
+            };
             let Some(cpu_ids) = read_sysfs(&opts.root, &path) else {
                 return single();
             };
-            let cpus: Vec<CpuIndex> = parse_cpu_list(&remove_whitespace(&cpu_ids))
+            let cpus: Vec<CpuIndex> = parse_cpu_list(&cpu_ids)
                 .into_iter()
                 .filter(|c| opts.online_cpus.contains(c))
                 .collect();
@@ -215,9 +260,10 @@ pub fn l3_domains(opts: &SysfsOptions, layout: &NumaLayout) -> Vec<L3Domain> {
         if placed.contains(&cpu) {
             continue;
         }
-        let path = format!("devices/system/cpu/cpu{cpu}/cache/index3/shared_cpu_list");
-        let siblings = read_sysfs(&opts.root, &path).unwrap_or_default();
-        let mut cpus: Vec<CpuIndex> = parse_cpu_list(&remove_whitespace(&siblings))
+        let siblings = cpu_l3_siblings_path(cpu)
+            .and_then(|path| read_sysfs(&opts.root, &path))
+            .unwrap_or_default();
+        let mut cpus: Vec<CpuIndex> = parse_cpu_list(&siblings)
             .into_iter()
             .filter(|c| opts.online_cpus.contains(c) && !placed.contains(c))
             .collect();
@@ -237,14 +283,17 @@ pub fn l3_domains(opts: &SysfsOptions, layout: &NumaLayout) -> Vec<L3Domain> {
     domains
 }
 
-/// Renders an ascending CPU sequence in the shortened form the sysfs files use:
-/// `','` between entries, `"a-b"` for a run of consecutive indices.
+/// Appends an ascending CPU sequence to `push` in the shortened form the sysfs
+/// files use: `','` between entries, `"a-b"` for a run of consecutive indices.
 ///
 /// The inverse of [`parse_cpu_list`], so a rendered list parses back to the
 /// sequence it came from.
-pub fn format_cpu_list(cpus: impl IntoIterator<Item = CpuIndex>) -> String {
+///
+/// The list arrives as byte fragments rather than in a buffer because the layer
+/// that composes a notice around it owns the buffer it goes into, and this one
+/// sits below it.
+pub fn write_cpu_list(cpus: impl IntoIterator<Item = CpuIndex>, mut push: impl FnMut(&[u8])) {
     let v: Vec<CpuIndex> = cpus.into_iter().collect();
-    let mut out = String::new();
     let mut range_start = 0usize; // index into `v`
     for i in 0..v.len() {
         let at_range_end = i + 1 == v.len() || v[i + 1] != v[i] + 1;
@@ -252,50 +301,46 @@ pub fn format_cpu_list(cpus: impl IntoIterator<Item = CpuIndex>) -> String {
             continue;
         }
         if range_start != 0 {
-            out.push(',');
+            push(b",");
         }
         if i != range_start {
-            let _ = write!(out, "{}-{}", v[range_start], v[i]);
-        } else {
-            let _ = write!(out, "{}", v[i]);
+            push(Decimal::of(v[range_start]).as_bytes());
+            push(b"-");
         }
+        push(Decimal::of(v[i]).as_bytes());
         range_start = i + 1;
     }
-    out
 }
 
 /// Expands the shortened index-list syntax into a flat list of indices: `','`
 /// separates entries, each either a single index or an inclusive `"a-b"` range.
-/// Empty entries are skipped, and an entry that is not an index at all
-/// contributes nothing.
-pub fn parse_cpu_list(s: &str) -> Vec<CpuIndex> {
+/// ASCII whitespace — the newline a sysfs file ends with, above all — is
+/// ignored wherever it appears. Empty entries are skipped, and an entry that is
+/// not an index at all contributes nothing.
+pub fn parse_cpu_list(text: &[u8]) -> Vec<CpuIndex> {
     let mut indices = Vec::new();
 
-    if s.is_empty() {
-        return indices;
-    }
-
-    for ss in s.split(',') {
-        if ss.is_empty() {
+    for entry in text.split(|&b| b == b',') {
+        let mut parts = entry.split(|&b| b == b'-');
+        let first = parts.next().unwrap_or_default();
+        let second = parts.next();
+        if parts.next().is_some() {
+            // Entries with three or more dash-separated parts describe no index.
             continue;
         }
-
-        let parts: Vec<&str> = ss.split('-').collect();
-        match parts.as_slice() {
-            [single] => {
-                if let Some(c) = parse_index(single) {
+        match second {
+            None => {
+                if let Some(c) = parse_index(first) {
                     indices.push(c);
                 }
             }
-            [first, last] => {
+            Some(last) => {
                 if let (Some(cfirst), Some(clast)) = (parse_index(first), parse_index(last)) {
                     for c in cfirst..=clast {
                         indices.push(c);
                     }
                 }
             }
-            // Entries with 0 or 3+ dash-separated parts describe no index.
-            _ => {}
         }
     }
 
@@ -304,24 +349,52 @@ pub fn parse_cpu_list(s: &str) -> Vec<CpuIndex> {
 
 /// Reads a sysfs file under `root`, returning its contents, or `None` if it
 /// cannot be read.
-fn read_sysfs(root: &Path, rel: &str) -> Option<String> {
-    std::fs::read_to_string(root.join(rel)).ok()
+fn read_sysfs(root: &Path, rel: &Path) -> Option<Vec<u8>> {
+    std::fs::read(root.join(rel)).ok()
 }
 
-/// Removes all ASCII whitespace from `s`.
-fn remove_whitespace(s: &str) -> String {
-    s.chars().filter(|c| !c.is_ascii_whitespace()).collect()
+/// `devices/system/node/node<n>/cpulist`, as the relative path
+/// [`read_sysfs`] takes.
+fn node_cpulist_path(node: NumaIndex) -> Option<PathBuf> {
+    let digits = Decimal::of(node);
+    let mut name = [0u8; 4 + 20];
+    name[..4].copy_from_slice(b"node");
+    let end = 4 + digits.as_bytes().len();
+    name[4..end].copy_from_slice(digits.as_bytes());
+    Some(
+        Path::new("devices/system/node")
+            .join(path_segment(&name[..end])?)
+            .join("cpulist"),
+    )
 }
 
-/// Parses a single decimal index, tolerating surrounding whitespace and
-/// trailing non-digits. Returns `None` when no leading digits are present.
-fn parse_index(s: &str) -> Option<CpuIndex> {
-    let t = s.trim_start();
-    let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
-        return None;
-    }
-    digits.parse::<CpuIndex>().ok()
+/// `devices/system/cpu/cpu<n>/cache/index3/shared_cpu_list`, likewise.
+fn cpu_l3_siblings_path(cpu: CpuIndex) -> Option<PathBuf> {
+    let digits = Decimal::of(cpu);
+    let mut name = [0u8; 3 + 20];
+    name[..3].copy_from_slice(b"cpu");
+    let end = 3 + digits.as_bytes().len();
+    name[3..end].copy_from_slice(digits.as_bytes());
+    Some(
+        Path::new("devices/system/cpu")
+            .join(path_segment(&name[..end])?)
+            .join("cache/index3/shared_cpu_list"),
+    )
+}
+
+/// Parses a single decimal index, ignoring ASCII whitespace and stopping at the
+/// first byte that is neither. Returns `None` when no digits are present.
+fn parse_index(text: &[u8]) -> Option<CpuIndex> {
+    let start = text
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(text.len());
+    let digits = &text[start..];
+    let end = digits
+        .iter()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(digits.len());
+    atoi_usize(&digits[..end])
 }
 
 /// The number of usable hardware threads, at least 1.
@@ -458,49 +531,94 @@ fn pin_current_thread(_cpu: CpuIndex) {}
 mod tests {
     use super::*;
 
+    /// A rendered CPU list, gathered so an assertion can read it.
+    fn rendered(cpus: impl IntoIterator<Item = CpuIndex>) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_cpu_list(cpus, |fragment| out.extend_from_slice(fragment));
+        out
+    }
+
+    /// A refusal's message, likewise.
+    fn refusal_message(err: &SysfsError) -> String {
+        let mut out = Vec::new();
+        err.write_message(|fragment| out.extend_from_slice(fragment));
+        String::from_utf8(out).expect("a message is ASCII")
+    }
+
     // -- shortened-list parsing -------------------------------------------
 
     #[test]
     fn parse_simple_list_and_range() {
-        assert_eq!(parse_cpu_list("0-3,8"), vec![0, 1, 2, 3, 8]);
-        assert_eq!(parse_cpu_list("5"), vec![5]);
-        assert_eq!(parse_cpu_list("2-2"), vec![2]);
+        assert_eq!(parse_cpu_list(b"0-3,8"), vec![0, 1, 2, 3, 8]);
+        assert_eq!(parse_cpu_list(b"5"), vec![5]);
+        assert_eq!(parse_cpu_list(b"2-2"), vec![2]);
     }
 
     #[test]
     fn parse_empty_and_empty_entries() {
-        assert_eq!(parse_cpu_list(""), Vec::<CpuIndex>::new());
+        assert_eq!(parse_cpu_list(b""), Vec::<CpuIndex>::new());
         // Empty entries between commas are skipped.
-        assert_eq!(parse_cpu_list("0,,3"), vec![0, 3]);
+        assert_eq!(parse_cpu_list(b"0,,3"), vec![0, 3]);
     }
 
     #[test]
     fn parse_tolerates_whitespace() {
-        // sysfs content is passed through `remove_whitespace` first.
-        assert_eq!(
-            parse_cpu_list(&remove_whitespace(" 0-3 , 8 \n")),
-            vec![0, 1, 2, 3, 8]
-        );
-        assert_eq!(parse_cpu_list("0-3\n"), vec![0, 1, 2, 3]);
+        // A sysfs file ends with a newline, and an entry may be padded.
+        assert_eq!(parse_cpu_list(b" 0-3 , 8 \n"), vec![0, 1, 2, 3, 8]);
+        assert_eq!(parse_cpu_list(b"0-3\n"), vec![0, 1, 2, 3]);
     }
 
     #[test]
     fn descending_range_is_empty() {
-        assert_eq!(parse_cpu_list("5-3"), Vec::<CpuIndex>::new());
+        assert_eq!(parse_cpu_list(b"5-3"), Vec::<CpuIndex>::new());
+    }
+
+    /// A byte no index list is spelled in makes the entry describe no index,
+    /// and leaves the rest of the list alone.
+    #[test]
+    fn a_non_ascii_byte_contributes_no_index() {
+        assert_eq!(parse_cpu_list(b"\x82\xa0"), Vec::<CpuIndex>::new());
+        assert_eq!(parse_cpu_list(b"0,\x82\xa0,3"), vec![0, 3]);
     }
 
     // -- CPU-list rendering -----------------------------------------------
 
     #[test]
     fn cpu_list_rendering_compresses_runs() {
-        assert_eq!(format_cpu_list([0, 1, 2, 3, 8]), "0-3,8");
-        assert_eq!(format_cpu_list([5]), "5");
-        assert_eq!(format_cpu_list([]), "");
-        assert_eq!(format_cpu_list([1, 3, 5]), "1,3,5");
+        assert_eq!(rendered([0, 1, 2, 3, 8]), b"0-3,8");
+        assert_eq!(rendered([5]), b"5");
+        assert_eq!(rendered([]), b"");
+        assert_eq!(rendered([1, 3, 5]), b"1,3,5");
         // The inverse of the parser it renders for.
         assert_eq!(
-            parse_cpu_list(&format_cpu_list([0, 1, 2, 7, 8])),
+            parse_cpu_list(&rendered([0, 1, 2, 7, 8])),
             vec![0, 1, 2, 7, 8]
+        );
+    }
+
+    // -- sysfs refusals ---------------------------------------------------
+
+    #[test]
+    fn a_refusal_names_the_file_it_read() {
+        assert_eq!(
+            refusal_message(&SysfsError::Unreadable(PathBuf::from("/sys/x/online"))),
+            "cannot read `/sys/x/online`"
+        );
+        assert_eq!(
+            refusal_message(&SysfsError::NoOnlineCpu(PathBuf::from("/sys/x/online"))),
+            "`/sys/x/online` lists no online CPU"
+        );
+    }
+
+    #[test]
+    fn the_sysfs_paths_name_the_node_and_the_cpu() {
+        assert_eq!(
+            node_cpulist_path(3).expect("a path on this platform"),
+            PathBuf::from("devices/system/node/node3/cpulist")
+        );
+        assert_eq!(
+            cpu_l3_siblings_path(17).expect("a path on this platform"),
+            PathBuf::from("devices/system/cpu/cpu17/cache/index3/shared_cpu_list")
         );
     }
 

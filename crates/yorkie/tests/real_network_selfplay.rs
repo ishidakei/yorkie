@@ -21,7 +21,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use common::{engine_cwd, engine_has_network, engine_network_path};
-use yorkie_state::{Move, Position, parse_usi_move};
+mod text_str;
+
+use text_str::parse_usi_move;
+use yorkie_state::{Move, Position};
 
 const MAX_PLIES: usize = 40;
 
@@ -118,7 +121,7 @@ fn real_network_self_play_stays_legal_and_exits_cleanly() {
         }
 
         let mv = parse_usi_move(&mv_str, &pos)
-            .unwrap_or_else(|e| panic!("ply {ply}: malformed bestmove {mv_str:?}: {e}"));
+            .unwrap_or_else(|e| panic!("ply {ply}: malformed bestmove {mv_str:?}: {e:?}"));
         assert!(
             legal_moves(&pos).contains(&mv),
             "ply {ply}: bestmove {mv_str} is not legal for the running position"

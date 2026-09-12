@@ -497,7 +497,7 @@ mod tests {
 
     use super::*;
     use crate::move_::Move;
-    use crate::sfen::{format_sfen, parse_sfen};
+    use crate::text::test_text::{parse_sfen_str as parse_sfen, sfen_string as format_sfen};
 
     /// Parse an SFEN that may omit the trailing ply field, as the reference's
     /// own test vectors do.

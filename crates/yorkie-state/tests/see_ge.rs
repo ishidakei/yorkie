@@ -1,13 +1,16 @@
 //! Hand-built exchange scenarios for `Position::see_ge`, each with its expected
 //! value worked out below, plus a seeded-playout sweep over the perft fixtures.
 
+mod text_str;
+
 use yorkie_state::board::Board;
 use yorkie_state::color::Color;
-use yorkie_state::move_::{Move, parse_usi_move};
+use yorkie_state::move_::Move;
 use yorkie_state::piece::{Piece, PieceKind};
 use yorkie_state::position::Position;
-use yorkie_state::sfen::parse_sfen;
 use yorkie_state::square::Square;
+
+use text_str::{parse_sfen, parse_usi_move};
 
 /// Apery material values, so the expected SEE values read in named terms.
 const PAWN: i32 = 90;

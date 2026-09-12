@@ -1380,7 +1380,7 @@ mod tests {
         assert!(cycle.is_empty(), "expected empty cycle, got {cycle:?}");
     }
 
-    use crate::sfen::parse_sfen;
+    use crate::text::test_text::parse_sfen_str as parse_sfen;
 
     const FIXTURE_SFENS: &[&str] = &[
         "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1", // startpos
@@ -1488,7 +1488,7 @@ mod tests {
         let play = |line: &[&str]| {
             let mut p = Position::startpos();
             for usi in line {
-                let m = crate::move_::parse_usi_move(usi, &p).expect("legal move");
+                let m = crate::move_::parse_usi_move(usi.as_bytes(), &p).expect("legal move");
                 p.do_move(m);
             }
             p
@@ -1659,7 +1659,8 @@ mod tests {
         let mut any_recurrence = false;
 
         for usi in &moves {
-            let m = crate::move_::parse_usi_move(usi, &pos).expect("fixture move parses");
+            let m =
+                crate::move_::parse_usi_move(usi.as_bytes(), &pos).expect("fixture move parses");
             pos.do_move(m);
             assert_key_consistent(&pos, &format!("sennichite `{usi}`"));
 
@@ -1750,7 +1751,8 @@ mod tests {
         let (sfen, moves) = load_sennichite();
         let mut pos = parse_sfen(&sfen).expect("fixture sfen parses");
         for (idx, usi) in moves.iter().enumerate() {
-            let m = crate::move_::parse_usi_move(usi, &pos).expect("fixture move parses");
+            let m =
+                crate::move_::parse_usi_move(usi.as_bytes(), &pos).expect("fixture move parses");
             pos.do_move(m);
             let depth = idx + 1;
             let rep = pos.is_repetition(16);
@@ -2090,7 +2092,8 @@ mod tests {
         let mut stack: Vec<(Move, Undo)> = Vec::new();
         let mut forward: Vec<RepetitionState> = Vec::new();
         for usi in &moves {
-            let m = crate::move_::parse_usi_move(usi, &pos).expect("fixture move parses");
+            let m =
+                crate::move_::parse_usi_move(usi.as_bytes(), &pos).expect("fixture move parses");
             let u = pos.do_move(m);
             forward.push(pos.is_repetition(16));
             stack.push((m, u));

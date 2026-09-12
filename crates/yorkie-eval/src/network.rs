@@ -201,8 +201,8 @@ fn per_layer_flow_unfused(transformed: &[u8; FC_0_INPUT_DIMS], stack: NetStack) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text_str::parse_sfen;
     use crate::types::OwnedNetwork;
-    use yorkie_state::parse_sfen;
 
     #[test]
     fn zero_network_evaluates_to_zero() {

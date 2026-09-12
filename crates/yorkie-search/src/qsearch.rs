@@ -3975,7 +3975,9 @@ mod tests {
     use yorkie_eval::{
         FC_0_PADDED_INPUT_DIMS, HIDDEN_SIZE, HIDDEN1_DIMS, LAYER_STACKS, OwnedNetwork, PtrNetwork,
     };
-    use yorkie_state::{Piece, PieceKind, Square, parse_sfen};
+    use yorkie_state::{Piece, PieceKind, Square};
+
+    use crate::text_str::parse_sfen;
     use yorkie_storage::{Bound, TTData, TranspositionTable};
 
     /// The instantiation these tests drive: a network they made up, so its

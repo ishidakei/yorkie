@@ -91,7 +91,7 @@ fn multi_cycle_without_network_survives_and_resigns() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn position_then_go_after_sfen_without_network_resigns() {
-    let sfen = yorkie_state::STARTPOS_SFEN;
+    let sfen = String::from_utf8(yorkie_state::STARTPOS_SFEN.to_vec()).expect("an SFEN is ASCII");
     let session = format!(
         "usi\n\
          isready\n\

@@ -66,32 +66,83 @@ pub enum BookError {
     Io(std::io::Error),
 }
 
-impl std::fmt::Display for BookError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl BookError {
+    /// Append this failure's message to `push`, one fragment at a time.
+    ///
+    /// The message arrives as byte fragments rather than in a buffer because
+    /// the layer that composes a notice owns the buffer it goes into, and this
+    /// one sits below it. The operating system's own description of an I/O
+    /// failure is not this project's text, so its error number is named
+    /// instead.
+    pub fn write_message(&self, mut push: impl FnMut(&[u8])) {
+        push(b"ybb: ");
         match self {
-            BookError::TruncatedHeader => f.write_str("ybb: file shorter than the 32-byte header"),
-            BookError::BadMagic => f.write_str("ybb: bad magic (not a YANE-BINBOOK-V1 file)"),
+            BookError::TruncatedHeader => push(b"file shorter than the 32-byte header"),
+            BookError::BadMagic => push(b"bad magic (not a YANE-BINBOOK-V1 file)"),
             BookError::UnknownFlags(flags) => {
-                write!(f, "ybb: header flags {flags:#x} carry unknown bits")
+                push(b"header flags 0x");
+                push(hex_digits(*flags).as_bytes());
+                push(b" carry unknown bits");
             }
             BookError::RecordCountOverflow => {
-                f.write_str("ybb: record count overflows the index region size")
+                push(b"record count overflows the index region size");
             }
-            BookError::TruncatedIndex => {
-                f.write_str("ybb: file too short for the declared index region")
+            BookError::TruncatedIndex => push(b"file too short for the declared index region"),
+            BookError::Io(e) => {
+                push(b"i/o error: errno ");
+                match e.raw_os_error() {
+                    Some(errno) => push(decimal_digits(errno.unsigned_abs().into()).as_bytes()),
+                    None => push(b"unknown"),
+                }
             }
-            BookError::Io(e) => write!(f, "ybb: i/o error: {e}"),
         }
     }
 }
 
-impl std::error::Error for BookError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            BookError::Io(e) => Some(e),
-            _ => None,
+/// One value's ASCII digits, held where a caller can borrow them for as long as
+/// it takes to write them out.
+struct Digits {
+    bytes: [u8; 20],
+    start: usize,
+}
+
+impl Digits {
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[self.start..]
+    }
+}
+
+/// `value`'s lower-case hexadecimal digits.
+fn hex_digits(value: u64) -> Digits {
+    const HEX: [u8; 16] = *b"0123456789abcdef";
+    let mut bytes = [0u8; 20];
+    let mut start = bytes.len();
+    let mut v = value;
+    loop {
+        start -= 1;
+        bytes[start] = HEX[(v & 0xF) as usize];
+        v >>= 4;
+        if v == 0 {
+            break;
         }
     }
+    Digits { bytes, start }
+}
+
+/// `value`'s decimal digits.
+fn decimal_digits(value: u64) -> Digits {
+    let mut bytes = [0u8; 20];
+    let mut start = bytes.len();
+    let mut v = value;
+    loop {
+        start -= 1;
+        bytes[start] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    Digits { bytes, start }
 }
 
 impl From<std::io::Error> for BookError {

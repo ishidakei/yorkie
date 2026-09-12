@@ -28,7 +28,7 @@ pub fn load_network(path: &Path) -> Result<OwnedNetwork, NnueError> {
 /// a version mismatch still fail with an error.
 pub fn load_network_with_warnings(path: &Path) -> Result<(OwnedNetwork, Vec<String>), NnueError> {
     let bytes = std::fs::read(path).map_err(|e| NnueError::Io {
-        path: path.display().to_string(),
+        path: path.to_path_buf(),
         source: e,
     })?;
     network_from_bytes(&bytes, &NetDims::STANDARD)

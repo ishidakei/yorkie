@@ -1,12 +1,21 @@
-//! The USI command parser: one line of text in, one typed request out.
+//! The USI command parser: one line of bytes in, one typed request out.
 //!
 //! What a `position` or a `go` line *means* — the start position and the moves
 //! that reached it, the bounds on a search — is the engine's vocabulary, so the
 //! types this fills are [`crate::engine`]'s. This module owns only the reading.
+//!
+//! A line is bytes. USI is ASCII by specification, so nothing here decodes a
+//! character, and a line carrying bytes that are not valid UTF-8 — a `setoption`
+//! value spelling a path in a Windows code page, say — is read like any other.
+//! Such a token matches no keyword and parses as no number, so it fails exactly
+//! where a malformed ASCII token fails and the session goes on.
 
 #[cfg(feature = "verbose2")]
 use crate::engine::MATE_UNLIMITED_MS;
 use crate::engine::{GoParams, PositionSfen};
+#[cfg(feature = "verbose2")]
+use yorkie_state::text::atoi_u32;
+use yorkie_state::text::{atoi_u64, split_token, trim_ascii_whitespace};
 
 /// Input-validation limit: lines longer than this become
 /// `Command::TooLong` and are not parsed further.
@@ -19,15 +28,25 @@ pub const MAX_LINE_BYTES: usize = 64 * 1024;
 /// dropping the clause would turn `go depth 4` into an unbounded, clock-less
 /// search in the middle of a game.
 #[cfg(not(feature = "verbose2"))]
-pub const EXTRA_GO_CLAUSES: [&str; 6] = ["depth", "nodes", "mate", "movetime", "infinite", "rtime"];
+pub const EXTRA_GO_CLAUSES: [&[u8]; 6] = [
+    b"depth",
+    b"nodes",
+    b"mate",
+    b"movetime",
+    b"infinite",
+    b"rtime",
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command<'a> {
     Usi,
     IsReady,
     SetOption {
-        name: String,
-        value: String,
+        /// The option's name, borrowed from the command line.
+        name: &'a [u8],
+        /// Everything after the `value` keyword, still the one run of line it
+        /// arrived as. Empty when the command named no value.
+        value: &'a [u8],
     },
     UsiNewGame,
     Position {
@@ -36,7 +55,7 @@ pub enum Command<'a> {
         /// of the command line: the game path splits them where it replays
         /// them, so no move is ever copied out of the line. Empty when the
         /// command carried none.
-        moves: &'a str,
+        moves: &'a [u8],
     },
     Go(GoParams),
     /// A `go` line carrying one of the [`EXTRA_GO_CLAUSES`], parsed by a build
@@ -45,7 +64,7 @@ pub enum Command<'a> {
     /// feature — with `verbose2`, every one of those clauses parses into
     /// [`Command::Go`].
     #[cfg(not(feature = "verbose2"))]
-    GoExtraClause(String),
+    GoExtraClause(&'a [u8]),
     Stop,
     /// `gameover [win|lose|draw]` — the game ended. The optional result token
     /// is ignored; the command is treated exactly like `stop`: over a shogi
@@ -60,109 +79,91 @@ pub enum Command<'a> {
     ///
     /// `verbose3` only, so the default build cannot even name the command.
     #[cfg(feature = "verbose3")]
-    Bench(Vec<String>),
+    Bench(Vec<&'a [u8]>),
     /// `tt <store|probe|children> …` — the verbosity-gated transposition-table
     /// read/write commands (`verbose3`). Like [`Command::Bench`] the trailing
     /// tokens are carried verbatim; [`crate::tt_command::parse_tt`] gives them
     /// meaning. The variant exists only with that feature, so a build without it
     /// cannot even name the command.
     #[cfg(feature = "verbose3")]
-    Tt(Vec<String>),
+    Tt(Vec<&'a [u8]>),
     Quit,
-    /// A line no arm recognised. The line text is retained only so the
-    /// `verbose1` diagnostic can echo it back; without that feature nothing can
-    /// print it, so the variant carries nothing and the text is never copied.
-    /// Every construction goes through `unknown`, which is where the two shapes
-    /// live.
+    /// A line no arm recognised. The line is retained only so the `verbose1`
+    /// diagnostic can echo it back; without that feature nothing can print it,
+    /// so the variant carries nothing. Every construction goes through
+    /// `unknown`, which is where the two shapes live.
     #[cfg(feature = "verbose1")]
-    Unknown(String),
+    Unknown(&'a [u8]),
     #[cfg(not(feature = "verbose1"))]
     Unknown,
     TooLong,
 }
 
-/// [`Command::Unknown`] for `line`, carrying the text only where a build can
+/// [`Command::Unknown`] for `line`, carrying the line only where a build can
 /// print it.
 #[cfg(feature = "verbose1")]
-fn unknown(line: &str) -> Command<'static> {
-    Command::Unknown(line.to_string())
+fn unknown(line: &[u8]) -> Command<'_> {
+    Command::Unknown(line)
 }
 
 #[cfg(not(feature = "verbose1"))]
-fn unknown(_line: &str) -> Command<'static> {
+fn unknown(_line: &[u8]) -> Command<'static> {
     Command::Unknown
 }
 
-/// [`Command::Unknown`] for a malformed `setoption`, whose reported text is the
-/// re-joined line. The join exists only for the report, so a build that cannot
-/// print one does not perform it.
-#[cfg(feature = "verbose1")]
-fn unknown_setoption(tokens: &[&str]) -> Command<'static> {
-    Command::Unknown(format!("setoption {}", tokens.join(" ")))
+/// The tokens of `args`, for the two `verbose3` commands that carry their
+/// arguments to a parser of their own.
+#[cfg(feature = "verbose3")]
+fn tokens(args: &[u8]) -> Vec<&[u8]> {
+    yorkie_state::text::tokens(args).collect()
 }
 
-#[cfg(not(feature = "verbose1"))]
-fn unknown_setoption(_tokens: &[&str]) -> Command<'static> {
-    Command::Unknown
-}
-
-/// Split off the leading token: what precedes the first run of whitespace, and
-/// what follows that run. Both halves are empty once nothing is left, and the
-/// tail keeps its own inner spacing, so a caller can hand it on whole.
-fn split_token(s: &str) -> (&str, &str) {
-    match s.find(char::is_whitespace) {
-        Some(i) => (&s[..i], s[i..].trim_start()),
-        None => (s, ""),
-    }
-}
-
-pub fn parse_line(input: &str) -> Command<'_> {
+pub fn parse_line(input: &[u8]) -> Command<'_> {
     if input.len() > MAX_LINE_BYTES {
         return Command::TooLong;
     }
-    let trimmed = input.trim_matches(|c: char| c == '\r' || c == '\n' || c.is_whitespace());
+    let trimmed = trim_ascii_whitespace(input);
     if trimmed.is_empty() {
-        return unknown("");
+        return unknown(b"");
     }
     let (head, rest) = split_token(trimmed);
-    let parts = rest.split_whitespace();
     match head {
-        "usi" => Command::Usi,
-        "isready" => Command::IsReady,
-        "usinewgame" => Command::UsiNewGame,
-        "quit" => Command::Quit,
-        "setoption" => parse_setoption(parts),
-        "position" => parse_position(trimmed, rest),
-        "go" => parse_go(trimmed, rest),
-        "stop" => Command::Stop,
+        b"usi" => Command::Usi,
+        b"isready" => Command::IsReady,
+        b"usinewgame" => Command::UsiNewGame,
+        b"quit" => Command::Quit,
+        b"setoption" => parse_setoption(trimmed, rest),
+        b"position" => parse_position(trimmed, rest),
+        b"go" => parse_go(trimmed, rest),
+        b"stop" => Command::Stop,
         // `gameover [result]`: the trailing win/lose/draw token is optional and
         // ignored — the command is handled identically to `stop`.
-        "gameover" => Command::GameOver,
-        "ponderhit" => Command::PonderHit,
+        b"gameover" => Command::GameOver,
+        b"ponderhit" => Command::PonderHit,
         // The trailing `bench` tokens are preserved verbatim for the semantic
         // parse in `crate::bench` (which fills defaults and validates them).
         // `verbose3` only: without that feature this arm does not exist and
         // `bench …` falls through to `Command::Unknown`, exactly like `tt`.
         #[cfg(feature = "verbose3")]
-        "bench" => Command::Bench(parts.map(str::to_string).collect()),
+        b"bench" => Command::Bench(tokens(rest)),
         // `verbose3` only. Without that feature this arm does not exist, so
         // `tt …` falls through to `Command::Unknown` like any other unrecognised
         // line — the default build's behaviour is byte-identical to before the
         // command existed.
         #[cfg(feature = "verbose3")]
-        "tt" => Command::Tt(parts.map(str::to_string).collect()),
+        b"tt" => Command::Tt(tokens(rest)),
         _ => unknown(trimmed),
     }
 }
 
-fn parse_position<'a>(line: &'a str, args: &'a str) -> Command<'a> {
+fn parse_position<'a>(line: &'a [u8], args: &'a [u8]) -> Command<'a> {
     let (kind, rest) = split_token(args);
     let (sfen, after_sfen) = match kind {
-        "startpos" => (PositionSfen::StartPos, rest),
-        "sfen" => {
+        b"startpos" => (PositionSfen::StartPos, rest),
+        b"sfen" => {
             // The four SFEN fields are: board, side-to-move, hands, ply. The
-            // engine hands them to `yorkie_state::parse_sfen` and surfaces any
-            // per-field error from there.
+            // engine hands them to `yorkie_state::parse_sfen_fields_into` and
+            // surfaces any per-field error from there.
             let (board, rest) = split_token(rest);
             let (side_to_move, rest) = split_token(rest);
             let (hands, rest) = split_token(rest);
@@ -175,22 +176,16 @@ fn parse_position<'a>(line: &'a str, args: &'a str) -> Command<'a> {
         _ => return unknown(line),
     };
     if after_sfen.is_empty() {
-        return Command::Position { sfen, moves: "" };
+        return Command::Position { sfen, moves: b"" };
     }
     let (keyword, moves) = split_token(after_sfen);
-    if keyword != "moves" {
+    if keyword != b"moves" {
         return unknown(line);
     }
     Command::Position { sfen, moves }
 }
 
-/// The `u64` the clause's value token spells, or `None` when it is missing or
-/// malformed.
-fn u64_arg(value: &str) -> Option<u64> {
-    value.parse::<u64>().ok()
-}
-
-fn parse_go<'a>(line: &'a str, args: &'a str) -> Command<'a> {
+fn parse_go<'a>(line: &'a [u8], args: &'a [u8]) -> Command<'a> {
     let mut limits = GoParams::default();
     let mut rest = args;
     while !rest.is_empty() {
@@ -206,15 +201,15 @@ fn parse_go<'a>(line: &'a str, args: &'a str) -> Command<'a> {
         // search.
         #[cfg(not(feature = "verbose2"))]
         if EXTRA_GO_CLAUSES.contains(&key) {
-            return Command::GoExtraClause(key.to_string());
+            return Command::GoExtraClause(key);
         }
         match key {
             #[cfg(feature = "verbose2")]
-            "infinite" => {
+            b"infinite" => {
                 limits.infinite = true;
                 rest = after_key;
             }
-            "ponder" => {
+            b"ponder" => {
                 limits.ponder = true;
                 rest = after_key;
             }
@@ -223,17 +218,17 @@ fn parse_go<'a>(line: &'a str, args: &'a str) -> Command<'a> {
             // Anything else that is not a valid `u64` is an error (the
             // reference's `stoi` would throw).
             #[cfg(feature = "verbose2")]
-            "mate" => match value {
-                "" => {
+            b"mate" => match value {
+                b"" => {
                     limits.mate = Some(MATE_UNLIMITED_MS);
                     rest = after_key;
                 }
-                "infinite" => {
+                b"infinite" => {
                     limits.mate = Some(MATE_UNLIMITED_MS);
                     rest = after_value;
                 }
                 _ => {
-                    let Ok(v) = value.parse::<u64>() else {
+                    let Some(v) = atoi_u64(value) else {
                         return unknown(line);
                     };
                     limits.mate = Some(v);
@@ -241,36 +236,36 @@ fn parse_go<'a>(line: &'a str, args: &'a str) -> Command<'a> {
                 }
             },
             #[cfg(feature = "verbose2")]
-            "depth" => {
-                let Ok(v) = value.parse::<u32>() else {
+            b"depth" => {
+                let Some(v) = atoi_u32(value) else {
                     return unknown(line);
                 };
                 limits.depth = Some(v);
                 rest = after_value;
             }
             #[cfg(feature = "verbose2")]
-            "nodes" | "movetime" | "rtime" => {
-                let Some(v) = u64_arg(value) else {
+            b"nodes" | b"movetime" | b"rtime" => {
+                let Some(v) = atoi_u64(value) else {
                     return unknown(line);
                 };
                 match key {
-                    "nodes" => limits.nodes = Some(v),
-                    "movetime" => limits.movetime = Some(v),
+                    b"nodes" => limits.nodes = Some(v),
+                    b"movetime" => limits.movetime = Some(v),
                     _ => limits.rtime = Some(v),
                 }
                 rest = after_value;
             }
-            "wtime" | "btime" | "winc" | "binc" | "byoyomi" => {
-                let Some(v) = u64_arg(value) else {
+            b"wtime" | b"btime" | b"winc" | b"binc" | b"byoyomi" => {
+                let Some(v) = atoi_u64(value) else {
                     return unknown(line);
                 };
                 match key {
-                    "wtime" => limits.wtime = Some(v),
-                    "btime" => limits.btime = Some(v),
-                    "winc" => limits.winc = Some(v),
-                    "binc" => limits.binc = Some(v),
-                    "byoyomi" => limits.byoyomi = Some(v),
-                    _ => unreachable!("matched key {key} but no branch"),
+                    b"wtime" => limits.wtime = Some(v),
+                    b"btime" => limits.btime = Some(v),
+                    b"winc" => limits.winc = Some(v),
+                    b"binc" => limits.binc = Some(v),
+                    b"byoyomi" => limits.byoyomi = Some(v),
+                    _ => unreachable!("matched a clock clause but no branch"),
                 }
                 rest = after_value;
             }
@@ -280,32 +275,28 @@ fn parse_go<'a>(line: &'a str, args: &'a str) -> Command<'a> {
     Command::Go(limits)
 }
 
-fn parse_setoption<'a>(parts: impl Iterator<Item = &'a str>) -> Command<'static> {
-    // USI: setoption name <NAME> [value <VALUE...>]
-    // Per the protocol, NAME is a single token (option names contain no spaces),
-    // and everything after `value` is the value (joined back with single spaces).
-    let tokens: Vec<&str> = parts.collect();
-    let mut iter = tokens.iter();
-    let Some(&kw) = iter.next() else {
-        return unknown_setoption(&tokens);
-    };
-    if kw != "name" {
-        return unknown_setoption(&tokens);
+/// `setoption name <NAME> [value <VALUE…>]`.
+///
+/// Per the protocol, NAME is a single token (option names contain no spaces),
+/// and everything after `value` is the value — handed on as the one run of line
+/// it arrived as, spacing and all, rather than re-joined.
+fn parse_setoption<'a>(line: &'a [u8], args: &'a [u8]) -> Command<'a> {
+    let (keyword, rest) = split_token(args);
+    if keyword != b"name" {
+        return unknown(line);
     }
-    let Some(&name) = iter.next() else {
-        return unknown_setoption(&tokens);
-    };
-    let rest: Vec<&str> = iter.copied().collect();
-    let value = match rest.as_slice() {
-        [] => String::new(),
-        ["value"] => String::new(),
-        ["value", rest @ ..] => rest.join(" "),
-        _ => return unknown_setoption(&tokens),
-    };
-    Command::SetOption {
-        name: name.to_string(),
-        value,
+    let (name, rest) = split_token(rest);
+    if name.is_empty() {
+        return unknown(line);
     }
+    if rest.is_empty() {
+        return Command::SetOption { name, value: b"" };
+    }
+    let (keyword, value) = split_token(rest);
+    if keyword != b"value" {
+        return unknown(line);
+    }
+    Command::SetOption { name, value }
 }
 
 #[cfg(test)]
@@ -314,34 +305,34 @@ mod tests {
 
     #[test]
     fn parses_usi() {
-        assert_eq!(parse_line("usi"), Command::Usi);
-        assert_eq!(parse_line("usi\n"), Command::Usi);
-        assert_eq!(parse_line("usi\r\n"), Command::Usi);
-        assert_eq!(parse_line("  usi  "), Command::Usi);
+        assert_eq!(parse_line(b"usi"), Command::Usi);
+        assert_eq!(parse_line(b"usi\n"), Command::Usi);
+        assert_eq!(parse_line(b"usi\r\n"), Command::Usi);
+        assert_eq!(parse_line(b"  usi  "), Command::Usi);
     }
 
     #[test]
     fn parses_isready() {
-        assert_eq!(parse_line("isready"), Command::IsReady);
+        assert_eq!(parse_line(b"isready"), Command::IsReady);
     }
 
     #[test]
     fn parses_usinewgame() {
-        assert_eq!(parse_line("usinewgame"), Command::UsiNewGame);
+        assert_eq!(parse_line(b"usinewgame"), Command::UsiNewGame);
     }
 
     #[test]
     fn parses_quit() {
-        assert_eq!(parse_line("quit"), Command::Quit);
+        assert_eq!(parse_line(b"quit"), Command::Quit);
     }
 
     #[test]
     fn parses_setoption_with_value() {
         assert_eq!(
-            parse_line("setoption name USI_Hash value 1024"),
+            parse_line(b"setoption name USI_Hash value 1024"),
             Command::SetOption {
-                name: "USI_Hash".to_string(),
-                value: "1024".to_string(),
+                name: b"USI_Hash",
+                value: b"1024",
             }
         );
     }
@@ -349,10 +340,10 @@ mod tests {
     #[test]
     fn parses_setoption_with_empty_value() {
         assert_eq!(
-            parse_line("setoption name EvalDir value"),
+            parse_line(b"setoption name EvalDir value"),
             Command::SetOption {
-                name: "EvalDir".to_string(),
-                value: String::new(),
+                name: b"EvalDir",
+                value: b"",
             }
         );
     }
@@ -360,10 +351,10 @@ mod tests {
     #[test]
     fn parses_setoption_with_no_value_keyword() {
         assert_eq!(
-            parse_line("setoption name UsiNewGameThing"),
+            parse_line(b"setoption name UsiNewGameThing"),
             Command::SetOption {
-                name: "UsiNewGameThing".to_string(),
-                value: String::new(),
+                name: b"UsiNewGameThing",
+                value: b"",
             }
         );
     }
@@ -371,42 +362,71 @@ mod tests {
     #[test]
     fn parses_setoption_with_multi_word_value() {
         assert_eq!(
-            parse_line("setoption name EvalDir value /srv/eval dir/sub"),
+            parse_line(b"setoption name EvalDir value /srv/eval dir/sub"),
             Command::SetOption {
-                name: "EvalDir".to_string(),
-                value: "/srv/eval dir/sub".to_string(),
+                name: b"EvalDir",
+                value: b"/srv/eval dir/sub",
             }
         );
     }
 
-    /// The retained text is the `verbose1` half of the variant, so this pins it
+    /// A `setoption` value carrying bytes no USI command is spelled in — a path
+    /// in a Windows code page, whose `\x82\xa0` is not valid UTF-8 — parses like
+    /// any other value. Reading the line is what used to fail here, and a
+    /// failed read ended the session.
+    #[test]
+    fn parses_setoption_whose_value_is_not_utf8() {
+        assert_eq!(
+            parse_line(b"setoption name EvalDir value C:\\\x82\xa0\\eval"),
+            Command::SetOption {
+                name: b"EvalDir",
+                value: b"C:\\\x82\xa0\\eval",
+            }
+        );
+    }
+
+    #[test]
+    fn a_malformed_setoption_is_unknown() {
+        assert_eq!(parse_line(b"setoption"), unknown(b"setoption"));
+        assert_eq!(
+            parse_line(b"setoption nombre X"),
+            unknown(b"setoption nombre X")
+        );
+        assert_eq!(parse_line(b"setoption name"), unknown(b"setoption name"));
+        assert_eq!(
+            parse_line(b"setoption name X worth 1"),
+            unknown(b"setoption name X worth 1")
+        );
+    }
+
+    /// The retained line is the `verbose1` half of the variant, so this pins it
     /// only where it exists; the rest of the unknown-line assertions compare
     /// against [`unknown`] and hold in every build.
     #[cfg(feature = "verbose1")]
     #[test]
     fn unknown_command_preserves_trimmed_line() {
         assert_eq!(
-            parse_line("frobnicate the gizmo"),
-            Command::Unknown("frobnicate the gizmo".to_string())
+            parse_line(b"frobnicate the gizmo"),
+            Command::Unknown(b"frobnicate the gizmo")
         );
     }
 
     /// The board / side-to-move / hands / ply fields of the initial position,
     /// as the four the `sfen` form is split into.
-    const STARTPOS_FIELDS: [&str; 4] = [
-        "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL",
-        "b",
-        "-",
-        "1",
+    const STARTPOS_FIELDS: [&[u8]; 4] = [
+        b"lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL",
+        b"b",
+        b"-",
+        b"1",
     ];
 
     #[test]
     fn parses_position_startpos() {
         assert_eq!(
-            parse_line("position startpos"),
+            parse_line(b"position startpos"),
             Command::Position {
                 sfen: PositionSfen::StartPos,
-                moves: "",
+                moves: b"",
             }
         );
     }
@@ -414,10 +434,10 @@ mod tests {
     #[test]
     fn parses_position_startpos_with_moves() {
         assert_eq!(
-            parse_line("position startpos moves 7g7f 8c8d"),
+            parse_line(b"position startpos moves 7g7f 8c8d"),
             Command::Position {
                 sfen: PositionSfen::StartPos,
-                moves: "7g7f 8c8d",
+                moves: b"7g7f 8c8d",
             }
         );
     }
@@ -428,51 +448,54 @@ mod tests {
     #[test]
     fn position_moves_are_the_line_run_whatever_its_spacing() {
         assert_eq!(
-            parse_line("position   startpos   moves   7g7f\t8c8d  "),
+            parse_line(b"position   startpos   moves   7g7f\t8c8d  "),
             Command::Position {
                 sfen: PositionSfen::StartPos,
-                moves: "7g7f\t8c8d",
+                moves: b"7g7f\t8c8d",
             }
         );
         assert_eq!(
-            parse_line("position startpos moves"),
+            parse_line(b"position startpos moves"),
             Command::Position {
                 sfen: PositionSfen::StartPos,
-                moves: "",
+                moves: b"",
             }
         );
     }
 
     #[test]
     fn parses_position_sfen_no_moves() {
-        let sfen = STARTPOS_FIELDS.join(" ");
         assert_eq!(
-            parse_line(&format!("position sfen {sfen}")),
+            parse_line(
+                b"position sfen lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1"
+            ),
             Command::Position {
                 sfen: PositionSfen::Sfen(STARTPOS_FIELDS),
-                moves: "",
+                moves: b"",
             }
         );
     }
 
     #[test]
     fn parses_position_sfen_with_moves() {
-        let sfen = STARTPOS_FIELDS.join(" ");
         assert_eq!(
-            parse_line(&format!("position sfen {sfen} moves 7g7f")),
+            parse_line(
+                b"position sfen lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1 \
+                  moves 7g7f"
+            ),
             Command::Position {
                 sfen: PositionSfen::Sfen(STARTPOS_FIELDS),
-                moves: "7g7f",
+                moves: b"7g7f",
             }
         );
     }
 
     #[test]
     fn position_without_kind_token_is_unknown() {
-        assert_eq!(parse_line("position"), unknown("position"));
+        assert_eq!(parse_line(b"position"), unknown(b"position"));
         assert_eq!(
-            parse_line("position something"),
-            unknown("position something")
+            parse_line(b"position something"),
+            unknown(b"position something")
         );
     }
 
@@ -480,14 +503,33 @@ mod tests {
     fn position_sfen_short_field_count_is_unknown() {
         // Only three tokens (missing ply) → cannot form a valid SFEN.
         assert_eq!(
-            parse_line("position sfen a b c"),
-            unknown("position sfen a b c")
+            parse_line(b"position sfen a b c"),
+            unknown(b"position sfen a b c")
+        );
+    }
+
+    /// A `position` token carrying a byte no USI line is spelled in takes the
+    /// path a malformed ASCII token takes: the keyword matches nothing, so the
+    /// line is unknown, and the SFEN fields reach the one parser that judges
+    /// them.
+    #[test]
+    fn a_non_ascii_position_token_takes_the_malformed_path() {
+        assert_eq!(
+            parse_line(b"position \x82\xa0"),
+            unknown(b"position \x82\xa0")
+        );
+        assert_eq!(
+            parse_line(b"position startpos moves \x82\xa0"),
+            Command::Position {
+                sfen: PositionSfen::StartPos,
+                moves: b"\x82\xa0",
+            }
         );
     }
 
     #[test]
     fn parses_bare_go() {
-        assert_eq!(parse_line("go"), Command::Go(GoParams::default()));
+        assert_eq!(parse_line(b"go"), Command::Go(GoParams::default()));
     }
 
     #[cfg(feature = "verbose2")]
@@ -497,7 +539,7 @@ mod tests {
             depth: Some(8),
             ..Default::default()
         };
-        assert_eq!(parse_line("go depth 8"), Command::Go(expected));
+        assert_eq!(parse_line(b"go depth 8"), Command::Go(expected));
     }
 
     #[cfg(feature = "verbose2")]
@@ -509,7 +551,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            parse_line("go nodes 1000 movetime 250"),
+            parse_line(b"go nodes 1000 movetime 250"),
             Command::Go(expected)
         );
     }
@@ -521,7 +563,7 @@ mod tests {
             infinite: true,
             ..Default::default()
         };
-        assert_eq!(parse_line("go infinite"), Command::Go(expected));
+        assert_eq!(parse_line(b"go infinite"), Command::Go(expected));
     }
 
     #[test]
@@ -533,7 +575,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            parse_line("go wtime 60000 btime 60000 byoyomi 5000"),
+            parse_line(b"go wtime 60000 btime 60000 byoyomi 5000"),
             Command::Go(expected)
         );
     }
@@ -545,71 +587,92 @@ mod tests {
             binc: Some(2000),
             ..Default::default()
         };
-        assert_eq!(parse_line("go winc 1000 binc 2000"), Command::Go(expected));
+        assert_eq!(parse_line(b"go winc 1000 binc 2000"), Command::Go(expected));
     }
 
     #[test]
     fn go_with_unknown_subtoken_is_unknown() {
         assert_eq!(
-            parse_line("go searchmoves 7g7f"),
-            unknown("go searchmoves 7g7f")
+            parse_line(b"go searchmoves 7g7f"),
+            unknown(b"go searchmoves 7g7f")
+        );
+    }
+
+    /// A `go` clause spelled in bytes no USI line carries matches no keyword,
+    /// which is the unknown-clause path.
+    #[test]
+    fn a_non_ascii_go_clause_is_unknown() {
+        assert_eq!(
+            parse_line(b"go \x82\xa0 1000"),
+            unknown(b"go \x82\xa0 1000")
+        );
+    }
+
+    /// A clock clause whose value carries such a byte parses as no number,
+    /// which is the malformed-value path.
+    #[test]
+    fn a_non_ascii_clock_value_is_unknown() {
+        assert_eq!(
+            parse_line(b"go btime \x82\xa0"),
+            unknown(b"go btime \x82\xa0")
         );
     }
 
     #[cfg(feature = "verbose2")]
     #[test]
     fn go_with_missing_value_is_unknown() {
-        assert_eq!(parse_line("go depth"), unknown("go depth"));
+        assert_eq!(parse_line(b"go depth"), unknown(b"go depth"));
     }
 
     #[cfg(feature = "verbose2")]
     #[test]
     fn go_with_non_integer_value_is_unknown() {
         assert_eq!(
-            parse_line("go nodes not-a-number"),
-            unknown("go nodes not-a-number")
+            parse_line(b"go nodes not-a-number"),
+            unknown(b"go nodes not-a-number")
         );
     }
 
     #[test]
     fn parses_stop() {
-        assert_eq!(parse_line("stop"), Command::Stop);
-        assert_eq!(parse_line("stop\n"), Command::Stop);
+        assert_eq!(parse_line(b"stop"), Command::Stop);
+        assert_eq!(parse_line(b"stop\n"), Command::Stop);
     }
 
     #[test]
     fn parses_gameover_with_and_without_result() {
-        assert_eq!(parse_line("gameover"), Command::GameOver);
-        assert_eq!(parse_line("gameover win"), Command::GameOver);
-        assert_eq!(parse_line("gameover lose"), Command::GameOver);
-        assert_eq!(parse_line("gameover draw"), Command::GameOver);
-        assert_eq!(parse_line("gameover\n"), Command::GameOver);
+        assert_eq!(parse_line(b"gameover"), Command::GameOver);
+        assert_eq!(parse_line(b"gameover win"), Command::GameOver);
+        assert_eq!(parse_line(b"gameover lose"), Command::GameOver);
+        assert_eq!(parse_line(b"gameover draw"), Command::GameOver);
+        assert_eq!(parse_line(b"gameover\n"), Command::GameOver);
     }
 
     #[cfg(feature = "verbose3")]
     #[test]
     fn parses_bare_bench() {
-        assert_eq!(parse_line("bench"), Command::Bench(Vec::new()));
+        assert_eq!(parse_line(b"bench"), Command::Bench(Vec::new()));
     }
 
     #[cfg(feature = "verbose3")]
     #[test]
     fn parses_bench_with_all_tokens() {
         assert_eq!(
-            parse_line("bench 16 1 6 default depth"),
-            Command::Bench(
-                ["16", "1", "6", "default", "depth"]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect()
-            )
+            parse_line(b"bench 16 1 6 default depth"),
+            Command::Bench(vec![
+                &b"16"[..],
+                &b"1"[..],
+                &b"6"[..],
+                &b"default"[..],
+                &b"depth"[..]
+            ])
         );
     }
 
     #[test]
     fn parses_ponderhit() {
-        assert_eq!(parse_line("ponderhit"), Command::PonderHit);
-        assert_eq!(parse_line("ponderhit\n"), Command::PonderHit);
+        assert_eq!(parse_line(b"ponderhit"), Command::PonderHit);
+        assert_eq!(parse_line(b"ponderhit\n"), Command::PonderHit);
     }
 
     #[test]
@@ -618,7 +681,7 @@ mod tests {
             ponder: true,
             ..Default::default()
         };
-        assert_eq!(parse_line("go ponder"), Command::Go(expected));
+        assert_eq!(parse_line(b"go ponder"), Command::Go(expected));
     }
 
     #[test]
@@ -630,7 +693,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            parse_line("go ponder btime 1000 wtime 1000"),
+            parse_line(b"go ponder btime 1000 wtime 1000"),
             Command::Go(expected)
         );
     }
@@ -642,7 +705,7 @@ mod tests {
             mate: Some(5000),
             ..Default::default()
         };
-        assert_eq!(parse_line("go mate 5000"), Command::Go(expected));
+        assert_eq!(parse_line(b"go mate 5000"), Command::Go(expected));
     }
 
     #[cfg(feature = "verbose2")]
@@ -652,7 +715,7 @@ mod tests {
             mate: Some(MATE_UNLIMITED_MS),
             ..Default::default()
         };
-        assert_eq!(parse_line("go mate"), Command::Go(expected));
+        assert_eq!(parse_line(b"go mate"), Command::Go(expected));
     }
 
     #[cfg(feature = "verbose2")]
@@ -662,13 +725,13 @@ mod tests {
             mate: Some(MATE_UNLIMITED_MS),
             ..Default::default()
         };
-        assert_eq!(parse_line("go mate infinite"), Command::Go(expected));
+        assert_eq!(parse_line(b"go mate infinite"), Command::Go(expected));
     }
 
     #[cfg(feature = "verbose2")]
     #[test]
     fn go_mate_non_integer_budget_is_unknown() {
-        assert_eq!(parse_line("go mate soon"), unknown("go mate soon"));
+        assert_eq!(parse_line(b"go mate soon"), unknown(b"go mate soon"));
     }
 
     /// Below `verbose3` — the default build: `bench` is not a command token at
@@ -677,10 +740,10 @@ mod tests {
     #[cfg(not(feature = "verbose3"))]
     #[test]
     fn bench_is_not_a_command_below_verbose3() {
-        assert_eq!(parse_line("bench"), unknown("bench"));
+        assert_eq!(parse_line(b"bench"), unknown(b"bench"));
         assert_eq!(
-            parse_line("bench 16 1 6 default depth"),
-            unknown("bench 16 1 6 default depth")
+            parse_line(b"bench 16 1 6 default depth"),
+            unknown(b"bench 16 1 6 default depth")
         );
     }
 
@@ -691,34 +754,31 @@ mod tests {
     #[test]
     fn gated_go_clauses_are_rejected_below_verbose2() {
         for clause in EXTRA_GO_CLAUSES {
+            let mut line = b"go ".to_vec();
+            line.extend_from_slice(clause);
+            line.extend_from_slice(b" 4");
             assert_eq!(
-                parse_line(&format!("go {clause} 4")),
-                Command::GoExtraClause(clause.to_string()),
-                "`go {clause} …` must be rejected by name"
+                parse_line(&line),
+                Command::GoExtraClause(clause),
+                "`go {clause:?} …` must be rejected by name"
             );
         }
         // Bare forms (no value) and clauses trailing a legitimate clock clause
         // are rejected the same way — the gate is checked before the clause is
         // interpreted, so a missing or malformed value cannot mask it.
         assert_eq!(
-            parse_line("go infinite"),
-            Command::GoExtraClause("infinite".to_string())
+            parse_line(b"go infinite"),
+            Command::GoExtraClause(b"infinite")
+        );
+        assert_eq!(parse_line(b"go mate"), Command::GoExtraClause(b"mate"));
+        assert_eq!(parse_line(b"go depth"), Command::GoExtraClause(b"depth"));
+        assert_eq!(
+            parse_line(b"go nodes not-a-number"),
+            Command::GoExtraClause(b"nodes")
         );
         assert_eq!(
-            parse_line("go mate"),
-            Command::GoExtraClause("mate".to_string())
-        );
-        assert_eq!(
-            parse_line("go depth"),
-            Command::GoExtraClause("depth".to_string())
-        );
-        assert_eq!(
-            parse_line("go nodes not-a-number"),
-            Command::GoExtraClause("nodes".to_string())
-        );
-        assert_eq!(
-            parse_line("go btime 1000 wtime 1000 depth 4"),
-            Command::GoExtraClause("depth".to_string())
+            parse_line(b"go btime 1000 wtime 1000 depth 4"),
+            Command::GoExtraClause(b"depth")
         );
     }
 
@@ -727,9 +787,9 @@ mod tests {
     #[cfg(not(feature = "verbose2"))]
     #[test]
     fn match_go_clauses_still_parse_below_verbose2() {
-        assert_eq!(parse_line("go"), Command::Go(GoParams::default()));
+        assert_eq!(parse_line(b"go"), Command::Go(GoParams::default()));
         assert_eq!(
-            parse_line("go btime 60000 wtime 60000 binc 1000 winc 1000 byoyomi 5000"),
+            parse_line(b"go btime 60000 wtime 60000 binc 1000 winc 1000 byoyomi 5000"),
             Command::Go(GoParams {
                 btime: Some(60000),
                 wtime: Some(60000),
@@ -740,7 +800,7 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_line("go ponder btime 1000 wtime 1000"),
+            parse_line(b"go ponder btime 1000 wtime 1000"),
             Command::Go(GoParams {
                 ponder: true,
                 btime: Some(1000),
@@ -750,8 +810,8 @@ mod tests {
         );
         // A genuinely unknown sub-token is still `Unknown`, not a gate report.
         assert_eq!(
-            parse_line("go searchmoves 7g7f"),
-            unknown("go searchmoves 7g7f")
+            parse_line(b"go searchmoves 7g7f"),
+            unknown(b"go searchmoves 7g7f")
         );
     }
 
@@ -761,10 +821,10 @@ mod tests {
     #[test]
     fn tt_is_not_a_command_below_verbose3() {
         assert_eq!(
-            parse_line("tt probe startpos"),
-            unknown("tt probe startpos")
+            parse_line(b"tt probe startpos"),
+            unknown(b"tt probe startpos")
         );
-        assert_eq!(parse_line("tt"), unknown("tt"));
+        assert_eq!(parse_line(b"tt"), unknown(b"tt"));
     }
 
     /// At `verbose3`: `tt` splits into verbatim tokens for
@@ -773,21 +833,21 @@ mod tests {
     #[test]
     fn parses_tt_tokens_verbatim_at_verbose3() {
         assert_eq!(
-            parse_line("tt probe startpos"),
-            Command::Tt(vec!["probe".to_string(), "startpos".to_string()])
+            parse_line(b"tt probe startpos"),
+            Command::Tt(vec![&b"probe"[..], &b"startpos"[..]])
         );
-        assert_eq!(parse_line("tt"), Command::Tt(Vec::new()));
+        assert_eq!(parse_line(b"tt"), Command::Tt(Vec::new()));
     }
 
     #[test]
     fn empty_line_is_unknown_empty() {
-        assert_eq!(parse_line(""), unknown(""));
-        assert_eq!(parse_line("   \n"), unknown(""));
+        assert_eq!(parse_line(b""), unknown(b""));
+        assert_eq!(parse_line(b"   \n"), unknown(b""));
     }
 
     #[test]
     fn oversized_line_returns_too_long() {
-        let line = "x".repeat(MAX_LINE_BYTES + 1);
+        let line = vec![b'x'; MAX_LINE_BYTES + 1];
         assert_eq!(parse_line(&line), Command::TooLong);
     }
 
@@ -795,7 +855,7 @@ mod tests {
     #[test]
     fn line_at_max_size_is_parsed_normally() {
         // 64 KB exactly — still parses (becomes Unknown since it's not a command).
-        let line = "x".repeat(MAX_LINE_BYTES);
+        let line = vec![b'x'; MAX_LINE_BYTES];
         assert_eq!(parse_line(&line), unknown(&line));
     }
 }

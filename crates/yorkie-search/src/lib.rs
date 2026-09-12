@@ -18,10 +18,21 @@ pub mod history;
 pub mod movepick;
 pub mod qsearch;
 pub mod root;
+/// The text forms this crate's own unit tests read through.
+///
+/// The engine speaks bytes: an SFEN and a USI move are `&[u8]` everywhere it
+/// handles them. Fixtures and assertion messages here are written as text
+/// instead, so this is the one place a fixture becomes the bytes a parser takes
+/// and a rendered move or notice becomes a string an assertion can print.
+#[cfg(test)]
+mod text_str;
 pub mod timeman;
 pub mod update;
 
 pub use book::{BookConfig, BookHit, BookProbeResult, Prng, probe_book};
+// The book probe's diagnostic notices: only a build that prints them.
+#[cfg(feature = "verbose1")]
+pub use book::BookDiagnostic;
 // The book hit's per-candidate `info` lines: only a build that prints them.
 #[cfg(feature = "verbose2")]
 pub use book::BookInfoLine;
@@ -199,7 +210,9 @@ mod tests {
         FC_0_PADDED_INPUT_DIMS, HIDDEN_SIZE, HIDDEN1_DIMS, LAYER_STACKS, NUM_FEATURES,
         NetworkParams, OwnedNetwork, evaluate,
     };
-    use yorkie_state::{Move, Position, format_usi_move, parse_sfen};
+    use yorkie_state::{Move, Position};
+
+    use crate::text_str::{format_usi_move, parse_sfen};
     use yorkie_storage::LargePageArray;
 
     // --- HalfKA_hm2 feature-plane geometry (mirrors yorkie-eval's features.rs).

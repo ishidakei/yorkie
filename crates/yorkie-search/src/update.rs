@@ -445,7 +445,9 @@ mod tests {
         CAPTURE_HISTORY_D, CONTINUATION_HISTORY_D, CORRECTION_HISTORY_D, MAIN_HISTORY_D,
         PAWN_HISTORY_D, apply_gravity,
     };
-    use yorkie_state::{Move, PieceKind, Square, parse_sfen};
+    use yorkie_state::{Move, PieceKind, Square};
+
+    use crate::text_str::parse_sfen;
 
     // ---- NUMA placement surface -------------------------------------------
 

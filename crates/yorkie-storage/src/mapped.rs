@@ -37,10 +37,7 @@ pub unsafe fn map_file_onto(addr: usize, len: usize, path: &Path, offset: u64) -
     if size < offset + len as u64 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
-            format!(
-                "file holds {size} bytes, {} were asked for",
-                offset + len as u64
-            ),
+            "the file is shorter than the range asked for",
         ));
     }
     // SAFETY: forwarded to the caller, who owns the same obligation.

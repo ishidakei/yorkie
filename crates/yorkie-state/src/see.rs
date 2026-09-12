@@ -350,7 +350,7 @@ mod equivalence {
     use super::*;
     use crate::move_::Move;
     use crate::piece::PieceKind;
-    use crate::sfen::parse_sfen;
+    use crate::text::test_text::parse_sfen_str as parse_sfen;
 
     /// The perft fixtures plus the SEE unit-test seeds.
     const FIXTURE_SFENS: &[&str] = &[

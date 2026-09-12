@@ -10,7 +10,10 @@
 use std::path::PathBuf;
 
 use serde::Deserialize;
-use yorkie_state::{parse_sfen, sfen_pack};
+mod text_str;
+
+use text_str::parse_sfen;
+use yorkie_state::sfen_pack;
 use yorkie_storage::{Book, BookMove};
 
 fn fixture(rel: &str) -> PathBuf {

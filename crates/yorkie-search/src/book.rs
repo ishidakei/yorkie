@@ -14,6 +14,8 @@
 //! consumes an already-parsed [`BookConfig`] snapshot and an injectable
 //! [`Prng`] so selection is deterministic under test.
 
+#[cfg(feature = "verbose1")]
+use yorkie_state::TextWriter;
 use yorkie_state::{
     Color, Move, PackedSfen, Piece, PieceKind, Position, Square, flip_move16, sfen_pack,
 };
@@ -24,7 +26,7 @@ use yorkie_storage::{Book, BookMove};
 /// where there is no diagnostic — it is the unit type and none of the option-name
 /// literals is compiled.
 #[cfg(feature = "verbose1")]
-type OptionName = &'static str;
+type OptionName = &'static [u8];
 #[cfg(not(feature = "verbose1"))]
 type OptionName = ();
 
@@ -183,18 +185,18 @@ impl BookConfig {
     /// the name is what the info string reports.
     fn depth_limit_for(&self, stm: Color) -> (OptionName, i64) {
         match (self.book_options_v2, stm) {
-            (false, _) => (option_name!("BookDepthLimit"), self.depth_limit),
-            (true, Color::Black) => (option_name!("BookDepthBlackLimit"), self.depth_black_limit),
-            (true, Color::White) => (option_name!("BookDepthWhiteLimit"), self.depth_white_limit),
+            (false, _) => (option_name!(b"BookDepthLimit"), self.depth_limit),
+            (true, Color::Black) => (option_name!(b"BookDepthBlackLimit"), self.depth_black_limit),
+            (true, Color::White) => (option_name!(b"BookDepthWhiteLimit"), self.depth_white_limit),
         }
     }
 
     /// The eval-gap option actually consulted at the root, likewise.
     fn eval_diff_for(&self, stm: Color) -> (OptionName, i64) {
         match (self.book_options_v2, stm) {
-            (false, _) => (option_name!("BookEvalDiff"), self.eval_diff),
-            (true, Color::Black) => (option_name!("BookEvalBlackDiff"), self.eval_black_diff),
-            (true, Color::White) => (option_name!("BookEvalWhiteDiff"), self.eval_white_diff),
+            (false, _) => (option_name!(b"BookEvalDiff"), self.eval_diff),
+            (true, Color::Black) => (option_name!(b"BookEvalBlackDiff"), self.eval_black_diff),
+            (true, Color::White) => (option_name!(b"BookEvalWhiteDiff"), self.eval_white_diff),
         }
     }
 
@@ -202,9 +204,9 @@ impl BookConfig {
     /// (already side-to-move dependent under V1).
     fn eval_limit_for(&self, stm: Color) -> (OptionName, i64) {
         if stm == Color::Black {
-            (option_name!("BookEvalBlackLimit"), self.eval_black_limit)
+            (option_name!(b"BookEvalBlackLimit"), self.eval_black_limit)
         } else {
-            (option_name!("BookEvalWhiteLimit"), self.eval_white_limit)
+            (option_name!(b"BookEvalWhiteLimit"), self.eval_white_limit)
         }
     }
 }
@@ -243,18 +245,89 @@ pub struct BookHit {
     pub info_lines: Vec<BookInfoLine>,
 }
 
-/// The outcome of a probe: an optional hit plus any diagnostic `info string`
-/// bodies the reference would have emitted (illegal-entry, narrow-book, and
-/// eval/depth-filter notices). The driver prefixes each with `info string `.
+/// One thing a probe has to say about what it found — the illegal-entry,
+/// narrow-book and eval/depth-filter notices the reference emits.
+///
+/// A probe carries what happened rather than a composed sentence, and
+/// [`Self::write_message`] spells it; the driver prefixes the result with
+/// `info string `. They are the diagnostic surface itself, so a build that
+/// prints no diagnostic compiles neither this type nor the wording in it.
+#[cfg(feature = "verbose1")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BookDiagnostic {
+    /// A stored move fragment matched no legal move, so the book is not a
+    /// subset of what this position allows.
+    IllegalMoveInDb { move16: u16 },
+    /// `NarrowBook` dropped the moves under 10% adoption.
+    NarrowBook { before: usize, after: usize },
+    /// The depth floor cleared the whole entry.
+    BelowDepthLimit { option: OptionName },
+    /// The eval cutoffs dropped some of the moves.
+    EvalFiltered {
+        diff_option: OptionName,
+        diff: i64,
+        limit_option: OptionName,
+        limit: i64,
+        before: usize,
+        after: usize,
+    },
+}
+
+#[cfg(feature = "verbose1")]
+impl BookDiagnostic {
+    /// Append this notice's message to `out`.
+    pub fn write_message(&self, out: &mut TextWriter<'_>) {
+        match self {
+            Self::IllegalMoveInDb { move16 } => {
+                out.bytes(b"Error! : Illegal Move In Book DB : move16 = 0x")
+                    .hex_padded(u64::from(*move16), 4);
+            }
+            Self::NarrowBook { before, after } => {
+                out.bytes(b"NarrowBook : ")
+                    .u64(*before as u64)
+                    .bytes(b" moves to ")
+                    .u64(*after as u64)
+                    .bytes(b" moves.");
+            }
+            Self::BelowDepthLimit { option } => {
+                out.bytes(option)
+                    .bytes(b" is lower than the depth of this node.");
+            }
+            Self::EvalFiltered {
+                diff_option,
+                diff,
+                limit_option,
+                limit,
+                before,
+                after,
+            } => {
+                out.bytes(diff_option)
+                    .bytes(b" = ")
+                    .i64(*diff)
+                    .bytes(b" , ")
+                    .bytes(limit_option)
+                    .bytes(b" = ")
+                    .i64(*limit)
+                    .bytes(b" , ")
+                    .u64(*before as u64)
+                    .bytes(b" moves to ")
+                    .u64(*after as u64)
+                    .bytes(b" moves.");
+            }
+        }
+    }
+}
+
+/// The outcome of a probe: an optional hit plus anything the probe has to say
+/// about what it found.
 #[derive(Clone, Debug, Default)]
 pub struct BookProbeResult {
     /// The chosen move, or `None` on a miss.
     pub hit: Option<BookHit>,
-    /// Diagnostic message bodies to surface as `info string` lines. They are the
-    /// diagnostic surface itself, so a build that prints no diagnostic neither
-    /// collects nor composes them.
+    /// What the probe has to say, in the order it found it out. A build that
+    /// prints no diagnostic neither collects nor composes any.
     #[cfg(feature = "verbose1")]
-    pub diagnostics: Vec<String>,
+    pub diagnostics: Vec<BookDiagnostic>,
 }
 
 /// A book move already widened to a legal [`Move`], carrying its stored stats.
@@ -318,10 +391,9 @@ pub fn probe_book(
                 count: bm.count,
             }),
             #[cfg(feature = "verbose1")]
-            None => result.diagnostics.push(format!(
-                "Error! : Illegal Move In Book DB : move16 = 0x{:04x}",
-                bm.move16
-            )),
+            None => result
+                .diagnostics
+                .push(BookDiagnostic::IllegalMoveInDb { move16: bm.move16 }),
             // The entry is dropped either way; only the report is gated.
             #[cfg(not(feature = "verbose1"))]
             None => {}
@@ -346,10 +418,10 @@ pub fn probe_book(
         candidates.retain(|c| f64::from(c.count) / move_count_total as f64 >= 0.1);
         #[cfg(feature = "verbose1")]
         if candidates.len() != before {
-            result.diagnostics.push(format!(
-                "NarrowBook : {before} moves to {} moves.",
-                candidates.len()
-            ));
+            result.diagnostics.push(BookDiagnostic::NarrowBook {
+                before,
+                after: candidates.len(),
+            });
         }
     }
     if candidates.is_empty() {
@@ -369,9 +441,9 @@ pub fn probe_book(
     let (_, depth_limit) = config.depth_limit_for(stm);
     if depth_limit != 0 && i64::from(candidates[0].depth) < depth_limit {
         #[cfg(feature = "verbose1")]
-        result.diagnostics.push(format!(
-            "{depth_limit_name} is lower than the depth of this node."
-        ));
+        result.diagnostics.push(BookDiagnostic::BelowDepthLimit {
+            option: depth_limit_name,
+        });
         candidates.clear();
     } else {
         let best_value = i64::from(candidates[0].value);
@@ -390,10 +462,14 @@ pub fn probe_book(
         candidates.retain(|c| i64::from(c.value) >= value_limit);
         #[cfg(feature = "verbose1")]
         if candidates.len() != before {
-            result.diagnostics.push(format!(
-                "{eval_diff_name} = {eval_diff} , {limit_name} = {value_limit2} , {before} moves to {} moves.",
-                candidates.len()
-            ));
+            result.diagnostics.push(BookDiagnostic::EvalFiltered {
+                diff_option: eval_diff_name,
+                diff: eval_diff,
+                limit_option: limit_name,
+                limit: value_limit2,
+                before,
+                after: candidates.len(),
+            });
         }
     }
     if candidates.is_empty() {
@@ -614,7 +690,7 @@ fn flipped_packed(pos: &Position) -> PackedSfen {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yorkie_state::{parse_sfen, parse_usi_move};
+    use crate::text_str::{parse_sfen, parse_usi_move};
 
     // Two independently constructed entropy-seeded streams differ (the time /
     // address / counter mix), mirroring the reference's per-process `PRNG()` seed.
@@ -754,7 +830,13 @@ mod tests {
     }
 
     fn usi(m: Move) -> String {
-        yorkie_state::format_usi_move(m)
+        crate::text_str::format_usi_move(m)
+    }
+
+    /// One diagnostic's message, so an assertion can read it as text.
+    #[cfg(feature = "verbose1")]
+    fn message(diagnostic: &BookDiagnostic) -> String {
+        crate::text_str::book_diagnostic_message(diagnostic)
     }
 
     /// A one-element priority list: the single-loaded-book shape.
@@ -848,21 +930,21 @@ mod tests {
     #[test]
     fn v2_resolves_option_names_by_side_to_move() {
         let v1 = cfg();
-        assert_eq!(v1.depth_limit_for(Color::Black).0, "BookDepthLimit");
-        assert_eq!(v1.depth_limit_for(Color::White).0, "BookDepthLimit");
-        assert_eq!(v1.eval_diff_for(Color::Black).0, "BookEvalDiff");
-        assert_eq!(v1.eval_diff_for(Color::White).0, "BookEvalDiff");
+        assert_eq!(v1.depth_limit_for(Color::Black).0, b"BookDepthLimit");
+        assert_eq!(v1.depth_limit_for(Color::White).0, b"BookDepthLimit");
+        assert_eq!(v1.eval_diff_for(Color::Black).0, b"BookEvalDiff");
+        assert_eq!(v1.eval_diff_for(Color::White).0, b"BookEvalDiff");
 
         let v2 = cfg_v2();
-        assert_eq!(v2.depth_limit_for(Color::Black).0, "BookDepthBlackLimit");
-        assert_eq!(v2.depth_limit_for(Color::White).0, "BookDepthWhiteLimit");
-        assert_eq!(v2.eval_diff_for(Color::Black).0, "BookEvalBlackDiff");
-        assert_eq!(v2.eval_diff_for(Color::White).0, "BookEvalWhiteDiff");
+        assert_eq!(v2.depth_limit_for(Color::Black).0, b"BookDepthBlackLimit");
+        assert_eq!(v2.depth_limit_for(Color::White).0, b"BookDepthWhiteLimit");
+        assert_eq!(v2.eval_diff_for(Color::Black).0, b"BookEvalBlackDiff");
+        assert_eq!(v2.eval_diff_for(Color::White).0, b"BookEvalWhiteDiff");
 
         // The eval FLOOR is already per-side under V1 and unchanged under V2.
         for c in [&v1, &v2] {
-            assert_eq!(c.eval_limit_for(Color::Black).0, "BookEvalBlackLimit");
-            assert_eq!(c.eval_limit_for(Color::White).0, "BookEvalWhiteLimit");
+            assert_eq!(c.eval_limit_for(Color::Black).0, b"BookEvalBlackLimit");
+            assert_eq!(c.eval_limit_for(Color::White).0, b"BookEvalWhiteLimit");
         }
     }
 
@@ -904,7 +986,8 @@ mod tests {
         assert!(
             r.diagnostics
                 .iter()
-                .any(|d| d.starts_with("BookEvalBlackDiff = 0 , BookEvalBlackLimit = ")),
+                .map(message)
+                .any(|d| { d.starts_with("BookEvalBlackDiff = 0 , BookEvalBlackLimit = ") }),
             "expected a BookEvalBlackDiff notice, got {:?}",
             r.diagnostics
         );
@@ -937,7 +1020,8 @@ mod tests {
         assert!(
             r.diagnostics
                 .iter()
-                .any(|d| d.starts_with("BookEvalWhiteDiff = 0 , BookEvalWhiteLimit = ")),
+                .map(message)
+                .any(|d| { d.starts_with("BookEvalWhiteDiff = 0 , BookEvalWhiteLimit = ") }),
             "expected a BookEvalWhiteDiff notice, got {:?}",
             r.diagnostics
         );
@@ -973,6 +1057,7 @@ mod tests {
         assert!(
             r.diagnostics
                 .iter()
+                .map(message)
                 .any(|d| d == "BookDepthBlackLimit is lower than the depth of this node."),
             "expected a BookDepthBlackLimit notice, got {:?}",
             r.diagnostics
@@ -996,6 +1081,7 @@ mod tests {
         assert!(
             r.diagnostics
                 .iter()
+                .map(message)
                 .any(|d| d == "BookDepthWhiteLimit is lower than the depth of this node."),
             "expected a BookDepthWhiteLimit notice, got {:?}",
             r.diagnostics
@@ -1192,7 +1278,10 @@ mod tests {
         assert_eq!(usi(hit.best), "7g7f");
         #[cfg(feature = "verbose1")]
         assert!(
-            r.diagnostics.iter().any(|d| d.contains("Illegal Move")),
+            r.diagnostics
+                .iter()
+                .map(message)
+                .any(|d| d.contains("Illegal Move")),
             "expected an illegal-move diagnostic, got {:?}",
             r.diagnostics
         );
@@ -1299,7 +1388,10 @@ mod tests {
             p.do_move(parse_usi_move("7g7f", &p).unwrap());
             p
         };
-        let after_sfen = yorkie_state::format_sfen(&after);
+        let mut sfen_buf = yorkie_state::SfenBuf::new();
+        let after_sfen =
+            String::from_utf8(yorkie_state::format_sfen(&after, &mut sfen_buf).to_vec())
+                .expect("an SFEN is ASCII");
         let recs = vec![
             (
                 sfen_pack(&pos(STARTPOS_B)),

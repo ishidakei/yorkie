@@ -10,7 +10,10 @@ use std::path::PathBuf;
 
 use yorkie_eval::{NetworkParams, evaluate};
 use yorkie_search::{NullInfoSink, Search, SearchLimits};
-use yorkie_state::{Move, Position, parse_sfen};
+mod text_str;
+
+use text_str::parse_sfen;
+use yorkie_state::{Move, Position};
 
 fn nn_bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../eval/nn.bin")

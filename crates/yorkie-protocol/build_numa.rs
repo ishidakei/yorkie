@@ -7,10 +7,21 @@
 // takes as a build dependency, while the other crates reading the same config do
 // not.
 
-use yorkie_numa::{NumaLayout, format_cpu_list, machine_sysfs_options};
+use yorkie_numa::{NumaLayout, machine_sysfs_options};
 
 /// The sysfs root a build reads the machine from.
 const SYSFS_ROOT: &str = "/sys";
+
+/// A CPU list in the shortened sysfs form, as the string this script renders
+/// into the generated items.
+///
+/// `yorkie_numa` hands the list over as byte fragments, because the engine
+/// composes it into a buffer it owns; a build script is free to gather them.
+fn format_cpu_list(cpus: impl IntoIterator<Item = usize>) -> String {
+    let mut out = Vec::new();
+    yorkie_numa::write_cpu_list(cpus, |fragment| out.extend_from_slice(fragment));
+    String::from_utf8(out).expect("a CPU list is ASCII")
+}
 
 /// The machine this build runs on, or the reason it cannot be read.
 ///
@@ -19,7 +30,11 @@ const SYSFS_ROOT: &str = "/sys";
 /// confined to part of it still yields the layout of the whole; a *run* so
 /// confined is what the engine's startup check catches.
 fn building_machine() -> Result<yorkie_numa::SysfsOptions, String> {
-    machine_sysfs_options(Path::new(SYSFS_ROOT))
+    machine_sysfs_options(Path::new(SYSFS_ROOT)).map_err(|e| {
+        let mut out = Vec::new();
+        e.write_message(|fragment| out.extend_from_slice(fragment));
+        String::from_utf8(out).expect("a refusal is ASCII")
+    })
 }
 
 /// Resolve the building machine's NUMA layout, and render it.

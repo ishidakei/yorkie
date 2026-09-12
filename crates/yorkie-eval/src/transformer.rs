@@ -291,7 +291,9 @@ pub(crate) fn apply_diff(
 mod tests {
     use super::*;
     use crate::types::OwnedNetwork;
-    use yorkie_state::{Move, PieceKind, format_usi_move, parse_sfen, parse_usi_move};
+    use yorkie_state::{Move, PieceKind};
+
+    use crate::text_str::{format_usi_move, parse_sfen, parse_usi_move};
 
     const STARTPOS: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
     const HALF: usize = HIDDEN_SIZE / 2;

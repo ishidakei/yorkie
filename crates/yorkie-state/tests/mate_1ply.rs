@@ -5,9 +5,12 @@
 //! mate in one, that repeated calls agree, and — against a vacuously sound
 //! "always `None`" — that hand-built head mates make it fire.
 
-use yorkie_state::move_::{Move, format_usi_move};
+mod text_str;
+
+use yorkie_state::move_::Move;
 use yorkie_state::position::{Position, Undo};
-use yorkie_state::sfen::parse_sfen;
+
+use text_str::{format_usi_move, parse_sfen};
 
 /// The perft-fixture SFENs.
 const FIXTURE_SFENS: &[&str] = &[

@@ -23,13 +23,13 @@
 //! `Gold` between `Silver` and `Bishop` — so `PIECE_KIND_TO_REF` and its
 //! inverse `REF_TO_PIECE_KIND` translate between them.
 
-use core::fmt;
 use core::num::{NonZeroU16, NonZeroU32};
 
 use crate::color::Color;
 use crate::piece::{Piece, PieceKind};
 use crate::position::Position;
 use crate::square::Square;
+use crate::text::TextWriter;
 
 /// Reference flag: drop (`MOVE_DROP`).
 const FLAG_DROP: u32 = 1 << 14;
@@ -305,16 +305,15 @@ pub const fn flip_move16(m: u16) -> u16 {
     }
 }
 
-/// Parse a USI move string such as `7g7f`, `8h2b+` or `P*5e` into a [`Move`].
+/// Parse a USI move's text such as `7g7f`, `8h2b+` or `P*5e` into a [`Move`].
 ///
 /// USI files run `1..=9` with file `1` on the right from Black's view, and
 /// ranks `a..=i` with rank `a` at the top; internal coordinates are both
 /// zero-based, matching the SFEN parser in [`crate::sfen`].
 ///
 /// `pos` supplies the moving piece and the side to move. Legality is the
-/// caller's concern: this only decodes a syntactically well-formed string.
-pub fn parse_usi_move(s: &str, pos: &Position) -> Result<Move, UsiMoveParseError> {
-    let bytes = s.as_bytes();
+/// caller's concern: this only decodes syntactically well-formed text.
+pub fn parse_usi_move(bytes: &[u8], pos: &Position) -> Result<Move, UsiMoveParseError> {
     if bytes.is_empty() {
         return Err(UsiMoveParseError::Empty);
     }
@@ -334,7 +333,7 @@ pub fn parse_usi_move(s: &str, pos: &Position) -> Result<Move, UsiMoveParseError
     let promote = match bytes.get(4) {
         None => false,
         Some(b'+') => true,
-        Some(&c) => return Err(UsiMoveParseError::InvalidPromotionMarker(c as char)),
+        Some(&b) => return Err(UsiMoveParseError::InvalidPromotionMarker(b)),
     };
 
     let piece = pos
@@ -359,7 +358,7 @@ pub const MAX_USI_MOVE_LEN: usize = 5;
 ///
 /// The text of a move is at most [`MAX_USI_MOVE_LEN`] bytes wide, so a caller
 /// that needs it only for as long as it takes to write it out borrows those
-/// bytes from here rather than taking a `String` per move.
+/// bytes from here rather than owning a buffer per move.
 pub struct UsiMoveBuf {
     bytes: [u8; MAX_USI_MOVE_LEN],
     len: usize,
@@ -373,16 +372,19 @@ impl UsiMoveBuf {
         }
     }
 
-    /// Write `m` into this buffer and return the text — [`format_usi_move`]
-    /// without the `String`, with the same behaviour on a non-move sentinel.
+    /// Write `m` into this buffer and return the text — the inverse of
+    /// [`parse_usi_move`].
+    ///
+    /// Behaviour on a non-move sentinel is unspecified: those values encode no
+    /// square or piece in the layout this decodes.
     ///
     /// # Panics
     /// Panics on a king drop, which USI has no notation for.
-    pub fn format(&mut self, m: Move) -> &str {
+    pub fn format(&mut self, m: Move) -> &[u8] {
         self.len = 0;
         if m.is_drop() {
             self.push(drop_letter(m.dropped_piece_kind()));
-            self.push('*');
+            self.push(b'*');
         } else {
             let from = m.from_sq();
             self.push(file_to_usi(from.file()));
@@ -394,16 +396,13 @@ impl UsiMoveBuf {
         // A drop is never a promotion, and `is_promote` reads a bit the drop
         // encoding uses for something else.
         if !m.is_drop() && m.is_promote() {
-            self.push('+');
+            self.push(b'+');
         }
-        // Every byte written above is one of the ASCII characters the two
-        // digit-and-letter mappings and the two markers produce.
-        core::str::from_utf8(&self.bytes[..self.len]).expect("composed of ASCII characters")
+        &self.bytes[..self.len]
     }
 
-    fn push(&mut self, c: char) {
-        debug_assert!(c.is_ascii(), "USI move text is ASCII");
-        self.bytes[self.len] = c as u8;
+    fn push(&mut self, byte: u8) {
+        self.bytes[self.len] = byte;
         self.len += 1;
     }
 }
@@ -414,50 +413,51 @@ impl Default for UsiMoveBuf {
     }
 }
 
-/// Format a [`Move`] as a USI move string — the inverse of [`parse_usi_move`].
+/// Append `m`'s USI text to `out`, for a caller composing a longer line — a PV,
+/// a `bestmove` reply — around it.
 ///
-/// Behaviour on a non-move sentinel is unspecified: those values encode no
-/// square or piece in the layout this decodes.
-pub fn format_usi_move(m: Move) -> String {
+/// # Panics
+/// Panics on a king drop, as [`UsiMoveBuf::format`] does.
+pub fn write_usi_move(m: Move, out: &mut TextWriter<'_>) {
     let mut buf = UsiMoveBuf::new();
-    buf.format(m).to_string()
+    out.bytes(buf.format(m));
 }
 
-fn drop_letter(kind: PieceKind) -> char {
+fn drop_letter(kind: PieceKind) -> u8 {
     match kind {
-        PieceKind::Pawn => 'P',
-        PieceKind::Lance => 'L',
-        PieceKind::Knight => 'N',
-        PieceKind::Silver => 'S',
-        PieceKind::Gold => 'G',
-        PieceKind::Bishop => 'B',
-        PieceKind::Rook => 'R',
+        PieceKind::Pawn => b'P',
+        PieceKind::Lance => b'L',
+        PieceKind::Knight => b'N',
+        PieceKind::Silver => b'S',
+        PieceKind::Gold => b'G',
+        PieceKind::Bishop => b'B',
+        PieceKind::Rook => b'R',
         // USI has no king-drop notation, and movegen never produces one, so
         // treating this as malformed input would mask a bug.
-        PieceKind::King => panic!("format_usi_move: King drops have no USI representation"),
+        PieceKind::King => panic!("a King drop has no USI representation"),
     }
 }
 
-fn file_to_usi(file: u8) -> char {
+fn file_to_usi(file: u8) -> u8 {
     debug_assert!(file < Square::FILES, "file out of range");
-    (b'1' + file) as char
+    b'1' + file
 }
 
-fn rank_to_usi(rank: u8) -> char {
+fn rank_to_usi(rank: u8) -> u8 {
     debug_assert!(rank < Square::RANKS, "rank out of range");
-    (b'a' + rank) as char
+    b'a' + rank
 }
 
 fn parse_square(file_byte: u8, rank_byte: u8) -> Result<Square, UsiMoveParseError> {
     if !(b'1'..=b'9').contains(&file_byte) {
-        return Err(UsiMoveParseError::InvalidFile(file_byte as char));
+        return Err(UsiMoveParseError::InvalidFile(file_byte));
     }
     if !(b'a'..=b'i').contains(&rank_byte) {
-        return Err(UsiMoveParseError::InvalidRank(rank_byte as char));
+        return Err(UsiMoveParseError::InvalidRank(rank_byte));
     }
     let file = file_byte - b'1';
     let rank = rank_byte - b'a';
-    Square::new(file, rank).ok_or(UsiMoveParseError::InvalidFile(file_byte as char))
+    Square::new(file, rank).ok_or(UsiMoveParseError::InvalidFile(file_byte))
 }
 
 fn parse_drop_piece(byte: u8) -> Result<PieceKind, UsiMoveParseError> {
@@ -469,7 +469,7 @@ fn parse_drop_piece(byte: u8) -> Result<PieceKind, UsiMoveParseError> {
         b'G' => Ok(PieceKind::Gold),
         b'B' => Ok(PieceKind::Bishop),
         b'R' => Ok(PieceKind::Rook),
-        c => Err(UsiMoveParseError::InvalidDropPiece(c as char)),
+        other => Err(UsiMoveParseError::InvalidDropPiece(other)),
     }
 }
 
@@ -477,34 +477,49 @@ fn parse_drop_piece(byte: u8) -> Result<PieceKind, UsiMoveParseError> {
 pub enum UsiMoveParseError {
     Empty,
     InvalidLength(usize),
-    InvalidFile(char),
-    InvalidRank(char),
-    InvalidDropPiece(char),
-    InvalidPromotionMarker(char),
+    InvalidFile(u8),
+    InvalidRank(u8),
+    InvalidDropPiece(u8),
+    InvalidPromotionMarker(u8),
     EmptyFromSquare,
     PromoteAlreadyPromoted,
 }
 
-impl fmt::Display for UsiMoveParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl UsiMoveParseError {
+    /// This error's message, as the bytes a diagnostic line carries. An input
+    /// byte is quoted the way [`TextWriter::quoted_byte`] quotes one.
+    pub fn write_message(&self, out: &mut TextWriter<'_>) {
+        out.bytes(b"usi-move: ");
         match self {
-            Self::Empty => f.write_str("usi-move: empty input"),
-            Self::InvalidLength(n) => write!(f, "usi-move: invalid length {n} (expected 4 or 5)"),
-            Self::InvalidFile(c) => write!(f, "usi-move: invalid file {c:?}"),
-            Self::InvalidRank(c) => write!(f, "usi-move: invalid rank {c:?}"),
-            Self::InvalidDropPiece(c) => write!(f, "usi-move: invalid drop piece {c:?}"),
-            Self::InvalidPromotionMarker(c) => {
-                write!(f, "usi-move: invalid promotion marker {c:?}")
+            Self::Empty => {
+                out.bytes(b"empty input");
             }
-            Self::EmptyFromSquare => f.write_str("usi-move: from-square is empty on the board"),
+            Self::InvalidLength(n) => {
+                out.bytes(b"invalid length ")
+                    .u64(*n as u64)
+                    .bytes(b" (expected 4 or 5)");
+            }
+            Self::InvalidFile(b) => {
+                out.bytes(b"invalid file ").quoted_byte(*b);
+            }
+            Self::InvalidRank(b) => {
+                out.bytes(b"invalid rank ").quoted_byte(*b);
+            }
+            Self::InvalidDropPiece(b) => {
+                out.bytes(b"invalid drop piece ").quoted_byte(*b);
+            }
+            Self::InvalidPromotionMarker(b) => {
+                out.bytes(b"invalid promotion marker ").quoted_byte(*b);
+            }
+            Self::EmptyFromSquare => {
+                out.bytes(b"from-square is empty on the board");
+            }
             Self::PromoteAlreadyPromoted => {
-                f.write_str("usi-move: cannot promote an already-promoted piece")
+                out.bytes(b"cannot promote an already-promoted piece");
             }
         }
     }
 }
-
-impl std::error::Error for UsiMoveParseError {}
 
 #[cfg(test)]
 mod tests {
@@ -900,7 +915,8 @@ mod tests {
 
     mod parse_usi_move {
         use super::*;
-        use crate::sfen::{STARTPOS_SFEN, parse_sfen};
+        use crate::sfen::STARTPOS_SFEN;
+        use crate::text::test_text::parse_sfen_str as parse_sfen;
 
         const SENNICHITE_SFEN: &str = "9/4k4/9/9/9/9/9/4K4/9 b 9P9p 1";
 
@@ -908,7 +924,7 @@ mod tests {
         fn board_move_no_promotion_matches_make() {
             // 7g7f from startpos: Black pawn (file 6, rank 6) → (file 6, rank 5).
             let pos = parse_sfen(STARTPOS_SFEN).unwrap();
-            let parsed = parse_usi_move("7g7f", &pos).unwrap();
+            let parsed = parse_usi_move(b"7g7f", &pos).unwrap();
             let expected = Move::make(
                 Square::new(6, 6).unwrap(),
                 Square::new(6, 5).unwrap(),
@@ -922,7 +938,7 @@ mod tests {
         fn sennichite_king_shuffle_parses() {
             // 5h4h: Black king at internal (4, 7) → (3, 7).
             let pos = parse_sfen(SENNICHITE_SFEN).unwrap();
-            let parsed = parse_usi_move("5h4h", &pos).unwrap();
+            let parsed = parse_usi_move(b"5h4h", &pos).unwrap();
             let expected = Move::make(
                 Square::new(4, 7).unwrap(),
                 Square::new(3, 7).unwrap(),
@@ -935,7 +951,7 @@ mod tests {
         fn promote_parses_and_round_trips() {
             // 8h2b+: Black bishop (7,7) → (1,1), promotes to horse.
             let pos = parse_sfen(STARTPOS_SFEN).unwrap();
-            let parsed = parse_usi_move("8h2b+", &pos).unwrap();
+            let parsed = parse_usi_move(b"8h2b+", &pos).unwrap();
             assert!(parsed.is_promote());
             assert!(!parsed.is_drop());
             assert_eq!(parsed.from_sq(), Square::new(7, 7).unwrap());
@@ -950,7 +966,7 @@ mod tests {
         fn drop_uses_side_to_move_color() {
             // P*5e on Black-to-move sennichite SFEN → black pawn drop at (4, 4).
             let pos = parse_sfen(SENNICHITE_SFEN).unwrap();
-            let parsed = parse_usi_move("P*5e", &pos).unwrap();
+            let parsed = parse_usi_move(b"P*5e", &pos).unwrap();
             assert!(parsed.is_drop());
             assert_eq!(parsed.to_sq(), Square::new(4, 4).unwrap());
             assert_eq!(parsed.dropped_piece_kind(), PieceKind::Pawn);
@@ -962,25 +978,25 @@ mod tests {
             // Same SFEN but flip side-to-move → drop encodes as white.
             let mut pos = parse_sfen(SENNICHITE_SFEN).unwrap();
             pos.set_side_to_move(Color::White);
-            let parsed = parse_usi_move("P*5e", &pos).unwrap();
+            let parsed = parse_usi_move(b"P*5e", &pos).unwrap();
             assert_eq!(parsed.moved_piece_after().color, Color::White);
         }
 
         #[test]
         fn empty_input_errors() {
             let pos = parse_sfen(STARTPOS_SFEN).unwrap();
-            assert_eq!(parse_usi_move("", &pos), Err(UsiMoveParseError::Empty));
+            assert_eq!(parse_usi_move(b"", &pos), Err(UsiMoveParseError::Empty));
         }
 
         #[test]
         fn wrong_length_errors() {
             let pos = parse_sfen(STARTPOS_SFEN).unwrap();
             assert_eq!(
-                parse_usi_move("7g7", &pos),
+                parse_usi_move(b"7g7", &pos),
                 Err(UsiMoveParseError::InvalidLength(3))
             );
             assert_eq!(
-                parse_usi_move("7g7f7f", &pos),
+                parse_usi_move(b"7g7f7f", &pos),
                 Err(UsiMoveParseError::InvalidLength(6))
             );
         }
@@ -989,12 +1005,12 @@ mod tests {
         fn invalid_file_or_rank_errors() {
             let pos = parse_sfen(STARTPOS_SFEN).unwrap();
             assert_eq!(
-                parse_usi_move("0a1a", &pos),
-                Err(UsiMoveParseError::InvalidFile('0'))
+                parse_usi_move(b"0a1a", &pos),
+                Err(UsiMoveParseError::InvalidFile(b'0'))
             );
             assert_eq!(
-                parse_usi_move("1j1a", &pos),
-                Err(UsiMoveParseError::InvalidRank('j'))
+                parse_usi_move(b"1j1a", &pos),
+                Err(UsiMoveParseError::InvalidRank(b'j'))
             );
         }
 
@@ -1002,8 +1018,8 @@ mod tests {
         fn fifth_byte_must_be_plus() {
             let pos = parse_sfen(STARTPOS_SFEN).unwrap();
             assert_eq!(
-                parse_usi_move("7g7fx", &pos),
-                Err(UsiMoveParseError::InvalidPromotionMarker('x'))
+                parse_usi_move(b"7g7fx", &pos),
+                Err(UsiMoveParseError::InvalidPromotionMarker(b'x'))
             );
         }
 
@@ -1012,7 +1028,7 @@ mod tests {
             // 5e5d on startpos: (4, 4) is empty.
             let pos = parse_sfen(STARTPOS_SFEN).unwrap();
             assert_eq!(
-                parse_usi_move("5e5d", &pos),
+                parse_usi_move(b"5e5d", &pos),
                 Err(UsiMoveParseError::EmptyFromSquare)
             );
         }
@@ -1023,7 +1039,7 @@ mod tests {
             let sfen = "9/9/9/9/9/9/9/1+B6K/9 b - 1";
             let pos = parse_sfen(sfen).unwrap();
             assert_eq!(
-                parse_usi_move("8h2b+", &pos),
+                parse_usi_move(b"8h2b+", &pos),
                 Err(UsiMoveParseError::PromoteAlreadyPromoted)
             );
         }
@@ -1032,15 +1048,16 @@ mod tests {
         fn invalid_drop_piece_errors() {
             let pos = parse_sfen(STARTPOS_SFEN).unwrap();
             assert_eq!(
-                parse_usi_move("K*5e", &pos),
-                Err(UsiMoveParseError::InvalidDropPiece('K'))
+                parse_usi_move(b"K*5e", &pos),
+                Err(UsiMoveParseError::InvalidDropPiece(b'K'))
             );
         }
     }
 
     mod format_usi_move {
         use super::*;
-        use crate::sfen::{STARTPOS_SFEN, parse_sfen};
+        use crate::sfen::STARTPOS_SFEN;
+        use crate::text::test_text::{format_usi_move, parse_sfen_str as parse_sfen};
 
         const SENNICHITE_SFEN: &str = "9/4k4/9/9/9/9/9/4K4/9 b 9P9p 1";
         const ALL_DROPS_SFEN: &str = "9/4k4/9/9/9/9/9/4K4/9 b RBGSNLP 1";
@@ -1048,21 +1065,21 @@ mod tests {
         #[test]
         fn board_move_at_startpos_round_trips() {
             let pos = parse_sfen(STARTPOS_SFEN).unwrap();
-            let m = parse_usi_move("7g7f", &pos).unwrap();
+            let m = parse_usi_move(b"7g7f", &pos).unwrap();
             assert_eq!(format_usi_move(m), "7g7f");
         }
 
         #[test]
         fn promotion_round_trips() {
             let pos = parse_sfen(STARTPOS_SFEN).unwrap();
-            let m = parse_usi_move("8h2b+", &pos).unwrap();
+            let m = parse_usi_move(b"8h2b+", &pos).unwrap();
             assert_eq!(format_usi_move(m), "8h2b+");
         }
 
         #[test]
         fn pawn_drop_round_trips() {
             let pos = parse_sfen(SENNICHITE_SFEN).unwrap();
-            let m = parse_usi_move("P*5e", &pos).unwrap();
+            let m = parse_usi_move(b"P*5e", &pos).unwrap();
             assert_eq!(format_usi_move(m), "P*5e");
         }
 
@@ -1080,7 +1097,7 @@ mod tests {
                 let s = format_usi_move(*m);
                 let letter = s.chars().next().unwrap();
                 seen_letters.insert(letter);
-                let reparsed = parse_usi_move(&s, &pos).unwrap();
+                let reparsed = parse_usi_move(s.as_bytes(), &pos).unwrap();
                 assert_eq!(reparsed, *m, "drop round-trip failed for {s}");
             }
             for expected in ['P', 'L', 'N', 'S', 'G', 'B', 'R'] {
@@ -1099,7 +1116,7 @@ mod tests {
             assert!(!moves.is_empty(), "startpos has legal moves");
             for m in moves {
                 let s = format_usi_move(m);
-                let reparsed = parse_usi_move(&s, &pos).unwrap();
+                let reparsed = parse_usi_move(s.as_bytes(), &pos).unwrap();
                 assert_eq!(reparsed, m, "round-trip failed for {s}");
             }
         }
@@ -1137,9 +1154,9 @@ mod tests {
                 Square::new(8, 8).unwrap(),
                 Piece::new(PieceKind::Pawn, Color::Black),
             );
-            assert_eq!(buf.format(promoting), "1a9i+");
-            assert_eq!(buf.format(parse_usi_move("P*5e", &pos).unwrap()), "P*5e");
-            assert_eq!(buf.format(promoting), "1a9i+");
+            assert_eq!(buf.format(promoting), b"1a9i+");
+            assert_eq!(buf.format(parse_usi_move(b"P*5e", &pos).unwrap()), b"P*5e");
+            assert_eq!(buf.format(promoting), b"1a9i+");
         }
 
         #[test]
@@ -1150,7 +1167,7 @@ mod tests {
             assert!(!moves.is_empty(), "the position has legal moves");
             let mut buf = UsiMoveBuf::new();
             for m in moves {
-                assert_eq!(buf.format(m), format_usi_move(m));
+                assert_eq!(buf.format(m), format_usi_move(m).as_bytes());
             }
         }
     }

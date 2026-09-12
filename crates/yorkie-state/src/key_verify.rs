@@ -270,7 +270,7 @@ fn composed_keys_match_maintained_keys() {
     // the recompute path.
     let sfens = [
         // Startpos, Black to move, empty hands.
-        crate::sfen::STARTPOS_SFEN,
+        "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
         // Promoted pieces of both colours on the board, Black to move.
         "+P+L+N+S1+p+l+n+s/9/9/9/4k4/9/9/9/4K4 b - 1",
         // Hand pieces for both colours (drops available), White to move.
@@ -279,7 +279,7 @@ fn composed_keys_match_maintained_keys() {
         "+r4+b2k/9/9/9/9/9/9/9/K3+R3+B b Gg5P 1",
     ];
     for sfen in sfens {
-        let pos = crate::sfen::parse_sfen(sfen).unwrap();
+        let pos = crate::text::test_text::parse_sfen_str(sfen).unwrap();
         assert_eq!(
             compose_key(&pos, &refs),
             pos.key(),
@@ -291,7 +291,7 @@ fn composed_keys_match_maintained_keys() {
     // recapture and a drop.
     let mut pos = crate::sfen::parse_sfen(crate::sfen::STARTPOS_SFEN).unwrap();
     for usi in ["7g7f", "3c3d", "8h2b+", "3a2b", "B*5e"] {
-        let mv = crate::move_::parse_usi_move(usi, &pos).unwrap();
+        let mv = crate::move_::parse_usi_move(usi.as_bytes(), &pos).unwrap();
         pos.do_move(mv);
         assert_eq!(
             compose_key(&pos, &refs),

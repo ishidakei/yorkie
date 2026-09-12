@@ -157,7 +157,7 @@ pub fn network_path_in(root: &Path, eval_dir: &str) -> PathBuf {
 /// out ahead of time saved.
 pub fn read_header(path: &Path) -> Result<Header, NnueError> {
     let mut file = File::open(path).map_err(|e| NnueError::Io {
-        path: path.display().to_string(),
+        path: path.to_path_buf(),
         source: e,
     })?;
     // The whole span before the data region: a header may grow into it without
@@ -171,7 +171,7 @@ pub fn read_header(path: &Path) -> Result<Header, NnueError> {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => {
                 return Err(NnueError::Io {
-                    path: path.display().to_string(),
+                    path: path.to_path_buf(),
                     source: e,
                 });
             }
@@ -283,7 +283,7 @@ fn regions_base() -> *const u8 {
 ///
 /// # Safety
 /// No search may still be reading region 0: its pages are replaced.
-pub unsafe fn map_shared(path: &Path) -> Result<Vec<String>, NnueError> {
+pub unsafe fn map_shared(path: &Path) -> Result<Vec<Vec<u8>>, NnueError> {
     let header = read_header(path)?;
     let (addr, _) = region_backing(0);
     // SAFETY: the region is this binary's own `REGION_BYTES` of storage, which
@@ -292,7 +292,7 @@ pub unsafe fn map_shared(path: &Path) -> Result<Vec<String>, NnueError> {
     let mapped =
         unsafe { yorkie_storage::map_file_onto(addr, DATA_BYTES, path, DATA_OFFSET as u64) }
             .map_err(|e| NnueError::Io {
-                path: path.display().to_string(),
+                path: path.to_path_buf(),
                 source: e,
             })?;
     if !mapped {
@@ -301,7 +301,7 @@ pub unsafe fn map_shared(path: &Path) -> Result<Vec<String>, NnueError> {
         // SAFETY: as the mapping above.
         unsafe { fill_region(addr, path)? };
     }
-    Ok(header.warnings)
+    Ok(warning_bytes(&header))
 }
 
 /// Copy the network at `path` into region `slot`.
@@ -313,12 +313,24 @@ pub unsafe fn map_shared(path: &Path) -> Result<Vec<String>, NnueError> {
 /// No search may still be reading region `slot`: the region is the process's
 /// only storage for that copy, so writing it again while something reads it
 /// would change parameters underneath a search.
-pub unsafe fn load_into_region(slot: usize, path: &Path) -> Result<Vec<String>, NnueError> {
+pub unsafe fn load_into_region(slot: usize, path: &Path) -> Result<Vec<Vec<u8>>, NnueError> {
     let header = read_header(path)?;
     let (addr, _) = region_backing(slot);
     // SAFETY: forwarded to the caller, who owns the same obligation.
     unsafe { fill_region(addr, path)? };
-    Ok(header.warnings)
+    Ok(warning_bytes(&header))
+}
+
+/// A header's complaints as the bytes a notice carries.
+///
+/// The wording is the file-format definition's, which is shared with the build
+/// script that writes the file; this is the one place it becomes bytes.
+fn warning_bytes(header: &Header) -> Vec<Vec<u8>> {
+    header
+        .warnings
+        .iter()
+        .map(|warning| warning.as_bytes().to_vec())
+        .collect()
 }
 
 /// Read the file's data region into the `DATA_BYTES` at `addr`.
@@ -332,11 +344,11 @@ unsafe fn fill_region(addr: usize, path: &Path) -> Result<(), NnueError> {
     // them.
     let target = unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, DATA_BYTES) };
     let mut file = File::open(path).map_err(|e| NnueError::Io {
-        path: path.display().to_string(),
+        path: path.to_path_buf(),
         source: e,
     })?;
     read_data_region(&mut file, target).map_err(|e| NnueError::Io {
-        path: path.display().to_string(),
+        path: path.to_path_buf(),
         source: e,
     })
 }

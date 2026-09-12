@@ -320,36 +320,36 @@ pub enum EnteringKingRule {
 impl EnteringKingRule {
     /// The `EKR_STRINGS` choice list in the reference's exact order — the `var`
     /// values of the `EnteringKingRule` combo option.
-    pub const STRINGS: [&'static str; 6] = [
-        "NoEnteringKing",
-        "CSARule24",
-        "CSARule24H",
-        "CSARule27",
-        "CSARule27H",
-        "TryRule",
+    pub const SPELLINGS: [&'static [u8]; 6] = [
+        b"NoEnteringKing",
+        b"CSARule24",
+        b"CSARule24H",
+        b"CSARule27",
+        b"CSARule27H",
+        b"TryRule",
     ];
 
-    /// Map an option string to its rule. An unrecognised string falls back to
-    /// [`EnteringKingRule::None`]; the config schema only accepts a declared
-    /// spelling, so the fallback is unreachable in practice.
+    /// Map an option spelling to its rule. An unrecognised spelling falls back
+    /// to [`EnteringKingRule::None`]; the config schema only accepts a declared
+    /// one, so the fallback is unreachable in practice.
     ///
     /// `const` because the rule the engine plays under is compiled in, and
     /// resolving it here is what lets the node-side check be the one branch of
     /// that rule.
-    pub const fn from_option(s: &str) -> Self {
-        // A `const fn` cannot `match` on a `&str`, so the choice list is walked
+    pub const fn from_option(s: &[u8]) -> Self {
+        // A `const fn` cannot `match` on a slice, so the choice list is walked
         // by byte comparison instead.
-        if str_eq(s, "NoEnteringKing") {
+        if bytes_eq(s, b"NoEnteringKing") {
             Self::None
-        } else if str_eq(s, "CSARule24") {
+        } else if bytes_eq(s, b"CSARule24") {
             Self::Point24
-        } else if str_eq(s, "CSARule24H") {
+        } else if bytes_eq(s, b"CSARule24H") {
             Self::Point24H
-        } else if str_eq(s, "CSARule27") {
+        } else if bytes_eq(s, b"CSARule27") {
             Self::Point27
-        } else if str_eq(s, "CSARule27H") {
+        } else if bytes_eq(s, b"CSARule27H") {
             Self::Point27H
-        } else if str_eq(s, "TryRule") {
+        } else if bytes_eq(s, b"TryRule") {
             Self::Try
         } else {
             Self::None
@@ -363,9 +363,8 @@ impl EnteringKingRule {
     }
 }
 
-/// Byte-wise `&str` equality, for [`EnteringKingRule::from_option`].
-const fn str_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
+/// Byte-wise equality, for [`EnteringKingRule::from_option`].
+const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -383,7 +382,7 @@ const fn str_eq(a: &str, b: &str) -> bool {
 /// build time. Every declaration check below branches on it, so the compiler
 /// keeps exactly the chosen rule's arm.
 pub const ENTERING_KING_RULE: EnteringKingRule =
-    EnteringKingRule::from_option(crate::config::ENTERING_KING_RULE);
+    EnteringKingRule::from_option(crate::config::ENTERING_KING_RULE.as_bytes());
 
 /// The compiled rule's per-side thresholds before any handicap adjustment —
 /// `Position::update_entering_point`'s starting pair, which for every rule but
@@ -620,8 +619,8 @@ fn king_adjacent(king_sq: Square, sq: Square) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text_str::parse_sfen;
     use std::collections::HashSet;
-    use yorkie_state::parse_sfen;
 
     fn pos(sfen: &str) -> Position {
         parse_sfen(sfen).expect("valid SFEN")
@@ -755,11 +754,15 @@ mod tests {
     fn each_declared_spelling_maps_to_its_own_rule() {
         use EnteringKingRule::*;
         const RULES: [EnteringKingRule; 6] = [None, Point24, Point24H, Point27, Point27H, Try];
-        for (s, rule) in EnteringKingRule::STRINGS.iter().zip(RULES) {
-            assert_eq!(EnteringKingRule::from_option(s), rule, "spelling `{s}`");
+        for (spelling, rule) in EnteringKingRule::SPELLINGS.iter().zip(RULES) {
+            assert_eq!(
+                EnteringKingRule::from_option(spelling),
+                rule,
+                "spelling {spelling:?}"
+            );
         }
         // An undeclared spelling cannot enable a declaration.
-        assert_eq!(EnteringKingRule::from_option("CSARule28"), None);
+        assert_eq!(EnteringKingRule::from_option(b"CSARule28"), None);
     }
 
     #[test]

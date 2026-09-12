@@ -22,7 +22,9 @@ mod common;
 
 use common::{StreamHarness, bestmove_lines, legal, parse, stage_configured_eval_dir};
 use yorkie_protocol::config;
-use yorkie_state::parse_usi_move;
+mod text_str;
+
+use text_str::parse_usi_move;
 
 /// Black to move with five legal moves: four king steps off 5i, and the pawn
 /// on 5h one square forward.

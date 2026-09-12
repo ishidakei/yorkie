@@ -538,7 +538,7 @@ pub(crate) fn is_uchifuzume_after_drop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sfen::parse_sfen;
+    use crate::text::test_text::parse_sfen_str as parse_sfen;
 
     fn legal_count(sfen: &str) -> usize {
         let pos = parse_sfen(sfen).unwrap();
@@ -556,7 +556,10 @@ mod tests {
 
     #[test]
     fn startpos_legal_move_count_is_30() {
-        assert_eq!(legal_count(crate::sfen::STARTPOS_SFEN), 30);
+        assert_eq!(
+            legal_count("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1"),
+            30
+        );
     }
 
     #[test]
@@ -1609,8 +1612,8 @@ mod king_lookup_equivalence {
     use crate::color::Color;
     use crate::move_::Move;
     use crate::piece::{Piece, PieceKind};
-    use crate::sfen::parse_sfen;
     use crate::square::Square;
+    use crate::text::test_text::parse_sfen_str as parse_sfen;
 
     const SFENS: &[&str] = &[
         "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",

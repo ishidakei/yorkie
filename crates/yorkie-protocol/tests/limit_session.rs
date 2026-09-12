@@ -26,7 +26,9 @@ use common::{
     stage_configured_eval_dir,
 };
 use yorkie_protocol::config;
-use yorkie_state::parse_usi_move;
+mod text_str;
+
+use text_str::parse_usi_move;
 
 const STARTPOS: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
 

@@ -635,8 +635,8 @@ impl MoveDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text_str::{parse_sfen, parse_usi_move};
     use std::collections::HashSet;
-    use yorkie_state::{parse_sfen, parse_usi_move};
 
     const STARTPOS: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
     // Sparse and hand-heavy: six board pieces and six held.

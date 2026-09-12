@@ -20,7 +20,10 @@ use proptest::test_runner::TestCaseResult;
 use yorkie_eval::{Accumulator, NetworkParams, Region, active_backend, evaluate, evaluate_with};
 
 mod common;
-use yorkie_state::{Color, Move, Position, Undo, format_usi_move, parse_sfen};
+mod text_str;
+
+use text_str::{format_usi_move, parse_sfen};
+use yorkie_state::{Color, Move, Position, Undo};
 
 /// Roots the random lines start from, covering the opening, check-evasion,
 /// drop-heavy, mid-game-tactical and promotion-zone shapes.

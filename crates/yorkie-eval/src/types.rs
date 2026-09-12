@@ -17,8 +17,9 @@
 //! FT layer is never called "L1". In the identifiers below, L1 is `fc_0`, L2 is
 //! `fc_1` and L3 is `fc_2`.
 
-use std::fmt;
+use std::path::PathBuf;
 
+use yorkie_state::TextWriter;
 #[cfg(any(test, feature = "source-network"))]
 use yorkie_storage::LargePageArray;
 
@@ -313,11 +314,16 @@ impl OwnedNetwork {
 }
 
 /// Errors returned when the engine's network cannot be read. Every variant
-/// carries a human-readable reason; nothing here panics on a malformed file.
+/// carries a reason a notice can name; nothing here panics on a malformed file.
+///
+/// The two `reason` fields carry the text the file-format definition produced.
+/// That definition is shared with the build script that writes the file, which
+/// is where its wording lives; the bytes of it are taken once, in
+/// [`Self::write_message`].
 #[derive(Debug)]
 pub enum NnueError {
     Io {
-        path: String,
+        path: PathBuf,
         source: std::io::Error,
     },
     SizeMismatch {
@@ -334,36 +340,43 @@ pub enum NnueError {
     NotLoaded,
 }
 
-impl fmt::Display for NnueError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl NnueError {
+    /// This error's message, as the bytes a notice carries.
+    ///
+    /// The operating system's own description of an I/O failure is the one
+    /// thing here that is not this project's text, and it arrives through
+    /// `std::io::Error`; its error number is named instead, so composing the
+    /// line needs no formatter.
+    pub fn write_message(&self, out: &mut TextWriter<'_>) {
         match self {
             NnueError::Io { path, source } => {
-                write!(f, "failed to open NNUE file {path}: {source}")
+                out.bytes(b"failed to open NNUE file ").path(path);
+                out.bytes(b": errno ");
+                match source.raw_os_error() {
+                    Some(errno) => out.i64(i64::from(errno)),
+                    None => out.bytes(b"unknown"),
+                };
             }
-            NnueError::SizeMismatch { expected, got } => write!(
-                f,
-                "NNUE file has unexpected size: expected {expected} bytes, got {got}"
-            ),
+            NnueError::SizeMismatch { expected, got } => {
+                out.bytes(b"NNUE file has unexpected size: expected ")
+                    .u64(*expected as u64)
+                    .bytes(b" bytes, got ")
+                    .u64(*got as u64);
+            }
             NnueError::InvalidFormat { reason } => {
-                write!(f, "NNUE file is malformed: {reason}")
+                out.bytes(b"NNUE file is malformed: ")
+                    .bytes(reason.as_bytes());
             }
-            NnueError::Mismatch { reason } => write!(
-                f,
-                "the evaluation file is not the one this build reads: {reason}"
-            ),
-            NnueError::NotLoaded => write!(
-                f,
-                "no NNUE network loaded; the engine reads one from the evaluation directory beside it"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for NnueError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            NnueError::Io { source, .. } => Some(source),
-            _ => None,
+            NnueError::Mismatch { reason } => {
+                out.bytes(b"the evaluation file is not the one this build reads: ")
+                    .bytes(reason.as_bytes());
+            }
+            NnueError::NotLoaded => {
+                out.bytes(
+                    b"no NNUE network loaded; the engine reads one from the evaluation \
+                      directory beside it",
+                );
+            }
         }
     }
 }
@@ -490,9 +503,18 @@ mod tests {
         assert_eq!(FC_2_PADDED_INPUT_DIMS, 32);
     }
 
+    /// An error's message as a string, for the assertions below.
+    fn message(err: &NnueError) -> String {
+        let mut bytes = [0u8; 512];
+        let mut out = TextWriter::new(&mut bytes);
+        err.write_message(&mut out);
+        assert!(!out.overflowed(), "a message fits the buffer");
+        String::from_utf8(out.as_bytes().to_vec()).expect("a message is ASCII")
+    }
+
     #[test]
     fn not_loaded_has_human_readable_message() {
-        let msg = format!("{}", NnueError::NotLoaded);
+        let msg = message(&NnueError::NotLoaded);
         assert!(!msg.is_empty());
         assert!(msg.contains("no NNUE network loaded"));
         assert!(msg.contains("evaluation directory"));
@@ -500,23 +522,36 @@ mod tests {
 
     #[test]
     fn invalid_format_carries_reason() {
-        let msg = format!(
-            "{}",
-            NnueError::InvalidFormat {
-                reason: "bad magic".to_string()
-            }
-        );
+        let msg = message(&NnueError::InvalidFormat {
+            reason: "bad magic".to_string(),
+        });
         assert!(msg.contains("bad magic"));
     }
 
     #[test]
     fn a_mismatch_names_what_differs() {
-        let msg = format!(
-            "{}",
-            NnueError::Mismatch {
-                reason: "made from no network file".to_string()
-            }
-        );
+        let msg = message(&NnueError::Mismatch {
+            reason: "made from no network file".to_string(),
+        });
         assert!(msg.contains("made from no network file"), "got: {msg}");
+    }
+
+    #[test]
+    fn an_io_failure_names_the_path_and_the_error_number() {
+        let msg = message(&NnueError::Io {
+            path: PathBuf::from("/srv/eval/nn.kernel.bin"),
+            source: std::io::Error::from_raw_os_error(2),
+        });
+        assert!(msg.contains("/srv/eval/nn.kernel.bin"), "got: {msg}");
+        assert!(msg.contains("errno 2"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_size_mismatch_names_both_sizes() {
+        let msg = message(&NnueError::SizeMismatch {
+            expected: 1024,
+            got: 512,
+        });
+        assert!(msg.contains("expected 1024 bytes, got 512"), "got: {msg}");
     }
 }

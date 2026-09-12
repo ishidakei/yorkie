@@ -1728,8 +1728,8 @@ impl Position {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::move_::format_usi_move;
-    use crate::sfen::parse_sfen;
+    use crate::text::test_text::format_usi_move;
+    use crate::text::test_text::parse_sfen_str as parse_sfen;
 
     fn pos(sfen: &str) -> Position {
         parse_sfen(sfen).expect("valid SFEN")
@@ -2399,8 +2399,8 @@ mod attack_query_equivalence {
     use crate::movegen::{attackers_bb, is_attacked_by, is_attacked_by_scan, try_find_king};
     use crate::piece::{Piece, PieceKind};
     use crate::position::Position;
-    use crate::sfen::parse_sfen;
     use crate::square::Square;
+    use crate::text::test_text::parse_sfen_str as parse_sfen;
 
     const FIXTURES: &[&str] = &[
         "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
@@ -2617,9 +2617,10 @@ mod attack_query_equivalence {
 mod nifu_files_equivalence {
     use super::{ExtMove, nifu_blocked_files, nifu_blocked_files_scan};
     use crate::color::Color;
-    use crate::move_::{Move, format_usi_move};
+    use crate::move_::Move;
     use crate::position::{Position, Undo};
-    use crate::sfen::parse_sfen;
+    use crate::text::test_text::format_usi_move;
+    use crate::text::test_text::parse_sfen_str as parse_sfen;
 
     /// The second fixture starts in check, so the evasion generator runs from
     /// ply 0.
@@ -2775,10 +2776,11 @@ mod nifu_files_equivalence {
 mod drop_emitter_equivalence {
     use super::{ALL_SQUARES, ExtMove, nifu_blocked_files};
     use crate::bitboard::Bitboard;
-    use crate::move_::{Move, format_usi_move};
+    use crate::move_::Move;
     use crate::piece::PieceKind;
     use crate::position::{Position, Undo};
-    use crate::sfen::parse_sfen;
+    use crate::text::test_text::format_usi_move;
+    use crate::text::test_text::parse_sfen_str as parse_sfen;
 
     const FIXTURE_SFENS: &[&str] = &[
         "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",

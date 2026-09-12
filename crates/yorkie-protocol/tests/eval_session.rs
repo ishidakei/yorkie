@@ -25,7 +25,10 @@ use common::{NOISY_EVALUATION, drive, evaluation_is_noise_free, stage_configured
 use yorkie_eval::{Region, network_file};
 use yorkie_protocol::{UsiEngine, config};
 use yorkie_search::{QSearch, RootKind, RootOutcome};
-use yorkie_state::{Move, Position, format_usi_move, parse_sfen, parse_usi_move};
+mod text_str;
+
+use text_str::{format_usi_move, parse_sfen, parse_usi_move};
+use yorkie_state::{Move, Position};
 use yorkie_storage::TranspositionTable;
 
 /// The one transposition table, emptied — what a driver session and a direct

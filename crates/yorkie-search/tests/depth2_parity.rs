@@ -29,7 +29,10 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 use yorkie_search::{QSearch, RootKind};
-use yorkie_state::{Move, Position, format_usi_move, parse_sfen, parse_usi_move};
+mod text_str;
+
+use text_str::{format_usi_move, parse_sfen, parse_usi_move};
+use yorkie_state::{Move, Position};
 use yorkie_storage::TranspositionTable;
 
 /// `VALUE_MATE`.

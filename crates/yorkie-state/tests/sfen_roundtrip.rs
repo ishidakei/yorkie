@@ -1,7 +1,9 @@
+mod text_str;
+
 use proptest::prelude::*;
-use yorkie_state::{
-    Color, Hand, Piece, PieceKind, Position, STARTPOS_SFEN, Square, format_sfen, parse_sfen,
-};
+use yorkie_state::{Color, Hand, Piece, PieceKind, Position, STARTPOS_SFEN, Square};
+
+use text_str::{format_sfen, parse_sfen};
 
 const ALL_KINDS: [PieceKind; 8] = [
     PieceKind::Pawn,
@@ -119,5 +121,5 @@ proptest! {
 #[test]
 fn startpos_constant_round_trips_through_helper() {
     let p = Position::startpos();
-    assert_eq!(format_sfen(&p), STARTPOS_SFEN);
+    assert_eq!(format_sfen(&p).as_bytes(), STARTPOS_SFEN);
 }

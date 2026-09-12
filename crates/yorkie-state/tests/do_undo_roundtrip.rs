@@ -11,7 +11,10 @@
 
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseResult;
-use yorkie_state::{Color, Move, Position, Undo, format_sfen, format_usi_move, parse_sfen};
+mod text_str;
+
+use text_str::{format_sfen, format_usi_move, parse_sfen};
+use yorkie_state::{Color, Move, Position, Undo};
 
 /// Roots the random lines start from: `startpos`, plus already-sharp positions
 /// so checks, drops and promotions are sampled from ply 0.

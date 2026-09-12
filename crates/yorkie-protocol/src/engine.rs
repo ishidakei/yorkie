@@ -17,9 +17,11 @@
 //! on the game path is dispatched through a pointer.
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::io;
 #[cfg(feature = "verbose2")]
 use std::num::NonZeroU64;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -27,7 +29,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use yorkie_eval::{NetworkParams, NnueError, network_file};
-use yorkie_numa::{NumaIndex, NumaLayout, mempolicy};
+use yorkie_numa::{CpuIndex, NumaIndex, NumaLayout, SysfsError, mempolicy};
 use yorkie_search::{
     BookConfig, BookHit, EnteringKingConfig, PonderSignal, Prng, QSearch, RootMove, SearchControl,
     SharedHistories, TimeControl, TimeInput, TimeManagement, WorkerHistories, WorkerResult,
@@ -41,7 +43,9 @@ use yorkie_search::{PvInfo, PvOutputConfig, PvSink};
 // The per-game evaluation-noise seed: drawn here, read only by the search.
 #[cfg(feature = "random")]
 use yorkie_search::new_game_seed;
-use yorkie_state::{ExtMove, Move, Position, SfenError, parse_sfen_into, parse_usi_move};
+use yorkie_state::{
+    ExtMove, Move, Position, SfenError, TextWriter, parse_sfen_into, parse_usi_move,
+};
 use yorkie_storage::{Book, TranspositionTable, Value};
 // The per-reply allocation tally: raised by the counting global allocator this
 // feature installs, and cleared where an interval starts.
@@ -82,7 +86,25 @@ pub(crate) const MAX_POSITION_MOVES: usize = 1024;
 /// board can spell — every square occupied by a promoted piece, both hands
 /// full, a five-digit ply — so a game's `position` commands are written into
 /// the buffer already there.
-const SFEN_CAPACITY: usize = 256;
+const SFEN_CAPACITY: usize = yorkie_state::SFEN_CAPACITY;
+
+/// Room an initialisation-phase notice is composed in.
+///
+/// The longest of them is a filesystem path with a sentence around it, so the
+/// buffer is sized for a path the operating system will still open rather than
+/// for the sentence.
+pub(crate) const NOTICE_BYTES: usize = 8 * 1024;
+
+/// `"applied"` or `"refused"` — how a best-effort placement call went, which is
+/// what every placement notice reports.
+fn outcome(accepted: bool) -> &'static [u8] {
+    if accepted { b"applied" } else { b"refused" }
+}
+
+/// Room one book-probe notice is composed in: its widest form is two option
+/// names, two values and two move counts.
+#[cfg(feature = "verbose1")]
+const BOOK_DIAGNOSTIC_BYTES: usize = 256;
 
 /// Legal moves the widest shogi position offers, which is what the replay's
 /// legality buffer is built to hold (the reference's `MAX_MOVES`).
@@ -100,7 +122,7 @@ struct RetainedPosition {
     startpos: bool,
     /// The four SFEN fields joined by single spaces — the form
     /// [`parse_sfen_into`] reads.
-    sfen: String,
+    sfen: Vec<u8>,
     /// The moves in the order they were applied.
     moves: Vec<Move>,
 }
@@ -110,7 +132,7 @@ impl RetainedPosition {
     fn new() -> Self {
         Self {
             startpos: true,
-            sfen: String::with_capacity(SFEN_CAPACITY),
+            sfen: Vec::with_capacity(SFEN_CAPACITY),
             moves: Vec::with_capacity(MAX_POSITION_MOVES),
         }
     }
@@ -131,9 +153,9 @@ impl RetainedPosition {
             self.startpos = false;
             for (i, field) in fields.iter().enumerate() {
                 if i > 0 {
-                    self.sfen.push(' ');
+                    self.sfen.push(b' ');
                 }
-                self.sfen.push_str(field);
+                self.sfen.extend_from_slice(field);
             }
         }
     }
@@ -154,7 +176,7 @@ impl RetainedPosition {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PositionRefusal<'a> {
     Sfen(SfenError),
-    IllegalMove(&'a str),
+    IllegalMove(&'a [u8]),
     TooManyMoves,
 }
 
@@ -164,7 +186,7 @@ pub enum PositionRefusal<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PositionSfen<'a> {
     StartPos,
-    Sfen([&'a str; 4]),
+    Sfen([&'a [u8]; 4]),
 }
 
 /// Everything that bounds one search, captured verbatim — including what a
@@ -542,8 +564,99 @@ pub enum GoOutcome {
 /// answers a failed one with a readiness reply.
 pub enum ReadyOutcome {
     Ready,
-    LoadFailed(String),
-    LayoutMismatch(String),
+    LoadFailed(NnueError),
+    LayoutMismatch(LayoutRefusal),
+}
+
+/// Why the machine this process runs on is not the one the binary was built
+/// for — one of four ways to differ, in the order a reader wants them, plus the
+/// sysfs tree that could not be read at all.
+///
+/// Each variant carries what differs rather than a sentence about it;
+/// [`Self::write_message`] spells it where the notice is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayoutRefusal {
+    /// The tree does not describe a machine whose layout can be read. An
+    /// unverifiable layout is not a matching one.
+    Unreadable(SysfsError),
+    /// A different number of NUMA nodes.
+    NodeCount { built: usize, live: usize },
+    /// A node holding different CPUs.
+    NodeCpus {
+        node: usize,
+        live: Vec<CpuIndex>,
+        built: Vec<CpuIndex>,
+    },
+    /// CPUs a worker pins itself to that this process may not run on — what a
+    /// `taskset` or a `cpuset` around the engine produces.
+    DeniedCpus(Vec<CpuIndex>),
+    /// A CPU that sits on another node than the built layout puts it on, which
+    /// would leave a worker's memory placed away from the CPU reading it.
+    CpuNode {
+        worker: usize,
+        cpu: CpuIndex,
+        live_node: Option<NumaIndex>,
+        built_node: NumaIndex,
+    },
+}
+
+impl LayoutRefusal {
+    /// Append this refusal's message to `out`.
+    pub fn write_message(&self, out: &mut TextWriter<'_>) {
+        match self {
+            Self::Unreadable(e) => e.write_message(|fragment| {
+                out.bytes(fragment);
+            }),
+            Self::NodeCount { built, live } => {
+                out.bytes(b"this binary is built for ")
+                    .u64(*built as u64)
+                    .bytes(b" NUMA node(s), this host has ")
+                    .u64(*live as u64);
+            }
+            Self::NodeCpus { node, live, built } => {
+                out.bytes(b"node ").u64(*node as u64).bytes(b" holds CPUs ");
+                write_cpu_list(live, out);
+                out.bytes(b" on this host, ");
+                write_cpu_list(built, out);
+                out.bytes(b" in the layout this binary is built for");
+            }
+            Self::DeniedCpus(cpus) => {
+                out.bytes(b"this process may not run on CPUs ");
+                write_cpu_list(cpus, out);
+                out.bytes(b", which its workers are pinned to");
+            }
+            Self::CpuNode {
+                worker,
+                cpu,
+                live_node,
+                built_node,
+            } => {
+                out.bytes(b"worker ")
+                    .u64(*worker as u64)
+                    .bytes(b" runs on CPU ")
+                    .u64(*cpu as u64);
+                match live_node {
+                    Some(live_node) => {
+                        out.bytes(b", which is on node ")
+                            .u64(*live_node as u64)
+                            .bytes(b" on this host and on node ")
+                            .u64(*built_node as u64)
+                            .bytes(b" in the layout this binary is built for");
+                    }
+                    None => {
+                        out.bytes(b", which no node of this host holds");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Append `cpus` to `out` in the shortened form the sysfs files use.
+fn write_cpu_list<'c>(cpus: impl IntoIterator<Item = &'c CpuIndex>, out: &mut TextWriter<'_>) {
+    yorkie_numa::write_cpu_list(cpus.into_iter().copied(), |fragment| {
+        out.bytes(fragment);
+    });
 }
 
 /// Where an [`Engine`]'s output goes: the one protocol layer this build was
@@ -566,12 +679,12 @@ pub trait EngineSink: Clone + Send + 'static {
     /// One initialisation-phase notice — where the table and the network went,
     /// which CPUs the workers took, what the book load found. Present in every
     /// build: they are how a failed startup is diagnosed at all.
-    fn notice(&self, msg: &str) -> io::Result<()>;
+    fn notice(&self, msg: &[u8]) -> io::Result<()>;
 
     /// One diagnostic notice, the `verbose1` surface. Best-effort: it may be
     /// produced on the search thread, where a broken pipe must not panic.
     #[cfg(feature = "verbose1")]
-    fn diagnostic(&self, msg: &str);
+    fn diagnostic(&self, msg: &[u8]);
 
     /// The engine's reply to a search request.
     ///
@@ -887,10 +1000,10 @@ impl<P: EngineSink> Engine<P> {
         self.rebuild_pool();
     }
 
-    /// `"Using N thread[s] on CPUs <list>"` for the live pool.
+    /// Append `"Using N thread[s] on CPUs <list>"` for the live pool to `out`.
     #[cfg(feature = "verbose3")]
-    pub fn thread_allocation_information(&self) -> String {
-        thread_allocation_information_as_string(self.pool.size(), &self.worker_plan)
+    pub fn write_thread_allocation_information(&self, out: &mut TextWriter<'_>) {
+        write_thread_allocation_information(self.pool.size(), &self.worker_plan, out);
     }
 
     /// If a search worker is running, request its stop and join it, reclaiming
@@ -959,25 +1072,29 @@ impl<P: EngineSink> Engine<P> {
         // included; the size reported is the clusters, which is what the
         // `usi_hash` setting asked for.
         let (addr, span) = TranspositionTable::shared().backing_region();
-        let outcome = |accepted: bool| if accepted { "applied" } else { "refused" };
-        let placement = match table_placement(&self.worker_plan) {
-            TablePlacement::OnNode(node) => format!(
-                "preferred on node {node} {}",
-                outcome(mempolicy::prefer_region_on_node(addr, span, node))
-            ),
-            TablePlacement::AcrossNodes(nodes) => format!(
-                "interleave on nodes {} {}",
-                yorkie_numa::format_cpu_list(nodes.iter().copied()),
-                outcome(mempolicy::interleave_region_over_nodes(addr, span, &nodes))
-            ),
-        };
+        let mut bytes = [0u8; NOTICE_BYTES];
+        let mut out = TextWriter::new(&mut bytes);
+        out.bytes(b"transposition table: ")
+            .u64((yorkie_storage::TABLE_BYTES / (1024 * 1024)) as u64)
+            .bytes(b" MiB; ");
+        match table_placement(&self.worker_plan) {
+            TablePlacement::OnNode(node) => {
+                out.bytes(b"preferred on node ").u64(node as u64).byte(b' ');
+                out.bytes(outcome(mempolicy::prefer_region_on_node(addr, span, node)));
+            }
+            TablePlacement::AcrossNodes(nodes) => {
+                out.bytes(b"interleave on nodes ");
+                write_cpu_list(&nodes, &mut out);
+                out.byte(b' ');
+                out.bytes(outcome(mempolicy::interleave_region_over_nodes(
+                    addr, span, &nodes,
+                )));
+            }
+        }
         let huge = yorkie_storage::advise_huge_pages(addr, span);
+        out.bytes(b"; huge pages ").bytes(outcome(huge));
 
-        self.sink.notice(&format!(
-            "transposition table: {} MiB; {placement}; huge pages {}",
-            yorkie_storage::TABLE_BYTES / (1024 * 1024),
-            outcome(huge),
-        ))
+        self.sink.notice(out.as_bytes())
     }
 
     /// Recompute the worker → CPU assignment for the current pool size and
@@ -1044,11 +1161,11 @@ impl<P: EngineSink> Engine<P> {
     /// out of the list without panicking; a `.db` whose file is absent falls
     /// back to the `.ybb` sibling with the reference's fallback info string.
     fn reload_book(&mut self) -> io::Result<()> {
-        let book_file = self.settings.book_file().to_string();
-        let book_dir = self.settings.book_dir().to_string();
+        let book_file = self.settings.book_file();
+        let book_dir = self.settings.book_dir();
         let on_the_fly = self.settings.book_on_the_fly();
         let ignore_book_ply = self.settings.ignore_book_ply();
-        let base = self.book_path(&book_dir, &book_file);
+        let base = self.book_path(book_dir, book_file);
 
         // Enumerate the priority series now: the resolved name list is half of
         // the reload-skip capture, so a numbered file appearing (or vanishing)
@@ -1070,8 +1187,12 @@ impl<P: EngineSink> Engine<P> {
 
         // The "priority book file exists twice" notices from the enumeration,
         // verbatim from the reference.
+        let mut bytes = [0u8; NOTICE_BYTES];
         for notice in &notices {
-            self.sink.notice(notice)?;
+            let mut out = TextWriter::new(&mut bytes);
+            out.bytes(b"priority book file exists twice. use : ")
+                .path(notice);
+            self.sink.notice(out.as_bytes())?;
         }
 
         let mut books: Vec<Book> = Vec::new();
@@ -1082,11 +1203,12 @@ impl<P: EngineSink> Engine<P> {
             // proved the file exists).
             let resolved = resolve_book_filename_with_ybb_fallback(name);
             if &resolved != name {
-                self.sink.notice(&format!(
-                    "book file fallback : {} -> {}",
-                    name.display(),
-                    resolved.display()
-                ))?;
+                let mut out = TextWriter::new(&mut bytes);
+                out.bytes(b"book file fallback : ")
+                    .path(name)
+                    .bytes(b" -> ")
+                    .path(&resolved);
+                self.sink.notice(out.as_bytes())?;
             }
 
             // Divergence from the reference: only `.ybb` is supported. Anything
@@ -1095,8 +1217,9 @@ impl<P: EngineSink> Engine<P> {
             // info-string notice, never a panic and never a SILENT skip: a
             // silent skip would hide a book the reference would have used.
             if !has_book_ext(&resolved, BOOK_EXT_YBB) {
-                self.sink
-                    .notice(&format!("unsupported book format : {}", resolved.display()))?;
+                let mut out = TextWriter::new(&mut bytes);
+                out.bytes(b"unsupported book format : ").path(&resolved);
+                self.sink.notice(out.as_bytes())?;
                 continue;
             }
 
@@ -1105,19 +1228,23 @@ impl<P: EngineSink> Engine<P> {
             } else {
                 Book::open_in_memory(&resolved)
             };
+            let mut out = TextWriter::new(&mut bytes);
             match opened {
                 Ok(book) => {
                     let count = book.record_count();
                     books.push(book);
-                    self.sink
-                        .notice(&format!("book loaded : {count} positions"))?;
+                    out.bytes(b"book loaded : ").u64(count).bytes(b" positions");
                 }
                 Err(e) => {
                     // Mirrors the reference's open/validate failure → this name is left
                     // out of the priority list.
-                    self.sink.notice(&format!("book load failed : {e}"))?;
+                    out.bytes(b"book load failed : ");
+                    e.write_message(|fragment| {
+                        out.bytes(fragment);
+                    });
                 }
             }
+            self.sink.notice(out.as_bytes())?;
         }
 
         if !books.is_empty() {
@@ -1150,10 +1277,13 @@ impl<P: EngineSink> Engine<P> {
         // on one machine has to be able to see, from the engine itself, that
         // each got the CPUs meant for it — so the line is an
         // initialisation-phase notice, present in every build.
-        self.sink.notice(&format!(
-            "workers on CPUs {}",
-            yorkie_numa::format_cpu_list(self.worker_plan.distinct_cpus())
-        ))?;
+        {
+            let mut bytes = [0u8; NOTICE_BYTES];
+            let mut out = TextWriter::new(&mut bytes);
+            out.bytes(b"workers on CPUs ");
+            write_cpu_list(&self.worker_plan.distinct_cpus(), &mut out);
+            self.sink.notice(out.as_bytes())?;
+        }
         // The machine is the one the binary was built for, so the workers'
         // nodes are the ones the table belongs on. Done before anything else
         // here, so the policy is in force before the first page of it is
@@ -1170,8 +1300,10 @@ impl<P: EngineSink> Engine<P> {
             return Ok(ReadyOutcome::Ready);
         }
 
-        match self.place_evaluation_network(&path) {
-            Ok((eval, warnings, placement)) => {
+        let mut bytes = [0u8; NOTICE_BYTES];
+        let mut placement = TextWriter::new(&mut bytes);
+        match self.place_evaluation_network(&path, &mut placement) {
+            Ok((eval, warnings)) => {
                 // Surface the complaints the conversion had about the source
                 // network (hash mismatches) as notices before the readiness
                 // reply, mirroring the reference `LoadAndShare` /
@@ -1180,11 +1312,11 @@ impl<P: EngineSink> Engine<P> {
                 for warning in &warnings {
                     self.sink.notice(warning)?;
                 }
-                self.sink.notice(&placement)?;
+                self.sink.notice(placement.as_bytes())?;
                 self.eval = Some(eval);
                 Ok(ReadyOutcome::Ready)
             }
-            Err(e) => Ok(ReadyOutcome::LoadFailed(e.to_string())),
+            Err(e) => Ok(ReadyOutcome::LoadFailed(e)),
         }
     }
 
@@ -1215,52 +1347,54 @@ impl<P: EngineSink> Engine<P> {
     fn place_evaluation_network(
         &mut self,
         path: &Path,
-    ) -> Result<(LoadedEval, Vec<String>, String), NnueError> {
+        notice: &mut TextWriter<'_>,
+    ) -> Result<(LoadedEval, Vec<Vec<u8>>), NnueError> {
         // Nothing may still be reading the regions when they are filled: they
         // are the process's only storage for the network. Any search has been
         // joined by the caller; clearing this here is what leaves the engine in
         // the "no network loaded" state until the fill succeeds.
         self.eval = None;
 
-        let outcome = |accepted: bool| if accepted { "applied" } else { "refused" };
         let mut warnings = Vec::new();
+        notice
+            .bytes(b"evaluation network: ")
+            .u64((network_file::DATA_BYTES / (1024 * 1024)) as u64)
+            .bytes(b" MiB; ");
 
-        let placement = if network_file::SHARED_MAPPING {
+        if network_file::SHARED_MAPPING {
             // SAFETY: nothing is pointed at the region — no search that could
             // have read it survives, each one having been joined before the
             // readiness handshake reached here.
             warnings = unsafe { network_file::map_shared(path)? };
             let (addr, span) = network_file::Region::<0>::new().parameter_region();
             let huge = yorkie_storage::advise_huge_pages(addr, span);
-            format!("one shared mapping; huge pages {}", outcome(huge))
+            notice
+                .bytes(b"one shared mapping; huge pages ")
+                .bytes(outcome(huge));
         } else {
-            let mut reported = Vec::new();
+            notice.bytes(b"one copy on ");
             for (slot, node) in config::EVAL_REGION_NODES.iter().copied().enumerate() {
+                if slot != 0 {
+                    notice.bytes(b"; ");
+                }
                 let (addr, span) = network_file::region_backing(slot);
-                let placed = format!(
-                    "node {node} {}",
-                    outcome(mempolicy::migrate_region_to_node(addr, span, node))
-                );
+                notice.bytes(b"node ").u64(node as u64).byte(b' ');
+                notice.bytes(outcome(mempolicy::migrate_region_to_node(addr, span, node)));
                 let huge = yorkie_storage::advise_huge_pages(addr, span);
                 // SAFETY: as the shared mapping above.
                 let w = unsafe { network_file::load_into_region(slot, path)? };
                 // Every region reads the same file, so its complaints are the
                 // same each time; they are worth reporting once.
                 warnings = w;
-                reported.push(format!("{placed}, huge pages {}", outcome(huge)));
+                notice.bytes(b", huge pages ").bytes(outcome(huge));
             }
-            format!("one copy on {}", reported.join("; "))
-        };
+        }
 
         Ok((
             LoadedEval {
                 path: path.to_path_buf(),
             },
             warnings,
-            format!(
-                "evaluation network: {} MiB; {placement}",
-                network_file::DATA_BYTES / (1024 * 1024),
-            ),
         ))
     }
 
@@ -1271,10 +1405,10 @@ impl<P: EngineSink> Engine<P> {
     /// online CPU, so what is compared is machine against machine and not
     /// machine against process. A tree that cannot be read is itself a refusal —
     /// an unverifiable layout is not a matching one.
-    fn numa_layout_refusal(&self) -> Option<String> {
+    fn numa_layout_refusal(&self) -> Option<LayoutRefusal> {
         let opts = match yorkie_numa::machine_sysfs_options(&self.sysfs_root) {
             Ok(opts) => opts,
-            Err(e) => return Some(e),
+            Err(e) => return Some(LayoutRefusal::Unreadable(e)),
         };
         machine_refusal(
             &NumaLayout::of_machine(&opts),
@@ -1296,7 +1430,7 @@ impl<P: EngineSink> Engine<P> {
     pub fn set_position<'a>(
         &mut self,
         sfen: PositionSfen<'a>,
-        moves: &'a str,
+        moves: &'a [u8],
     ) -> Result<(), PositionRefusal<'a>> {
         let Self {
             pending_position: pending,
@@ -1307,7 +1441,7 @@ impl<P: EngineSink> Engine<P> {
         } = self;
         pending.set_start(sfen);
         pending.start_into(scratch).map_err(PositionRefusal::Sfen)?;
-        for mv in moves.split_whitespace() {
+        for mv in yorkie_state::text::tokens(moves) {
             if pending.moves.len() == MAX_POSITION_MOVES {
                 return Err(PositionRefusal::TooManyMoves);
             }
@@ -1611,7 +1745,7 @@ impl<P: EngineSink> Engine<P> {
             #[cfg(feature = "verbose1")]
             if tm.mtg_error {
                 self.sink
-                    .diagnostic("Error! : MaxMovesToDraw is too small.");
+                    .diagnostic(b"Error! : MaxMovesToDraw is too small.");
             }
             Some(TimeControl {
                 tm,
@@ -1919,19 +2053,29 @@ fn book_name_without_extension(name: &Path) -> Option<PathBuf> {
 /// index past 999 simply grows past three digits, exactly as the reference's
 /// `while (number.size() < 3)` padding does.
 fn priority_book_filename(stem: &Path, index: usize, extension: &str) -> PathBuf {
+    // The suffix is composed as bytes, and joined to the stem's own: a file name
+    // is bytes on the platform this plays on, and nothing about it is text.
+    let mut bytes = [0u8; 1 + 20 + 1 + 8];
+    let mut suffix = TextWriter::new(&mut bytes);
+    suffix
+        .byte(b'-')
+        .u64_padded(index as u64, 3)
+        .byte(b'.')
+        .bytes(extension.as_bytes());
     let mut name = stem.as_os_str().to_os_string();
-    name.push(format!("-{index:03}.{extension}"));
+    name.push(OsStr::from_bytes(suffix.as_bytes()));
     PathBuf::from(name)
 }
 
 /// Resolve priority book `index` for `base` (`resolve_priority_book_filename`).
 ///
 /// The primary extension is the base name's own and wins when both files exist,
-/// which also produces the reference's `priority book file exists twice` notice,
-/// returned as the second tuple element for the caller to emit.
+/// which also produces the reference's `priority book file exists twice` notice
+/// — the second tuple element is the name that notice quotes, for the caller to
+/// emit.
 ///
 /// `None` means neither extension exists at this index, which ends the series.
-fn resolve_priority_book_filename(base: &Path, index: usize) -> Option<(PathBuf, Option<String>)> {
+fn resolve_priority_book_filename(base: &Path, index: usize) -> Option<(PathBuf, Option<PathBuf>)> {
     let stem = book_name_without_extension(base)?;
 
     let (primary_ext, secondary_ext) = if has_book_ext(base, BOOK_EXT_YBB) {
@@ -1943,12 +2087,7 @@ fn resolve_priority_book_filename(base: &Path, index: usize) -> Option<(PathBuf,
     let secondary = priority_book_filename(&stem, index, secondary_ext);
 
     if primary.exists() {
-        let notice = secondary.exists().then(|| {
-            format!(
-                "priority book file exists twice. use : {}",
-                primary.display()
-            )
-        });
+        let notice = secondary.exists().then(|| primary.clone());
         return Some((primary, notice));
     }
     if secondary.exists() {
@@ -1962,9 +2101,9 @@ fn resolve_priority_book_filename(base: &Path, index: usize) -> Option<(PathBuf,
 /// so a gap ends the series and a `-003` after a missing `-002` is never
 /// reached, then the plain `base` appended last.
 ///
-/// The second tuple element carries the `info string` bodies the enumeration
-/// produced, in list order, for the caller to emit.
-fn book_names(base: &Path) -> (Vec<PathBuf>, Vec<String>) {
+/// The second tuple element carries the names the enumeration's `info string`s
+/// quote, in list order, for the caller to emit.
+fn book_names(base: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut names = Vec::new();
     let mut notices = Vec::new();
     for index in 0.. {
@@ -2458,46 +2597,38 @@ fn machine_refusal(
     affinity: &BTreeSet<usize>,
     plan: &WorkerPlan,
     built: &NumaLayout,
-) -> Option<String> {
+) -> Option<LayoutRefusal> {
     if live.nodes.len() != built.nodes.len() {
-        return Some(format!(
-            "this binary is built for {} NUMA node(s), this host has {}",
-            built.nodes.len(),
-            live.nodes.len()
-        ));
+        return Some(LayoutRefusal::NodeCount {
+            built: built.nodes.len(),
+            live: live.nodes.len(),
+        });
     }
-    for (n, (live_cpus, built_cpus)) in live.nodes.iter().zip(&built.nodes).enumerate() {
+    for (node, (live_cpus, built_cpus)) in live.nodes.iter().zip(&built.nodes).enumerate() {
         if live_cpus != built_cpus {
-            return Some(format!(
-                "node {n} holds CPUs {} on this host, {} in the layout this binary is built \
-                 for",
-                yorkie_numa::format_cpu_list(live_cpus.iter().copied()),
-                yorkie_numa::format_cpu_list(built_cpus.iter().copied())
-            ));
+            return Some(LayoutRefusal::NodeCpus {
+                node,
+                live: live_cpus.clone(),
+                built: built_cpus.clone(),
+            });
         }
     }
-    let missing: BTreeSet<usize> = plan
+    let missing: Vec<CpuIndex> = plan
         .distinct_cpus()
         .into_iter()
         .filter(|cpu| !affinity.contains(cpu))
         .collect();
     if !missing.is_empty() {
-        return Some(format!(
-            "this process may not run on CPUs {}, which its workers are pinned to",
-            yorkie_numa::format_cpu_list(missing)
-        ));
+        return Some(LayoutRefusal::DeniedCpus(missing));
     }
     for (worker, (&cpu, &node)) in plan.cpus.iter().zip(&plan.system_nodes).enumerate() {
         let live_node = live.system_node_of_cpu(cpu);
         if live_node != Some(node) {
-            return Some(match live_node {
-                Some(live_node) => format!(
-                    "worker {worker} runs on CPU {cpu}, which is on node {live_node} on this \
-                     host and on node {node} in the layout this binary is built for"
-                ),
-                None => {
-                    format!("worker {worker} runs on CPU {cpu}, which no node of this host holds")
-                }
+            return Some(LayoutRefusal::CpuNode {
+                worker,
+                cpu,
+                live_node,
+                built_node: node,
             });
         }
     }
@@ -2614,16 +2745,21 @@ fn shared_node_counts(worker_nodes: &[NumaIndex]) -> std::collections::BTreeMap<
 /// `"Using N thread[s] on CPUs <list>"` — the pool size, and the CPUs its
 /// workers are pinned to.
 #[cfg(feature = "verbose3")]
-fn thread_allocation_information_as_string(threads_size: usize, plan: &WorkerPlan) -> String {
-    format!(
-        "Using {threads_size} {} on CPUs {}",
-        if threads_size > 1 {
-            "threads"
+fn write_thread_allocation_information(
+    threads_size: usize,
+    plan: &WorkerPlan,
+    out: &mut TextWriter<'_>,
+) {
+    out.bytes(b"Using ")
+        .u64(threads_size as u64)
+        .byte(b' ')
+        .bytes(if threads_size > 1 {
+            &b"threads"[..]
         } else {
-            "thread"
-        },
-        yorkie_numa::format_cpu_list(plan.distinct_cpus())
-    )
+            &b"thread"[..]
+        })
+        .bytes(b" on CPUs ");
+    write_cpu_list(&plan.distinct_cpus(), out);
 }
 
 /// The bundle [`Engine::go`] hands its coordinator thread — grouped
@@ -2868,8 +3004,13 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
             &mut prng,
         );
         #[cfg(feature = "verbose1")]
-        for diag in &probed.diagnostics {
-            sink.diagnostic(diag);
+        {
+            let mut bytes = [0u8; BOOK_DIAGNOSTIC_BYTES];
+            for diag in &probed.diagnostics {
+                let mut out = TextWriter::new(&mut bytes);
+                diag.write_message(&mut out);
+                sink.diagnostic(out.as_bytes());
+            }
         }
         if let Some(hit) = probed.hit {
             // `tm.elapsed_time()` at the moment the book answered, floored at 1
@@ -3139,13 +3280,14 @@ mod tests {
         let _tt = serial_tt();
         let mut engine = idle_engine();
         engine
-            .set_position(PositionSfen::StartPos, "7g7f 3c3d")
+            .set_position(PositionSfen::StartPos, b"7g7f 3c3d")
             .expect("both moves are legal");
         let accepted_ply = engine.pos.ply();
 
+        let past_the_bound = king_shuffle(MAX_POSITION_MOVES + 1);
         for refused in [
-            "7g7f 1a1b",                                   // an illegal move mid-list
-            king_shuffle(MAX_POSITION_MOVES + 1).as_str(), // past the bound
+            &b"7g7f 1a1b"[..],         // an illegal move mid-list
+            past_the_bound.as_bytes(), // past the bound
         ] {
             let _ = engine.set_position(PositionSfen::StartPos, refused);
             assert_eq!(engine.pos.ply(), accepted_ply);
@@ -3153,7 +3295,7 @@ mod tests {
         }
 
         // A malformed SFEN is refused before any move is looked at.
-        let _ = engine.set_position(PositionSfen::Sfen(["not-a-board", "b", "-", "1"]), "");
+        let _ = engine.set_position(PositionSfen::Sfen([b"not-a-board", b"b", b"-", b"1"]), b"");
         assert_eq!(engine.pos.ply(), accepted_ply);
         assert_eq!(engine.last_position.moves.len(), 2);
     }
@@ -3166,18 +3308,19 @@ mod tests {
     fn a_games_position_commands_reuse_the_buffers() {
         let _tt = serial_tt();
         let mut engine = idle_engine();
-        let sfen = [
-            "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL",
-            "b",
-            "-",
-            "1",
+        let sfen: [&[u8]; 4] = [
+            b"lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL",
+            b"b",
+            b"-",
+            b"1",
         ];
         for plies in 0..64 {
+            let moves = king_shuffle(plies);
             engine
-                .set_position(PositionSfen::StartPos, &king_shuffle(plies))
+                .set_position(PositionSfen::StartPos, moves.as_bytes())
                 .expect("a king shuffle is legal");
             engine
-                .set_position(PositionSfen::Sfen(sfen), &king_shuffle(plies))
+                .set_position(PositionSfen::Sfen(sfen), moves.as_bytes())
                 .expect("a king shuffle is legal");
         }
         assert_eq!(engine.last_position.moves.len(), 63);
@@ -3198,6 +3341,14 @@ mod tests {
 
     fn affinity(cpus: &[usize]) -> BTreeSet<usize> {
         cpus.iter().copied().collect()
+    }
+
+    /// A refusal's message as a string, so the assertions below read as text.
+    fn refusal_message(refusal: &LayoutRefusal) -> String {
+        let mut bytes = [0u8; NOTICE_BYTES];
+        let mut out = TextWriter::new(&mut bytes);
+        refusal.write_message(&mut out);
+        String::from_utf8(out.as_bytes().to_vec()).expect("a message is ASCII")
     }
 
     /// A plan pinning one worker to each of `cpus`, on the node `built` puts it
@@ -3227,6 +3378,7 @@ mod tests {
         let live = layout(&[&[0, 1, 2, 3]]);
         let msg = machine_refusal(&live, &affinity(&[0, 1, 2, 3]), &plan, &built)
             .expect("one node is not two");
+        let msg = refusal_message(&msg);
         assert!(msg.contains("built for 2 NUMA node(s)"), "message: {msg}");
         assert!(msg.contains("this host has 1"), "message: {msg}");
     }
@@ -3238,6 +3390,7 @@ mod tests {
         let live = layout(&[&[0, 1], &[2, 3, 4]]);
         let msg = machine_refusal(&live, &affinity(&[0, 1, 2, 3, 4]), &plan, &built)
             .expect("node 1 grew a CPU");
+        let msg = refusal_message(&msg);
         assert!(msg.contains("node 1"), "message: {msg}");
         assert!(msg.contains("2-4"), "message: {msg}");
         assert!(msg.contains("2-3"), "message: {msg}");
@@ -3253,6 +3406,7 @@ mod tests {
         let plan = plan_over(&[0, 2, 3], &built);
         let msg = machine_refusal(&built, &affinity(&[0, 1]), &plan, &built)
             .expect("two of the plan's CPUs are hidden");
+        let msg = refusal_message(&msg);
         assert!(msg.contains("may not run on CPUs 2-3"), "message: {msg}");
         assert!(
             msg.contains("which its workers are pinned to"),
@@ -3261,6 +3415,7 @@ mod tests {
 
         let msg = machine_refusal(&built, &affinity(&[0, 1, 2]), &plan, &built)
             .expect("one of the plan's CPUs is hidden");
+        let msg = refusal_message(&msg);
         assert!(msg.contains("may not run on CPUs 3"), "message: {msg}");
     }
 
@@ -3293,6 +3448,7 @@ mod tests {
         let live = NumaLayout::from_const(&[&[0, 1], &[2, 3]], &[1, 0]);
         let msg = machine_refusal(&live, &affinity(&[0, 1, 2, 3]), &plan, &built)
             .expect("CPU 0 is on the other node now");
+        let msg = refusal_message(&msg);
         assert!(msg.contains("worker 0 runs on CPU 0"), "message: {msg}");
         assert!(msg.contains("node 1 on this host"), "message: {msg}");
         assert!(msg.contains("node 0 in the layout"), "message: {msg}");
@@ -3301,17 +3457,17 @@ mod tests {
     #[cfg(feature = "verbose3")]
     #[test]
     fn info_strings_exact_formats() {
+        let rendered = |threads: usize, plan: &WorkerPlan| {
+            let mut bytes = [0u8; NOTICE_BYTES];
+            let mut out = TextWriter::new(&mut bytes);
+            write_thread_allocation_information(threads, plan, &mut out);
+            out.as_bytes().to_vec()
+        };
         // Singular and plural, and the CPU list in the shortened form.
         let one = WorkerPlan::of(&[5], &[0], 1);
-        assert_eq!(
-            thread_allocation_information_as_string(1, &one),
-            "Using 1 thread on CPUs 5"
-        );
+        assert_eq!(rendered(1, &one), b"Using 1 thread on CPUs 5");
         let four = WorkerPlan::of(&[0, 1, 2, 8], &[0, 0, 0, 1], 4);
-        assert_eq!(
-            thread_allocation_information_as_string(4, &four),
-            "Using 4 threads on CPUs 0-2,8"
-        );
+        assert_eq!(rendered(4, &four), b"Using 4 threads on CPUs 0-2,8");
     }
 
     #[test]
@@ -3800,13 +3956,7 @@ mod tests {
             file_names(&names),
             vec!["user_book1-000.ybb", "user_book1.ybb"]
         );
-        assert_eq!(
-            notices,
-            vec![format!(
-                "priority book file exists twice. use : {}",
-                dir.join("user_book1-000.ybb").display()
-            )]
-        );
+        assert_eq!(notices, vec![dir.join("user_book1-000.ybb")]);
 
         // `.db` base: primary `.db` wins over a co-existing `.ybb`.
         let db_base = dir.join("user_book2.db");
@@ -3817,13 +3967,7 @@ mod tests {
             file_names(&names),
             vec!["user_book2-000.db", "user_book2.db"]
         );
-        assert_eq!(
-            notices,
-            vec![format!(
-                "priority book file exists twice. use : {}",
-                dir.join("user_book2-000.db").display()
-            )]
-        );
+        assert_eq!(notices, vec![dir.join("user_book2-000.db")]);
 
         // Secondary-only: a `.ybb` base with just a `.db` at index 0 resolves to
         // the `.db` (which `reload_book` then routes to the fail-loud path).

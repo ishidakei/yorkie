@@ -21,7 +21,17 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use yorkie_eval::network_file;
 use yorkie_protocol::UsiEngine;
-use yorkie_state::{Move, Position, parse_sfen, parse_usi_move, sfen_pack};
+use yorkie_state::{Move, Position, SfenError, UsiMoveParseError, sfen_pack};
+
+/// The engine speaks bytes; the fixtures here are written as text. These two
+/// are where one becomes the other, for the `.ybb` writer below.
+fn parse_sfen(sfen: &str) -> Result<Position, SfenError> {
+    yorkie_state::parse_sfen(sfen.as_bytes())
+}
+
+fn parse_usi_move(usi: &str, pos: &Position) -> Result<Move, UsiMoveParseError> {
+    yorkie_state::parse_usi_move(usi.as_bytes(), pos)
+}
 
 /// The message a test that is pinned to the test config's values fails with when
 /// the engine was built from another config.
@@ -197,6 +207,17 @@ pub fn drive(input: &str) -> String {
         .expect("driver run");
     let bytes = output.lock().expect("output lock").clone();
     String::from_utf8(bytes).expect("utf-8")
+}
+
+/// Like [`drive`] for a session whose input is not text: the bytes go in as
+/// they are and the transcript comes back as bytes, so a line carrying a value
+/// spelled in some host's code page can be driven and read.
+pub fn drive_bytes(input: &[u8]) -> Vec<u8> {
+    let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+    driver(input, Arc::clone(&output), None)
+        .run()
+        .expect("driver run");
+    output.lock().expect("output lock").clone()
 }
 
 /// A fixed seed for reproducible book / `rtime` sessions: injecting it makes
