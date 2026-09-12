@@ -42,11 +42,10 @@ const EWM_PRESHIFT: u32 = 7;
 /// [`scalar_post_ft::ewm_one_perspective`] for the exact semantics).
 ///
 /// # Safety
-/// The running CPU must support `avx512f` and `avx512bw`. `half` must be
-/// [`HIDDEN_SIZE`] long and `out` must be `HIDDEN_SIZE / 2` long.
+/// The running CPU must support `avx512f` and `avx512bw`. `out` must be
+/// `HIDDEN_SIZE / 2` long.
 #[target_feature(enable = "avx512f,avx512bw")]
-pub unsafe fn ewm_one_perspective(half: &[i16], out: &mut [u8]) {
-    debug_assert_eq!(half.len(), HIDDEN_SIZE);
+pub unsafe fn ewm_one_perspective(half: &[i16; HIDDEN_SIZE], out: &mut [u8]) {
     debug_assert_eq!(out.len(), EWM_HALF);
     // SAFETY: `half` holds 2*EWM_HALF i16 and `out` holds EWM_HALF u8.
     unsafe { ewm_one_perspective_ptr(half.as_ptr(), out.as_mut_ptr()) };

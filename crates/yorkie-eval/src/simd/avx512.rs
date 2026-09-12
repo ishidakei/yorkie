@@ -22,11 +22,14 @@ const NUM_CHUNKS: usize = HIDDEN_SIZE / 32;
 const LANES: usize = 32;
 
 /// # Safety
-/// The running CPU must support `avx512f` and `avx512bw`. `out` and every
-/// referenced weight column must be `HIDDEN_SIZE` long.
+/// The running CPU must support `avx512f` and `avx512bw`. Every referenced
+/// weight column must be `HIDDEN_SIZE` long.
 #[target_feature(enable = "avx512f,avx512bw")]
-pub unsafe fn add_features(out: &mut [i16], weights: &[i16], indices: &[FeatureIndex]) {
-    debug_assert_eq!(out.len(), HIDDEN_SIZE);
+pub unsafe fn add_features(
+    out: &mut [i16; HIDDEN_SIZE],
+    weights: &[i16],
+    indices: &[FeatureIndex],
+) {
     let out_ptr = out.as_mut_ptr();
     for &idx in indices {
         let base = idx as usize * HIDDEN_SIZE;
@@ -35,7 +38,7 @@ pub unsafe fn add_features(out: &mut [i16], weights: &[i16], indices: &[FeatureI
         for chunk in 0..NUM_CHUNKS {
             let offset = chunk * LANES;
             // SAFETY: `chunk * LANES + LANES <= HIDDEN_SIZE`, which is both
-            // `out.len()` and `col.len()`; the unaligned 512-bit ops impose no
+            // the length of both `out` and `col`; the unaligned 512-bit ops impose no
             // alignment requirement.
             unsafe {
                 let o = _mm512_loadu_si512(out_ptr.add(offset).cast::<__m512i>());
@@ -52,8 +55,11 @@ pub unsafe fn add_features(out: &mut [i16], weights: &[i16], indices: &[FeatureI
 /// # Safety
 /// See [`add_features`].
 #[target_feature(enable = "avx512f,avx512bw")]
-pub unsafe fn sub_features(out: &mut [i16], weights: &[i16], indices: &[FeatureIndex]) {
-    debug_assert_eq!(out.len(), HIDDEN_SIZE);
+pub unsafe fn sub_features(
+    out: &mut [i16; HIDDEN_SIZE],
+    weights: &[i16],
+    indices: &[FeatureIndex],
+) {
     let out_ptr = out.as_mut_ptr();
     for &idx in indices {
         let base = idx as usize * HIDDEN_SIZE;
@@ -78,16 +84,15 @@ pub unsafe fn sub_features(out: &mut [i16], weights: &[i16], indices: &[FeatureI
 /// See [`add_features`].
 #[target_feature(enable = "avx512f,avx512bw")]
 pub unsafe fn add_sub_features(
-    out: &mut [i16],
+    out: &mut [i16; HIDDEN_SIZE],
     weights: &[i16],
     added: &[FeatureIndex],
     removed: &[FeatureIndex],
 ) {
-    debug_assert_eq!(out.len(), HIDDEN_SIZE);
     let out_ptr = out.as_mut_ptr();
     for chunk in 0..NUM_CHUNKS {
         let offset = chunk * LANES;
-        // SAFETY: `chunk * LANES + LANES <= HIDDEN_SIZE = out.len()`.
+        // SAFETY: `chunk * LANES + LANES <= HIDDEN_SIZE`, the length of `out`.
         let mut acc = unsafe { _mm512_loadu_si512(out_ptr.add(offset).cast::<__m512i>()) };
         for &idx in added {
             let base = idx as usize * HIDDEN_SIZE;
@@ -112,17 +117,16 @@ pub unsafe fn add_sub_features(
 /// See [`add_features`].
 #[target_feature(enable = "avx512f,avx512bw")]
 pub unsafe fn add_sub_sub_features(
-    out: &mut [i16],
+    out: &mut [i16; HIDDEN_SIZE],
     weights: &[i16],
     added: &[FeatureIndex],
     removed_a: &[FeatureIndex],
     removed_b: &[FeatureIndex],
 ) {
-    debug_assert_eq!(out.len(), HIDDEN_SIZE);
     let out_ptr = out.as_mut_ptr();
     for chunk in 0..NUM_CHUNKS {
         let offset = chunk * LANES;
-        // SAFETY: `chunk * LANES + LANES <= HIDDEN_SIZE = out.len()`.
+        // SAFETY: `chunk * LANES + LANES <= HIDDEN_SIZE`, the length of `out`.
         let mut acc = unsafe { _mm512_loadu_si512(out_ptr.add(offset).cast::<__m512i>()) };
         for &idx in added {
             let base = idx as usize * HIDDEN_SIZE;

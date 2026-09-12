@@ -1,5 +1,9 @@
-//! 64-byte-aligned heap buffer for NNUE weight/bias data: forces a 64-byte base
-//! so the AVX-512 kernels' unaligned 512-bit loads never split a cache line.
+//! 64-byte-aligned heap buffer: forces a 64-byte base so the AVX-512 kernels'
+//! unaligned 512-bit loads never split a cache line.
+//!
+//! This is what the kernel parity tests hold a made-up weight or input buffer
+//! in, so that what they feed a kernel sits on the cache lines the engine's own
+//! parameters and accumulators do.
 
 use std::alloc::{self, Layout};
 use std::fmt;

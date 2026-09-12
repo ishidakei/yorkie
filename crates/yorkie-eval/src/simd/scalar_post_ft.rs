@@ -76,9 +76,8 @@ pub fn sqr_clipped_relu(input: &[i32], output: &mut [u8]) {
 /// `j + HIDDEN_SIZE/2`, each clamped to `[0, EWM_CLAMP]`, multiplied, then
 /// shifted right by [`EWM_SHIFT`]. Reads `HIDDEN_SIZE` `i16`s, writes
 /// `HIDDEN_SIZE/2` bytes.
-pub fn ewm_one_perspective(half: &[i16], out: &mut [u8]) {
+pub fn ewm_one_perspective(half: &[i16; HIDDEN_SIZE], out: &mut [u8]) {
     const HALF: usize = HIDDEN_SIZE / 2;
-    debug_assert_eq!(half.len(), HIDDEN_SIZE);
     debug_assert_eq!(out.len(), HALF);
     for j in 0..HALF {
         let s0 = (half[j] as i32).clamp(0, EWM_CLAMP);

@@ -488,6 +488,11 @@ pub struct QSearch<N: NetworkParams> {
     /// always the accumulator for the position the current node is searching.
     /// Never shared, and preallocated so a node never allocates; the constant
     /// length lets the optimizer drop the per-access bounds check.
+    ///
+    /// Each slot carries its two `i16` rows inline, so the whole stack is one
+    /// contiguous block and a row is the base address plus a constant: the depth
+    /// scales the slot size, and nothing on the way to the lanes is loaded from
+    /// memory.
     acc_stack: Box<[Accumulator; ACC_LEN]>,
     /// Index of the current node's accumulator within [`Self::acc_stack`] (the
     /// live top of the do/undo stack). Incremented per `do_move`, decremented per
@@ -866,7 +871,8 @@ impl<N: NetworkParams> QSearch<N> {
             // One accumulator slot per reachable do/undo depth (bounded by
             // `MAX_PLY`, plus headroom); `Accumulator` is not `Clone`, so build
             // the slots individually. A boxed fixed-size array keeps the large
-            // slots on the heap (no stack copy) with a compile-time length.
+            // slots on the heap (no stack copy) with a compile-time length, and
+            // is the whole stack's one allocation: a slot's rows are part of it.
             acc_stack: (0..ACC_LEN)
                 .map(|_| Accumulator::new())
                 .collect::<Vec<_>>()

@@ -36,7 +36,6 @@
 
 use yorkie_state::{Color, Position, Square};
 
-use crate::aligned::Aligned64;
 use crate::features::{
     DiffScratch, FeatureIndex, MAX_ACTIVE_FEATURES, active_features_into, changed_indices_into,
 };
@@ -45,11 +44,17 @@ use crate::types::{HIDDEN_SIZE, NetworkParams};
 
 /// One cached refreshed half: the accumulation and the active-feature list it
 /// was built from.
+///
+/// The accumulation is held inline and the entry is 64-byte aligned, so the
+/// table is one contiguous run of cache-line-aligned rows rather than a row per
+/// allocation, and the rebuild reaches one through the table's base address
+/// alone.
 #[derive(Debug)]
+#[repr(C, align(64))]
 struct FinnyEntry {
     /// `ft_biases + sum(ft_weights[c] for c in active)`, valid only while
     /// [`Self::initialized`] is set.
-    accumulation: Aligned64<i16>,
+    accumulation: [i16; HIDDEN_SIZE],
     /// The active-feature multiset [`Self::accumulation`] corresponds to.
     active: Vec<FeatureIndex>,
     /// Whether [`Self::accumulation`] currently satisfies the module invariant.
@@ -59,7 +64,7 @@ struct FinnyEntry {
 impl FinnyEntry {
     fn new() -> Self {
         FinnyEntry {
-            accumulation: Aligned64::<i16>::zeroed(HIDDEN_SIZE),
+            accumulation: [0; HIDDEN_SIZE],
             active: Vec::with_capacity(MAX_ACTIVE_FEATURES),
             initialized: false,
         }
@@ -81,15 +86,30 @@ pub struct FinnyCache {
 }
 
 impl FinnyCache {
-    /// Allocate an empty cache. Boxed because the entries own ~0.5 MiB of
-    /// accumulation buffers, so this belongs at worker setup, not on the search
+    /// Allocate an empty cache. Boxed because the entries carry ~0.5 MiB of
+    /// accumulation rows, so this belongs at worker setup, not on the search
     /// path.
+    ///
+    /// Each entry is written straight into the heap allocation. Building the
+    /// table as a value first would put that half-mebibyte on the stack, and a
+    /// worker thread's stack is not that large.
     pub fn new() -> Box<Self> {
-        Box::new(FinnyCache {
-            entries: std::array::from_fn(|_| std::array::from_fn(|_| FinnyEntry::new())),
-            scratch_active: Vec::with_capacity(MAX_ACTIVE_FEATURES),
-            diff: DiffScratch::default(),
-        })
+        let mut cache = Box::<FinnyCache>::new_uninit();
+        let base = cache.as_mut_ptr();
+        // SAFETY: `base` addresses one uninitialised, suitably aligned
+        // `FinnyCache` this call owns; every field is written exactly once, and
+        // through a raw pointer, so nothing reads the memory before it holds a
+        // value. `assume_init` runs only once all of them have.
+        unsafe {
+            for perspective in 0..Color::COUNT {
+                for bucket in 0..Square::COUNT {
+                    (&raw mut (*base).entries[perspective][bucket]).write(FinnyEntry::new());
+                }
+            }
+            (&raw mut (*base).scratch_active).write(Vec::with_capacity(MAX_ACTIVE_FEATURES));
+            (&raw mut (*base).diff).write(DiffScratch::default());
+            cache.assume_init()
+        }
     }
 
     /// Rebuild `perspective`'s half of the accumulator for `pos` into `dst`,
@@ -102,7 +122,7 @@ impl FinnyCache {
         net: N,
         pos: &Position,
         perspective: Color,
-        dst: &mut [i16],
+        dst: &mut [i16; HIDDEN_SIZE],
     ) {
         // Destructure so the entry borrow and the scratch borrows are disjoint.
         let FinnyCache {
@@ -142,7 +162,7 @@ impl FinnyCache {
             entry.initialized = true;
         }
 
-        dst.copy_from_slice(&entry.accumulation);
+        *dst = entry.accumulation;
         // The old list becomes the next call's scratch, so the steady state
         // allocates nothing.
         std::mem::swap(&mut entry.active, scratch_active);
@@ -173,10 +193,54 @@ impl FinnyCache {
                     }
                 }
                 assert_eq!(
-                    &*entry.accumulation,
+                    entry.accumulation.as_slice(),
                     expected.as_slice(),
                     "finny entry violates the biases+columns invariant",
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fresh_cache_is_one_arena_of_cache_line_aligned_empty_entries() {
+        /// Compared against whole, rather than lane by lane: this test runs
+        /// under miri, where a quarter of a million interpreted loads is the
+        /// difference between a fast test and a slow one.
+        const ZEROED: [i16; HIDDEN_SIZE] = [0; HIDDEN_SIZE];
+
+        let cache = FinnyCache::new();
+        assert!(
+            size_of::<FinnyEntry>().is_multiple_of(64),
+            "an entry that is not a whole number of cache lines wide pushes the next one off a line",
+        );
+
+        let mut previous: Option<usize> = None;
+        for perspective in [Color::Black, Color::White] {
+            for bucket in 0..Square::COUNT {
+                let entry = &cache.entries[perspective.index()][bucket];
+                assert!(!entry.initialized);
+                assert!(entry.accumulation == ZEROED, "entry is not zeroed");
+                assert!(entry.active.is_empty());
+
+                let row = entry.accumulation.as_ptr() as usize;
+                assert_eq!(
+                    row % 64,
+                    0,
+                    "{perspective:?} bucket {bucket} is not 64-byte aligned"
+                );
+                if let Some(previous) = previous {
+                    assert_eq!(
+                        row - previous,
+                        size_of::<FinnyEntry>(),
+                        "{perspective:?} bucket {bucket} does not follow its predecessor",
+                    );
+                }
+                previous = Some(row);
             }
         }
     }

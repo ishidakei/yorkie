@@ -19,7 +19,6 @@
 
 use yorkie_state::{Color, Move, Position};
 
-use crate::aligned::Aligned64;
 use crate::features::{
     FeatureIndex, FeatureList, MoveDelta, active_features, active_features_into, changed_indices,
     requires_full_refresh,
@@ -32,27 +31,35 @@ use crate::types::{FC_0_INPUT_DIMS, HIDDEN_SIZE, NetworkParams};
 /// input, i.e. `HIDDEN_SIZE/2` per perspective across the two perspectives.
 pub const FT_OUTPUT_DIMS: usize = FC_0_INPUT_DIMS;
 
-/// Per-perspective feature-transformer accumulator: one `i16` vector of
-/// [`HIDDEN_SIZE`] per perspective, each cache-line aligned.
+/// Per-perspective feature-transformer accumulator: one `i16` row of
+/// [`HIDDEN_SIZE`] per perspective, held inline and back to back.
+///
+/// The rows are part of the value, so an accumulator is one block of memory and
+/// a row is a constant offset into it — a stack of accumulators is a contiguous
+/// arena, and reaching a row costs no pointer of its own. The type is 64-byte
+/// aligned and a row is a whole number of cache lines wide, so both rows start
+/// on a line boundary and the AVX-512 kernels' 512-bit loads never split one.
 #[derive(Debug)]
+#[repr(C, align(64))]
 pub struct Accumulator {
     /// Indexed by [`Color::index`], never by side to move.
-    perspectives: [Aligned64<i16>; Color::COUNT],
+    perspectives: [[i16; HIDDEN_SIZE]; Color::COUNT],
 }
 
+/// The second row only starts on a cache line because a row's byte width is a
+/// multiple of one; nothing else makes it so.
+const _: () = assert!((HIDDEN_SIZE * size_of::<i16>()).is_multiple_of(64));
+
 impl Accumulator {
-    /// Allocates a zeroed accumulator (both perspectives all-zero).
-    pub fn new() -> Self {
+    /// A zeroed accumulator (both perspectives all-zero).
+    pub const fn new() -> Self {
         Accumulator {
-            perspectives: [
-                Aligned64::<i16>::zeroed(HIDDEN_SIZE),
-                Aligned64::<i16>::zeroed(HIDDEN_SIZE),
-            ],
+            perspectives: [[0; HIDDEN_SIZE]; Color::COUNT],
         }
     }
 
     /// Read-only view of one perspective's accumulator half.
-    pub fn perspective(&self, color: Color) -> &[i16] {
+    pub fn perspective(&self, color: Color) -> &[i16; HIDDEN_SIZE] {
         &self.perspectives[color.index()]
     }
 
@@ -128,7 +135,7 @@ impl Accumulator {
             } else {
                 let after = active_features(pos, color);
                 let (removed, added) = changed_indices(&before[i], &after);
-                next.perspectives[i].copy_from_slice(&self.perspectives[i]);
+                next.perspectives[i] = self.perspectives[i];
                 apply_diff(
                     &mut next.perspectives[i],
                     net.ft_weights(),
@@ -163,7 +170,7 @@ impl Accumulator {
             let i = color.index();
             match delta.half(color) {
                 Some(pd) => {
-                    dst.perspectives[i].copy_from_slice(&src.perspectives[i]);
+                    dst.perspectives[i] = src.perspectives[i];
                     apply_diff(
                         &mut dst.perspectives[i],
                         net.ft_weights(),
@@ -210,7 +217,7 @@ impl Accumulator {
             let i = color.index();
             match delta.half(color) {
                 Some(pd) => {
-                    dst.perspectives[i].copy_from_slice(&src.perspectives[i]);
+                    dst.perspectives[i] = src.perspectives[i];
                     apply_diff(
                         &mut dst.perspectives[i],
                         net.ft_weights(),
@@ -243,7 +250,7 @@ impl Default for Accumulator {
 /// Rebuild one perspective's half: copy the biases, then add each active
 /// feature's weight column. `ft_weights` is row-major `[feature][lane]`.
 pub(crate) fn refresh_perspective(
-    out: &mut [i16],
+    out: &mut [i16; HIDDEN_SIZE],
     ft_biases: &[i16],
     ft_weights: &[i16],
     indices: &[FeatureIndex],
@@ -259,7 +266,7 @@ pub(crate) fn refresh_perspective(
 /// The common single-add arities route to fused kernels, one accumulator
 /// round-trip per lane; any other shape falls back to a separate sub-then-add.
 pub(crate) fn apply_diff(
-    out: &mut [i16],
+    out: &mut [i16; HIDDEN_SIZE],
     weights: &[i16],
     added: &[FeatureIndex],
     removed: &[FeatureIndex],
@@ -310,6 +317,34 @@ mod tests {
     }
 
     #[test]
+    fn the_rows_of_a_stack_of_accumulators_are_one_contiguous_arena() {
+        assert_eq!(
+            size_of::<Accumulator>(),
+            Color::COUNT * HIDDEN_SIZE * size_of::<i16>(),
+            "an accumulator is its rows and nothing else",
+        );
+
+        const SLOTS: usize = 4;
+        let stack: Vec<Accumulator> = (0..SLOTS).map(|_| Accumulator::new()).collect();
+        let row = |slot: &Accumulator, color| slot.perspective(color).as_ptr() as usize;
+
+        for slot in &stack {
+            assert_eq!(
+                row(slot, Color::White) - row(slot, Color::Black),
+                HIDDEN_SIZE * size_of::<i16>(),
+                "the two rows of one accumulator are not adjacent",
+            );
+        }
+        for pair in stack.windows(2) {
+            assert_eq!(
+                row(&pair[1], Color::Black) - row(&pair[0], Color::Black),
+                size_of::<Accumulator>(),
+                "consecutive slots are not one slot apart",
+            );
+        }
+    }
+
+    #[test]
     fn refresh_perspective_sums_bias_and_active_columns() {
         // biases[i] = i; weights[column c][lane i] = c*100 + i. With active
         // indices {2, 5}: out[i] = i + (200 + i) + (500 + i) = 700 + 3*i.
@@ -322,7 +357,7 @@ mod tests {
             }
         }
 
-        let mut out = vec![0i16; HIDDEN_SIZE];
+        let mut out = [0i16; HIDDEN_SIZE];
         refresh_perspective(&mut out, &biases, &weights, &[2, 5]);
 
         assert_eq!(out[0], 700);
@@ -338,15 +373,15 @@ mod tests {
     fn refresh_perspective_with_no_active_features_is_the_bias_vector() {
         let biases: Vec<i16> = (0..HIDDEN_SIZE).map(|i| (i as i16) % 17 - 8).collect();
         let weights = vec![123i16; 4 * HIDDEN_SIZE];
-        let mut out = vec![0i16; HIDDEN_SIZE];
+        let mut out = [0i16; HIDDEN_SIZE];
         refresh_perspective(&mut out, &biases, &weights, &[]);
-        assert_eq!(out, biases);
+        assert_eq!(out.as_slice(), biases.as_slice());
     }
 
     #[test]
     fn add_features_uses_wrapping_i16_arithmetic() {
         // A bias of `i16::MAX` plus a column of ones wraps to `i16::MIN`.
-        let mut out = vec![i16::MAX; HIDDEN_SIZE];
+        let mut out = [i16::MAX; HIDDEN_SIZE];
         let weights = vec![1i16; HIDDEN_SIZE];
         transformer_kernel::add_features(&mut out, &weights, &[0]);
         assert!(out.iter().all(|&x| x == i16::MIN));
@@ -771,11 +806,11 @@ mod tests {
         color: Color,
         what: &str,
     ) {
-        let mut dst = vec![0i16; HIDDEN_SIZE];
+        let mut dst = [0i16; HIDDEN_SIZE];
         cache.refresh_into(net, pos, color, &mut dst);
         assert_eq!(
-            dst,
-            expected_half(net, pos, color),
+            dst.as_slice(),
+            expected_half(net, pos, color).as_slice(),
             "{color:?}: cached rebuild != from-scratch refresh ({what})",
         );
         cache.assert_invariant(net);
@@ -1039,8 +1074,8 @@ mod tests {
         let mut acc = Accumulator::new();
         for color in [Color::Black, Color::White] {
             let half = &mut acc.perspectives[color.index()];
-            for i in 0..HIDDEN_SIZE {
-                half[i] = ((i as i32 * 5 + color.index() as i32 * 3) % 400 - 50) as i16;
+            for (i, lane) in half.iter_mut().enumerate() {
+                *lane = ((i as i32 * 5 + color.index() as i32 * 3) % 400 - 50) as i16;
             }
         }
 

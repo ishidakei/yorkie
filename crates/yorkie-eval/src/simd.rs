@@ -82,10 +82,11 @@ pub const fn active_backend() -> Backend {
 pub mod transformer_kernel {
     use super::avx512;
     use crate::features::FeatureIndex;
+    use crate::types::HIDDEN_SIZE;
 
     /// Add each active feature's FT weight column into `out`.
     #[inline]
-    pub fn add_features(out: &mut [i16], weights: &[i16], indices: &[FeatureIndex]) {
+    pub fn add_features(out: &mut [i16; HIDDEN_SIZE], weights: &[i16], indices: &[FeatureIndex]) {
         // SAFETY: this module is compiled only into a build enabling exactly
         // the features the callee's `#[target_feature]` names, and such a build
         // is `-C target-cpu=native`, so it only ever runs on a host with them.
@@ -94,7 +95,7 @@ pub mod transformer_kernel {
 
     /// Subtract each feature's FT weight column from `out`.
     #[inline]
-    pub fn sub_features(out: &mut [i16], weights: &[i16], indices: &[FeatureIndex]) {
+    pub fn sub_features(out: &mut [i16; HIDDEN_SIZE], weights: &[i16], indices: &[FeatureIndex]) {
         // SAFETY: see `add_features`.
         unsafe { avx512::sub_features(out, weights, indices) }
     }
@@ -102,7 +103,7 @@ pub mod transformer_kernel {
     /// Fused single-add / single-sub delta.
     #[inline]
     pub fn add_sub_features(
-        out: &mut [i16],
+        out: &mut [i16; HIDDEN_SIZE],
         weights: &[i16],
         added: &[FeatureIndex],
         removed: &[FeatureIndex],
@@ -114,7 +115,7 @@ pub mod transformer_kernel {
     /// Fused single-add / double-sub delta (capture-style updates).
     #[inline]
     pub fn add_sub_sub_features(
-        out: &mut [i16],
+        out: &mut [i16; HIDDEN_SIZE],
         weights: &[i16],
         added: &[FeatureIndex],
         removed_a: &[FeatureIndex],
@@ -145,10 +146,11 @@ pub mod transformer_kernel {
 ))]
 pub mod post_ft_kernel {
     use super::{avx512_post_ft, scalar_post_ft};
+    use crate::types::HIDDEN_SIZE;
 
     /// Pairwise element-wise multiply for one perspective half.
     #[inline]
-    pub fn ewm_one_perspective(half: &[i16], out: &mut [u8]) {
+    pub fn ewm_one_perspective(half: &[i16; HIDDEN_SIZE], out: &mut [u8]) {
         // SAFETY: this module is compiled only into a build enabling exactly
         // the features the callee's `#[target_feature]` names, and such a build
         // is `-C target-cpu=native`, so it only ever runs on a host with them.

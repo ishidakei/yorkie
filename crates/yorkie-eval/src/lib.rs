@@ -13,6 +13,10 @@
 //! ([`NetworkParams`]), so that address stays a constant all the way into the
 //! kernels.
 
+// The engine's own parameters are at an address the linker fixed and its
+// accumulators carry their rows inline, so nothing outside the kernel parity
+// tests asks for an aligned buffer of its own.
+#[cfg(test)]
 mod aligned;
 mod config;
 mod features;
@@ -37,7 +41,6 @@ mod simd;
 mod transformer;
 mod types;
 
-pub use aligned::Aligned64;
 pub use features::{
     FEATURE_DIMENSION, FeatureIndex, MAX_ACTIVE_FEATURES, MoveDelta, PerspectiveDelta,
     active_features, active_features_both, requires_full_refresh,

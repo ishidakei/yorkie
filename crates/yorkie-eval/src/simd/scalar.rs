@@ -11,8 +11,7 @@
 use crate::features::FeatureIndex;
 use crate::types::HIDDEN_SIZE;
 
-pub fn add_features(out: &mut [i16], weights: &[i16], indices: &[FeatureIndex]) {
-    debug_assert_eq!(out.len(), HIDDEN_SIZE);
+pub fn add_features(out: &mut [i16; HIDDEN_SIZE], weights: &[i16], indices: &[FeatureIndex]) {
     for &idx in indices {
         let base = idx as usize * HIDDEN_SIZE;
         let col = &weights[base..base + HIDDEN_SIZE];
@@ -22,8 +21,7 @@ pub fn add_features(out: &mut [i16], weights: &[i16], indices: &[FeatureIndex]) 
     }
 }
 
-pub fn sub_features(out: &mut [i16], weights: &[i16], indices: &[FeatureIndex]) {
-    debug_assert_eq!(out.len(), HIDDEN_SIZE);
+pub fn sub_features(out: &mut [i16; HIDDEN_SIZE], weights: &[i16], indices: &[FeatureIndex]) {
     for &idx in indices {
         let base = idx as usize * HIDDEN_SIZE;
         let col = &weights[base..base + HIDDEN_SIZE];
@@ -34,12 +32,11 @@ pub fn sub_features(out: &mut [i16], weights: &[i16], indices: &[FeatureIndex]) 
 }
 
 pub fn add_sub_features(
-    out: &mut [i16],
+    out: &mut [i16; HIDDEN_SIZE],
     weights: &[i16],
     added: &[FeatureIndex],
     removed: &[FeatureIndex],
 ) {
-    debug_assert_eq!(out.len(), HIDDEN_SIZE);
     for (i, slot) in out.iter_mut().enumerate() {
         let mut acc = *slot;
         for &idx in added {
@@ -53,13 +50,12 @@ pub fn add_sub_features(
 }
 
 pub fn add_sub_sub_features(
-    out: &mut [i16],
+    out: &mut [i16; HIDDEN_SIZE],
     weights: &[i16],
     added: &[FeatureIndex],
     removed_a: &[FeatureIndex],
     removed_b: &[FeatureIndex],
 ) {
-    debug_assert_eq!(out.len(), HIDDEN_SIZE);
     for (i, slot) in out.iter_mut().enumerate() {
         let mut acc = *slot;
         for &idx in added {
