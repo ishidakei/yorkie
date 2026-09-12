@@ -87,9 +87,9 @@ fn king_safe_after(pos: &Position, mv: Move) -> bool {
 fn pseudo_legal_candidates(pos: &Position) -> Vec<Move> {
     let mut buf: Vec<ExtMove> = Vec::with_capacity(64);
     if pos.in_check() {
-        pos.generate_evasions::<true>(&mut buf);
+        pos.generate_evasions::<true, _>(&mut buf);
     } else {
-        pos.generate_non_evasions::<true>(&mut buf);
+        pos.generate_non_evasions::<true, _>(&mut buf);
     }
     buf.into_iter().map(|em| em.mv).collect()
 }
@@ -192,9 +192,9 @@ fn check_generator_paths_agree(pos: &Position) -> TestCaseResult {
     }
 
     let mut captures: Vec<ExtMove> = Vec::with_capacity(32);
-    pos.generate_captures::<true>(&mut captures);
+    pos.generate_captures::<true, _>(&mut captures);
     let mut quiets: Vec<ExtMove> = Vec::with_capacity(64);
-    pos.generate_quiets::<true>(&mut quiets);
+    pos.generate_quiets::<true, _>(&mut quiets);
 
     let capture_set: HashSet<Move> = captures.iter().map(|em| em.mv).collect();
     let quiet_set: HashSet<Move> = quiets.iter().map(|em| em.mv).collect();

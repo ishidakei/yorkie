@@ -28,7 +28,7 @@ use yorkie_storage::{Bound, TranspositionTable, TtSlot, Value};
 
 use crate::config::GENERATE_ALL_LEGAL_MOVES;
 use crate::history::{ContinuationCorrectionHistory, ContinuationHistory, CorrChannel};
-use crate::movepick::MovePicker;
+use crate::movepick::{MovePicker, PickerScratch};
 use crate::root::{
     EnteringKingConfig, RootKind, RootMove, RootOutcome, declaration_win, generate_root_moves,
 };
@@ -255,6 +255,18 @@ const STACK_LEN: usize = STACK_BASE + MAX_PLY as usize + 2;
 /// do/undo depth, plus headroom. Boxed, so the large `Accumulator` slots stay
 /// on the heap while the length remains a compile-time constant.
 const ACC_LEN: usize = MAX_PLY as usize + 8;
+
+/// Number of [`PickerScratch`] buffers: one per [`MovePicker`] that can be live
+/// at once, which is two per ply.
+///
+/// A node's own picker is the first. The second is the singular extension's:
+/// it re-enters `search` on the node's *own* ply while that picker is still
+/// yielding, and the re-entry builds a picker of its own. Nothing adds a third,
+/// because the re-entry carries an excluded move and a node with one takes
+/// neither the singular nor a further re-entry path. The ProbCut picker needs
+/// no slot of its own — it is finished before the node's own picker is built —
+/// and a node only reaches either with `ply < MAX_PLY`.
+const PICKER_SCRATCH_LEN: usize = 2 * MAX_PLY as usize + 4;
 
 /// Outcome of a top-level [`QSearch::run`].
 #[derive(Debug, Clone)]
@@ -484,6 +496,16 @@ pub struct QSearch<N: NetworkParams> {
     /// This worker's private finny table. Allocated once and never shared, so
     /// it needs no synchronisation.
     finny: Box<FinnyCache>,
+
+    /// The [`MovePicker`] buffers, [`PICKER_SCRATCH_LEN`] of them, in one
+    /// block allocated once here so no node ever reaches the allocator.
+    ///
+    /// The recursion hands each picker a `&mut` to one of them and searches on
+    /// with the rest, which is a borrow of this array that outlives the `&mut
+    /// self` of the search call it spans — so the array is lent out for the
+    /// length of one run ([`Self::lend_picker_scratch`]) and this field is
+    /// `None` while that run is in flight. Nothing reads it there.
+    picker_scratch: Option<Box<[PickerScratch; PICKER_SCRATCH_LEN]>>,
     /// Test-only: when set, [`Self::static_eval`] asserts the differential
     /// accumulator equals a from-scratch [`yorkie_eval::evaluate`] at every
     /// evaluation point (the accumulator-equivalence test). Enabled via
@@ -854,6 +876,17 @@ impl<N: NetworkParams> QSearch<N> {
                 .expect("ACC_LEN slots collected"),
             acc_depth: 0,
             finny: FinnyCache::new(),
+            // One block for the whole set: the buffers carry their storage
+            // inline, so this is the only allocation any of them costs.
+            picker_scratch: Some(
+                (0..PICKER_SCRATCH_LEN)
+                    .map(|_| PickerScratch::new())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+                    .try_into()
+                    .map_err(|_| ())
+                    .expect("PICKER_SCRATCH_LEN buffers collected"),
+            ),
             #[cfg(test)]
             verify_accumulator: false,
             histories,
@@ -1225,7 +1258,8 @@ impl<N: NetworkParams> QSearch<N> {
         // Seed the root accumulator; every node below derives from it.
         self.seed_accumulator(pos);
 
-        let value = self.qsearch(pos, 0, alpha, beta);
+        let value =
+            self.lend_picker_scratch(|this, scratch| this.qsearch(pos, 0, alpha, beta, scratch));
 
         QSearchOutcome {
             value,
@@ -1239,6 +1273,33 @@ impl<N: NetworkParams> QSearch<N> {
     #[inline]
     fn si(ply: i32) -> usize {
         STACK_BASE + ply as usize
+    }
+
+    /// Take the picker buffer for one node, leaving the rest for whatever it
+    /// searches. The lender sizes the array so a live picker always finds one.
+    #[inline]
+    fn split_picker_scratch(
+        scratch: &mut [PickerScratch],
+    ) -> (&mut PickerScratch, &mut [PickerScratch]) {
+        scratch
+            .split_first_mut()
+            .expect("a picker buffer per live picker")
+    }
+
+    /// Run `f` with the picker buffers (see [`Self::picker_scratch`]) lent to
+    /// it, and take them back when it returns. Every entry into the recursion
+    /// goes through here.
+    fn lend_picker_scratch<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self, &mut [PickerScratch]) -> R,
+    ) -> R {
+        let mut scratch = self
+            .picker_scratch
+            .take()
+            .expect("the picker buffers are lent to one run at a time");
+        let value = f(self, &mut scratch[..]);
+        self.picker_scratch = Some(scratch);
+        value
     }
 
     /// The current node's live accumulator (`acc_stack[acc_depth]`), read by the
@@ -1421,8 +1482,24 @@ impl<N: NetworkParams> QSearch<N> {
             .find(|&m| m.move16_stored() == Some(move16))
     }
 
-    /// The core recursive qsearch.
-    fn qsearch(&mut self, pos: &mut Position, ply: i32, mut alpha: Value, beta: Value) -> Value {
+    /// Enter [`Self::qsearch`] at `ply` with the picker buffers lent to it —
+    /// the entry the tests that drive a single node use.
+    #[cfg(test)]
+    fn qsearch_at(&mut self, pos: &mut Position, ply: i32, alpha: Value, beta: Value) -> Value {
+        self.lend_picker_scratch(|this, scratch| this.qsearch(pos, ply, alpha, beta, scratch))
+    }
+
+    /// The core recursive qsearch. `scratch` holds the picker buffers still
+    /// free: this node takes the first for its own picker and the moves it
+    /// searches get the rest.
+    fn qsearch(
+        &mut self,
+        pos: &mut Position,
+        ply: i32,
+        mut alpha: Value,
+        beta: Value,
+        scratch: &mut [PickerScratch],
+    ) -> Value {
         let pv_node = self.pv_node;
 
         // The node starts unmarked; every return below leaves this holding the
@@ -1607,7 +1684,8 @@ impl<N: NetworkParams> QSearch<N> {
         // evasion ordering is a constant shift.
         let cont_planes: [usize; 6] =
             std::array::from_fn(|i| self.stack[Self::si(ply) - 1 - i].cont_hist);
-        let mut mp = MovePicker::new_qsearch(pos, tt_move, cont_planes);
+        let (slot, scratch) = Self::split_picker_scratch(scratch);
+        let mut mp = MovePicker::new_qsearch(pos, tt_move, cont_planes, slot);
 
         let mut best_move: Option<Move> = None;
 
@@ -1664,7 +1742,7 @@ impl<N: NetworkParams> QSearch<N> {
             self.push_accumulator(pos, &acc_delta);
             #[cfg(feature = "verbose3")]
             let node_path_dep = self.path_dep;
-            let value = -self.qsearch(pos, ply + 1, -beta, -alpha);
+            let value = -self.qsearch(pos, ply + 1, -beta, -alpha, scratch);
             #[cfg(feature = "verbose3")]
             let child_path_dep = self.child_path_dep(node_path_dep);
             pos.undo_move(mv, undo);
@@ -2257,17 +2335,20 @@ impl<N: NetworkParams> QSearch<N> {
             self.root_depth = root_depth;
             // Slot 0 still holds the root refresh seeded by the caller.
             self.acc_depth = 0;
-            best_value = self.search(
-                work,
-                0,
-                alpha,
-                beta,
-                adjusted_depth,
-                false,
-                true,
-                None,
-                Some(&mut *root_moves),
-            );
+            best_value = self.lend_picker_scratch(|this, scratch| {
+                this.search(
+                    work,
+                    0,
+                    alpha,
+                    beta,
+                    adjusted_depth,
+                    false,
+                    true,
+                    None,
+                    Some(&mut *root_moves),
+                    scratch,
+                )
+            });
 
             // Non-PV moves carry `-VALUE_INFINITE`, so this stable sort only
             // raises the PV and leaves the rest in order.
@@ -2736,14 +2817,20 @@ impl<N: NetworkParams> QSearch<N> {
             cell.pv = pv;
         }
         self.seed_accumulator(pos);
-        self.search(pos, 0, alpha, beta, depth, cut_node, pv_node, None, None)
+        self.lend_picker_scratch(|this, scratch| {
+            this.search(
+                pos, 0, alpha, beta, depth, cut_node, pv_node, None, None, scratch,
+            )
+        })
     }
 
     /// The shared `search<Root/PV/NonPV>` body. `prior_captured` is the piece
     /// the move that reached this node captured.
     ///
     /// `root_moves` is `Some` **only** for the root call; its presence is the
-    /// `rootNode` flag.
+    /// `rootNode` flag. `scratch` holds the picker buffers still free: this
+    /// node takes one for each picker it builds and passes the rest to
+    /// everything it searches, the same-ply singular re-entry included.
     #[allow(clippy::too_many_arguments)]
     fn search(
         &mut self,
@@ -2756,6 +2843,7 @@ impl<N: NetworkParams> QSearch<N> {
         pv_node: bool,
         prior_captured: Option<Piece>,
         mut root_moves: Option<&mut Vec<RootMove>>,
+        scratch: &mut [PickerScratch],
     ) -> Value {
         // `Root` is a PV node, so `pv_node` is also true at the root.
         let root_node = root_moves.is_some();
@@ -2767,7 +2855,7 @@ impl<N: NetworkParams> QSearch<N> {
         if depth <= 0 {
             self.pv_node = pv_node;
             self.set_read_tt(true);
-            return self.qsearch(pos, ply, alpha, beta);
+            return self.qsearch(pos, ply, alpha, beta, scratch);
         }
 
         // The node starts unmarked; every return below leaves this holding the
@@ -3050,7 +3138,7 @@ impl<N: NetworkParams> QSearch<N> {
             if !pv_node && eval < alpha - 502 - 306 * depth * depth {
                 self.pv_node = false;
                 self.set_read_tt(true);
-                return self.qsearch(pos, ply, alpha, beta);
+                return self.qsearch(pos, ply, alpha, beta, scratch);
             }
 
             // Step 8. Futility pruning.
@@ -3101,6 +3189,7 @@ impl<N: NetworkParams> QSearch<N> {
                     false,
                     None,
                     None,
+                    scratch,
                 );
                 // The null child is the only thing a returned `null_value`
                 // comes from; the verification search below only gates it, so
@@ -3136,6 +3225,7 @@ impl<N: NetworkParams> QSearch<N> {
                         false,
                         prior_captured,
                         None,
+                        scratch,
                     );
                     // A re-entry on this node's own ply: it overwrites the
                     // live mark, which is restored here rather than kept, since
@@ -3178,7 +3268,11 @@ impl<N: NetworkParams> QSearch<N> {
             if depth >= 3 && !is_decisive(beta) && !(is_valid(tt_value) && tt_value < prob_cut_beta)
             {
                 let prob_cut_depth = depth - 4;
-                let mut mp = MovePicker::new_probcut(pos, tt_move, prob_cut_beta - static_eval);
+                // This picker is done before the node's own is built, so the
+                // buffer it takes is the one that picker will take.
+                let (slot, scratch) = Self::split_picker_scratch(scratch);
+                let mut mp =
+                    MovePicker::new_probcut(pos, tt_move, prob_cut_beta - static_eval, slot);
                 while let Some(mv) = mp.next_move(pos, &self.histories) {
                     if Some(mv) == excluded_move || !pos.is_legal(mv) {
                         continue;
@@ -3197,7 +3291,8 @@ impl<N: NetworkParams> QSearch<N> {
                     self.set_read_tt(true);
                     #[cfg(feature = "verbose3")]
                     let node_path_dep = self.path_dep;
-                    let mut value = -self.qsearch(pos, ply + 1, -prob_cut_beta, -prob_cut_beta + 1);
+                    let mut value =
+                        -self.qsearch(pos, ply + 1, -prob_cut_beta, -prob_cut_beta + 1, scratch);
                     if value >= prob_cut_beta && prob_cut_depth > 0 {
                         value = -self.search(
                             pos,
@@ -3209,6 +3304,7 @@ impl<N: NetworkParams> QSearch<N> {
                             false,
                             undo.captured(),
                             None,
+                            scratch,
                         );
                     }
                     #[cfg(feature = "verbose3")]
@@ -3259,7 +3355,8 @@ impl<N: NetworkParams> QSearch<N> {
         // as snapshots, so a plane updated by an earlier move's subtree is seen
         // when a later stage scores against it.
         let cont_planes: [usize; 6] = std::array::from_fn(|i| self.stack[s - 1 - i].cont_hist);
-        let mut mp = MovePicker::new_main_search(pos, tt_move, depth, ply, cont_planes);
+        let (slot, scratch) = Self::split_picker_scratch(scratch);
+        let mut mp = MovePicker::new_main_search(pos, tt_move, depth, ply, cont_planes, slot);
 
         let mut move_count = 0i32;
         let mut quiets_searched = SearchedList::new();
@@ -3410,6 +3507,7 @@ impl<N: NetworkParams> QSearch<N> {
                     false,
                     prior_captured,
                     None,
+                    scratch,
                 );
                 // A re-entry on this node's own ply, so its mark is held aside
                 // and folded in only where `s_value` becomes this node's value.
@@ -3529,6 +3627,7 @@ impl<N: NetworkParams> QSearch<N> {
                     false,
                     undo.captured(),
                     None,
+                    scratch,
                 );
                 self.stack[s].reduction = 0;
                 if value > alpha {
@@ -3546,6 +3645,7 @@ impl<N: NetworkParams> QSearch<N> {
                             false,
                             undo.captured(),
                             None,
+                            scratch,
                         );
                     }
                     update_continuation_histories(
@@ -3576,6 +3676,7 @@ impl<N: NetworkParams> QSearch<N> {
                     false,
                     undo.captured(),
                     None,
+                    scratch,
                 );
             }
 
@@ -3599,6 +3700,7 @@ impl<N: NetworkParams> QSearch<N> {
                     true,
                     undo.captured(),
                     None,
+                    scratch,
                 );
             }
 
@@ -4270,7 +4372,7 @@ mod tests {
             Piece::new(PieceKind::Pawn, Color::White),
         );
         q.stack[STACK_BASE - 1].current_move = Some(prev);
-        let _ = q.qsearch(&mut p, 0, 0, 1);
+        let _ = q.qsearch_at(&mut p, 0, 0, 1);
         assert_eq!(q.nodes, 3, "the recapture is exempt from moveCount pruning");
     }
 
@@ -4532,9 +4634,9 @@ mod tests {
 
         // At ply == MAX_PLY the node returns draw_value(DRAW, us) + dither.
         q.nodes = 0;
-        assert_eq!(q.qsearch(&mut p, MAX_PLY, -1, 0), -1 + value_draw(0)); // -2
+        assert_eq!(q.qsearch_at(&mut p, MAX_PLY, -1, 0), -1 + value_draw(0)); // -2
         q.nodes = 2;
-        assert_eq!(q.qsearch(&mut p, MAX_PLY, -1, 0), -1 + value_draw(2)); // 0
+        assert_eq!(q.qsearch_at(&mut p, MAX_PLY, -1, 0), -1 + value_draw(2)); // 0
     }
 
     #[cfg_attr(miri, ignore)]
@@ -4579,7 +4681,7 @@ mod tests {
         q.pv_node = false;
         q.nodes = 0;
         // draw_value(DRAW, Black=root_us) + value_draw(0) == -1 + -1 == -2.
-        assert_eq!(q.qsearch(&mut p, 6, -1, 0), -2);
+        assert_eq!(q.qsearch_at(&mut p, 6, -1, 0), -2);
     }
 
     /// The `verbose3` path-dependence mark: where it comes from, how it rides
@@ -4665,13 +4767,13 @@ mod tests {
             q.pv_node = false;
 
             q.nodes = 0;
-            q.qsearch(&mut p, 6, -1, 0);
+            q.qsearch_at(&mut p, 6, -1, 0);
             assert!(q.path_dep, "the repetition draw is a path-dependent value");
 
             // The same position, reached at a ply the judgement does not apply
             // to: an ordinary node, and an unmarked value.
             q.nodes = 0;
-            q.qsearch(&mut p, 4, -1, 0);
+            q.qsearch_at(&mut p, 4, -1, 0);
             assert!(!q.path_dep);
         }
 
@@ -5272,7 +5374,9 @@ mod tests {
 
         // A small zero-window above 0 makes every white king move (value 0) fail
         // low without tripping razoring (which needs eval < alpha - 808).
-        let v = q.search(&mut p, 1, 1, 2, 1, false, false, None, None);
+        let v = q.lend_picker_scratch(|this, scratch| {
+            this.search(&mut p, 1, 1, 2, 1, false, false, None, None, scratch)
+        });
         assert_eq!(v, 0);
 
         // bonusScale = -232 - (-20000/108) + 59 = 12; scaledBonus = 55*12 = 660.
@@ -5437,10 +5541,12 @@ mod tests {
             // pattern.
             let mut inputs: Vec<Option<Move>> = vec![None];
             inputs.extend(accepted.iter().map(|&m| Some(m)));
+            let mut q_scratch = PickerScratch::new();
+            let mut main_scratch = PickerScratch::new();
             for tt_move in inputs {
                 for mut mp in [
-                    MovePicker::new_qsearch(p, tt_move, [0; 6]),
-                    MovePicker::new_main_search(p, tt_move, 6, 0, [0; 6]),
+                    MovePicker::new_qsearch(p, tt_move, [0; 6], &mut q_scratch),
+                    MovePicker::new_main_search(p, tt_move, 6, 0, [0; 6], &mut main_scratch),
                 ] {
                     while let Some(m) = mp.next_move(p, &hist) {
                         assert!(
@@ -5466,10 +5572,10 @@ mod tests {
     fn strict_search_legal(p: &Position) -> Vec<Move> {
         let mut pseudo: Vec<yorkie_state::ExtMove> = Vec::new();
         if p.in_check() {
-            p.generate_evasions::<false>(&mut pseudo);
+            p.generate_evasions::<false, _>(&mut pseudo);
         } else {
-            p.generate_captures::<false>(&mut pseudo);
-            p.generate_quiets::<false>(&mut pseudo);
+            p.generate_captures::<false, _>(&mut pseudo);
+            p.generate_quiets::<false, _>(&mut pseudo);
         }
         pseudo
             .into_iter()

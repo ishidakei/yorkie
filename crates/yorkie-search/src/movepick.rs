@@ -33,9 +33,7 @@
 //! reference: repetition is handled by scoring, never by filtering the move out
 //! of the picker.
 
-use std::cell::RefCell;
-
-use yorkie_state::{CheckSquares, ExtMove, Move, Position, piece_value};
+use yorkie_state::{CheckSquares, ExtMove, Move, MoveSink, Position, piece_value};
 
 use crate::config::GENERATE_ALL_LEGAL_MOVES;
 use crate::history::LOW_PLY_HISTORY_SIZE;
@@ -50,47 +48,126 @@ const GOOD_QUIET_THRESHOLD: i32 = -14000;
 /// `debug_assert`ed on generation overflow.
 const MAX_MOVES: usize = 600;
 
-/// The reusable per-node move buffers a [`MovePicker`] draws from — the port's
-/// analogue of the reference's fixed `ExtMove moves[MAX_MOVES]` stack buffer.
-/// A picker is constructed at every search node, so allocating these `Vec`s
-/// afresh would fault a fresh heap page per node; instead each picker borrows
-/// one from a per-thread pool and returns it on [`Drop`], cleared but never
-/// shrunk. The pool grows to at most the live recursion depth, since a parent
-/// picker holds its scratch while its children search with their own.
-#[derive(Default)]
-struct PickerScratch {
+/// The slot a buffer's unused tail holds. Never read — [`PickerScratch::len`]
+/// bounds every read to the written prefix — so any move value serves.
+const EMPTY_SLOT: ExtMove = ExtMove {
+    mv: Move::null(),
+    value: 0,
+};
+
+/// The per-node move buffer a [`MovePicker`] works in — the port's analogue of
+/// the reference's fixed `ExtMove moves[MAX_MOVES]` member array.
+///
+/// A picker is constructed at every search node, so the buffer is never built
+/// there: the caller owns one per live picker and lends it out. The storage is
+/// inline, so lending one costs nothing and no node ever reaches the allocator;
+/// the caller allocates the whole set of buffers in one block.
+pub struct PickerScratch {
     /// The single stage-machine buffer: captures (or evasions) first, then —
     /// for the main not-in-check picker — the raw quiets. The sort, bad-capture
     /// compaction and segment replays all walk index boundaries into it.
-    buf: Vec<ExtMove>,
+    buf: [ExtMove; MAX_MOVES],
+    /// The written prefix of `buf`: the list is `buf[..len]`.
+    len: usize,
 }
 
 impl PickerScratch {
-    /// Empty the buffer without releasing capacity — the reuse contract that
-    /// keeps steady-state allocation at zero.
-    fn clear(&mut self) {
-        self.buf.clear();
+    /// An empty buffer.
+    pub const fn new() -> Self {
+        PickerScratch {
+            buf: [EMPTY_SLOT; MAX_MOVES],
+            len: 0,
+        }
+    }
+
+    /// Empty the buffer.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// The number of moves held.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Does the buffer hold no move?
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The moves held, in buffer order.
+    #[inline]
+    pub fn as_slice(&self) -> &[ExtMove] {
+        &self.buf[..self.len]
+    }
+
+    /// The moves held, in buffer order, mutably — the sorts and the bad-capture
+    /// compaction work through this.
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [ExtMove] {
+        &mut self.buf[..self.len]
+    }
+
+    /// Keep the moves `f` accepts, in order, and drop the rest.
+    #[inline]
+    fn retain(&mut self, mut f: impl FnMut(&ExtMove) -> bool) {
+        let mut kept = 0;
+        for i in 0..self.len {
+            if f(&self.buf[i]) {
+                self.buf[kept] = self.buf[i];
+                kept += 1;
+            }
+        }
+        self.len = kept;
     }
 }
 
-thread_local! {
-    /// Per-worker (per-thread) free-list of [`PickerScratch`] buffers. Each Lazy
-    /// SMP worker runs on its own thread, so a thread-local pool is exactly a
-    /// per-worker pool. Popped at [`MovePicker`] construction, pushed back on
-    /// [`Drop`]; capacity accumulates to the deepest concurrent recursion.
-    static SCRATCH_POOL: RefCell<Vec<PickerScratch>> = const { RefCell::new(Vec::new()) };
+impl Default for PickerScratch {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-/// Borrow a cleared scratch from the thread-local pool (or a fresh one if the
-/// pool is empty — a one-time cost as the pool warms to recursion depth). Both
-/// buffers are reserved to [`MAX_MOVES`] so no reallocation occurs mid-search.
-fn take_scratch() -> PickerScratch {
-    let mut scratch = SCRATCH_POOL
-        .with(|pool| pool.borrow_mut().pop())
-        .unwrap_or_default();
-    scratch.clear();
-    scratch.buf.reserve(MAX_MOVES);
-    scratch
+impl MoveSink for PickerScratch {
+    #[inline]
+    fn push(&mut self, m: ExtMove) {
+        debug_assert!(
+            self.len < MAX_MOVES,
+            "move buffer overflow: {} >= {MAX_MOVES}",
+            self.len
+        );
+        self.buf[self.len] = m;
+        self.len += 1;
+    }
+}
+
+impl std::ops::Index<usize> for PickerScratch {
+    type Output = ExtMove;
+
+    #[inline]
+    fn index(&self, i: usize) -> &ExtMove {
+        debug_assert!(
+            i < self.len,
+            "read past the buffer's moves: {i} >= {}",
+            self.len
+        );
+        &self.buf[i]
+    }
+}
+
+impl std::ops::IndexMut<usize> for PickerScratch {
+    #[inline]
+    fn index_mut(&mut self, i: usize) -> &mut ExtMove {
+        debug_assert!(
+            i < self.len,
+            "write past the buffer's moves: {i} >= {}",
+            self.len
+        );
+        &mut self.buf[i]
+    }
 }
 
 /// The reference `partial_insertion_sort`: a stable descending insertion sort
@@ -240,10 +317,11 @@ enum Stage {
 /// Yields the moves of a search node in the reference `MovePicker` order.
 ///
 /// Construct with [`MovePicker::new_qsearch`], [`MovePicker::new_main_search`]
-/// or [`MovePicker::new_probcut`], then pull moves with
-/// [`MovePicker::next_move`], **passing the live [`WorkerHistories`] each
-/// call**, until it returns `None`. Every yielded move is legal.
-pub struct MovePicker {
+/// or [`MovePicker::new_probcut`] — each takes the [`PickerScratch`] it works
+/// in — then pull moves with [`MovePicker::next_move`], **passing the live
+/// [`WorkerHistories`] each call**, until it returns `None`. Every yielded move
+/// is legal.
+pub struct MovePicker<'a> {
     kind: Kind,
     tt: Option<Move>,
     /// Search depth (`> 0` for the main picker) — the `QUIET_INIT` partial-sort
@@ -258,16 +336,15 @@ pub struct MovePicker {
     /// [`WorkerHistories::continuation`] (`contHist`).
     cont_planes: [usize; 6],
 
-    /// The reusable per-node move buffers, borrowed from the thread-local pool
-    /// at construction and returned on [`Drop`] (see [`PickerScratch`]). `buf` is
-    /// filled with the generated moves at construction; scoring fills each
-    /// `value` in place at the `*_INIT` stages.
-    scratch: PickerScratch,
+    /// The move buffer this picker works in, lent by the caller for the
+    /// picker's lifetime (see [`PickerScratch`]). The `*_INIT` stages fill it
+    /// with the generated moves and score each `value` in place.
+    scratch: &'a mut PickerScratch,
 
     skip_quiets: bool,
     stage: Stage,
 
-    // The reference's pointers, as indices into `scratch.buf`.
+    // The reference's pointers, as indices into `scratch`.
     /// The next move to return.
     cur: usize,
     /// The end of the segment `select` currently walks.
@@ -280,29 +357,23 @@ pub struct MovePicker {
     end_generated: usize,
 }
 
-impl Drop for MovePicker {
-    /// Return the scratch buffers (capacity intact) to the thread-local pool for
-    /// the next node's picker to reuse. Running on `Drop` makes reclamation
-    /// robust to every early return in the search loops.
-    fn drop(&mut self) {
-        let scratch = std::mem::take(&mut self.scratch);
-        SCRATCH_POOL.with(|pool| pool.borrow_mut().push(scratch));
-    }
-}
-
-impl MovePicker {
-    /// Build a qsearch picker for `pos`. `cont_planes` holds
-    /// `(ss-1-i)->continuationHistory`, of which qsearch scores read only plane
-    /// `[0]`. There is no good/bad split in qsearch — the whole sorted list is
-    /// emitted best-first.
-    pub fn new_qsearch(pos: &Position, tt_move: Option<Move>, cont_planes: [usize; 6]) -> Self {
+impl<'a> MovePicker<'a> {
+    /// Build a qsearch picker for `pos`, working in `scratch`. `cont_planes`
+    /// holds `(ss-1-i)->continuationHistory`, of which qsearch scores read only
+    /// plane `[0]`. There is no good/bad split in qsearch — the whole sorted
+    /// list is emitted best-first.
+    pub fn new_qsearch(
+        pos: &Position,
+        tt_move: Option<Move>,
+        cont_planes: [usize; 6],
+        scratch: &'a mut PickerScratch,
+    ) -> Self {
         let in_check = pos.in_check();
         let tt = tt_move.filter(|&m| {
             m.is_ok() && pos.pseudo_legal::<GENERATE_ALL_LEGAL_MOVES>(m) && pos.is_legal(m)
         });
         // The capture / evasion list is generated at the `*_INIT` stage entry,
         // not here, so a node that cuts off at the TT stage never pays for it.
-        let scratch = take_scratch();
         Self::from_parts(
             if in_check {
                 Kind::Evasion
@@ -318,13 +389,15 @@ impl MovePicker {
         )
     }
 
-    /// Build a main-search picker for `pos` at `depth` (`> 0`) and `ply`.
+    /// Build a main-search picker for `pos` at `depth` (`> 0`) and `ply`,
+    /// working in `scratch`.
     pub fn new_main_search(
         pos: &Position,
         tt_move: Option<Move>,
         depth: i32,
         ply: i32,
         cont_planes: [usize; 6],
+        scratch: &'a mut PickerScratch,
     ) -> Self {
         let in_check = pos.in_check();
         let tt = tt_move.filter(|&m| {
@@ -334,12 +407,12 @@ impl MovePicker {
         // stage entry, so a node that cuts off during the TT / good-capture
         // stages — or that had `skip_quiets` set by late-move pruning before
         // `QUIET_INIT` — never pays for the generation it does not reach.
-        let scratch = take_scratch();
         let kind = if in_check { Kind::Evasion } else { Kind::Main };
         Self::from_parts(kind, tt, depth, ply, 0, cont_planes, scratch)
     }
 
-    /// Build a ProbCut picker for `pos` with SEE `threshold`.
+    /// Build a ProbCut picker for `pos` with SEE `threshold`, working in
+    /// `scratch`.
     ///
     /// The TT move leads iff it is a legal capture, and is exempt from the SEE
     /// filter as in the reference's `PROBCUT_TT` stage. ProbCut is only entered
@@ -349,7 +422,12 @@ impl MovePicker {
     /// its generator would not produce; that holds by construction here, since
     /// `generate_captures` targets enemy squares only and so generates no quiet
     /// pawn push regardless of `ALL`.
-    pub fn new_probcut(pos: &Position, tt_move: Option<Move>, threshold: i32) -> Self {
+    pub fn new_probcut(
+        pos: &Position,
+        tt_move: Option<Move>,
+        threshold: i32,
+        scratch: &'a mut PickerScratch,
+    ) -> Self {
         let is_capture = |m: Move| !m.is_drop() && pos.board().get(m.to_sq()).is_some();
         let tt = tt_move.filter(|&m| {
             m.is_ok()
@@ -359,12 +437,11 @@ impl MovePicker {
         });
         // The capture list is generated at `PROBCUT_INIT` stage entry, not
         // here: the buffer starts empty and is filled at that `next_move` arm.
-        let scratch = take_scratch();
         Self::from_parts(Kind::ProbCut, tt, 0, 0, threshold, [0; 6], scratch)
     }
 
     /// Generate the legal, TT-deduped capture (or, for the `Evasion` kind,
-    /// evasion) list into `scratch.buf` at `*_INIT` stage entry.
+    /// evasion) list into `scratch` at `*_INIT` stage entry.
     ///
     /// Generation is a pure function of the position, and the search restores
     /// the board around each `next_move`, so deferring it from construction
@@ -374,19 +451,13 @@ impl MovePicker {
         let in_check = self.kind == Kind::Evasion;
         let tt = self.tt;
         if in_check {
-            pos.generate_evasions::<GENERATE_ALL_LEGAL_MOVES>(&mut self.scratch.buf);
+            pos.generate_evasions::<GENERATE_ALL_LEGAL_MOVES, _>(&mut *self.scratch);
         } else {
-            pos.generate_captures::<GENERATE_ALL_LEGAL_MOVES>(&mut self.scratch.buf);
+            pos.generate_captures::<GENERATE_ALL_LEGAL_MOVES, _>(&mut *self.scratch);
         }
         self.scratch
-            .buf
             .retain(|e| pos.is_legal(e.mv) && Some(e.mv) != tt);
-        debug_assert!(
-            self.scratch.buf.len() <= MAX_MOVES,
-            "move buffer overflow: {} > {MAX_MOVES}",
-            self.scratch.buf.len()
-        );
-        self.end_captures = self.scratch.buf.len();
+        self.end_captures = self.scratch.len();
         self.end_generated = self.end_captures;
     }
 
@@ -398,8 +469,11 @@ impl MovePicker {
         ply: i32,
         threshold: i32,
         cont_planes: [usize; 6],
-        scratch: PickerScratch,
+        scratch: &'a mut PickerScratch,
     ) -> Self {
+        // The buffer arrives holding the previous picker's list, and its
+        // storage is inline, so emptying it is the whole of the setup.
+        scratch.clear();
         MovePicker {
             kind,
             tt,
@@ -429,12 +503,12 @@ impl MovePicker {
         F: FnMut(&mut Self, &Position) -> bool,
     {
         while self.cur < self.end_cur {
-            let m = self.scratch.buf[self.cur].mv;
+            let m = self.scratch[self.cur].mv;
             if Some(m) != self.tt && filter(self, pos) {
                 // `return *cur++`: the true-path filters never mutate `buf[cur]`,
                 // so this equals `m` (the `GOOD_CAPTURE` swap only fires on the
                 // false path).
-                let r = self.scratch.buf[self.cur].mv;
+                let r = self.scratch[self.cur].mv;
                 self.cur += 1;
                 return Some(r);
             }
@@ -448,8 +522,8 @@ impl MovePicker {
     fn score_captures_in_place(&mut self, pos: &Position, hist: &WorkerHistories) {
         let evasion = self.kind == Kind::Evasion;
         for i in 0..self.end_captures {
-            let m = self.scratch.buf[i].mv;
-            self.scratch.buf[i].value = if evasion {
+            let m = self.scratch[i].mv;
+            self.scratch[i].value = if evasion {
                 score_evasion(pos, m, hist, self.cont_planes[0])
             } else {
                 score_capture(pos, m, hist)
@@ -466,8 +540,8 @@ impl MovePicker {
         // every quiet scored here.
         let check_squares = pos.check_squares();
         for i in self.end_captures..self.end_generated {
-            let m = self.scratch.buf[i].mv;
-            self.scratch.buf[i].value =
+            let m = self.scratch[i].mv;
+            self.scratch[i].value =
                 score_quiet(pos, m, self.ply, hist, self.cont_planes, &check_squares);
         }
     }
@@ -499,7 +573,10 @@ impl MovePicker {
                 Stage::CaptureInit => {
                     self.generate_capture_list(pos);
                     self.score_captures_in_place(pos, hist);
-                    partial_insertion_sort(&mut self.scratch.buf[0..self.end_captures], i32::MIN);
+                    partial_insertion_sort(
+                        &mut self.scratch.as_mut_slice()[0..self.end_captures],
+                        i32::MIN,
+                    );
                     self.cur = 0;
                     self.end_bad_captures = 0;
                     self.end_cur = self.end_captures;
@@ -510,11 +587,11 @@ impl MovePicker {
                 // pays the remaining captures' SEE.
                 Stage::GoodCapture => {
                     if let Some(m) = self.select(pos, |s, p| {
-                        let e = s.scratch.buf[s.cur];
+                        let e = s.scratch[s.cur];
                         if p.see_ge(e.mv, -e.value / 18) {
                             true
                         } else {
-                            s.scratch.buf.swap(s.end_bad_captures, s.cur);
+                            s.scratch.as_mut_slice().swap(s.end_bad_captures, s.cur);
                             s.end_bad_captures += 1;
                             false
                         }
@@ -536,17 +613,12 @@ impl MovePicker {
                         // in the buffer changes the unsorted tail's final
                         // order. Dropping either here would silently reorder
                         // the surviving quiets.
-                        pos.generate_quiets::<GENERATE_ALL_LEGAL_MOVES>(&mut self.scratch.buf);
-                        debug_assert!(
-                            self.scratch.buf.len() <= MAX_MOVES,
-                            "move buffer overflow: {} > {MAX_MOVES}",
-                            self.scratch.buf.len()
-                        );
-                        self.end_generated = self.scratch.buf.len();
+                        pos.generate_quiets::<GENERATE_ALL_LEGAL_MOVES, _>(&mut *self.scratch);
+                        self.end_generated = self.scratch.len();
 
                         self.score_quiets_in_place(pos, hist);
                         partial_insertion_sort(
-                            &mut self.scratch.buf[self.end_captures..self.end_generated],
+                            &mut self.scratch.as_mut_slice()[self.end_captures..self.end_generated],
                             -3560 * self.depth,
                         );
                     }
@@ -560,7 +632,7 @@ impl MovePicker {
                 Stage::GoodQuiet => {
                     if !self.skip_quiets
                         && let Some(m) = self.select(pos, |s, p| {
-                            let e = s.scratch.buf[s.cur];
+                            let e = s.scratch[s.cur];
                             e.value > GOOD_QUIET_THRESHOLD && p.is_legal(e.mv)
                         })
                     {
@@ -592,7 +664,7 @@ impl MovePicker {
                         continue;
                     }
                     return self.select(pos, |s, p| {
-                        let e = s.scratch.buf[s.cur];
+                        let e = s.scratch[s.cur];
                         e.value <= GOOD_QUIET_THRESHOLD && p.is_legal(e.mv)
                     });
                 }
@@ -603,7 +675,10 @@ impl MovePicker {
                 Stage::QcaptureInit => {
                     self.generate_capture_list(pos);
                     self.score_captures_in_place(pos, hist);
-                    partial_insertion_sort(&mut self.scratch.buf[0..self.end_captures], i32::MIN);
+                    partial_insertion_sort(
+                        &mut self.scratch.as_mut_slice()[0..self.end_captures],
+                        i32::MIN,
+                    );
                     self.cur = 0;
                     self.end_cur = self.end_captures;
                     self.stage = Stage::Qcapture;
@@ -611,7 +686,10 @@ impl MovePicker {
                 Stage::EvasionInit => {
                     self.generate_capture_list(pos);
                     self.score_captures_in_place(pos, hist);
-                    partial_insertion_sort(&mut self.scratch.buf[0..self.end_captures], i32::MIN);
+                    partial_insertion_sort(
+                        &mut self.scratch.as_mut_slice()[0..self.end_captures],
+                        i32::MIN,
+                    );
                     self.cur = 0;
                     self.end_cur = self.end_captures;
                     self.stage = Stage::Evasion;
@@ -619,7 +697,10 @@ impl MovePicker {
                 Stage::ProbcutInit => {
                     self.generate_capture_list(pos);
                     self.score_captures_in_place(pos, hist);
-                    partial_insertion_sort(&mut self.scratch.buf[0..self.end_captures], i32::MIN);
+                    partial_insertion_sort(
+                        &mut self.scratch.as_mut_slice()[0..self.end_captures],
+                        i32::MIN,
+                    );
                     self.cur = 0;
                     self.end_cur = self.end_captures;
                     self.stage = Stage::Probcut;
@@ -635,7 +716,7 @@ impl MovePicker {
                 // evaluated lazily per move.
                 Stage::Probcut => {
                     return self.select(pos, |s, p| {
-                        let e = s.scratch.buf[s.cur];
+                        let e = s.scratch[s.cur];
                         p.see_ge(e.mv, s.threshold)
                     });
                 }
@@ -782,7 +863,7 @@ mod twin {
             }
             Self::generate_into(pos, false, tt, &mut scratch.raw_captures);
             let mut tmp: Vec<ExtMove> = Vec::new();
-            pos.generate_quiets::<GENERATE_ALL_LEGAL_MOVES>(&mut tmp);
+            pos.generate_quiets::<GENERATE_ALL_LEGAL_MOVES, _>(&mut tmp);
             scratch.raw_quiets.extend(tmp.into_iter().map(|e| e.mv));
             Self::from_parts(Kind::Main, tt, depth, ply, 0, cont_planes, scratch)
         }
@@ -806,9 +887,9 @@ mod twin {
             // logic never sees an `ExtMove`.
             let mut tmp: Vec<ExtMove> = Vec::new();
             if in_check {
-                pos.generate_evasions::<GENERATE_ALL_LEGAL_MOVES>(&mut tmp);
+                pos.generate_evasions::<GENERATE_ALL_LEGAL_MOVES, _>(&mut tmp);
             } else {
-                pos.generate_captures::<GENERATE_ALL_LEGAL_MOVES>(&mut tmp);
+                pos.generate_captures::<GENERATE_ALL_LEGAL_MOVES, _>(&mut tmp);
             }
             for e in tmp {
                 if pos.is_legal(e.mv) && Some(e.mv) != tt {
@@ -998,8 +1079,13 @@ mod tests {
         h
     }
 
+    /// A buffer for one picker; each test lends one to every picker it builds.
+    fn scratch() -> PickerScratch {
+        PickerScratch::new()
+    }
+
     /// Drive a picker to exhaustion against `hist`, collecting USI strings.
-    fn collect_usi(mut mp: MovePicker, p: &Position, hist: &WorkerHistories) -> Vec<String> {
+    fn collect_usi(mut mp: MovePicker<'_>, p: &Position, hist: &WorkerHistories) -> Vec<String> {
         let mut out = Vec::new();
         while let Some(m) = mp.next_move(p, hist) {
             out.push(format_usi_move(m));
@@ -1008,7 +1094,7 @@ mod tests {
     }
 
     /// Drive a picker to exhaustion, collecting moves.
-    fn collect_moves(mut mp: MovePicker, p: &Position, hist: &WorkerHistories) -> Vec<Move> {
+    fn collect_moves(mut mp: MovePicker<'_>, p: &Position, hist: &WorkerHistories) -> Vec<Move> {
         let mut out = Vec::new();
         while let Some(m) = mp.next_move(p, hist) {
             out.push(m);
@@ -1028,8 +1114,8 @@ mod tests {
 
     //   qsearch picker (init histories): MVV / capture-first behaviour
 
-    fn qpicker(p: &Position, tt: Option<Move>) -> MovePicker {
-        MovePicker::new_qsearch(p, tt, SENTINEL_PLANES)
+    fn qpicker<'a>(p: &Position, tt: Option<Move>, sc: &'a mut PickerScratch) -> MovePicker<'a> {
+        MovePicker::new_qsearch(p, tt, SENTINEL_PLANES, sc)
     }
 
     #[cfg_attr(miri, ignore)]
@@ -1037,9 +1123,10 @@ mod tests {
     fn qsearch_captures_are_ordered_by_victim_value_descending() {
         let p = pos("9/9/9/9/b3R3g/9/4p4/9/K7k b - 1");
         let h = init_histories();
+        let mut sc = scratch();
         assert!(!p.in_check());
         assert_eq!(
-            collect_usi(qpicker(&p, None), &p, &h),
+            collect_usi(qpicker(&p, None, &mut sc), &p, &h),
             vec!["5e9e".to_string(), "5e1e".to_string(), "5e5g".to_string()],
         );
     }
@@ -1049,8 +1136,9 @@ mod tests {
     fn qsearch_equal_value_victims_keep_reference_generation_order() {
         let p = pos("9/9/9/2p1p4/2S1G4/9/9/9/K7k b - 1");
         let h = init_histories();
+        let mut sc = scratch();
         assert_eq!(
-            collect_usi(qpicker(&p, None), &p, &h),
+            collect_usi(qpicker(&p, None, &mut sc), &p, &h),
             vec!["7e7d".to_string(), "5e5d".to_string()],
         );
     }
@@ -1064,7 +1152,8 @@ mod tests {
         let tt = Move::make(Square::new(4, 4).unwrap(), Square::new(4, 6).unwrap(), rook);
         assert_eq!(format_usi_move(tt), "5e5g");
 
-        let order = collect_usi(qpicker(&p, Some(tt)), &p, &h);
+        let mut sc = scratch();
+        let order = collect_usi(qpicker(&p, Some(tt), &mut sc), &p, &h);
         assert_eq!(
             order,
             vec!["5e5g".to_string(), "5e9e".to_string(), "5e1e".to_string()],
@@ -1078,7 +1167,8 @@ mod tests {
         let p = pos("k8/9/9/9/4R4/9/4p4/9/8K b - 1");
         let h = init_histories();
         assert!(!p.in_check());
-        let order = collect_usi(qpicker(&p, None), &p, &h);
+        let mut sc = scratch();
+        let order = collect_usi(qpicker(&p, None, &mut sc), &p, &h);
         assert_eq!(order, vec!["5e5g".to_string()]);
     }
 
@@ -1092,7 +1182,12 @@ mod tests {
         let h = init_histories();
         assert!(!p.in_check());
 
-        let moves = collect_usi(MovePicker::new_qsearch(&p, None, SENTINEL_PLANES), &p, &h);
+        let mut sc = scratch();
+        let moves = collect_usi(
+            MovePicker::new_qsearch(&p, None, SENTINEL_PLANES, &mut sc),
+            &p,
+            &h,
+        );
         if GENERATE_ALL_LEGAL_MOVES {
             assert!(
                 moves.contains(&"5d5b".to_string()),
@@ -1114,7 +1209,8 @@ mod tests {
         let h = init_histories();
         assert!(p.in_check());
 
-        let picker_moves = collect_moves(qpicker(&p, None), &p, &h);
+        let mut sc = scratch();
+        let picker_moves = collect_moves(qpicker(&p, None, &mut sc), &p, &h);
         let picker_set: std::collections::HashSet<Move> = picker_moves.iter().copied().collect();
         let legal_set: std::collections::HashSet<Move> = legal_moves(&p).into_iter().collect();
         assert_eq!(picker_set, legal_set);
@@ -1138,17 +1234,23 @@ mod tests {
 
     //   main-search picker with reference clear() histories
 
-    fn main_picker(p: &Position, tt: Option<Move>, depth: i32, ply: i32) -> MovePicker {
-        MovePicker::new_main_search(p, tt, depth, ply, SENTINEL_PLANES)
+    fn main_picker<'a>(
+        p: &Position,
+        tt: Option<Move>,
+        depth: i32,
+        ply: i32,
+        sc: &'a mut PickerScratch,
+    ) -> MovePicker<'a> {
+        MovePicker::new_main_search(p, tt, depth, ply, SENTINEL_PLANES, sc)
     }
 
     /// The union of legal captures and legal quiets — the moves the not-in-check
     /// main picker is responsible for.
     fn legal_capture_and_quiet_set(p: &Position) -> std::collections::HashSet<Move> {
         let mut caps: Vec<ExtMove> = Vec::new();
-        p.generate_captures::<GENERATE_ALL_LEGAL_MOVES>(&mut caps);
+        p.generate_captures::<GENERATE_ALL_LEGAL_MOVES, _>(&mut caps);
         let mut quiets: Vec<ExtMove> = Vec::new();
-        p.generate_quiets::<GENERATE_ALL_LEGAL_MOVES>(&mut quiets);
+        p.generate_quiets::<GENERATE_ALL_LEGAL_MOVES, _>(&mut quiets);
         caps.into_iter()
             .chain(quiets)
             .map(|e| e.mv)
@@ -1161,7 +1263,8 @@ mod tests {
     fn main_capture_order_is_mvv_with_initial_histories() {
         let p = pos("9/9/9/9/b3R3g/9/4p4/9/K7k b - 1");
         let h = init_histories();
-        let order = collect_usi(main_picker(&p, None, 8, 0), &p, &h);
+        let mut sc = scratch();
+        let order = collect_usi(main_picker(&p, None, 8, 0, &mut sc), &p, &h);
         assert_eq!(
             &order[..3],
             &["5e9e".to_string(), "5e1e".to_string(), "5e5g".to_string()],
@@ -1183,7 +1286,8 @@ mod tests {
         let tt = Move::make(Square::new(4, 4).unwrap(), Square::new(4, 6).unwrap(), rook);
         assert_eq!(format_usi_move(tt), "5e5g");
 
-        let order = collect_usi(main_picker(&p, Some(tt), 8, 0), &p, &h);
+        let mut sc = scratch();
+        let order = collect_usi(main_picker(&p, Some(tt), 8, 0, &mut sc), &p, &h);
         assert_eq!(order[0], "5e5g");
         assert_eq!(order.iter().filter(|s| *s == "5e5g").count(), 1);
     }
@@ -1195,7 +1299,8 @@ mod tests {
             pos("l7l/1r1sg2k1/2nppgsp1/p1p3p1p/1p2N4/2P1P1P2/PPSP1PB1P/3GG1SR1/LN2K3L b BNPp 1");
         let h = init_histories();
         assert!(!p.in_check());
-        let emitted = collect_moves(main_picker(&p, None, 6, 3), &p, &h);
+        let mut sc = scratch();
+        let emitted = collect_moves(main_picker(&p, None, 6, 3, &mut sc), &p, &h);
 
         let emitted_set: std::collections::HashSet<Move> = emitted.iter().copied().collect();
         assert_eq!(emitted_set.len(), emitted.len(), "a move was emitted twice");
@@ -1213,14 +1318,15 @@ mod tests {
 
         // Pick an arbitrary legal quiet move as the TT move.
         let mut caps: Vec<ExtMove> = Vec::new();
-        p.generate_captures::<GENERATE_ALL_LEGAL_MOVES>(&mut caps);
+        p.generate_captures::<GENERATE_ALL_LEGAL_MOVES, _>(&mut caps);
         let cap_set: std::collections::HashSet<Move> = caps.iter().map(|e| e.mv).collect();
         let tt = legal_moves(&p)
             .into_iter()
             .find(|m| !cap_set.contains(m) && !m.is_drop())
             .expect("a legal quiet move exists");
 
-        let emitted = collect_moves(main_picker(&p, Some(tt), 6, 3), &p, &h);
+        let mut sc = scratch();
+        let emitted = collect_moves(main_picker(&p, Some(tt), 6, 3, &mut sc), &p, &h);
         assert_eq!(emitted[0], tt, "TT move must lead");
         let emitted_set: std::collections::HashSet<Move> = emitted.iter().copied().collect();
         assert_eq!(emitted_set.len(), emitted.len(), "a move was emitted twice");
@@ -1232,7 +1338,8 @@ mod tests {
     fn main_good_bad_capture_split_respects_see_boundary() {
         let p = pos("6rkg/8G/9/9/9/9/9/9/K8 b - 1");
         let h = init_histories();
-        let emitted = collect_moves(main_picker(&p, None, 6, 0), &p, &h);
+        let mut sc = scratch();
+        let emitted = collect_moves(main_picker(&p, None, 6, 0, &mut sc), &p, &h);
         let boundary = split_and_check(&p, &h, &emitted);
         assert!(
             boundary,
@@ -1272,11 +1379,12 @@ mod tests {
         let h = init_histories();
 
         // Full run to know the bad-capture set.
-        let full = collect_moves(main_picker(&p, None, 6, 3), &p, &h);
+        let mut sc = scratch();
+        let full = collect_moves(main_picker(&p, None, 6, 3, &mut sc), &p, &h);
         let is_cap = |m: Move| !m.is_drop() && p.board().get(m.to_sq()).is_some();
 
         // Skip quiets from the very start: only captures (good + bad) remain.
-        let mut mp = main_picker(&p, None, 6, 3);
+        let mut mp = main_picker(&p, None, 6, 3, &mut sc);
         mp.skip_quiet_moves();
         let mut kept = Vec::new();
         while let Some(m) = mp.next_move(&p, &h) {
@@ -1301,7 +1409,8 @@ mod tests {
         let h = init_histories();
         let is_cap = |m: Move| !m.is_drop() && p.board().get(m.to_sq()).is_some();
 
-        let mut mp = main_picker(&p, None, 6, 3);
+        let mut sc = scratch();
+        let mut mp = main_picker(&p, None, 6, 3, &mut sc);
         // Pull a few moves, then skip quiets.
         let mut seen = Vec::new();
         for _ in 0..2 {
@@ -1316,7 +1425,7 @@ mod tests {
         // No quiet appears after the skip point; and the set of captures equals
         // the captures of a never-skipped run.
         let full_caps: std::collections::HashSet<Move> =
-            collect_moves(main_picker(&p, None, 6, 3), &p, &h)
+            collect_moves(main_picker(&p, None, 6, 3, &mut sc), &p, &h)
                 .into_iter()
                 .filter(|&m| is_cap(m))
                 .collect();
@@ -1331,7 +1440,8 @@ mod tests {
         let p = pos("4r4/5G3/9/9/9/9/9/9/4K3k b - 1");
         let h = init_histories();
         assert!(p.in_check());
-        let emitted = collect_moves(main_picker(&p, None, 6, 0), &p, &h);
+        let mut sc = scratch();
+        let emitted = collect_moves(main_picker(&p, None, 6, 0, &mut sc), &p, &h);
 
         let emitted_set: std::collections::HashSet<Move> = emitted.iter().copied().collect();
         let legal_set: std::collections::HashSet<Move> = legal_moves(&p).into_iter().collect();
@@ -1348,7 +1458,8 @@ mod tests {
         let p = pos("4k4/9/R8/9/9/9/9/9/8K b - 1");
         let h = init_histories();
         assert!(!p.in_check());
-        let emitted = collect_moves(main_picker(&p, None, 6, 0), &p, &h);
+        let mut sc = scratch();
+        let emitted = collect_moves(main_picker(&p, None, 6, 0, &mut sc), &p, &h);
 
         let is_quiet = |m: Move| m.is_drop() || p.board().get(m.to_sq()).is_none();
         let quiets: Vec<Move> = emitted.into_iter().filter(|&m| is_quiet(m)).collect();
@@ -1394,8 +1505,9 @@ mod tests {
         // only be moved forward by a score bump, so it is the discriminator.
         let h0 = init_histories();
         let mut base_quiets = Vec::new();
+        let mut sc = scratch();
         {
-            let mut mp0 = main_picker(&p, None, 6, 5);
+            let mut mp0 = main_picker(&p, None, 6, 5, &mut sc);
             while let Some(m) = mp0.next_move(&p, &h0) {
                 if !is_capture(&p, m) {
                     base_quiets.push(m);
@@ -1420,7 +1532,7 @@ mod tests {
         // before the first quiet is pulled (i.e. before QUIET_INIT runs). Staged
         // scoring must read the bump and surface `b` ahead of `a`.
         let mut h = init_histories();
-        let mut mp = main_picker(&p, None, 6, 5);
+        let mut mp = main_picker(&p, None, 6, 5, &mut sc);
         let first = mp.next_move(&p, &h).unwrap();
         assert!(is_capture(&p, first), "the good capture must lead");
 
@@ -1474,7 +1586,8 @@ mod tests {
 
         // Fresh picker, no TT, both captures scored at CAPTURE_INIT against the
         // updated table: cap_b (bumped) must now precede cap_a.
-        let order = collect_moves(main_picker(&p, None, 6, 0), &p, &h);
+        let mut sc = scratch();
+        let order = collect_moves(main_picker(&p, None, 6, 0, &mut sc), &p, &h);
         let ia = order.iter().position(|&m| m == cap_a).unwrap();
         let ib = order.iter().position(|&m| m == cap_b).unwrap();
         assert!(ib < ia, "the capture with the bumped history must lead");
@@ -1484,7 +1597,7 @@ mod tests {
         // reflects the same (post-bump) ordering — i.e. scoring is not frozen at
         // construction.
         let mut h2 = init_histories();
-        let mut mp = MovePicker::new_main_search(&p, Some(cap_a), 6, 0, SENTINEL_PLANES);
+        let mut mp = MovePicker::new_main_search(&p, Some(cap_a), 6, 0, SENTINEL_PLANES, &mut sc);
         let tt_out = mp.next_move(&p, &h2).unwrap();
         assert_eq!(tt_out, cap_a, "TT move leads");
         // Bump cap_b between the TT stage and CAPTURE_INIT.
@@ -1528,7 +1641,8 @@ mod tests {
         );
         assert!(legal_moves(&p).contains(&q_target));
 
-        let mut mp = MovePicker::new_main_search(&p, None, 6, 0, cont_planes);
+        let mut sc = scratch();
+        let mut mp = MovePicker::new_main_search(&p, None, 6, 0, cont_planes, &mut sc);
         // No captures in this position, so the first next_move enters QUIET_INIT.
         // Bump the plane cell for q_target before that first call.
         h.continuation.update_at(
@@ -1559,7 +1673,7 @@ mod tests {
         // The illegal knight move is generated (pseudo-legal) but not legal.
         let knight_illegal = "1g2e";
         let mut raw_ext: Vec<ExtMove> = Vec::new();
-        p.generate_quiets::<GENERATE_ALL_LEGAL_MOVES>(&mut raw_ext);
+        p.generate_quiets::<GENERATE_ALL_LEGAL_MOVES, _>(&mut raw_ext);
         let raw_quiets: Vec<Move> = raw_ext.into_iter().map(|e| e.mv).collect();
         let raw_usi: Vec<String> = raw_quiets.iter().map(|&m| format_usi_move(m)).collect();
         assert_eq!(
@@ -1588,7 +1702,8 @@ mod tests {
         // Drive the real picker with the reference `clear()` histories (no
         // lowPlyHistory fill, so the -5091 baseline is exact).
         let h = WorkerHistories::new();
-        let mut mp = main_picker(&p, None, 1, 0);
+        let mut sc = scratch();
+        let mut mp = main_picker(&p, None, 1, 0, &mut sc);
         let mut emitted = Vec::new();
         while let Some(m) = mp.next_move(&p, &h) {
             emitted.push(format_usi_move(m));
@@ -1677,7 +1792,9 @@ mod tests {
     fn assert_gate_main(case: &GateCase, hist: &WorkerHistories, skip_at: Option<usize>) {
         let p = pos(case.sfen);
         let tt = tt_pick(&p, &case.tt);
-        let mut prod = MovePicker::new_main_search(&p, tt, case.depth, case.ply, SENTINEL_PLANES);
+        let mut sc = scratch();
+        let mut prod =
+            MovePicker::new_main_search(&p, tt, case.depth, case.ply, SENTINEL_PLANES, &mut sc);
         let mut twin =
             TwinMovePicker::new_main_search(&p, tt, case.depth, case.ply, SENTINEL_PLANES);
 
@@ -1714,7 +1831,8 @@ mod tests {
     fn assert_gate_qsearch(sfen: &str, tt_usi: Option<&str>, hist: &WorkerHistories) {
         let p = pos(sfen);
         let tt = tt_move(&p, tt_usi);
-        let mut prod = MovePicker::new_qsearch(&p, tt, SENTINEL_PLANES);
+        let mut sc = scratch();
+        let mut prod = MovePicker::new_qsearch(&p, tt, SENTINEL_PLANES, &mut sc);
         let mut twin = TwinMovePicker::new_qsearch(&p, tt, SENTINEL_PLANES);
         let mut n = 0usize;
         loop {
@@ -1731,7 +1849,8 @@ mod tests {
     /// Drive both ProbCut pickers to exhaustion and assert identical sequences.
     fn assert_gate_probcut(sfen: &str, threshold: i32, hist: &WorkerHistories) {
         let p = pos(sfen);
-        let mut prod = MovePicker::new_probcut(&p, None, threshold);
+        let mut sc = scratch();
+        let mut prod = MovePicker::new_probcut(&p, None, threshold, &mut sc);
         let mut twin = TwinMovePicker::new_probcut(&p, None, threshold);
         let mut n = 0usize;
         loop {

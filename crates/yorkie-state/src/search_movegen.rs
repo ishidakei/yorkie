@@ -32,6 +32,23 @@ pub struct ExtMove {
     pub value: i32,
 }
 
+/// Where a generator appends the moves it produces.
+///
+/// Appending is all a generator asks of its output, and the search's move
+/// buffer is a fixed-capacity array rather than a growable one, so the
+/// generators take any sink instead of a `Vec`.
+pub trait MoveSink {
+    /// Append one generated move.
+    fn push(&mut self, m: ExtMove);
+}
+
+impl MoveSink for Vec<ExtMove> {
+    #[inline]
+    fn push(&mut self, m: ExtMove) {
+        Vec::push(self, m);
+    }
+}
+
 /// Scan-based twins of the four search generators, derived independently of the
 /// bitboard tables, against which the production generators are pinned
 /// move-for-move.
@@ -139,14 +156,14 @@ fn reachable_scan(board: &Board, from: Square, piece: Piece, target: Target) -> 
     out
 }
 
-fn push_promote(from: Square, to: Square, piece: Piece, out: &mut Vec<ExtMove>) {
+fn push_promote<S: MoveSink>(from: Square, to: Square, piece: Piece, out: &mut S) {
     out.push(ExtMove {
         mv: Move::make_promote(from, to, piece),
         value: 0,
     });
 }
 
-fn push_plain(from: Square, to: Square, piece: Piece, out: &mut Vec<ExtMove>) {
+fn push_plain<S: MoveSink>(from: Square, to: Square, piece: Piece, out: &mut S) {
     out.push(ExtMove {
         mv: Move::make(from, to, piece),
         value: 0,
@@ -187,11 +204,11 @@ fn lance_nonpromote_rank_ok<const ALL: bool>(to: Square, color: Color) -> bool {
 }
 
 /// Emit a pawn's move to its single forward `to`.
-fn emit_pawn<const ALL: bool>(
+fn emit_pawn<const ALL: bool, S: MoveSink>(
     from: Square,
     targets: Bitboard,
     piece: Piece,
-    out: &mut Vec<ExtMove>,
+    out: &mut S,
 ) {
     for to in targets.squares() {
         if is_in_promotion_zone(to, piece.color) {
@@ -207,11 +224,11 @@ fn emit_pawn<const ALL: bool>(
 
 /// Emit a lance's moves: all promotions into the enemy field first, then the
 /// rank-masked non-promotions.
-fn emit_lance<const ALL: bool>(
+fn emit_lance<const ALL: bool, S: MoveSink>(
     from: Square,
     targets: Bitboard,
     piece: Piece,
-    out: &mut Vec<ExtMove>,
+    out: &mut S,
 ) {
     for to in targets.squares() {
         if is_in_promotion_zone(to, piece.color) {
@@ -226,7 +243,7 @@ fn emit_lance<const ALL: bool>(
 }
 
 /// Emit a knight's moves.
-fn emit_knight(from: Square, targets: Bitboard, piece: Piece, out: &mut Vec<ExtMove>) {
+fn emit_knight<S: MoveSink>(from: Square, targets: Bitboard, piece: Piece, out: &mut S) {
     for to in targets.squares() {
         if is_in_promotion_zone(to, piece.color) {
             push_promote(from, to, piece, out);
@@ -240,7 +257,7 @@ fn emit_knight(from: Square, targets: Bitboard, piece: Piece, out: &mut Vec<ExtM
 /// Emit a silver's moves. When `from` is outside the enemy field the reference
 /// emits the into-zone destinations before the rest, so this runs as two
 /// passes.
-fn emit_silver(from: Square, targets: Bitboard, piece: Piece, out: &mut Vec<ExtMove>) {
+fn emit_silver<S: MoveSink>(from: Square, targets: Bitboard, piece: Piece, out: &mut S) {
     if is_in_promotion_zone(from, piece.color) {
         for to in targets.squares() {
             push_promote(from, to, piece, out);
@@ -264,11 +281,11 @@ fn emit_silver(from: Square, targets: Bitboard, piece: Piece, out: &mut Vec<ExtM
 /// Emit a bishop's / rook's moves. The in-zone non-promotion is `ALL`-only, and
 /// is interleaved right after each promotion rather than batched into the
 /// second pass.
-fn emit_bishop_rook<const ALL: bool>(
+fn emit_bishop_rook<const ALL: bool, S: MoveSink>(
     from: Square,
     targets: Bitboard,
     piece: Piece,
-    out: &mut Vec<ExtMove>,
+    out: &mut S,
 ) {
     if is_in_promotion_zone(from, piece.color) {
         for to in targets.squares() {
@@ -295,7 +312,7 @@ fn emit_bishop_rook<const ALL: bool>(
 }
 
 /// Emit a never-promoting piece's moves — gold-likes, horse, dragon, king.
-fn emit_plain_only(from: Square, targets: Bitboard, piece: Piece, out: &mut Vec<ExtMove>) {
+fn emit_plain_only<S: MoveSink>(from: Square, targets: Bitboard, piece: Piece, out: &mut S) {
     for to in targets.squares() {
         push_plain(from, to, piece, out);
     }
@@ -352,14 +369,14 @@ impl Group {
         out: &mut Vec<ExtMove>,
     ) {
         match (self, all) {
-            (Group::Pawn, false) => emit_pawn::<false>(from, targets, piece, out),
-            (Group::Pawn, true) => emit_pawn::<true>(from, targets, piece, out),
-            (Group::Lance, false) => emit_lance::<false>(from, targets, piece, out),
-            (Group::Lance, true) => emit_lance::<true>(from, targets, piece, out),
+            (Group::Pawn, false) => emit_pawn::<false, _>(from, targets, piece, out),
+            (Group::Pawn, true) => emit_pawn::<true, _>(from, targets, piece, out),
+            (Group::Lance, false) => emit_lance::<false, _>(from, targets, piece, out),
+            (Group::Lance, true) => emit_lance::<true, _>(from, targets, piece, out),
             (Group::Knight, _) => emit_knight(from, targets, piece, out),
             (Group::Silver, _) => emit_silver(from, targets, piece, out),
-            (Group::BishopRook, false) => emit_bishop_rook::<false>(from, targets, piece, out),
-            (Group::BishopRook, true) => emit_bishop_rook::<true>(from, targets, piece, out),
+            (Group::BishopRook, false) => emit_bishop_rook::<false, _>(from, targets, piece, out),
+            (Group::BishopRook, true) => emit_bishop_rook::<true, _>(from, targets, piece, out),
             (Group::GoldHdk { .. }, _) => emit_plain_only(from, targets, piece, out),
         }
     }
@@ -377,7 +394,12 @@ trait GroupSpec {
     /// Emit one `from`-square piece's pseudo-moves onto `targets`. `ALL` is the
     /// `GenerateAllLegalMoves` setting, which the engine compiles in, so the
     /// non-promotion widening it decides is resolved before the loop is entered.
-    fn emit<const ALL: bool>(from: Square, targets: Bitboard, piece: Piece, out: &mut Vec<ExtMove>);
+    fn emit<const ALL: bool, S: MoveSink>(
+        from: Square,
+        targets: Bitboard,
+        piece: Piece,
+        out: &mut S,
+    );
 }
 
 /// `KING` says whether the gold group carries the king: it does for `CAPTURES` /
@@ -394,13 +416,13 @@ impl GroupSpec for PawnG {
     fn pieces(board: &Board, stm: Color) -> Bitboard {
         board.pieces_pattern(stm, pat::PAWN)
     }
-    fn emit<const ALL: bool>(
+    fn emit<const ALL: bool, S: MoveSink>(
         from: Square,
         targets: Bitboard,
         piece: Piece,
-        out: &mut Vec<ExtMove>,
+        out: &mut S,
     ) {
-        emit_pawn::<ALL>(from, targets, piece, out);
+        emit_pawn::<ALL, _>(from, targets, piece, out);
     }
 }
 
@@ -408,13 +430,13 @@ impl GroupSpec for LanceG {
     fn pieces(board: &Board, stm: Color) -> Bitboard {
         board.pieces_pattern(stm, pat::LANCE)
     }
-    fn emit<const ALL: bool>(
+    fn emit<const ALL: bool, S: MoveSink>(
         from: Square,
         targets: Bitboard,
         piece: Piece,
-        out: &mut Vec<ExtMove>,
+        out: &mut S,
     ) {
-        emit_lance::<ALL>(from, targets, piece, out);
+        emit_lance::<ALL, _>(from, targets, piece, out);
     }
 }
 
@@ -422,11 +444,11 @@ impl GroupSpec for KnightG {
     fn pieces(board: &Board, stm: Color) -> Bitboard {
         board.pieces_pattern(stm, pat::KNIGHT)
     }
-    fn emit<const ALL: bool>(
+    fn emit<const ALL: bool, S: MoveSink>(
         from: Square,
         targets: Bitboard,
         piece: Piece,
-        out: &mut Vec<ExtMove>,
+        out: &mut S,
     ) {
         emit_knight(from, targets, piece, out);
     }
@@ -436,11 +458,11 @@ impl GroupSpec for SilverG {
     fn pieces(board: &Board, stm: Color) -> Bitboard {
         board.pieces_pattern(stm, pat::SILVER)
     }
-    fn emit<const ALL: bool>(
+    fn emit<const ALL: bool, S: MoveSink>(
         from: Square,
         targets: Bitboard,
         piece: Piece,
-        out: &mut Vec<ExtMove>,
+        out: &mut S,
     ) {
         emit_silver(from, targets, piece, out);
     }
@@ -450,13 +472,13 @@ impl GroupSpec for BishopRookG {
     fn pieces(board: &Board, stm: Color) -> Bitboard {
         board.pieces_pattern(stm, pat::BISHOP) | board.pieces_pattern(stm, pat::ROOK)
     }
-    fn emit<const ALL: bool>(
+    fn emit<const ALL: bool, S: MoveSink>(
         from: Square,
         targets: Bitboard,
         piece: Piece,
-        out: &mut Vec<ExtMove>,
+        out: &mut S,
     ) {
-        emit_bishop_rook::<ALL>(from, targets, piece, out);
+        emit_bishop_rook::<ALL, _>(from, targets, piece, out);
     }
 }
 
@@ -470,11 +492,11 @@ impl<const KING: bool> GroupSpec for GoldHdkG<KING> {
         }
         bb
     }
-    fn emit<const ALL: bool>(
+    fn emit<const ALL: bool, S: MoveSink>(
         from: Square,
         targets: Bitboard,
         piece: Piece,
-        out: &mut Vec<ExtMove>,
+        out: &mut S,
     ) {
         emit_plain_only(from, targets, piece, out);
     }
@@ -483,32 +505,32 @@ impl<const KING: bool> GroupSpec for GoldHdkG<KING> {
 /// Iterate the side-to-move's group-`G` pieces by ascending square and emit
 /// their pseudo-moves onto the `target` squares. `ALL` is the
 /// `GenerateAllLegalMoves` flag, widening the suppressed non-promotions.
-fn emit_group<G: GroupSpec, const ALL: bool>(
+fn emit_group<G: GroupSpec, const ALL: bool, S: MoveSink>(
     board: &Board,
     stm: Color,
     target: Target,
-    out: &mut Vec<ExtMove>,
+    out: &mut S,
 ) {
-    emit_group_masked::<G, ALL>(board, stm, target, ALL_SQUARES, out);
+    emit_group_masked::<G, ALL, _>(board, stm, target, ALL_SQUARES, out);
 }
 
 /// [`emit_group`] with the reachable destinations additionally intersected with
 /// `restrict` — the reference `target2` mask the evasion generator threads in.
 /// Because `restrict` only removes destinations, the emission stays a
 /// subsequence of the unrestricted one and so keeps its order.
-fn emit_group_masked<G: GroupSpec, const ALL: bool>(
+fn emit_group_masked<G: GroupSpec, const ALL: bool, S: MoveSink>(
     board: &Board,
     stm: Color,
     target: Target,
     restrict: Bitboard,
-    out: &mut Vec<ExtMove>,
+    out: &mut S,
 ) {
     for from in G::pieces(board, stm).squares() {
         let piece = board
             .get(from)
             .expect("group_pieces bit implies a piece stands on the square");
         let targets = reachable(board, from, piece, target) & restrict;
-        G::emit::<ALL>(from, targets, piece, out);
+        G::emit::<ALL, _>(from, targets, piece, out);
     }
 }
 
@@ -1259,15 +1281,15 @@ impl Position {
     /// Append the pseudo-legal `CAPTURES` candidates to `out`
     /// (`generate_general<CAPTURES>`). No drops, and no non-capturing pawn
     /// promotion — that is `CAPTURES_PRO_PLUS`.
-    pub fn generate_captures<const ALL: bool>(&self, out: &mut Vec<ExtMove>) {
+    pub fn generate_captures<const ALL: bool, S: MoveSink>(&self, out: &mut S) {
         let board = self.board();
         let stm = self.side_to_move();
-        emit_group::<PawnG, ALL>(board, stm, Target::Captures, out);
-        emit_group::<LanceG, ALL>(board, stm, Target::Captures, out);
-        emit_group::<KnightG, ALL>(board, stm, Target::Captures, out);
-        emit_group::<SilverG, ALL>(board, stm, Target::Captures, out);
-        emit_group::<BishopRookG, ALL>(board, stm, Target::Captures, out);
-        emit_group::<GoldHdkG<true>, ALL>(board, stm, Target::Captures, out);
+        emit_group::<PawnG, ALL, _>(board, stm, Target::Captures, out);
+        emit_group::<LanceG, ALL, _>(board, stm, Target::Captures, out);
+        emit_group::<KnightG, ALL, _>(board, stm, Target::Captures, out);
+        emit_group::<SilverG, ALL, _>(board, stm, Target::Captures, out);
+        emit_group::<BishopRookG, ALL, _>(board, stm, Target::Captures, out);
+        emit_group::<GoldHdkG<true>, ALL, _>(board, stm, Target::Captures, out);
     }
 
     /// Append the pseudo-legal `QUIETS` candidates to `out`
@@ -1275,15 +1297,15 @@ impl Position {
     /// every drop. Non-capturing pawn promotions belong here, not to
     /// [`Position::generate_captures`], so the two generators partition the
     /// destinations with no overlap.
-    pub fn generate_quiets<const ALL: bool>(&self, out: &mut Vec<ExtMove>) {
+    pub fn generate_quiets<const ALL: bool, S: MoveSink>(&self, out: &mut S) {
         let board = self.board();
         let stm = self.side_to_move();
-        emit_group::<PawnG, ALL>(board, stm, Target::Quiets, out);
-        emit_group::<LanceG, ALL>(board, stm, Target::Quiets, out);
-        emit_group::<KnightG, ALL>(board, stm, Target::Quiets, out);
-        emit_group::<SilverG, ALL>(board, stm, Target::Quiets, out);
-        emit_group::<BishopRookG, ALL>(board, stm, Target::Quiets, out);
-        emit_group::<GoldHdkG<true>, ALL>(board, stm, Target::Quiets, out);
+        emit_group::<PawnG, ALL, _>(board, stm, Target::Quiets, out);
+        emit_group::<LanceG, ALL, _>(board, stm, Target::Quiets, out);
+        emit_group::<KnightG, ALL, _>(board, stm, Target::Quiets, out);
+        emit_group::<SilverG, ALL, _>(board, stm, Target::Quiets, out);
+        emit_group::<BishopRookG, ALL, _>(board, stm, Target::Quiets, out);
+        emit_group::<GoldHdkG<true>, ALL, _>(board, stm, Target::Quiets, out);
         self.emit_drops(out);
     }
 
@@ -1293,7 +1315,7 @@ impl Position {
     /// drops. [`Position::is_legal`] removes the remaining suicide king steps.
     ///
     /// **Entry contract:** the side to move is in check.
-    pub fn generate_evasions<const ALL: bool>(&self, out: &mut Vec<ExtMove>) {
+    pub fn generate_evasions<const ALL: bool, S: MoveSink>(&self, out: &mut S) {
         let board = self.board();
         let stm = self.side_to_move();
 
@@ -1344,12 +1366,18 @@ impl Position {
         let target2 = target1 | Bitboard::from_square(checksq); // + capture the checker
 
         // The gold group excludes the king, which was emitted above.
-        emit_group_masked::<PawnG, ALL>(board, stm, Target::BlockOrCapture, target2, out);
-        emit_group_masked::<LanceG, ALL>(board, stm, Target::BlockOrCapture, target2, out);
-        emit_group_masked::<KnightG, ALL>(board, stm, Target::BlockOrCapture, target2, out);
-        emit_group_masked::<SilverG, ALL>(board, stm, Target::BlockOrCapture, target2, out);
-        emit_group_masked::<BishopRookG, ALL>(board, stm, Target::BlockOrCapture, target2, out);
-        emit_group_masked::<GoldHdkG<false>, ALL>(board, stm, Target::BlockOrCapture, target2, out);
+        emit_group_masked::<PawnG, ALL, _>(board, stm, Target::BlockOrCapture, target2, out);
+        emit_group_masked::<LanceG, ALL, _>(board, stm, Target::BlockOrCapture, target2, out);
+        emit_group_masked::<KnightG, ALL, _>(board, stm, Target::BlockOrCapture, target2, out);
+        emit_group_masked::<SilverG, ALL, _>(board, stm, Target::BlockOrCapture, target2, out);
+        emit_group_masked::<BishopRookG, ALL, _>(board, stm, Target::BlockOrCapture, target2, out);
+        emit_group_masked::<GoldHdkG<false>, ALL, _>(
+            board,
+            stm,
+            Target::BlockOrCapture,
+            target2,
+            out,
+        );
 
         self.emit_drops_masked(target1, out);
     }
@@ -1360,15 +1388,15 @@ impl Position {
     /// concatenating [`Position::generate_captures`] and
     /// [`Position::generate_quiets`] would put every capture first and change
     /// which move the root search sees as its first legal one.
-    pub fn generate_non_evasions<const ALL: bool>(&self, out: &mut Vec<ExtMove>) {
+    pub fn generate_non_evasions<const ALL: bool, S: MoveSink>(&self, out: &mut S) {
         let board = self.board();
         let stm = self.side_to_move();
-        emit_group::<PawnG, ALL>(board, stm, Target::BlockOrCapture, out);
-        emit_group::<LanceG, ALL>(board, stm, Target::BlockOrCapture, out);
-        emit_group::<KnightG, ALL>(board, stm, Target::BlockOrCapture, out);
-        emit_group::<SilverG, ALL>(board, stm, Target::BlockOrCapture, out);
-        emit_group::<BishopRookG, ALL>(board, stm, Target::BlockOrCapture, out);
-        emit_group::<GoldHdkG<true>, ALL>(board, stm, Target::BlockOrCapture, out);
+        emit_group::<PawnG, ALL, _>(board, stm, Target::BlockOrCapture, out);
+        emit_group::<LanceG, ALL, _>(board, stm, Target::BlockOrCapture, out);
+        emit_group::<KnightG, ALL, _>(board, stm, Target::BlockOrCapture, out);
+        emit_group::<SilverG, ALL, _>(board, stm, Target::BlockOrCapture, out);
+        emit_group::<BishopRookG, ALL, _>(board, stm, Target::BlockOrCapture, out);
+        emit_group::<GoldHdkG<true>, ALL, _>(board, stm, Target::BlockOrCapture, out);
         self.emit_drops(out);
     }
 
@@ -1391,9 +1419,9 @@ impl Position {
     pub fn generate_legal_all_with(&self, pseudo: &mut Vec<ExtMove>, out: &mut Vec<Move>) {
         pseudo.clear();
         if self.in_check() {
-            self.generate_evasions::<true>(pseudo);
+            self.generate_evasions::<true, _>(pseudo);
         } else {
-            self.generate_non_evasions::<true>(pseudo);
+            self.generate_non_evasions::<true, _>(pseudo);
         }
         for em in pseudo.iter() {
             if self.is_legal(em.mv) {
@@ -1404,7 +1432,7 @@ impl Position {
 
     /// Emit the pseudo-legal drops on empty squares in `GenerateDropMoves`
     /// order: pawn drops first, then the other kinds in rank bands.
-    fn emit_drops(&self, out: &mut Vec<ExtMove>) {
+    fn emit_drops<S: MoveSink>(&self, out: &mut S) {
         self.emit_drops_masked(ALL_SQUARES, out);
     }
 
@@ -1412,7 +1440,7 @@ impl Position {
     /// intersected with `restrict` — the reference `target1` the evasion
     /// generator threads in. Because `restrict` only removes squares, the
     /// emission stays a subsequence of the unrestricted one.
-    fn emit_drops_masked(&self, restrict: Bitboard, out: &mut Vec<ExtMove>) {
+    fn emit_drops_masked<S: MoveSink>(&self, restrict: Bitboard, out: &mut S) {
         use crate::bitboard::rank_mask;
 
         let board = self.board();
@@ -1713,19 +1741,19 @@ mod tests {
 
     fn captures(p: &Position) -> Vec<Move> {
         let mut v = Vec::new();
-        p.generate_captures::<false>(&mut v);
+        p.generate_captures::<false, _>(&mut v);
         unwrap_ext(v)
     }
 
     fn captures_all(p: &Position) -> Vec<Move> {
         let mut v = Vec::new();
-        p.generate_captures::<true>(&mut v);
+        p.generate_captures::<true, _>(&mut v);
         unwrap_ext(v)
     }
 
     fn quiets_all(p: &Position) -> Vec<Move> {
         let mut v = Vec::new();
-        p.generate_quiets::<true>(&mut v);
+        p.generate_quiets::<true, _>(&mut v);
         unwrap_ext(v)
     }
 
@@ -1735,7 +1763,7 @@ mod tests {
 
     fn evasions(p: &Position) -> Vec<Move> {
         let mut v = Vec::new();
-        p.generate_evasions::<false>(&mut v);
+        p.generate_evasions::<false, _>(&mut v);
         unwrap_ext(v)
     }
 
@@ -1822,12 +1850,12 @@ mod tests {
     /// settings, concatenated.
     fn all_generator_moves(p: &Position) -> Vec<Move> {
         fn one<const ALL: bool>(p: &Position, ext: &mut Vec<ExtMove>) {
-            p.generate_captures::<ALL>(ext);
-            p.generate_quiets::<ALL>(ext);
+            p.generate_captures::<ALL, _>(ext);
+            p.generate_quiets::<ALL, _>(ext);
             if p.in_check() {
-                p.generate_evasions::<ALL>(ext);
+                p.generate_evasions::<ALL, _>(ext);
             }
-            p.generate_non_evasions::<ALL>(ext);
+            p.generate_non_evasions::<ALL, _>(ext);
         }
         let mut ext: Vec<ExtMove> = Vec::new();
         one::<false>(p, &mut ext);
@@ -1844,11 +1872,11 @@ mod tests {
     fn is_legal_contract_moves(p: &Position) -> Vec<Move> {
         fn one<const ALL: bool>(p: &Position, ext: &mut Vec<ExtMove>) {
             if p.in_check() {
-                p.generate_evasions::<ALL>(ext);
+                p.generate_evasions::<ALL, _>(ext);
             } else {
-                p.generate_captures::<ALL>(ext);
-                p.generate_quiets::<ALL>(ext);
-                p.generate_non_evasions::<ALL>(ext);
+                p.generate_captures::<ALL, _>(ext);
+                p.generate_quiets::<ALL, _>(ext);
+                p.generate_non_evasions::<ALL, _>(ext);
             }
         }
         let mut ext: Vec<ExtMove> = Vec::new();
@@ -2185,7 +2213,7 @@ mod tests {
 
     fn quiets(p: &Position) -> Vec<Move> {
         let mut v = Vec::new();
-        p.generate_quiets::<false>(&mut v);
+        p.generate_quiets::<false, _>(&mut v);
         unwrap_ext(v)
     }
 
@@ -2296,13 +2324,13 @@ mod tests {
                 continue;
             }
             let mut non_ev = Vec::new();
-            p.generate_non_evasions::<false>(&mut non_ev);
+            p.generate_non_evasions::<false, _>(&mut non_ev);
             let non_ev = unwrap_ext(non_ev);
             let mut caps = Vec::new();
-            p.generate_captures::<false>(&mut caps);
+            p.generate_captures::<false, _>(&mut caps);
             let caps = unwrap_ext(caps);
             let mut quiets = Vec::new();
-            p.generate_quiets::<false>(&mut quiets);
+            p.generate_quiets::<false, _>(&mut quiets);
             let quiets = unwrap_ext(quiets);
 
             let ne_set: std::collections::HashSet<Move> = non_ev.iter().copied().collect();
@@ -2339,16 +2367,16 @@ mod tests {
         assert!(!p.in_check());
 
         let mut caps = Vec::new();
-        p.generate_captures::<false>(&mut caps);
+        p.generate_captures::<false, _>(&mut caps);
         let caps = unwrap_ext(caps);
         assert!(!caps.is_empty(), "fixture must offer at least one capture");
 
         let mut non_ev = Vec::new();
-        p.generate_non_evasions::<false>(&mut non_ev);
+        p.generate_non_evasions::<false, _>(&mut non_ev);
         let non_ev = unwrap_ext(non_ev);
         let concat: Vec<Move> = {
             let mut quiets = Vec::new();
-            p.generate_quiets::<false>(&mut quiets);
+            p.generate_quiets::<false, _>(&mut quiets);
             let quiets = unwrap_ext(quiets);
             caps.iter().chain(quiets.iter()).copied().collect()
         };
@@ -2623,10 +2651,10 @@ mod nifu_files_equivalence {
     fn production(p: &Position, which: usize, all: bool) -> Vec<Move> {
         fn one<const ALL: bool>(p: &Position, which: usize, v: &mut Vec<ExtMove>) {
             match which {
-                0 => p.generate_captures::<ALL>(v),
-                1 => p.generate_quiets::<ALL>(v),
-                2 => p.generate_evasions::<ALL>(v),
-                3 => p.generate_non_evasions::<ALL>(v),
+                0 => p.generate_captures::<ALL, _>(v),
+                1 => p.generate_quiets::<ALL, _>(v),
+                2 => p.generate_evasions::<ALL, _>(v),
+                3 => p.generate_non_evasions::<ALL, _>(v),
                 _ => unreachable!(),
             }
         }

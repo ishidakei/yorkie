@@ -32,7 +32,7 @@ pub use history::{
     CorrChannel, LOW_PLY_HISTORY_SIZE, LowPlyHistory, PieceToHistory, SharedHistories,
     TtMoveHistory, apply_gravity,
 };
-pub use movepick::MovePicker;
+pub use movepick::{MovePicker, PickerScratch};
 pub use qsearch::{
     PonderSignal, QSearch, QSearchOutcome, SearchControl, TimeControl, WorkerResult,
 };

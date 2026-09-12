@@ -277,9 +277,9 @@ pub fn generate_root_moves(pos: &Position) -> Vec<RootMove> {
     // `Move`, read via `.mv` in the legality compaction and `RootMove::new`.
     let mut pseudo: Vec<ExtMove> = Vec::new();
     if pos.in_check() {
-        pos.generate_evasions::<GENERATE_ALL_LEGAL_MOVES>(&mut pseudo);
+        pos.generate_evasions::<GENERATE_ALL_LEGAL_MOVES, _>(&mut pseudo);
     } else {
-        pos.generate_non_evasions::<GENERATE_ALL_LEGAL_MOVES>(&mut pseudo);
+        pos.generate_non_evasions::<GENERATE_ALL_LEGAL_MOVES, _>(&mut pseudo);
     }
 
     // `while (cur != last) if (!legal(*cur)) *cur = *(--last); else ++cur;`
@@ -643,9 +643,9 @@ mod tests {
         assert!(!rm.is_empty());
 
         let mut caps: Vec<ExtMove> = Vec::new();
-        p.generate_captures::<ALL>(&mut caps);
+        p.generate_captures::<ALL, _>(&mut caps);
         let mut quiets: Vec<ExtMove> = Vec::new();
-        p.generate_quiets::<ALL>(&mut quiets);
+        p.generate_quiets::<ALL, _>(&mut quiets);
         let legal: HashSet<Move> = caps
             .into_iter()
             .chain(quiets)
@@ -662,7 +662,7 @@ mod tests {
         let rm: HashSet<Move> = generate_root_moves(&p).into_iter().map(|r| r.mv).collect();
 
         let mut ev: Vec<ExtMove> = Vec::new();
-        p.generate_evasions::<ALL>(&mut ev);
+        p.generate_evasions::<ALL, _>(&mut ev);
         let legal: HashSet<Move> = ev
             .into_iter()
             .map(|e| e.mv)
