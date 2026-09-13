@@ -16,6 +16,7 @@ use std::arch::x86_64::{
 };
 
 use crate::features::FeatureIndex;
+use crate::simd::ft_column;
 use crate::types::HIDDEN_SIZE;
 
 const NUM_CHUNKS: usize = HIDDEN_SIZE / 32;
@@ -32,9 +33,7 @@ pub unsafe fn add_features(
 ) {
     let out_ptr = out.as_mut_ptr();
     for &idx in indices {
-        let base = idx as usize * HIDDEN_SIZE;
-        let col = &weights[base..base + HIDDEN_SIZE];
-        let col_ptr = col.as_ptr();
+        let col_ptr = ft_column(weights, idx).as_ptr();
         for chunk in 0..NUM_CHUNKS {
             let offset = chunk * LANES;
             // SAFETY: `chunk * LANES + LANES <= HIDDEN_SIZE`, which is both
@@ -62,9 +61,7 @@ pub unsafe fn sub_features(
 ) {
     let out_ptr = out.as_mut_ptr();
     for &idx in indices {
-        let base = idx as usize * HIDDEN_SIZE;
-        let col = &weights[base..base + HIDDEN_SIZE];
-        let col_ptr = col.as_ptr();
+        let col_ptr = ft_column(weights, idx).as_ptr();
         for chunk in 0..NUM_CHUNKS {
             let offset = chunk * LANES;
             // SAFETY: see `add_features`.
@@ -86,30 +83,23 @@ pub unsafe fn sub_features(
 pub unsafe fn add_sub_features(
     out: &mut [i16; HIDDEN_SIZE],
     weights: &[i16],
-    added: &[FeatureIndex],
-    removed: &[FeatureIndex],
+    added: FeatureIndex,
+    removed: FeatureIndex,
 ) {
     let out_ptr = out.as_mut_ptr();
+    let add_ptr = ft_column(weights, added).as_ptr();
+    let sub_ptr = ft_column(weights, removed).as_ptr();
     for chunk in 0..NUM_CHUNKS {
         let offset = chunk * LANES;
-        // SAFETY: `chunk * LANES + LANES <= HIDDEN_SIZE`, the length of `out`.
-        let mut acc = unsafe { _mm512_loadu_si512(out_ptr.add(offset).cast::<__m512i>()) };
-        for &idx in added {
-            let base = idx as usize * HIDDEN_SIZE;
-            let col_ptr = weights[base..base + HIDDEN_SIZE].as_ptr();
-            // SAFETY: `col` is `HIDDEN_SIZE`-long, same offset bound.
-            let w = unsafe { _mm512_loadu_si512(col_ptr.add(offset).cast::<__m512i>()) };
-            acc = _mm512_add_epi16(acc, w);
+        // SAFETY: `chunk * LANES + LANES <= HIDDEN_SIZE`, the length of `out`
+        // and of each column.
+        unsafe {
+            let acc = _mm512_loadu_si512(out_ptr.add(offset).cast::<__m512i>());
+            let a = _mm512_loadu_si512(add_ptr.add(offset).cast::<__m512i>());
+            let s = _mm512_loadu_si512(sub_ptr.add(offset).cast::<__m512i>());
+            let acc = _mm512_sub_epi16(_mm512_add_epi16(acc, a), s);
+            _mm512_storeu_si512(out_ptr.add(offset).cast::<__m512i>(), acc);
         }
-        for &idx in removed {
-            let base = idx as usize * HIDDEN_SIZE;
-            let col_ptr = weights[base..base + HIDDEN_SIZE].as_ptr();
-            // SAFETY: see above.
-            let w = unsafe { _mm512_loadu_si512(col_ptr.add(offset).cast::<__m512i>()) };
-            acc = _mm512_sub_epi16(acc, w);
-        }
-        // SAFETY: same offset bound on `out`.
-        unsafe { _mm512_storeu_si512(out_ptr.add(offset).cast::<__m512i>(), acc) };
     }
 }
 
@@ -119,38 +109,26 @@ pub unsafe fn add_sub_features(
 pub unsafe fn add_sub_sub_features(
     out: &mut [i16; HIDDEN_SIZE],
     weights: &[i16],
-    added: &[FeatureIndex],
-    removed_a: &[FeatureIndex],
-    removed_b: &[FeatureIndex],
+    added: FeatureIndex,
+    removed_a: FeatureIndex,
+    removed_b: FeatureIndex,
 ) {
     let out_ptr = out.as_mut_ptr();
+    let add_ptr = ft_column(weights, added).as_ptr();
+    let sub_a_ptr = ft_column(weights, removed_a).as_ptr();
+    let sub_b_ptr = ft_column(weights, removed_b).as_ptr();
     for chunk in 0..NUM_CHUNKS {
         let offset = chunk * LANES;
-        // SAFETY: `chunk * LANES + LANES <= HIDDEN_SIZE`, the length of `out`.
-        let mut acc = unsafe { _mm512_loadu_si512(out_ptr.add(offset).cast::<__m512i>()) };
-        for &idx in added {
-            let base = idx as usize * HIDDEN_SIZE;
-            let col_ptr = weights[base..base + HIDDEN_SIZE].as_ptr();
-            // SAFETY: `col` is `HIDDEN_SIZE`-long, same offset bound.
-            let w = unsafe { _mm512_loadu_si512(col_ptr.add(offset).cast::<__m512i>()) };
-            acc = _mm512_add_epi16(acc, w);
+        // SAFETY: `chunk * LANES + LANES <= HIDDEN_SIZE`, the length of `out`
+        // and of each column.
+        unsafe {
+            let acc = _mm512_loadu_si512(out_ptr.add(offset).cast::<__m512i>());
+            let a = _mm512_loadu_si512(add_ptr.add(offset).cast::<__m512i>());
+            let sa = _mm512_loadu_si512(sub_a_ptr.add(offset).cast::<__m512i>());
+            let sb = _mm512_loadu_si512(sub_b_ptr.add(offset).cast::<__m512i>());
+            let acc = _mm512_sub_epi16(_mm512_sub_epi16(_mm512_add_epi16(acc, a), sa), sb);
+            _mm512_storeu_si512(out_ptr.add(offset).cast::<__m512i>(), acc);
         }
-        for &idx in removed_a {
-            let base = idx as usize * HIDDEN_SIZE;
-            let col_ptr = weights[base..base + HIDDEN_SIZE].as_ptr();
-            // SAFETY: see above.
-            let w = unsafe { _mm512_loadu_si512(col_ptr.add(offset).cast::<__m512i>()) };
-            acc = _mm512_sub_epi16(acc, w);
-        }
-        for &idx in removed_b {
-            let base = idx as usize * HIDDEN_SIZE;
-            let col_ptr = weights[base..base + HIDDEN_SIZE].as_ptr();
-            // SAFETY: see above.
-            let w = unsafe { _mm512_loadu_si512(col_ptr.add(offset).cast::<__m512i>()) };
-            acc = _mm512_sub_epi16(acc, w);
-        }
-        // SAFETY: same offset bound on `out`.
-        unsafe { _mm512_storeu_si512(out_ptr.add(offset).cast::<__m512i>(), acc) };
     }
 }
 
@@ -233,10 +211,10 @@ mod tests {
 
         let mut avx = initial;
         // SAFETY: guarded by `require_avx512bw!`.
-        unsafe { add_sub_features(&mut avx, &weights, &added, &removed) };
+        unsafe { add_sub_features(&mut avx, &weights, added[0], removed[0]) };
 
         let mut sca = initial;
-        scalar::add_sub_features(&mut sca, &weights, &added, &removed);
+        scalar::add_sub_features(&mut sca, &weights, added[0], removed[0]);
 
         assert_eq!(avx, sca);
     }
@@ -253,10 +231,10 @@ mod tests {
 
         let mut avx = initial;
         // SAFETY: guarded by `require_avx512bw!`.
-        unsafe { add_sub_sub_features(&mut avx, &weights, &added, &removed_a, &removed_b) };
+        unsafe { add_sub_sub_features(&mut avx, &weights, added[0], removed_a[0], removed_b[0]) };
 
         let mut sca = initial;
-        scalar::add_sub_sub_features(&mut sca, &weights, &added, &removed_a, &removed_b);
+        scalar::add_sub_sub_features(&mut sca, &weights, added[0], removed_a[0], removed_b[0]);
 
         assert_eq!(avx, sca);
     }

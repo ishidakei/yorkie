@@ -68,7 +68,16 @@ impl Square {
     }
 
     pub const fn index(self) -> u8 {
-        self as u8
+        let i = self as u8;
+        debug_assert!((i as usize) < Self::COUNT);
+        // SAFETY: the enum defines a variant for exactly the discriminants
+        // `0..COUNT`, so this holds for every `Square` that exists. Stating it
+        // is what lets an `[_; Square::COUNT]` indexed by this value carry no
+        // bounds check: a square recovered from the `Option<Square>` niche is
+        // only known to differ from the `None` pattern, which on its own does
+        // not bound it.
+        unsafe { core::hint::assert_unchecked((i as usize) < Self::COUNT) };
+        i
     }
 
     pub const fn file(self) -> u8 {

@@ -1526,8 +1526,11 @@ impl Position {
         }
 
         // Band 1 — own back rank: neither lance nor knight may sit there.
+        // Each band skips a prefix counted off `drops` itself, so the count can
+        // never run past the end; `skip` says that to the compiler, where a
+        // range expression would leave a check in the square loop.
         for sq in (base & rank_mask(back_rank)).squares() {
-            for &kind in &drops[next_to_lance..] {
+            for &kind in drops.iter().skip(next_to_lance) {
                 out.push(ExtMove {
                     mv: Move::make_drop(kind, stm, sq),
                     value: 0,
@@ -1536,7 +1539,7 @@ impl Position {
         }
         // Band 2 — own second rank: lance too, but not knight.
         for sq in (base & rank_mask(second_rank)).squares() {
-            for &kind in &drops[next_to_knight..] {
+            for &kind in drops.iter().skip(next_to_knight) {
                 out.push(ExtMove {
                     mv: Move::make_drop(kind, stm, sq),
                     value: 0,

@@ -19,6 +19,9 @@
 //! `cfg(target_feature = ...)` naming exactly what its callee enables, so no
 //! `unsafe` escapes the SIMD modules.
 
+use crate::features::FeatureIndex;
+use crate::types::HIDDEN_SIZE;
+
 // Both backends are compiled unconditionally so the equivalence tests can
 // compare them, which leaves the one this build did not select without a caller
 // outside `cfg(test)`.
@@ -33,6 +36,21 @@ pub mod avx512;
 #[allow(dead_code)]
 #[cfg(target_arch = "x86_64")]
 pub mod avx512_post_ft;
+
+/// Borrow feature `idx`'s FT weight column out of the row-major weight block as
+/// a fixed-width array.
+///
+/// Resolving a column costs one length check against the block, which the
+/// kernels take once per column rather than once per lane; the array type then
+/// carries the column's width into the lane loop, so the loop itself indexes
+/// nothing of run-time length.
+#[inline]
+pub(crate) fn ft_column(weights: &[i16], idx: FeatureIndex) -> &[i16; HIDDEN_SIZE] {
+    let base = idx as usize * HIDDEN_SIZE;
+    weights[base..base + HIDDEN_SIZE]
+        .try_into()
+        .expect("a HIDDEN_SIZE-long subslice converts to the array of that width")
+}
 
 /// Which kernel backend this build compiled into the forward pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,8 +123,8 @@ pub mod transformer_kernel {
     pub fn add_sub_features(
         out: &mut [i16; HIDDEN_SIZE],
         weights: &[i16],
-        added: &[FeatureIndex],
-        removed: &[FeatureIndex],
+        added: FeatureIndex,
+        removed: FeatureIndex,
     ) {
         // SAFETY: see `add_features`.
         unsafe { avx512::add_sub_features(out, weights, added, removed) }
@@ -117,9 +135,9 @@ pub mod transformer_kernel {
     pub fn add_sub_sub_features(
         out: &mut [i16; HIDDEN_SIZE],
         weights: &[i16],
-        added: &[FeatureIndex],
-        removed_a: &[FeatureIndex],
-        removed_b: &[FeatureIndex],
+        added: FeatureIndex,
+        removed_a: FeatureIndex,
+        removed_b: FeatureIndex,
     ) {
         // SAFETY: see `add_features`.
         unsafe { avx512::add_sub_sub_features(out, weights, added, removed_a, removed_b) }

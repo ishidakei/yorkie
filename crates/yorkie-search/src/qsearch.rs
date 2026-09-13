@@ -27,7 +27,9 @@ use yorkie_state::{Color, Move, Piece, PieceKind, Position, RepetitionState, pie
 use yorkie_storage::{Bound, TranspositionTable, TtSlot, Value};
 
 use crate::config::GENERATE_ALL_LEGAL_MOVES;
-use crate::history::{ContinuationCorrectionHistory, ContinuationHistory, CorrChannel};
+use crate::history::{
+    ContPlane, ContinuationCorrectionHistory, ContinuationHistory, CorrChannel, CorrPlane,
+};
 use crate::movepick::{MovePicker, PickerScratch};
 use crate::root::{
     EnteringKingConfig, RootKind, RootMove, RootOutcome, declaration_win, generate_root_moves,
@@ -1688,7 +1690,7 @@ impl<N: NetworkParams> QSearch<N> {
         // score reads plane `[0]`, the previous ply's REAL continuation plane;
         // with untouched tables it holds the uniform -523 fill, so the depth-1
         // evasion ordering is a constant shift.
-        let cont_planes: [usize; 6] =
+        let cont_planes: [ContPlane; 6] =
             std::array::from_fn(|i| self.stack[Self::si(ply) - 1 - i].cont_hist);
         let (slot, scratch) = Self::split_picker_scratch(scratch);
         let mut mp = MovePicker::new_qsearch(pos, tt_move, cont_planes, slot);
@@ -2666,7 +2668,7 @@ impl<N: NetworkParams> QSearch<N> {
 
 /// `NO_PIECE` continuation plane (`continuationHistory[0][0][NO_PIECE][SQ_ZERO]`):
 /// the null-move sentinel plane, index `0` in this port's flat layout.
-const NULL_MOVE_CONT_PLANE: usize = 0;
+const NULL_MOVE_CONT_PLANE: ContPlane = ContPlane::SENTINEL;
 
 impl<N: NetworkParams> QSearch<N> {
     /// Whether `m` is a plain capture in `pos`. In this engine the
@@ -3177,7 +3179,7 @@ impl<N: NetworkParams> QSearch<N> {
                 let r = 7 + depth / 3;
                 self.stack[s].current_move = Some(Move::null());
                 self.stack[s].cont_hist = NULL_MOVE_CONT_PLANE;
-                self.stack[s].cont_corr = ContinuationCorrectionHistory::SENTINEL_PLANE;
+                self.stack[s].cont_corr = CorrPlane::SENTINEL;
                 pos.do_null_move();
                 // A null move touches no accumulator, so it bypasses
                 // `push_accumulator`'s prefetch and needs this one, matching
@@ -3360,7 +3362,7 @@ impl<N: NetworkParams> QSearch<N> {
         // Held as flat plane indices into the live `continuationHistory`, not
         // as snapshots, so a plane updated by an earlier move's subtree is seen
         // when a later stage scores against it.
-        let cont_planes: [usize; 6] = std::array::from_fn(|i| self.stack[s - 1 - i].cont_hist);
+        let cont_planes: [ContPlane; 6] = std::array::from_fn(|i| self.stack[s - 1 - i].cont_hist);
         let (slot, scratch) = Self::split_picker_scratch(scratch);
         let mut mp = MovePicker::new_main_search(pos, tt_move, depth, ply, cont_planes, slot);
 
@@ -5553,8 +5555,15 @@ mod tests {
             let mut main_scratch = PickerScratch::new();
             for tt_move in inputs {
                 for mut mp in [
-                    MovePicker::new_qsearch(p, tt_move, [0; 6], &mut q_scratch),
-                    MovePicker::new_main_search(p, tt_move, 6, 0, [0; 6], &mut main_scratch),
+                    MovePicker::new_qsearch(p, tt_move, [ContPlane::SENTINEL; 6], &mut q_scratch),
+                    MovePicker::new_main_search(
+                        p,
+                        tt_move,
+                        6,
+                        0,
+                        [ContPlane::SENTINEL; 6],
+                        &mut main_scratch,
+                    ),
                 ] {
                     while let Some(m) = mp.next_move(p, &hist) {
                         assert!(

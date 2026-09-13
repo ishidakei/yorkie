@@ -9,12 +9,12 @@
 //! is allowed here because the downstream clipped output transform saturates.
 
 use crate::features::FeatureIndex;
+use crate::simd::ft_column;
 use crate::types::HIDDEN_SIZE;
 
 pub fn add_features(out: &mut [i16; HIDDEN_SIZE], weights: &[i16], indices: &[FeatureIndex]) {
     for &idx in indices {
-        let base = idx as usize * HIDDEN_SIZE;
-        let col = &weights[base..base + HIDDEN_SIZE];
+        let col = ft_column(weights, idx);
         for (o, &w) in out.iter_mut().zip(col.iter()) {
             *o = o.wrapping_add(w);
         }
@@ -23,8 +23,7 @@ pub fn add_features(out: &mut [i16; HIDDEN_SIZE], weights: &[i16], indices: &[Fe
 
 pub fn sub_features(out: &mut [i16; HIDDEN_SIZE], weights: &[i16], indices: &[FeatureIndex]) {
     for &idx in indices {
-        let base = idx as usize * HIDDEN_SIZE;
-        let col = &weights[base..base + HIDDEN_SIZE];
+        let col = ft_column(weights, idx);
         for (o, &w) in out.iter_mut().zip(col.iter()) {
             *o = o.wrapping_sub(w);
         }
@@ -34,40 +33,33 @@ pub fn sub_features(out: &mut [i16; HIDDEN_SIZE], weights: &[i16], indices: &[Fe
 pub fn add_sub_features(
     out: &mut [i16; HIDDEN_SIZE],
     weights: &[i16],
-    added: &[FeatureIndex],
-    removed: &[FeatureIndex],
+    added: FeatureIndex,
+    removed: FeatureIndex,
 ) {
-    for (i, slot) in out.iter_mut().enumerate() {
-        let mut acc = *slot;
-        for &idx in added {
-            acc = acc.wrapping_add(weights[idx as usize * HIDDEN_SIZE + i]);
-        }
-        for &idx in removed {
-            acc = acc.wrapping_sub(weights[idx as usize * HIDDEN_SIZE + i]);
-        }
-        *slot = acc;
+    let add = ft_column(weights, added);
+    let sub = ft_column(weights, removed);
+    for ((slot, &a), &s) in out.iter_mut().zip(add.iter()).zip(sub.iter()) {
+        *slot = slot.wrapping_add(a).wrapping_sub(s);
     }
 }
 
 pub fn add_sub_sub_features(
     out: &mut [i16; HIDDEN_SIZE],
     weights: &[i16],
-    added: &[FeatureIndex],
-    removed_a: &[FeatureIndex],
-    removed_b: &[FeatureIndex],
+    added: FeatureIndex,
+    removed_a: FeatureIndex,
+    removed_b: FeatureIndex,
 ) {
-    for (i, slot) in out.iter_mut().enumerate() {
-        let mut acc = *slot;
-        for &idx in added {
-            acc = acc.wrapping_add(weights[idx as usize * HIDDEN_SIZE + i]);
-        }
-        for &idx in removed_a {
-            acc = acc.wrapping_sub(weights[idx as usize * HIDDEN_SIZE + i]);
-        }
-        for &idx in removed_b {
-            acc = acc.wrapping_sub(weights[idx as usize * HIDDEN_SIZE + i]);
-        }
-        *slot = acc;
+    let add = ft_column(weights, added);
+    let sub_a = ft_column(weights, removed_a);
+    let sub_b = ft_column(weights, removed_b);
+    for (((slot, &a), &sa), &sb) in out
+        .iter_mut()
+        .zip(add.iter())
+        .zip(sub_a.iter())
+        .zip(sub_b.iter())
+    {
+        *slot = slot.wrapping_add(a).wrapping_sub(sa).wrapping_sub(sb);
     }
 }
 
@@ -139,7 +131,7 @@ mod tests {
         let initial = seeded_initial(7);
 
         let mut fused = initial;
-        add_sub_features(&mut fused, &weights, &added, &removed);
+        add_sub_features(&mut fused, &weights, added[0], removed[0]);
 
         let mut unfused = initial;
         add_features(&mut unfused, &weights, &added);
@@ -160,7 +152,7 @@ mod tests {
         let initial = seeded_initial(19);
 
         let mut fused = initial;
-        add_sub_sub_features(&mut fused, &weights, &added, &removed_a, &removed_b);
+        add_sub_sub_features(&mut fused, &weights, added[0], removed_a[0], removed_b[0]);
 
         let mut unfused = initial;
         add_features(&mut unfused, &weights, &added);
@@ -171,11 +163,11 @@ mod tests {
     }
 
     #[test]
-    fn add_sub_features_with_empty_slices_is_identity() {
-        let weights = vec![99i16; HIDDEN_SIZE * 4].into_boxed_slice();
+    fn add_sub_features_with_the_same_column_is_identity() {
+        let mut weights = vec![0i16; HIDDEN_SIZE * 4].into_boxed_slice();
+        fill_weights(&mut weights, 41);
         let mut out = [5i16; HIDDEN_SIZE];
-        let empty: [FeatureIndex; 0] = [];
-        add_sub_features(&mut out, &weights, &empty, &empty);
+        add_sub_features(&mut out, &weights, 2, 2);
         assert!(out.iter().all(|&x| x == 5));
     }
 }

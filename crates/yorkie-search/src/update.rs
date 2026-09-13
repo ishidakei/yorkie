@@ -15,8 +15,9 @@ use yorkie_state::{Color, Move, Piece, Position, Square};
 use yorkie_storage::Value;
 
 use crate::history::{
-    ButterflyHistory, CapturePieceToHistory, ContinuationCorrectionHistory, ContinuationHistory,
-    CorrChannel, LOW_PLY_HISTORY_SIZE, LowPlyHistory, SharedHistories, TtMoveHistory,
+    ButterflyHistory, CapturePieceToHistory, ContPlane, ContinuationCorrectionHistory,
+    ContinuationHistory, CorrChannel, CorrPlane, LOW_PLY_HISTORY_SIZE, LowPlyHistory,
+    SharedHistories, TtMoveHistory,
 };
 
 /// Reference `clear()` init constants.
@@ -69,6 +70,10 @@ impl SearchedList {
 
     /// The pushed moves in order.
     pub fn as_slice(&self) -> &[Option<Move>] {
+        debug_assert!(self.len <= self.moves.len());
+        // SAFETY: `len` is private and only `push` raises it, one step per
+        // `moves` slot it writes, so it never passes the array's length.
+        unsafe { core::hint::assert_unchecked(self.len <= self.moves.len()) };
         &self.moves[..self.len]
     }
 }
@@ -150,13 +155,13 @@ impl WorkerHistories {
     /// [`Self::shared`] is deliberately absent: those tables are shared by every
     /// worker of a node and placed by whoever builds them.
     pub fn backing_regions(&self) -> Vec<(usize, usize)> {
-        let mut regions = Vec::with_capacity(5);
-        regions.extend(self.main.backing_region());
-        regions.extend(self.low_ply.backing_region());
-        regions.extend(self.capture.backing_region());
-        regions.push(self.continuation.backing_region());
-        regions.push(self.continuation_correction.backing_region());
-        regions
+        vec![
+            self.main.backing_region(),
+            self.low_ply.backing_region(),
+            self.capture.backing_region(),
+            self.continuation.backing_region(),
+            self.continuation_correction.backing_region(),
+        ]
     }
 
     /// Swap in a different node's shared tables, leaving the per-worker tables
@@ -210,10 +215,10 @@ pub struct SearchStackCell {
     pub pv: Vec<Move>,
     /// Plane index into [`ContinuationHistory`] this cell points at
     /// (`ss->continuationHistory`).
-    pub cont_hist: usize,
+    pub cont_hist: ContPlane,
     /// Plane index into [`ContinuationCorrectionHistory`] this cell points at
     /// (`ss->continuationCorrectionHistory`).
-    pub cont_corr: usize,
+    pub cont_corr: CorrPlane,
 }
 
 impl Default for SearchStackCell {
@@ -233,8 +238,8 @@ impl Default for SearchStackCell {
             excluded_move: None,
             follow_pv: false,
             pv: Vec::new(),
-            cont_hist: 0,
-            cont_corr: ContinuationCorrectionHistory::SENTINEL_PLANE,
+            cont_hist: ContPlane::SENTINEL,
+            cont_corr: CorrPlane::SENTINEL,
         }
     }
 }
@@ -617,7 +622,7 @@ mod tests {
         );
         // continuationHistory init -523, across distinct planes.
         assert_eq!(
-            hist.continuation.get_at(0, bs, to),
+            hist.continuation.get_at(ContPlane::SENTINEL, bs, to),
             CONTINUATION_INIT as i32
         );
         let last_plane = ContinuationHistory::plane_index(true, true, bs, to);
@@ -639,11 +644,8 @@ mod tests {
         }
         // continuationCorrectionHistory init 6, sentinel and a deep plane.
         assert_eq!(
-            hist.continuation_correction.get_at(
-                ContinuationCorrectionHistory::SENTINEL_PLANE,
-                bs,
-                to
-            ),
+            hist.continuation_correction
+                .get_at(CorrPlane::SENTINEL, bs, to),
             CONTINUATION_CORRECTION_INIT as i32,
         );
         let deep = ContinuationCorrectionHistory::plane_index(bs, to);
@@ -686,7 +688,7 @@ mod tests {
         // Give each of the six previous plies an ok move and a unique plane.
         for i in 1..=6 {
             stack[ss - i].current_move = Some(dummy);
-            stack[ss - i].cont_hist = i; // distinct planes 1..=6
+            stack[ss - i].cont_hist = ContPlane::new(i); // distinct planes 1..=6
         }
         stack[ss].in_check = false;
 
@@ -696,7 +698,7 @@ mod tests {
 
         // Pre-values are all the -523 continuation init.
         let pre: Vec<i32> = (1..=6)
-            .map(|i| hist.continuation.get_at(i, pc, to))
+            .map(|i| hist.continuation.get_at(ContPlane::new(i), pc, to))
             .collect();
 
         update_continuation_histories(&mut hist, &stack, ss, pc, to, bonus);
@@ -706,7 +708,7 @@ mod tests {
             let write = (bonus * weight / 1024) + 88 * (i < 2) as i32;
             let expected = apply_gravity(pre[idx] as i16, write, CONTINUATION_HISTORY_D) as i32;
             assert_eq!(
-                hist.continuation.get_at(i, pc, to),
+                hist.continuation.get_at(ContPlane::new(i), pc, to),
                 expected,
                 "continuation plane {i} mismatch",
             );
@@ -724,7 +726,7 @@ mod tests {
         let dummy = Move::make(Square::new(4, 4).unwrap(), Square::new(4, 3).unwrap(), pawn);
         for i in 1..=6 {
             stack[ss - i].current_move = Some(dummy);
-            stack[ss - i].cont_hist = i;
+            stack[ss - i].cont_hist = ContPlane::new(i);
         }
         stack[ss].in_check = true;
 
@@ -734,16 +736,16 @@ mod tests {
 
         // Planes 1,2 changed; 3..6 remain at the -523 init.
         assert_ne!(
-            hist.continuation.get_at(1, pc, to),
+            hist.continuation.get_at(ContPlane::new(1), pc, to),
             CONTINUATION_INIT as i32
         );
         assert_ne!(
-            hist.continuation.get_at(2, pc, to),
+            hist.continuation.get_at(ContPlane::new(2), pc, to),
             CONTINUATION_INIT as i32
         );
         for i in 3..=6 {
             assert_eq!(
-                hist.continuation.get_at(i, pc, to),
+                hist.continuation.get_at(ContPlane::new(i), pc, to),
                 CONTINUATION_INIT as i32,
                 "plane {i} must be untouched in check",
             );
@@ -764,19 +766,19 @@ mod tests {
             Square::new(4, 3).unwrap(),
             pawn,
         ));
-        stack[ss - 1].cont_hist = 1;
+        stack[ss - 1].cont_hist = ContPlane::new(1);
 
         let pc = Piece::new(PieceKind::Silver, Color::Black);
         let to = Square::new(3, 3).unwrap();
         update_continuation_histories(&mut hist, &stack, ss, pc, to, 1000);
 
         assert_ne!(
-            hist.continuation.get_at(1, pc, to),
+            hist.continuation.get_at(ContPlane::new(1), pc, to),
             CONTINUATION_INIT as i32
         );
         // Plane 0 (the sentinel the other cells point at) is untouched.
         assert_eq!(
-            hist.continuation.get_at(0, pc, to),
+            hist.continuation.get_at(ContPlane::SENTINEL, pc, to),
             CONTINUATION_INIT as i32
         );
     }
@@ -798,7 +800,7 @@ mod tests {
             Square::new(0, 5).unwrap(),
             bp,
         ));
-        stack[ss - 1].cont_hist = 3;
+        stack[ss - 1].cont_hist = ContPlane::new(3);
 
         // The quiet move under test: black pawn 5e->5d (quiet, no capture).
         let mv = Move::make(Square::new(4, 4).unwrap(), Square::new(4, 3).unwrap(), bp);
@@ -812,7 +814,7 @@ mod tests {
         let main_pre = hist.main.get(us, mv) as i16;
         let low_pre = hist.low_ply.get(2, mv) as i16;
         let pawn_pre = hist.shared.pawn_get(pk, moved, to) as i16;
-        let cont_pre = hist.continuation.get_at(3, moved, to) as i16;
+        let cont_pre = hist.continuation.get_at(ContPlane::new(3), moved, to) as i16;
 
         update_quiet_histories(&mut hist, &pos, &stack, ss, mv, bonus);
 
@@ -827,7 +829,7 @@ mod tests {
         // continuation write uses bonus*955/1024 (+88 since i==1) at plane 3.
         let cont_write = (bonus * 955 / 1024 * CONTHIST_BONUSES[0].1 / 1024) + 88;
         assert_eq!(
-            hist.continuation.get_at(3, moved, to),
+            hist.continuation.get_at(ContPlane::new(3), moved, to),
             apply_gravity(cont_pre, cont_write, CONTINUATION_HISTORY_D) as i32,
         );
         // pawn write: bonus>0 ⇒ *850/1024.
@@ -1028,7 +1030,7 @@ mod tests {
             Square::new(0, 5).unwrap(),
             bp,
         ));
-        stack[ss - 2].cont_hist = 5;
+        stack[ss - 2].cont_hist = ContPlane::new(5);
 
         // Best is a quiet so the quiet branch runs; depth for malus.
         let bk = Piece::new(PieceKind::King, Color::Black);
@@ -1038,7 +1040,9 @@ mod tests {
 
         // (ss-1) continuation write: pc=prev_piece, to=prev_sq, plane from
         // (ss-2).cont_hist (=5), i==1 weight 1157, +88.
-        let pre = hist.continuation.get_at(5, prev_piece, prev_sq) as i16;
+        let pre = hist
+            .continuation
+            .get_at(ContPlane::new(5), prev_piece, prev_sq) as i16;
 
         update_all_stats(
             &mut hist,
@@ -1056,7 +1060,8 @@ mod tests {
 
         let write = (-malus * 616 / 1024 * CONTHIST_BONUSES[0].1 / 1024) + 88;
         assert_eq!(
-            hist.continuation.get_at(5, prev_piece, prev_sq),
+            hist.continuation
+                .get_at(ContPlane::new(5), prev_piece, prev_sq),
             apply_gravity(pre, write, CONTINUATION_HISTORY_D) as i32,
         );
     }
@@ -1167,7 +1172,7 @@ mod tests {
             apply_gravity(pawn_pre, bonus, CORRECTION_HISTORY_D) as i32,
         );
         // The sentinel continuation-correction plane is untouched (fill 6).
-        let sentinel = ContinuationCorrectionHistory::SENTINEL_PLANE;
+        let sentinel = CorrPlane::SENTINEL;
         let bp = Piece::new(PieceKind::Pawn, Color::Black);
         assert_eq!(
             hist.continuation_correction

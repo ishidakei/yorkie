@@ -36,7 +36,7 @@
 use yorkie_state::{CheckSquares, ExtMove, Move, MoveSink, Position, piece_value};
 
 use crate::config::GENERATE_ALL_LEGAL_MOVES;
-use crate::history::LOW_PLY_HISTORY_SIZE;
+use crate::history::{ContPlane, LOW_PLY_HISTORY_SIZE};
 use crate::update::WorkerHistories;
 
 /// `goodQuietThreshold`: quiets scoring above this go to `GOOD_QUIET`, the rest
@@ -101,6 +101,10 @@ impl PickerScratch {
     /// The moves held, in buffer order.
     #[inline]
     pub fn as_slice(&self) -> &[ExtMove] {
+        debug_assert!(self.len <= self.buf.len());
+        // SAFETY: `len` is private and only `push` raises it, one step per `buf`
+        // slot it writes, so it never passes the array's length.
+        unsafe { core::hint::assert_unchecked(self.len <= self.buf.len()) };
         &self.buf[..self.len]
     }
 
@@ -108,6 +112,9 @@ impl PickerScratch {
     /// compaction work through this.
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [ExtMove] {
+        debug_assert!(self.len <= self.buf.len());
+        // SAFETY: see `as_slice`.
+        unsafe { core::hint::assert_unchecked(self.len <= self.buf.len()) };
         &mut self.buf[..self.len]
     }
 
@@ -213,7 +220,7 @@ fn score_capture(pos: &Position, m: Move, hist: &WorkerHistories) -> i32 {
 /// `score<EVASIONS>` for a single evasion. The `1 << 28` term makes capturing
 /// evasions outrank every quiet. `cont_plane0` is the flat index of
 /// `(ss-1)->continuationHistory` into `hist`.
-fn score_evasion(pos: &Position, m: Move, hist: &WorkerHistories, cont_plane0: usize) -> i32 {
+fn score_evasion(pos: &Position, m: Move, hist: &WorkerHistories, cont_plane0: ContPlane) -> i32 {
     let to = m.to_sq();
     let victim = if m.is_drop() {
         None
@@ -243,7 +250,7 @@ fn score_quiet(
     m: Move,
     ply: i32,
     hist: &WorkerHistories,
-    cont_planes: [usize; 6],
+    cont_planes: [ContPlane; 6],
     check_squares: &CheckSquares,
 ) -> i32 {
     let us = pos.side_to_move();
@@ -334,7 +341,7 @@ pub struct MovePicker<'a> {
     threshold: i32,
     /// Flat plane indices of `(ss-1-i)->continuationHistory` into
     /// [`WorkerHistories::continuation`] (`contHist`).
-    cont_planes: [usize; 6],
+    cont_planes: [ContPlane; 6],
 
     /// The move buffer this picker works in, lent by the caller for the
     /// picker's lifetime (see [`PickerScratch`]). The `*_INIT` stages fill it
@@ -365,7 +372,7 @@ impl<'a> MovePicker<'a> {
     pub fn new_qsearch(
         pos: &Position,
         tt_move: Option<Move>,
-        cont_planes: [usize; 6],
+        cont_planes: [ContPlane; 6],
         scratch: &'a mut PickerScratch,
     ) -> Self {
         let in_check = pos.in_check();
@@ -396,7 +403,7 @@ impl<'a> MovePicker<'a> {
         tt_move: Option<Move>,
         depth: i32,
         ply: i32,
-        cont_planes: [usize; 6],
+        cont_planes: [ContPlane; 6],
         scratch: &'a mut PickerScratch,
     ) -> Self {
         let in_check = pos.in_check();
@@ -437,7 +444,15 @@ impl<'a> MovePicker<'a> {
         });
         // The capture list is generated at `PROBCUT_INIT` stage entry, not
         // here: the buffer starts empty and is filled at that `next_move` arm.
-        Self::from_parts(Kind::ProbCut, tt, 0, 0, threshold, [0; 6], scratch)
+        Self::from_parts(
+            Kind::ProbCut,
+            tt,
+            0,
+            0,
+            threshold,
+            [ContPlane::SENTINEL; 6],
+            scratch,
+        )
     }
 
     /// Generate the legal, TT-deduped capture (or, for the `Evasion` kind,
@@ -468,7 +483,7 @@ impl<'a> MovePicker<'a> {
         depth: i32,
         ply: i32,
         threshold: i32,
-        cont_planes: [usize; 6],
+        cont_planes: [ContPlane; 6],
         scratch: &'a mut PickerScratch,
     ) -> Self {
         // The buffer arrives holding the previous picker's list, and its
@@ -744,8 +759,8 @@ mod twin {
     use yorkie_state::{Move, Position};
 
     use super::{
-        ExtMove, GENERATE_ALL_LEGAL_MOVES, GOOD_QUIET_THRESHOLD, Kind, partial_insertion_sort,
-        score_capture, score_evasion, score_quiet,
+        ContPlane, ExtMove, GENERATE_ALL_LEGAL_MOVES, GOOD_QUIET_THRESHOLD, Kind,
+        partial_insertion_sort, score_capture, score_evasion, score_quiet,
     };
     use crate::update::WorkerHistories;
 
@@ -804,7 +819,7 @@ mod twin {
         depth: i32,
         ply: i32,
         threshold: i32,
-        cont_planes: [usize; 6],
+        cont_planes: [ContPlane; 6],
         scratch: PickerScratch,
         skip_quiets: bool,
         stage: Stage,
@@ -822,7 +837,7 @@ mod twin {
         pub(super) fn new_qsearch(
             pos: &Position,
             tt_move: Option<Move>,
-            cont_planes: [usize; 6],
+            cont_planes: [ContPlane; 6],
         ) -> Self {
             let in_check = pos.in_check();
             let tt = tt_move.filter(|&m| {
@@ -850,7 +865,7 @@ mod twin {
             tt_move: Option<Move>,
             depth: i32,
             ply: i32,
-            cont_planes: [usize; 6],
+            cont_planes: [ContPlane; 6],
         ) -> Self {
             let in_check = pos.in_check();
             let tt = tt_move.filter(|&m| {
@@ -878,7 +893,15 @@ mod twin {
             });
             let mut scratch = take_scratch();
             Self::generate_into(pos, false, tt, &mut scratch.raw_captures);
-            Self::from_parts(Kind::ProbCut, tt, 0, 0, threshold, [0; 6], scratch)
+            Self::from_parts(
+                Kind::ProbCut,
+                tt,
+                0,
+                0,
+                threshold,
+                [ContPlane::SENTINEL; 6],
+                scratch,
+            )
         }
 
         fn generate_into(pos: &Position, in_check: bool, tt: Option<Move>, out: &mut Vec<Move>) {
@@ -904,7 +927,7 @@ mod twin {
             depth: i32,
             ply: i32,
             threshold: i32,
-            cont_planes: [usize; 6],
+            cont_planes: [ContPlane; 6],
             scratch: PickerScratch,
         ) -> Self {
             TwinMovePicker {
@@ -1060,7 +1083,7 @@ mod twin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::ContinuationHistory;
+    use crate::history::{ContPlane, ContinuationHistory};
     use yorkie_state::{Color, Piece, PieceKind, Square};
 
     use crate::text_str::{format_usi_move, parse_sfen};
@@ -1071,7 +1094,7 @@ mod tests {
 
     /// The six sentinel continuation planes at a node with untouched stack cells
     /// (all pointing at plane `0`, the `[0][0][NO_PIECE][SQ_ZERO]` sentinel).
-    const SENTINEL_PLANES: [usize; 6] = [0; 6];
+    const SENTINEL_PLANES: [ContPlane; 6] = [ContPlane::SENTINEL; 6];
 
     /// A `WorkerHistories` with the reference `clear()` init values, plus the
     /// per-`go` `lowPlyHistory` fill of `98`.
@@ -1633,7 +1656,8 @@ mod tests {
             Piece::new(PieceKind::Rook, Color::Black),
             Square::new(4, 4).unwrap(),
         );
-        let cont_planes = [plane, 0, 0, 0, 0, 0];
+        let cont_planes = [plane, S, S, S, S, S];
+        const S: ContPlane = ContPlane::SENTINEL;
         let mut h = init_histories();
 
         let q_target = Move::make(

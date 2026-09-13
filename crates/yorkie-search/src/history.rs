@@ -31,6 +31,43 @@ use std::sync::atomic::{AtomicI16, Ordering};
 use yorkie_state::{Color, Move, Piece, Square};
 use yorkie_storage::{LargePageArray, LargePageBox, Zeroable};
 
+/// Index of one plane of an `N`-plane continuation-style history table.
+///
+/// Every way of making one bounds the value below `N`, and the field is private,
+/// so a table lookup addresses its plane straight away: the plane number a
+/// search stack cell carries has otherwise lost the bound its `plane_index`
+/// computation had.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PlaneIndex<const N: usize>(usize);
+
+impl<const N: usize> PlaneIndex<N> {
+    /// The `[NO_PIECE][0]` plane the reference seeds pre-root cells with.
+    /// `NO_PIECE` has piece code `0` in this port's dense encoding, so it is
+    /// plane `0`.
+    pub const SENTINEL: Self = {
+        assert!(N > 0, "a history table has at least one plane");
+        Self(0)
+    };
+
+    /// Plane `i`.
+    ///
+    /// # Panics
+    /// Panics unless `i < N`.
+    pub fn new(i: usize) -> Self {
+        assert!(i < N, "plane index {i} is past the table's {N} planes");
+        Self(i)
+    }
+
+    /// The plane number, known to the compiler to be below `N`.
+    fn get(self) -> usize {
+        debug_assert!(self.0 < N);
+        // SAFETY: the field is private and every constructor bounds it below
+        // `N`, so this holds for every value of the type that exists.
+        unsafe { core::hint::assert_unchecked(self.0 < N) };
+        self.0
+    }
+}
+
 /// Number of low-ply planes the reference keeps (`LOW_PLY_HISTORY_SIZE`):
 /// `lowPlyHistory` is indexed by `ply` for `ply < 5`.
 pub const LOW_PLY_HISTORY_SIZE: usize = 5;
@@ -81,8 +118,12 @@ pub fn apply_gravity(entry: i16, bonus: i32, d: i32) -> i16 {
 const PIECE_NB: usize = 32;
 /// Number of board squares.
 const SQ_NB: usize = Square::COUNT;
-/// Distinct captured-piece type codes: `kind` (0..8) + `promoted` (×8) ⇒ 0..16.
-const CAPTURED_NB: usize = 16;
+/// Distinct captured-piece type codes: the empty target at `0`, then one per
+/// `(kind, promoted)` pair — `kind` (0..8) + `promoted` (×8), shifted up by the
+/// empty slot, so `0..17`. A promoted king is not a piece any position holds,
+/// but giving its code a slot is what keeps [`captured_code`]'s range inside the
+/// table's without a case for it.
+const CAPTURED_NB: usize = 17;
 
 /// Dense index for a colored, possibly-promoted piece (the `pc` index). Unique
 /// per `(kind, color, promoted)`, in `0..PIECE_NB`.
@@ -101,13 +142,15 @@ fn captured_code(p: Piece) -> usize {
 /// `captureHistory[pc][to][type_of(captured)]` — the capture-ordering bonus for
 /// "moved piece `pc` captures a `captured`-type piece on square `to`".
 pub struct CapturePieceToHistory {
-    table: LargePageArray<i16>,
+    /// The dimensions are part of the type, so an entry's address is one
+    /// computation from the block's base and each index carries its own bound.
+    table: LargePageBox<[[[i16; CAPTURED_NB]; SQ_NB]; PIECE_NB]>,
 }
 
 impl Default for CapturePieceToHistory {
     fn default() -> Self {
         Self {
-            table: LargePageArray::zeroed(PIECE_NB * SQ_NB * CAPTURED_NB),
+            table: LargePageBox::zeroed(),
         }
     }
 }
@@ -120,40 +163,56 @@ impl CapturePieceToHistory {
 
     /// The `(address, byte length)` of this table's large-page block — see
     /// [`WorkerHistories::backing_regions`](crate::WorkerHistories::backing_regions).
-    pub fn backing_region(&self) -> Option<(usize, usize)> {
+    /// A [`LargePageBox`] always owns a block, so this is never `None`.
+    pub fn backing_region(&self) -> (usize, usize) {
         self.table.backing_region()
     }
 
     /// Overwrite every entry with `v` — the reference's
     /// `captureHistory.fill(v)` (init `-678`).
     pub fn fill(&mut self, v: i16) {
-        self.table.iter_mut().for_each(|e| *e = v);
-    }
-
-    fn index(moved: Piece, to: Square, captured: Piece) -> usize {
-        (piece_code(moved) * SQ_NB + to.index() as usize) * CAPTURED_NB + captured_code(captured)
+        self.table
+            .iter_mut()
+            .flatten()
+            .flatten()
+            .for_each(|e| *e = v);
     }
 
     /// The bonus for `moved` capturing `captured` on `to`. `0` for the
     /// zero-filled table.
     pub fn get(&self, moved: Piece, to: Square, captured: Piece) -> i32 {
-        self.table[Self::index(moved, to, captured)] as i32
+        self.table[piece_code(moved)][to.index() as usize][captured_code(captured)] as i32
     }
 
     /// The entry for `moved` moving to an **empty** `to` — the `NO_PIECE`
     /// (index `0`) victim slot the main search reads for a non-capturing check
     /// (`captureHistory[movedPiece][to][type_of(NO_PIECE)]`).
     pub fn get_empty(&self, moved: Piece, to: Square) -> i32 {
-        self.table[(piece_code(moved) * SQ_NB + to.index() as usize) * CAPTURED_NB] as i32
+        self.table[piece_code(moved)][to.index() as usize][0] as i32
     }
 
     /// Gravity-update the entry for `moved` capturing `captured` on `to`
     /// (`D = 10692`).
     #[inline(always)]
     pub fn update(&mut self, moved: Piece, to: Square, captured: Piece, bonus: i32) {
-        let i = Self::index(moved, to, captured);
-        self.table[i] = apply_gravity(self.table[i], bonus, CAPTURE_HISTORY_D);
+        let cell = &mut self.table[piece_code(moved)][to.index() as usize][captured_code(captured)];
+        *cell = apply_gravity(*cell, bonus, CAPTURE_HISTORY_D);
     }
+}
+
+/// Plane count of [`ContinuationHistory`]: `[in_check][capture][pc][to]`.
+pub const CONT_PLANES: usize = 2 * 2 * PIECE_NB * SQ_NB;
+/// Plane count of [`ContinuationCorrectionHistory`]: `[pc][to]`.
+pub const CONT_CORR_PLANES: usize = PIECE_NB * SQ_NB;
+
+/// A [`ContinuationHistory`] plane index.
+pub type ContPlane = PlaneIndex<CONT_PLANES>;
+/// A [`ContinuationCorrectionHistory`] plane index.
+pub type CorrPlane = PlaneIndex<CONT_CORR_PLANES>;
+
+/// The low 16 bits of the packed move — the butterfly tables' move dimension.
+fn move16(m: Move) -> usize {
+    (m.to_bits() & 0xFFFF) as usize
 }
 
 /// `mainHistory[us][move]` — the butterfly (from-to) quiet-move history for the
@@ -161,13 +220,14 @@ impl CapturePieceToHistory {
 /// exactly the `(from-or-dropped-type, to)` pair the reference's `move.raw()`
 /// uses.
 pub struct ButterflyHistory {
-    table: LargePageArray<i16>,
+    /// Layout `[us][move16]`, both dimensions compile-time.
+    table: LargePageBox<[[i16; 1 << 16]; Color::COUNT]>,
 }
 
 impl Default for ButterflyHistory {
     fn default() -> Self {
         Self {
-            table: LargePageArray::zeroed(Color::COUNT * (1 << 16)),
+            table: LargePageBox::zeroed(),
         }
     }
 }
@@ -180,36 +240,30 @@ impl ButterflyHistory {
 
     /// The `(address, byte length)` of this table's large-page block — see
     /// [`WorkerHistories::backing_regions`](crate::WorkerHistories::backing_regions).
-    pub fn backing_region(&self) -> Option<(usize, usize)> {
+    /// A [`LargePageBox`] always owns a block, so this is never `None`.
+    pub fn backing_region(&self) -> (usize, usize) {
         self.table.backing_region()
     }
 
     /// Overwrite every entry with `v` — the reference's `mainHistory.fill(v)`
     /// (init `0`).
     pub fn fill(&mut self, v: i16) {
-        self.table.iter_mut().for_each(|e| *e = v);
-    }
-
-    fn index(us: Color, m: Move) -> usize {
-        us.index() * (1 << 16) + (m.to_bits() & 0xFFFF) as usize
+        self.table.iter_mut().flatten().for_each(|e| *e = v);
     }
 
     /// The quiet-move history for `m` played by `us`. `0` for the zero-filled
     /// table.
     pub fn get(&self, us: Color, m: Move) -> i32 {
-        self.table[Self::index(us, m)] as i32
+        self.table[us.index()][move16(m)] as i32
     }
 
     /// Gravity-update `mainHistory[us][move.raw16]` (`D = 7183`).
     #[inline(always)]
     pub fn update(&mut self, us: Color, m: Move, bonus: i32) {
-        let i = Self::index(us, m);
-        self.table[i] = apply_gravity(self.table[i], bonus, MAIN_HISTORY_D);
+        let cell = &mut self.table[us.index()][move16(m)];
+        *cell = apply_gravity(*cell, bonus, MAIN_HISTORY_D);
     }
 }
-
-/// Entries in one continuation plane (`[pc][to]`).
-const PLANE_LEN: usize = PIECE_NB * SQ_NB;
 
 /// `PieceToHistory[pc][to]` — one continuation-history plane. The qsearch
 /// evasion quiet score reads only `continuationHistory[0]`, i.e. one such
@@ -218,17 +272,17 @@ const PLANE_LEN: usize = PIECE_NB * SQ_NB;
 /// The entries are inline, so a plane held inside a larger table is part of
 /// that table's block and an entry is one address computation away from it.
 pub struct PieceToHistory {
-    table: [i16; PLANE_LEN],
+    table: [[i16; SQ_NB]; PIECE_NB],
 }
 
-// SAFETY: an all-zero `[i16; PLANE_LEN]` is the zero-filled plane, a valid
-// value, and the plane needs no drop glue.
+// SAFETY: an all-zero `[[i16; SQ_NB]; PIECE_NB]` is the zero-filled plane, a
+// valid value, and the plane needs no drop glue.
 unsafe impl Zeroable for PieceToHistory {}
 
 impl Default for PieceToHistory {
     fn default() -> Self {
         Self {
-            table: [0i16; PLANE_LEN],
+            table: [[0i16; SQ_NB]; PIECE_NB],
         }
     }
 }
@@ -242,36 +296,33 @@ impl PieceToHistory {
     /// Overwrite every entry with `v` — the reference fills each
     /// `continuationHistory` plane with `-523`.
     pub fn fill(&mut self, v: i16) {
-        self.table.fill(v);
-    }
-
-    fn index(pc: Piece, to: Square) -> usize {
-        piece_code(pc) * SQ_NB + to.index() as usize
+        self.table.iter_mut().flatten().for_each(|e| *e = v);
     }
 
     /// The continuation bonus for piece `pc` moving to `to`. `0` for the
     /// zero-filled plane.
     pub fn get(&self, pc: Piece, to: Square) -> i32 {
-        self.table[Self::index(pc, to)] as i32
+        self.table[piece_code(pc)][to.index() as usize] as i32
     }
 
     /// Gravity-update the `[pc][to]` continuation entry (`D = 30000`).
     pub fn update(&mut self, pc: Piece, to: Square, bonus: i32) {
-        let i = Self::index(pc, to);
-        self.table[i] = apply_gravity(self.table[i], bonus, CONTINUATION_HISTORY_D);
+        let cell = &mut self.table[piece_code(pc)][to.index() as usize];
+        *cell = apply_gravity(*cell, bonus, CONTINUATION_HISTORY_D);
     }
 }
 
 /// `lowPlyHistory[ply][move]` — the near-root quiet bonus. Re-filled per `go`
 /// through [`fill`](LowPlyHistory::fill) at the root.
 pub struct LowPlyHistory {
-    table: LargePageArray<i16>,
+    /// Layout `[ply][move16]`, both dimensions compile-time.
+    table: LargePageBox<[[i16; 1 << 16]; LOW_PLY_HISTORY_SIZE]>,
 }
 
 impl Default for LowPlyHistory {
     fn default() -> Self {
         Self {
-            table: LargePageArray::zeroed(LOW_PLY_HISTORY_SIZE * (1 << 16)),
+            table: LargePageBox::zeroed(),
         }
     }
 }
@@ -284,31 +335,28 @@ impl LowPlyHistory {
 
     /// The `(address, byte length)` of this table's large-page block — see
     /// [`WorkerHistories::backing_regions`](crate::WorkerHistories::backing_regions).
-    pub fn backing_region(&self) -> Option<(usize, usize)> {
+    /// A [`LargePageBox`] always owns a block, so this is never `None`.
+    pub fn backing_region(&self) -> (usize, usize) {
         self.table.backing_region()
     }
 
     /// Overwrite every entry with `v` — the reference's `lowPlyHistory.fill(v)`
     /// (init `98`).
     pub fn fill(&mut self, v: i16) {
-        self.table.iter_mut().for_each(|e| *e = v);
-    }
-
-    fn index(ply: usize, m: Move) -> usize {
-        ply * (1 << 16) + (m.to_bits() & 0xFFFF) as usize
+        self.table.iter_mut().flatten().for_each(|e| *e = v);
     }
 
     /// The near-root bonus for `m` at `ply`. The caller guarantees
     /// `ply < LOW_PLY_HISTORY_SIZE`. `0` for the zero-filled table.
     pub fn get(&self, ply: usize, m: Move) -> i32 {
-        self.table[Self::index(ply, m)] as i32
+        self.table[ply][move16(m)] as i32
     }
 
     /// Gravity-update `lowPlyHistory[ply][move.raw16]` (`D = 7183`). The caller
     /// guarantees `ply < LOW_PLY_HISTORY_SIZE`.
     pub fn update(&mut self, ply: usize, m: Move, bonus: i32) {
-        let i = Self::index(ply, m);
-        self.table[i] = apply_gravity(self.table[i], bonus, LOW_PLY_HISTORY_D);
+        let cell = &mut self.table[ply][move16(m)];
+        *cell = apply_gravity(*cell, bonus, LOW_PLY_HISTORY_D);
     }
 }
 
@@ -444,17 +492,31 @@ impl SharedHistories {
         (slot * Color::COUNT + color.index()) * CorrChannel::COUNT + channel.index()
     }
 
+    /// The `channel` entry for side-to-move `color` in the slot keyed by `key`.
+    ///
+    /// Both tables are sized `slots * SLOT_LEN` and masked with `slots - 1` in
+    /// [`Self::new`], which is the only place either is built, so a masked index
+    /// is always inside the block. The length is a run-time value, so the bound
+    /// has to be stated rather than derived from the type.
+    fn corr_cell(&self, key: u64, color: Color, channel: CorrChannel) -> &AtomicI16 {
+        let i = self.corr_index(key, color, channel);
+        debug_assert!(i < self.correction.len());
+        // SAFETY: see the doc comment — `key & corr_mask < corr_mask + 1` and
+        // the table holds `(corr_mask + 1) * CORR_SLOT_LEN` entries.
+        unsafe { self.correction.get_unchecked(i) }
+    }
+
     /// The `channel` correction value for side-to-move `color` in the slot keyed
     /// by `key`. `0` on a fresh table.
     pub fn correction_get(&self, key: u64, color: Color, channel: CorrChannel) -> i32 {
-        self.correction[self.corr_index(key, color, channel)].load(Ordering::Relaxed) as i32
+        self.corr_cell(key, color, channel).load(Ordering::Relaxed) as i32
     }
 
     /// Gravity-update the `channel` entry for side-to-move `color` in the slot
     /// keyed by `key` (`D = 1024`).
     pub fn correction_update(&self, key: u64, color: Color, channel: CorrChannel, bonus: i32) {
         apply_gravity_atomic(
-            &self.correction[self.corr_index(key, color, channel)],
+            self.corr_cell(key, color, channel),
             bonus,
             CORRECTION_HISTORY_D,
         );
@@ -467,21 +529,27 @@ impl SharedHistories {
         (plane * PIECE_NB + piece_code(pc)) * SQ_NB + to.index() as usize
     }
 
+    /// The `[pc][to]` entry in the plane keyed by `pawn_key`. See
+    /// [`Self::corr_cell`] for why the masked index needs no check.
+    fn pawn_cell(&self, pawn_key: u64, pc: Piece, to: Square) -> &AtomicI16 {
+        let i = self.pawn_index(pawn_key, pc, to);
+        debug_assert!(i < self.pawn.len());
+        // SAFETY: `pawn_key & pawn_mask < pawn_mask + 1` and the table holds
+        // `(pawn_mask + 1) * PAWN_SLOT_LEN` entries.
+        unsafe { self.pawn.get_unchecked(i) }
+    }
+
     /// The pawn-structure bonus for piece `pc` moving to `to` in the plane keyed
     /// by `pawn_key`. `-1238` on a fresh table.
     pub fn pawn_get(&self, pawn_key: u64, pc: Piece, to: Square) -> i32 {
-        self.pawn[self.pawn_index(pawn_key, pc, to)].load(Ordering::Relaxed) as i32
+        self.pawn_cell(pawn_key, pc, to).load(Ordering::Relaxed) as i32
     }
 
     /// Gravity-update the `[pc][to]` entry in the plane keyed by `pawn_key`
     /// (`D = 8192`).
     #[inline(always)]
     pub fn pawn_update(&self, pawn_key: u64, pc: Piece, to: Square, bonus: i32) {
-        apply_gravity_atomic(
-            &self.pawn[self.pawn_index(pawn_key, pc, to)],
-            bonus,
-            PAWN_HISTORY_D,
-        );
+        apply_gravity_atomic(self.pawn_cell(pawn_key, pc, to), bonus, PAWN_HISTORY_D);
     }
 }
 
@@ -490,11 +558,11 @@ impl SharedHistories {
 ///
 /// The outer `[pc][to]` selects a *plane* — the one a search stack cell's
 /// `continuationCorrectionHistory` points at — and the inner `[pc][to]` indexes
-/// within it. [`Self::SENTINEL_PLANE`] is what pre-root cells are seeded with.
+/// within it. [`CorrPlane::SENTINEL`] is what pre-root cells are seeded with.
 pub struct ContinuationCorrectionHistory {
-    /// Layout: `[plane = outer_pc*SQ_NB + outer_to][inner_pc][inner_to]`. The
-    /// inner dimensions are fixed so each access carries a compile-time length.
-    table: LargePageBox<[[[i16; SQ_NB]; PIECE_NB]; ContinuationCorrectionHistory::NUM_PLANES]>,
+    /// Layout: `[plane = outer_pc*SQ_NB + outer_to][inner_pc][inner_to]`. Every
+    /// dimension is fixed so each access carries a compile-time length.
+    table: LargePageBox<[[[i16; SQ_NB]; PIECE_NB]; CONT_CORR_PLANES]>,
 }
 
 impl Default for ContinuationCorrectionHistory {
@@ -508,13 +576,6 @@ impl Default for ContinuationCorrectionHistory {
 }
 
 impl ContinuationCorrectionHistory {
-    /// Number of outer planes (`PIECE_NB * SQ_NB`).
-    const NUM_PLANES: usize = PIECE_NB * SQ_NB;
-    /// The `[NO_PIECE][0]` sentinel plane index (reference default). `NO_PIECE`
-    /// has piece code `0` in this port's dense encoding, so the sentinel is
-    /// plane `0`.
-    pub const SENTINEL_PLANE: usize = 0;
-
     /// A fresh, zero-filled table. Use [`Self::fill`] to apply the reference's
     /// init value of `6`.
     pub fn new() -> Self {
@@ -540,18 +601,18 @@ impl ContinuationCorrectionHistory {
 
     /// The plane index selected by the outer `[pc][to]` (the plane a search
     /// stack cell's `continuationCorrectionHistory` points at).
-    pub fn plane_index(pc: Piece, to: Square) -> usize {
-        piece_code(pc) * SQ_NB + to.index() as usize
+    pub fn plane_index(pc: Piece, to: Square) -> CorrPlane {
+        CorrPlane::new(piece_code(pc) * SQ_NB + to.index() as usize)
     }
 
     /// The inner `[pc][to]` value in `plane`. The fill value on a filled table.
-    pub fn get_at(&self, plane: usize, pc: Piece, to: Square) -> i32 {
-        self.table[plane][piece_code(pc)][to.index() as usize] as i32
+    pub fn get_at(&self, plane: CorrPlane, pc: Piece, to: Square) -> i32 {
+        self.table[plane.get()][piece_code(pc)][to.index() as usize] as i32
     }
 
     /// Gravity-update the inner `[pc][to]` entry in `plane` (`D = 1024`).
-    pub fn update_at(&mut self, plane: usize, pc: Piece, to: Square, bonus: i32) {
-        let cell = &mut self.table[plane][piece_code(pc)][to.index() as usize];
+    pub fn update_at(&mut self, plane: CorrPlane, pc: Piece, to: Square, bonus: i32) {
+        let cell = &mut self.table[plane.get()][piece_code(pc)][to.index() as usize];
         *cell = apply_gravity(*cell, bonus, CORRECTION_HISTORY_D);
     }
 }
@@ -565,7 +626,7 @@ pub struct ContinuationHistory {
     /// Layout: `[plane][inner_pc][inner_to]`, `plane` from [`Self::plane_index`].
     /// The planes are inline, so their length is part of the type and an entry's
     /// address is one computation from the block's base.
-    table: LargePageBox<[PieceToHistory; ContinuationHistory::NUM_PLANES]>,
+    table: LargePageBox<[PieceToHistory; CONT_PLANES]>,
 }
 
 impl Default for ContinuationHistory {
@@ -577,9 +638,6 @@ impl Default for ContinuationHistory {
 }
 
 impl ContinuationHistory {
-    /// Plane count: `[in_check][capture][pc][to]` == `2 * 2 * PIECE_NB * SQ_NB`.
-    const NUM_PLANES: usize = 2 * 2 * PIECE_NB * SQ_NB;
-
     /// A fresh, zero-filled table. Use [`Self::fill`] for the reference init.
     pub fn new() -> Self {
         Self::default()
@@ -602,27 +660,27 @@ impl ContinuationHistory {
 
     /// The plane index selected by `(in_check, capture, pc, to)` — the plane a
     /// search stack cell's `continuationHistory` points at after a move.
-    pub fn plane_index(in_check: bool, capture: bool, pc: Piece, to: Square) -> usize {
+    pub fn plane_index(in_check: bool, capture: bool, pc: Piece, to: Square) -> ContPlane {
         let ic = in_check as usize;
         let cap = capture as usize;
-        ((ic * 2 + cap) * PIECE_NB + piece_code(pc)) * SQ_NB + to.index() as usize
+        ContPlane::new(((ic * 2 + cap) * PIECE_NB + piece_code(pc)) * SQ_NB + to.index() as usize)
     }
 
     /// The inner `[pc][to]` value in `plane`.
-    pub fn get_at(&self, plane: usize, pc: Piece, to: Square) -> i32 {
-        self.table[plane].get(pc, to)
+    pub fn get_at(&self, plane: ContPlane, pc: Piece, to: Square) -> i32 {
+        self.table[plane.get()].get(pc, to)
     }
 
     /// Gravity-update the inner `[pc][to]` entry in `plane` (`D = 30000`).
-    pub fn update_at(&mut self, plane: usize, pc: Piece, to: Square, bonus: i32) {
-        self.table[plane].update(pc, to, bonus);
+    pub fn update_at(&mut self, plane: ContPlane, pc: Piece, to: Square, bonus: i32) {
+        self.table[plane.get()].update(pc, to, bonus);
     }
 
     /// Borrow `plane` whole, so a search that keeps its continuation table in
     /// this multi-plane form can hand the picker the six planes its `contHist`
     /// array names.
-    pub fn plane(&self, plane: usize) -> &PieceToHistory {
-        &self.table[plane]
+    pub fn plane(&self, plane: ContPlane) -> &PieceToHistory {
+        &self.table[plane.get()]
     }
 }
 
@@ -668,13 +726,21 @@ mod plane_tests {
     fn every_plane_lies_inside_the_tables_block() {
         let hist = ContinuationHistory::new();
         let (base, len) = hist.backing_region();
-        for plane in [0, 1, ContinuationHistory::NUM_PLANES - 1] {
+        for n in [0, 1, CONT_PLANES - 1] {
+            let plane = ContPlane::new(n);
             let at = hist.plane(plane) as *const PieceToHistory as usize;
             assert!(
                 at >= base && at + size_of::<PieceToHistory>() <= base + len,
-                "plane {plane} at {at:#x} is outside the block [{base:#x}, +{len})",
+                "plane {n} at {at:#x} is outside the block [{base:#x}, +{len})",
             );
         }
+    }
+
+    /// A plane index past the table's last plane is rejected at construction.
+    #[test]
+    #[should_panic(expected = "past the table's")]
+    fn a_plane_index_past_the_last_plane_is_rejected() {
+        let _ = ContPlane::new(CONT_PLANES);
     }
 
     /// A borrowed plane reads what the table reads at the same cell.
@@ -683,10 +749,15 @@ mod plane_tests {
     fn a_borrowed_plane_reads_what_the_table_reads() {
         let mut hist = ContinuationHistory::new();
         hist.fill(-523);
-        hist.update_at(7, bp(), to(), 4_000);
-        assert_eq!(hist.plane(7).get(bp(), to()), hist.get_at(7, bp(), to()));
-        assert_ne!(hist.plane(7).get(bp(), to()), -523);
-        assert_eq!(hist.plane(8).get(bp(), to()), -523);
+        let seven = ContPlane::new(7);
+        let eight = ContPlane::new(8);
+        hist.update_at(seven, bp(), to(), 4_000);
+        assert_eq!(
+            hist.plane(seven).get(bp(), to()),
+            hist.get_at(seven, bp(), to())
+        );
+        assert_ne!(hist.plane(seven).get(bp(), to()), -523);
+        assert_eq!(hist.plane(eight).get(bp(), to()), -523);
     }
 }
 

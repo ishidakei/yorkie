@@ -279,6 +279,10 @@ impl std::ops::Deref for FeatureList {
     type Target = [FeatureIndex];
 
     fn deref(&self) -> &[FeatureIndex] {
+        debug_assert!(self.len <= self.entries.len());
+        // SAFETY: `len` is private and only `push` raises it, one step per
+        // `entries` slot it writes, so it never passes the array's length.
+        unsafe { core::hint::assert_unchecked(self.len <= self.entries.len()) };
         &self.entries[..self.len]
     }
 }
@@ -507,12 +511,20 @@ impl PerspectiveDelta {
     /// Feature columns to subtract from the pre-move accumulator half.
     #[inline]
     pub fn removed(&self) -> &[FeatureIndex] {
+        debug_assert!(self.n_removed <= self.removed.len());
+        // SAFETY: the counter is private and only ever bumped alongside a write
+        // into the array, which bounds it by the array's own length. Stating
+        // that keeps a range check out of the per-node accumulator update.
+        unsafe { core::hint::assert_unchecked(self.n_removed <= self.removed.len()) };
         &self.removed[..self.n_removed]
     }
 
     /// Feature columns to add to the pre-move accumulator half.
     #[inline]
     pub fn added(&self) -> &[FeatureIndex] {
+        debug_assert!(self.n_added <= self.added.len());
+        // SAFETY: see `removed`.
+        unsafe { core::hint::assert_unchecked(self.n_added <= self.added.len()) };
         &self.added[..self.n_added]
     }
 }

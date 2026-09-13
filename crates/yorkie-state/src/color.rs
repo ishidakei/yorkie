@@ -16,7 +16,13 @@ impl Color {
     }
 
     pub const fn index(self) -> usize {
-        self as usize
+        let i = self as usize;
+        debug_assert!(i < Self::COUNT);
+        // SAFETY: the enum defines a variant for exactly the discriminants
+        // `0..COUNT`, so this holds for every `Color` that exists. See
+        // `Square::index` for why the bound is stated rather than inferred.
+        unsafe { core::hint::assert_unchecked(i < Self::COUNT) };
+        i
     }
 }
 

@@ -271,15 +271,9 @@ pub(crate) fn apply_diff(
     added: &[FeatureIndex],
     removed: &[FeatureIndex],
 ) {
-    match (added.len(), removed.len()) {
-        (1, 1) => transformer_kernel::add_sub_features(out, weights, added, removed),
-        (1, 2) => transformer_kernel::add_sub_sub_features(
-            out,
-            weights,
-            &added[..1],
-            &removed[..1],
-            &removed[1..2],
-        ),
+    match (added, removed) {
+        ([a], [r]) => transformer_kernel::add_sub_features(out, weights, *a, *r),
+        ([a], [r0, r1]) => transformer_kernel::add_sub_sub_features(out, weights, *a, *r0, *r1),
         _ => {
             transformer_kernel::sub_features(out, weights, removed);
             transformer_kernel::add_features(out, weights, added);
