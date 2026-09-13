@@ -17,7 +17,7 @@
 //! replacement selection against a cluster a child has since churned, and could
 //! pick a different slot.
 
-use std::num::{NonZeroU16, NonZeroU64};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -56,6 +56,10 @@ const VALUE_TB_WIN_IN_MAX_PLY: Value = VALUE_MATE - MAX_PLY; // 31754
 const VALUE_MAX_EVAL: Value = VALUE_TB_WIN_IN_MAX_PLY - 1; // 31753
 /// `VALUE_DRAW`.
 const VALUE_DRAW: Value = 0;
+/// The `rootDelta` a search that has not opened an aspiration window reduces
+/// against: the full window's width.
+const ROOT_DELTA_FULL: NonZeroU32 =
+    NonZeroU32::new(2 * VALUE_INFINITE as u32).expect("the full window has a positive width");
 /// `DEPTH_QS`.
 const DEPTH_QS: i32 = 0;
 /// `DEPTH_UNSEARCHED`.
@@ -526,10 +530,17 @@ pub struct QSearch<N: NetworkParams> {
     /// qsearch — the reference's contract.
     histories: WorkerHistories,
     /// `rootDelta` — the width `beta - alpha` of the *root* aspiration window,
-    /// read by [`Self::reduction`]. [`Self::run_root`] sets it before each
-    /// `search<Root>` call; the default is the full-window width
-    /// `2 * VALUE_INFINITE`.
-    root_delta: Value,
+    /// read by [`Self::reduction`]. [`Self::set_root_delta`] is the only way in;
+    /// [`Self::run_root`] calls it before each `search<Root>` call, and the
+    /// default is the full-window width `2 * VALUE_INFINITE`.
+    ///
+    /// A width, not a [`Value`]: `reduction` divides by it once per move at
+    /// every node, and a divisor a signed division cannot fault on has to be
+    /// positive — neither `0` nor `-1`, the two cases the language checks for
+    /// and panics on. Unsigned and non-zero is exactly that, and
+    /// [`Self::root_delta_divisor`] carries the range across to the `i32` the
+    /// division wants.
+    root_delta: NonZeroU32,
     /// `rootDepth` — the current iterative-deepening depth, read by the Step-20
     /// nodes tie-break (`ss->ply + 2 >= rootDepth`). [`Self::run_root`] sets it
     /// per iteration; default `1`.
@@ -898,7 +909,7 @@ impl<N: NetworkParams> QSearch<N> {
             #[cfg(test)]
             verify_accumulator: false,
             histories,
-            root_delta: 2 * VALUE_INFINITE,
+            root_delta: ROOT_DELTA_FULL,
             root_depth: 1,
             // Reserved to the longest PV a root move can hold, so the copy each
             // completed iteration makes into it never grows the buffer.
@@ -2339,7 +2350,7 @@ impl<N: NetworkParams> QSearch<N> {
         loop {
             let adjusted_depth =
                 1.max(root_depth - failed_high_cnt - 3 * (search_again_counter + 1) / 4);
-            self.root_delta = beta - alpha;
+            self.set_root_delta(beta - alpha);
             self.root_depth = root_depth;
             // Slot 0 still holds the root refresh seeded by the caller.
             self.acc_depth = 0;
@@ -2737,10 +2748,27 @@ impl<N: NetworkParams> QSearch<N> {
         }
     }
 
+    /// Install `width` as the `rootDelta` [`Self::reduction`] reduces against.
+    /// A window's width is positive — every caller passes `beta - alpha` with
+    /// `beta` above `alpha` — and the floor is where that becomes a fact of the
+    /// stored type rather than a property of the callers.
+    fn set_root_delta(&mut self, width: Value) {
+        self.root_delta = NonZeroU32::new(width.max(1) as u32).unwrap_or(NonZeroU32::MIN);
+    }
+
+    /// The `rootDelta` divisor in the `1..=i32::MAX` the signed division in
+    /// [`Self::reduction`] needs: positive by the stored type, and narrowed
+    /// here to the signed range. A width never reaches that ceiling — the
+    /// widest is the full window's `2 * VALUE_INFINITE` — so the narrowing
+    /// changes no value the search ever holds.
+    fn root_delta_divisor(&self) -> i32 {
+        self.root_delta.get().min(i32::MAX as u32) as i32
+    }
+
     /// `reduction(i, d, mn, delta)`, scaled by 1024.
     fn reduction(&self, improving: bool, d: i32, mn: i32, delta: i32) -> i32 {
         let reduction_scale = REDUCTIONS[d as usize] * REDUCTIONS[mn as usize];
-        reduction_scale - delta * 585 / self.root_delta
+        reduction_scale - delta * 585 / self.root_delta_divisor()
             + (!improving as i32) * reduction_scale * 206 / 512
             + 1133
     }
@@ -2812,7 +2840,7 @@ impl<N: NetworkParams> QSearch<N> {
         self.sel_depth = 0;
         self.root_us = pos.side_to_move();
         self.set_read_tt(true);
-        self.root_delta = (beta - alpha).max(1);
+        self.set_root_delta(beta - alpha);
         self.root_depth = depth;
         self.last_iteration_pv.clear();
         self.stopped = false;
@@ -3843,7 +3871,15 @@ impl<N: NetworkParams> QSearch<N> {
 
         // Step 21-23. Mate check, stat updates, TT write.
         if best_value >= beta && !is_decisive(best_value) && !is_decisive(alpha) {
-            best_value = (best_value * depth + beta) / (depth + 1);
+            // The blend weighs this node's depth against one ply of beta, and
+            // the depth here is at least 1: a node at 0 or below returned from
+            // the qsearch hand-off at the top and never reached this. The floor
+            // and the saturating step change no weight the search ever holds;
+            // between them they leave the divisor in `2..=i32::MAX`, where the
+            // signed division has neither a zero nor an `i32::MIN / -1` case to
+            // check for and fault on.
+            let weight = depth.max(1);
+            best_value = (best_value * weight + beta) / weight.saturating_add(1);
         }
 
         if move_count == 0 {
@@ -5157,19 +5193,41 @@ mod tests {
 
         // reduction(i, d, mn, delta) = rs - delta*585/rootDelta
         //                            + (!i)*rs*206/512 + 1133, rs = red[d]*red[mn].
-        q.root_delta = 1000;
+        q.set_root_delta(1000);
         let rs = REDUCTIONS[8] * REDUCTIONS[4];
         assert_eq!(q.reduction(true, 8, 4, 100), rs - 100 * 585 / 1000 + 1133);
         assert_eq!(
             q.reduction(false, 8, 4, 100),
             rs - 100 * 585 / 1000 + rs * 206 / 512 + 1133,
         );
-        q.root_delta = 200;
+        q.set_root_delta(200);
         let rs2 = REDUCTIONS[10] * REDUCTIONS[2];
         assert_eq!(
             q.reduction(false, 10, 2, 50),
             rs2 - 50 * 585 / 200 + rs2 * 206 / 512 + 1133,
         );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_width_no_window_could_have_reduces_against_one() {
+        let net = zero_net();
+        let _tt = fresh_tt();
+        let mut q = QSearch::new(net.network());
+
+        // No aspiration window closes to zero or inverts, and the width the
+        // divisor is built from stays positive when one does: `reduction`
+        // divides, and a zero or negative divisor is where that division would
+        // fault rather than reduce.
+        for width in [0, -1, Value::MIN] {
+            q.set_root_delta(width);
+            assert_eq!(q.root_delta_divisor(), 1, "width {width}");
+            let rs = REDUCTIONS[8] * REDUCTIONS[4];
+            assert_eq!(q.reduction(true, 8, 4, 100), rs - 100 * 585 + 1133);
+        }
+
+        q.set_root_delta(2 * VALUE_INFINITE);
+        assert_eq!(q.root_delta_divisor(), 2 * VALUE_INFINITE);
     }
 
     #[cfg_attr(miri, ignore)]
@@ -5362,7 +5420,7 @@ mod tests {
         q.nodes = 0;
         q.sel_depth = 0;
         q.root_us = Color::White;
-        q.root_delta = 2 * VALUE_INFINITE;
+        q.set_root_delta(2 * VALUE_INFINITE);
         q.root_depth = 1;
 
         let bk = Piece::new(PieceKind::King, Color::Black);
