@@ -125,16 +125,27 @@ impl PickerScratch {
     }
 
     /// Keep the moves `f` accepts, in order, and drop the rest.
+    ///
+    /// `rest` starts at the slot the next kept move is written to, so the move
+    /// being examined sits `skipped` slots along it — one slot per move dropped
+    /// so far, since a kept move both consumes a slot and frees one. The loop
+    /// guard bounds that read and the slice bounds the write, where a pair of
+    /// indices into `buf` carried no bound at all. Every move is either kept or
+    /// skipped, so the moves left are the ones not skipped.
     #[inline]
     fn retain(&mut self, mut f: impl FnMut(&ExtMove) -> bool) {
-        let mut kept = 0;
-        for i in 0..self.len {
-            if f(&self.buf[i]) {
-                self.buf[kept] = self.buf[i];
-                kept += 1;
+        let mut rest: &mut [ExtMove] = self.as_mut_slice();
+        let mut skipped = 0;
+        while skipped < rest.len() {
+            let m = rest[skipped];
+            if f(&m) {
+                rest[0] = m;
+                rest = core::mem::take(&mut rest).split_at_mut(1).1;
+            } else {
+                skipped += 1;
             }
         }
-        self.len = kept;
+        self.len -= skipped;
     }
 }
 
@@ -467,6 +478,34 @@ impl<'a> MovePicker<'a> {
         )
     }
 
+    /// A `*_INIT` stage bar its cursor setup: generate the capture (or evasion)
+    /// list, score it, sort it.
+    ///
+    /// [`Self::generate_capture_list`] leaves the buffer holding exactly that
+    /// list, so the region `[0, end_captures)` the reference scores and sorts is
+    /// the buffer itself — and a slice carries its own length into both walks
+    /// where the region's two indices carried nothing.
+    fn init_capture_list(&mut self, pos: &Position, hist: &WorkerHistories) {
+        self.generate_capture_list(pos);
+
+        // `score<CAPTURES>` / `score<EVASIONS>` against the *live* `hist`.
+        let evasion = self.kind == Kind::Evasion;
+        let plane = self.cont_planes[0];
+        for e in self.scratch.as_mut_slice().iter_mut() {
+            e.value = if evasion {
+                score_evasion(pos, e.mv, hist, plane)
+            } else {
+                score_capture(pos, e.mv, hist)
+            };
+        }
+
+        // `partial_insertion_sort` with `i32::MIN` promotes every element, so
+        // its promotion swap is a self-assignment — a pure descending
+        // permutation. That is why legality can be pre-filtered at generation
+        // here without perturbing order.
+        partial_insertion_sort(self.scratch.as_mut_slice(), i32::MIN);
+    }
+
     /// Generate the legal, TT-deduped capture (or, for the `Evasion` kind,
     /// evasion) list into `scratch` at `*_INIT` stage entry.
     ///
@@ -544,33 +583,25 @@ impl<'a> MovePicker<'a> {
         None
     }
 
-    /// Score the captures / evasions region `[0, end_captures)` in place against
-    /// the *live* `hist` (`score<CAPTURES>` / `score<EVASIONS>`).
-    fn score_captures_in_place(&mut self, pos: &Position, hist: &WorkerHistories) {
-        let evasion = self.kind == Kind::Evasion;
-        for i in 0..self.end_captures {
-            let m = self.scratch[i].mv;
-            self.scratch[i].value = if evasion {
-                score_evasion(pos, m, hist, self.cont_planes[0])
-            } else {
-                score_capture(pos, m, hist)
-            };
-        }
-    }
-
     /// Score the quiets region `[end_captures, end_generated)` in place against
-    /// the *live* `hist` (`score<QUIETS>`).
-    fn score_quiets_in_place(&mut self, pos: &Position, hist: &WorkerHistories) {
+    /// the *live* `hist` (`score<QUIETS>`), then sort it.
+    ///
+    /// The quiet generator appends to the capture list, so that region is the
+    /// tail `split_at_mut` cuts off at `end_captures`: one bound check for the
+    /// cut, and both walks then run over a slice that carries it.
+    fn score_and_sort_quiets(&mut self, pos: &Position, hist: &WorkerHistories) {
         // Snapshot the `checkSquares` table once for the whole quiet region — one
         // `check_info()` borrow instead of one per scored move. The
         // board is fixed for the picker's lifetime, so the snapshot is valid for
         // every quiet scored here.
         let check_squares = pos.check_squares();
-        for i in self.end_captures..self.end_generated {
-            let m = self.scratch[i].mv;
-            self.scratch[i].value =
-                score_quiet(pos, m, self.ply, hist, self.cont_planes, &check_squares);
+        let (ply, planes, depth, end_captures) =
+            (self.ply, self.cont_planes, self.depth, self.end_captures);
+        let (_, quiets) = self.scratch.as_mut_slice().split_at_mut(end_captures);
+        for e in quiets.iter_mut() {
+            e.value = score_quiet(pos, e.mv, ply, hist, planes, &check_squares);
         }
+        partial_insertion_sort(quiets, -3560 * depth);
     }
 
     /// The next move in picker order, or `None` when exhausted. `hist` are the
@@ -593,17 +624,8 @@ impl<'a> MovePicker<'a> {
                     }
                 }
 
-                // `partial_insertion_sort` with `i32::MIN` promotes every
-                // element, so its promotion swap is a self-assignment — a pure
-                // descending permutation. That is why legality can be
-                // pre-filtered at generation here without perturbing order.
                 Stage::CaptureInit => {
-                    self.generate_capture_list(pos);
-                    self.score_captures_in_place(pos, hist);
-                    partial_insertion_sort(
-                        &mut self.scratch.as_mut_slice()[0..self.end_captures],
-                        i32::MIN,
-                    );
+                    self.init_capture_list(pos, hist);
                     self.cur = 0;
                     self.end_bad_captures = 0;
                     self.end_cur = self.end_captures;
@@ -643,11 +665,7 @@ impl<'a> MovePicker<'a> {
                         pos.generate_quiets::<GENERATE_ALL_LEGAL_MOVES, _>(&mut *self.scratch);
                         self.end_generated = self.scratch.len();
 
-                        self.score_quiets_in_place(pos, hist);
-                        partial_insertion_sort(
-                            &mut self.scratch.as_mut_slice()[self.end_captures..self.end_generated],
-                            -3560 * self.depth,
-                        );
+                        self.score_and_sort_quiets(pos, hist);
                     }
                     self.cur = self.end_captures;
                     self.end_cur = self.end_generated;
@@ -700,34 +718,19 @@ impl<'a> MovePicker<'a> {
                 // single list (deferred here from construction), score it, full
                 // sort, then a lone `select` loop with no good/bad split.
                 Stage::QcaptureInit => {
-                    self.generate_capture_list(pos);
-                    self.score_captures_in_place(pos, hist);
-                    partial_insertion_sort(
-                        &mut self.scratch.as_mut_slice()[0..self.end_captures],
-                        i32::MIN,
-                    );
+                    self.init_capture_list(pos, hist);
                     self.cur = 0;
                     self.end_cur = self.end_captures;
                     self.stage = Stage::Qcapture;
                 }
                 Stage::EvasionInit => {
-                    self.generate_capture_list(pos);
-                    self.score_captures_in_place(pos, hist);
-                    partial_insertion_sort(
-                        &mut self.scratch.as_mut_slice()[0..self.end_captures],
-                        i32::MIN,
-                    );
+                    self.init_capture_list(pos, hist);
                     self.cur = 0;
                     self.end_cur = self.end_captures;
                     self.stage = Stage::Evasion;
                 }
                 Stage::ProbcutInit => {
-                    self.generate_capture_list(pos);
-                    self.score_captures_in_place(pos, hist);
-                    partial_insertion_sort(
-                        &mut self.scratch.as_mut_slice()[0..self.end_captures],
-                        i32::MIN,
-                    );
+                    self.init_capture_list(pos, hist);
                     self.cur = 0;
                     self.end_cur = self.end_captures;
                     self.stage = Stage::Probcut;

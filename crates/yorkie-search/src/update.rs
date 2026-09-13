@@ -265,10 +265,11 @@ impl Default for SearchStackCell {
     }
 }
 
-/// Plies-and-weights for [`update_continuation_histories`]:
-/// `{1:1157, 2:648, 3:288, 4:576, 5:140, 6:441}`.
-const CONTHIST_BONUSES: [(usize, i32); 6] =
-    [(1, 1157), (2, 648), (3, 288), (4, 576), (5, 140), (6, 441)];
+/// Weights for [`update_continuation_histories`], one per ply back from the
+/// current cell starting at `ss - 1`: `{1:1157, 2:648, 3:288, 4:576, 5:140,
+/// 6:441}`. The position in the table *is* the ply distance, which is what lets
+/// the walk pair a weight with a cell by stepping backwards over the stack.
+const CONTHIST_BONUSES: [i32; 6] = [1157, 648, 288, 576, 140, 441];
 
 /// A *plain* capture test (`Position::capture`): a non-drop landing on an
 /// occupied square. In this engine `capture_stage == capture`, so this is the
@@ -292,13 +293,18 @@ pub fn update_continuation_histories(
     to: Square,
     bonus: i32,
 ) {
+    debug_assert!(ss >= CONTHIST_BONUSES.len());
     let in_check = stack[ss].in_check;
-    for (i, weight) in CONTHIST_BONUSES {
+    // Walking the cells below `ss` backwards pairs each weight with the ply it
+    // belongs to, and the `zip` stops at the shorter of the two — so the walk
+    // carries the bound that `stack[ss - i]` had to be checked for.
+    let plies_back = CONTHIST_BONUSES.iter().zip(stack[..ss].iter().rev());
+    for (distance, (weight, prev)) in plies_back.enumerate() {
+        let i = distance + 1;
         // Only update the first 2 continuation histories if we are in check.
         if in_check && i > 2 {
             break;
         }
-        let prev = &stack[ss - i];
         if prev.current_move.is_some_and(Move::is_ok) {
             let value = (bonus * weight / 1024) + 88 * (i < 2) as i32;
             hist.continuation.update_at(prev.cont_hist, pc, to, value);
@@ -357,10 +363,11 @@ pub fn update_all_stats(
     prior_capture: bool,
 ) {
     let moved_piece = best_move.moved_piece_after();
+    let prev = &stack[ss - 1];
 
     let bonus = (128 * depth - 77).min(1529)
         + 353 * (Some(best_move) == tt_move) as i32
-        + stack[ss - 1].stat_score / 32;
+        + prev.stat_score / 32;
     let malus = (882 * depth - 204).min(2122);
 
     if !is_capture(pos, best_move) {
@@ -387,7 +394,7 @@ pub fn update_all_stats(
     // Extra penalty for a quiet early move that was not a TT move in the
     // previous ply when it gets refuted.
     if let Some(prev_sq) = prev_sq
-        && stack[ss - 1].move_count == 1 + stack[ss - 1].tt_hit as i32
+        && prev.move_count == 1 + prev.tt_hit as i32
         && !prior_capture
         && let Some(prev_piece) = pos.board().get(prev_sq)
     {
@@ -443,23 +450,20 @@ pub fn update_correction_history(
         bonus * 187 / 128,
     );
 
-    if let Some(m) = stack[ss - 1].current_move
+    // `ss - 1`, `ss - 2` and `ss - 4` all sit in the four cells below `ss`, so
+    // one window carries the bound for all three: the window's length is the
+    // constant 4, against which the offsets into it are checked at compile time.
+    let recent = &stack[ss - 4..ss];
+    let (prev1, prev2, prev4) = (&recent[3], &recent[2], &recent[0]);
+    if let Some(m) = prev1.current_move
         && m.is_ok()
     {
         let to = m.to_sq();
         if let Some(pc) = pos.board().get(to) {
-            hist.continuation_correction.update_at(
-                stack[ss - 2].cont_corr,
-                pc,
-                to,
-                bonus * 126 / 128,
-            );
-            hist.continuation_correction.update_at(
-                stack[ss - 4].cont_corr,
-                pc,
-                to,
-                bonus * 63 / 128,
-            );
+            hist.continuation_correction
+                .update_at(prev2.cont_corr, pc, to, bonus * 126 / 128);
+            hist.continuation_correction
+                .update_at(prev4.cont_corr, pc, to, bonus * 63 / 128);
         }
     }
 }
@@ -725,7 +729,7 @@ mod tests {
         update_continuation_histories(&mut hist, &stack, ss, pc, to, bonus);
 
         for (idx, i) in (1..=6).enumerate() {
-            let weight = CONTHIST_BONUSES[idx].1;
+            let weight = CONTHIST_BONUSES[idx];
             let write = (bonus * weight / 1024) + 88 * (i < 2) as i32;
             let expected = apply_gravity(pre[idx] as i16, write, CONTINUATION_HISTORY_D) as i32;
             assert_eq!(
@@ -848,7 +852,7 @@ mod tests {
             apply_gravity(low_pre, bonus * 761 / 1024, MAIN_HISTORY_D) as i32,
         );
         // continuation write uses bonus*955/1024 (+88 since i==1) at plane 3.
-        let cont_write = (bonus * 955 / 1024 * CONTHIST_BONUSES[0].1 / 1024) + 88;
+        let cont_write = (bonus * 955 / 1024 * CONTHIST_BONUSES[0] / 1024) + 88;
         assert_eq!(
             hist.continuation.get_at(ContPlane::new(3), moved, to),
             apply_gravity(cont_pre, cont_write, CONTINUATION_HISTORY_D) as i32,
@@ -1079,7 +1083,7 @@ mod tests {
             false,
         );
 
-        let write = (-malus * 616 / 1024 * CONTHIST_BONUSES[0].1 / 1024) + 88;
+        let write = (-malus * 616 / 1024 * CONTHIST_BONUSES[0] / 1024) + 88;
         assert_eq!(
             hist.continuation
                 .get_at(ContPlane::new(5), prev_piece, prev_sq),

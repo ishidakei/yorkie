@@ -234,12 +234,14 @@ pub fn select_best_worker(workers: &[WorkerVote]) -> usize {
     };
 
     // Scan all workers keeping the best. `best` starts at the main worker
-    // (index 0); comparing it against itself is a no-op.
+    // (index 0); comparing it against itself is a no-op. `cur` is the cell
+    // `best` names, carried alongside it so the scan re-reads the winner through
+    // the iterator's own bound rather than through an index into the slice.
+    let Some(mut cur) = workers.first() else {
+        return 0;
+    };
     let mut best = 0usize;
-    for i in 0..workers.len() {
-        let cur = &workers[best];
-        let th = &workers[i];
-
+    for (i, th) in workers.iter().enumerate() {
         let best_score = cur.score;
         let new_score = th.score;
 
@@ -259,19 +261,19 @@ pub fn select_best_worker(workers: &[WorkerVote]) -> usize {
         if best_in_win {
             // Keep the shortest mate: switch only to a higher proven-win score.
             if new_score > best_score {
-                best = i;
+                (best, cur) = (i, th);
             }
         } else if best_in_loss {
             // Keep the longest defence: switch only to a lower proven loss.
             if new_in_loss && new_score < best_score {
-                best = i;
+                (best, cur) = (i, th);
             }
         } else if new_in_win
             || new_in_loss
             || (!is_loss(new_score)
                 && (new_vote > best_vote || (new_vote == best_vote && better_voting_value)))
         {
-            best = i;
+            (best, cur) = (i, th);
         }
     }
 
@@ -295,18 +297,18 @@ pub fn generate_root_moves(pos: &Position) -> Vec<RootMove> {
         pos.generate_non_evasions::<GENERATE_ALL_LEGAL_MOVES, _>(&mut pseudo);
     }
 
-    // `while (cur != last) if (!legal(*cur)) *cur = *(--last); else ++cur;`
+    // `while (cur != last) if (!legal(*cur)) *cur = *(--last); else ++cur;` —
+    // overwriting the cursor with the last move and shrinking by one is what
+    // `swap_remove` is, and naming it that way both states the reordering and
+    // lets the loop guard stand as the cursor's bound.
     let mut cur = 0usize;
-    let mut last = pseudo.len();
-    while cur != last {
+    while cur < pseudo.len() {
         if pos.is_legal(pseudo[cur].mv) {
             cur += 1;
         } else {
-            pseudo[cur] = pseudo[last - 1];
-            last -= 1;
+            pseudo.swap_remove(cur);
         }
     }
-    pseudo.truncate(last);
 
     pseudo.into_iter().map(|e| RootMove::new(e.mv)).collect()
 }

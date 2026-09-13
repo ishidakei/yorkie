@@ -437,25 +437,30 @@ pub(crate) fn changed_indices_into(
     removed.clear();
     added.clear();
 
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < sorted_before.len() && j < sorted_after.len() {
-        match sorted_before[i].cmp(&sorted_after[j]) {
+    // Two cursors walked as peeking iterators: each side's remainder is then the
+    // iterator itself, which is what the tail `extend`s drain — a pair of
+    // indices would have had to be re-checked against both lengths to say the
+    // same thing.
+    let mut b = sorted_before.iter().copied().peekable();
+    let mut a = sorted_after.iter().copied().peekable();
+    while let (Some(&before_index), Some(&after_index)) = (b.peek(), a.peek()) {
+        match before_index.cmp(&after_index) {
             std::cmp::Ordering::Equal => {
-                i += 1;
-                j += 1;
+                b.next();
+                a.next();
             }
             std::cmp::Ordering::Less => {
-                removed.push(sorted_before[i]);
-                i += 1;
+                removed.push(before_index);
+                b.next();
             }
             std::cmp::Ordering::Greater => {
-                added.push(sorted_after[j]);
-                j += 1;
+                added.push(after_index);
+                a.next();
             }
         }
     }
-    removed.extend_from_slice(&sorted_before[i..]);
-    added.extend_from_slice(&sorted_after[j..]);
+    removed.extend(b);
+    added.extend(a);
 }
 
 // The hot search path cannot afford `active_features`'s 40-slot scan, sort and
@@ -647,13 +652,18 @@ impl MoveDelta {
             let mirror = needs_mirror(king_persp);
             let sq_k_code = mirror_if_needed(king_persp, mirror).index() as usize;
 
+            // Zipping the destination slots against the dirty slots pairs each
+            // encoded column with the slot it belongs in, and stops at the
+            // shorter of the two — so the walk carries the bound that indexing
+            // by the running count did not, and the count is what the walk ran
+            // to rather than what drove it.
             let mut pd = PerspectiveDelta::default();
-            for d in removed.iter().flatten() {
-                pd.removed[pd.n_removed as usize] = d.encode(persp, sq_k_code, mirror);
+            for (slot, d) in pd.removed.iter_mut().zip(removed.iter().flatten()) {
+                *slot = d.encode(persp, sq_k_code, mirror);
                 pd.n_removed += 1;
             }
-            for d in added.iter().flatten() {
-                pd.added[pd.n_added as usize] = d.encode(persp, sq_k_code, mirror);
+            for (slot, d) in pd.added.iter_mut().zip(added.iter().flatten()) {
+                *slot = d.encode(persp, sq_k_code, mirror);
                 pd.n_added += 1;
             }
             Some(pd)

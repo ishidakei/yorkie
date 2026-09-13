@@ -1746,7 +1746,13 @@ impl<N: NetworkParams> QSearch<N> {
         }
 
         // Step 5-8. Move loop.
-        let prev_sq = self.stack[Self::si(ply) - 1]
+        //
+        // `(ss-1)` down to `(ss-6)` are read here, so one window carries the
+        // bound for the whole group: the window's length is the constant 6,
+        // against which the offsets into it are checked at compile time.
+        let s = Self::si(ply);
+        let recent = &self.stack[s - 6..s];
+        let prev_sq = recent[5]
             .current_move
             .filter(|m| m.is_ok())
             .map(Move::to_sq);
@@ -1755,8 +1761,7 @@ impl<N: NetworkParams> QSearch<N> {
         // score reads plane `[0]`, the previous ply's REAL continuation plane;
         // with untouched tables it holds the uniform -523 fill, so the depth-1
         // evasion ordering is a constant shift.
-        let cont_planes: [ContPlane; 6] =
-            std::array::from_fn(|i| self.stack[Self::si(ply) - 1 - i].cont_hist);
+        let cont_planes: [ContPlane; 6] = std::array::from_fn(|i| recent[5 - i].cont_hist);
         let (slot, scratch) = Self::split_picker_scratch(scratch);
         let mut mp = MovePicker::new_qsearch(pos, tt_move, cont_planes, slot);
 
@@ -2854,20 +2859,24 @@ impl<N: NetworkParams> QSearch<N> {
             CorrChannel::NonPawnBlack,
         );
 
+        // `(ss-1)`, `(ss-2)` and `(ss-4)` all sit in the four cells below this
+        // one, so one window carries the bound for all three: the window's
+        // length is the constant 4, against which the offsets into it are
+        // checked at compile time.
         let s = Self::si(ply);
-        let cntcv = if let Some(prev_move) = self.stack[s - 1].current_move.filter(|m| m.is_ok()) {
+        let recent = &self.stack[s - 4..s];
+        let (prev1, prev2, prev4) = (&recent[3], &recent[2], &recent[0]);
+        let cntcv = if let Some(prev_move) = prev1.current_move.filter(|m| m.is_ok()) {
             let to = prev_move.to_sq();
             match pos.board().get(to) {
                 Some(pc) => {
-                    self.histories.continuation_correction.get_at(
-                        self.stack[s - 2].cont_corr,
-                        pc,
-                        to,
-                    ) + self.histories.continuation_correction.get_at(
-                        self.stack[s - 4].cont_corr,
-                        pc,
-                        to,
-                    )
+                    self.histories
+                        .continuation_correction
+                        .get_at(prev2.cont_corr, pc, to)
+                        + self
+                            .histories
+                            .continuation_correction
+                            .get_at(prev4.cont_corr, pc, to)
                 }
                 None => 8,
             }
