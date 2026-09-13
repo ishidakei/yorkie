@@ -34,7 +34,24 @@ opt-level = 2
 # Cargo ignores `panic` when building test targets, so `cargo test --release`
 # keeps unwinding and works unchanged. `strip` stays unset, since perf work needs
 # symbols.
+#
+# `debug` carries the line table, which is what maps a hot instruction back to
+# the line that produced it under `objdump -dS` and `perf annotate`. Line tables
+# alone, rather than `true`: full debug info makes the optimiser lay the text
+# segment out differently, and the point here is a release binary whose code is
+# the code that runs in a game. DWARF is never loaded at run time, so it costs
+# the running engine nothing; it only makes the file larger, and
+# `strip --strip-debug` takes it back out of a binary being handed to a
+# tournament machine.
 [profile.release]
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+debug = "line-tables-only"
+
+# The allocator's build script reads cargo's `DEBUG` and, when it is set, stops
+# defining `NDEBUG` and `MI_BUILD_RELEASE` for the vendored C sources — which
+# would leave the allocator's assertions compiled into a tournament binary. It
+# gets the line tables the profile above asks for only over the Rust code.
+[profile.release.package.libmimalloc-sys]
+debug = false
