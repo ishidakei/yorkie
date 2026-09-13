@@ -45,7 +45,7 @@ pub use history::{
 };
 pub use movepick::{MovePicker, PickerScratch};
 pub use qsearch::{
-    PonderSignal, QSearch, QSearchOutcome, SearchControl, TimeControl, WorkerResult,
+    PonderSignal, QSearch, QSearchOutcome, SearchControl, TallySlot, TimeControl, WorkerResult,
 };
 // The per-game evaluation noise: only a build that carries it.
 #[cfg(feature = "random")]

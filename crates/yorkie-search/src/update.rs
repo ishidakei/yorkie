@@ -44,6 +44,13 @@ pub struct SearchedList {
     len: usize,
 }
 
+// The moves plus the count, with nothing between them: `Move` is a non-zero
+// packed word, so the absent move costs no tag of its own and the array is the
+// capacity times the width of a move.
+const _: () = assert!(
+    size_of::<SearchedList>() == SEARCHED_LIST_CAPACITY * size_of::<Move>() + size_of::<usize>()
+);
+
 impl Default for SearchedList {
     fn default() -> Self {
         SearchedList {
@@ -105,6 +112,13 @@ pub struct WorkerHistories {
     /// one worker is visible to every worker on the same node.
     pub shared: Arc<SharedHistories>,
 }
+
+// Five large-page handles, the single gravity entry and the shared-table handle.
+// The six bytes past the entry are the bundle's own alignment and cannot be
+// reordered away: every other field is already eight bytes wide. The bundle is
+// per-worker and reached once per update, so its own line is never contended —
+// what a helper shares with its node is `shared`, whose entries are atomic.
+const _: () = assert!(size_of::<WorkerHistories>() == 136);
 
 impl Default for WorkerHistories {
     fn default() -> Self {
@@ -220,6 +234,13 @@ pub struct SearchStackCell {
     /// (`ss->continuationCorrectionHistory`).
     pub cont_corr: CorrPlane,
 }
+
+// The cell is exactly one cache line, and holds no padding: the interior search
+// reads `current_move`, `in_check`, `static_eval`, `ply`, `move_count`,
+// `cutoff_cnt`, `reduction` and both plane indices at every node, and one line
+// covers all of them together with the rest. A field added here costs a second
+// line per ply, so the size is pinned rather than left to drift.
+const _: () = assert!(size_of::<SearchStackCell>() == 64);
 
 impl Default for SearchStackCell {
     fn default() -> Self {

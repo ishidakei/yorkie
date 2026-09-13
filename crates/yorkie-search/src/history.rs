@@ -37,15 +37,29 @@ use yorkie_storage::{LargePageArray, LargePageBox, Zeroable};
 /// so a table lookup addresses its plane straight away: the plane number a
 /// search stack cell carries has otherwise lost the bound its `plane_index`
 /// computation had.
+///
+/// The plane number is held in a `u16` rather than a `usize`. Six of these ride
+/// in a [`MovePicker`](crate::MovePicker) and two in every search stack cell, so
+/// the six bytes a plane number does not need are six bytes of those two
+/// per-node structures. A table with more planes than a `u16` can address fails
+/// the build rather than truncating a plane number.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct PlaneIndex<const N: usize>(usize);
+pub struct PlaneIndex<const N: usize>(u16);
 
 impl<const N: usize> PlaneIndex<N> {
+    /// A table has at least one plane and no more than a `u16` can address, so a
+    /// table that outgrew the field is a build failure rather than a silently
+    /// truncated plane number. Every constructor evaluates it.
+    const PLANES_FIT: () = assert!(
+        N > 0 && N <= u16::MAX as usize + 1,
+        "a history table has at least one plane and at most u16::MAX + 1",
+    );
+
     /// The `[NO_PIECE][0]` plane the reference seeds pre-root cells with.
     /// `NO_PIECE` has piece code `0` in this port's dense encoding, so it is
     /// plane `0`.
     pub const SENTINEL: Self = {
-        assert!(N > 0, "a history table has at least one plane");
+        let () = Self::PLANES_FIT;
         Self(0)
     };
 
@@ -54,17 +68,19 @@ impl<const N: usize> PlaneIndex<N> {
     /// # Panics
     /// Panics unless `i < N`.
     pub fn new(i: usize) -> Self {
+        let () = Self::PLANES_FIT;
         assert!(i < N, "plane index {i} is past the table's {N} planes");
-        Self(i)
+        Self(i as u16)
     }
 
     /// The plane number, known to the compiler to be below `N`.
     fn get(self) -> usize {
-        debug_assert!(self.0 < N);
+        let i = self.0 as usize;
+        debug_assert!(i < N);
         // SAFETY: the field is private and every constructor bounds it below
         // `N`, so this holds for every value of the type that exists.
-        unsafe { core::hint::assert_unchecked(self.0 < N) };
-        self.0
+        unsafe { core::hint::assert_unchecked(i < N) };
+        i
     }
 }
 
@@ -210,6 +226,12 @@ pub type ContPlane = PlaneIndex<CONT_PLANES>;
 /// A [`ContinuationCorrectionHistory`] plane index.
 pub type CorrPlane = PlaneIndex<CONT_CORR_PLANES>;
 
+// A plane index is the bare plane number and nothing else: six of them sit in a
+// per-node `MovePicker` and two in every search stack cell, so a field added
+// here would be paid for at every node.
+const _: () = assert!(size_of::<ContPlane>() == 2);
+const _: () = assert!(size_of::<CorrPlane>() == 2);
+
 /// The low 16 bits of the packed move — the butterfly tables' move dimension.
 fn move16(m: Move) -> usize {
     (m.to_bits() & 0xFFFF) as usize
@@ -274,6 +296,11 @@ impl ButterflyHistory {
 pub struct PieceToHistory {
     table: [[i16; SQ_NB]; PIECE_NB],
 }
+
+// The plane is its entries and nothing else, so a plane held inside a larger
+// table is reached by multiplying the plane number by this constant.
+const _: () = assert!(size_of::<PieceToHistory>() == PIECE_NB * SQ_NB * size_of::<i16>());
+const _: () = assert!(align_of::<PieceToHistory>() == align_of::<i16>());
 
 // SAFETY: an all-zero `[[i16; SQ_NB]; PIECE_NB]` is the zero-filled plane, a
 // valid value, and the plane needs no drop glue.
@@ -413,6 +440,13 @@ const PAWN_SLOT_LEN: usize = PIECE_NB * SQ_NB;
 ///
 /// `thread_count` must be a non-zero power of two (asserted) so slot selection
 /// is a single mask over the full 64-bit key.
+///
+/// Every field here is written once, by whoever builds the tables, and only read
+/// afterwards — the entries the workers write live in the two blocks these
+/// handles address, not in the struct. So the struct's own cache lines are
+/// read-shared and need no boundary between fields; what the workers contend for
+/// is a table entry, and the tables are sized by the node's thread count exactly
+/// so that contention thins out as the node grows.
 pub struct SharedHistories {
     /// The node's thread count (a power of two); the slot multiplier of both
     /// tables.
@@ -689,6 +723,9 @@ impl ContinuationHistory {
 pub struct TtMoveHistory {
     entry: i16,
 }
+
+// One gravity entry, at the width every other history entry has.
+const _: () = assert!(size_of::<TtMoveHistory>() == size_of::<i16>());
 
 impl TtMoveHistory {
     /// A fresh, zero entry.

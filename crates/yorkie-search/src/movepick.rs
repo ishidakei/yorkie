@@ -71,6 +71,12 @@ pub struct PickerScratch {
     len: usize,
 }
 
+// The buffer and the count, with nothing between them: a search preallocates one
+// of these per ply it can reach twice over, so the block is sized by this
+// constant alone.
+const _: () =
+    assert!(size_of::<PickerScratch>() == MAX_MOVES * size_of::<ExtMove>() + size_of::<usize>());
+
 impl PickerScratch {
     /// An empty buffer.
     pub const fn new() -> Self {
@@ -363,6 +369,12 @@ pub struct MovePicker<'a> {
     /// The end of all generated moves.
     end_generated: usize,
 }
+
+// A picker is built at every search node, so its own size is a per-node cost:
+// the six continuation planes are twelve bytes rather than the forty-eight a
+// machine-word plane number would take, and the one byte past the five segment
+// boundaries is the struct's own alignment.
+const _: () = assert!(size_of::<MovePicker<'_>>() == 80);
 
 impl<'a> MovePicker<'a> {
     /// Build a qsearch picker for `pos`, working in `scratch`. `cont_planes`

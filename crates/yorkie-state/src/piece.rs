@@ -46,6 +46,13 @@ pub struct Piece {
     pub promoted: bool,
 }
 
+// Three bytes, one per field, and an empty square costs no fourth: `PieceKind`
+// leaves 248 of its 256 discriminants free, so `Option<Piece>` takes one of them
+// for the absent case and the 81-square board is 243 bytes.
+const _: () = assert!(size_of::<Piece>() == 3);
+const _: () = assert!(size_of::<Option<Piece>>() == size_of::<Piece>());
+const _: () = assert!(align_of::<Piece>() == 1);
+
 impl Piece {
     pub const fn new(kind: PieceKind, color: Color) -> Self {
         Self {

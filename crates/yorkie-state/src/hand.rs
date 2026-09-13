@@ -7,6 +7,11 @@ const MAX_BY_KIND: [u8; HAND_KINDS] = [18, 4, 4, 4, 4, 2, 2];
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Hand([u8; HAND_KINDS]);
 
+// One byte per droppable kind and no more: a pair of hands rides in every
+// per-ply state record, and the repetition look-back compares them whole.
+const _: () = assert!(size_of::<Hand>() == HAND_KINDS);
+const _: () = assert!(align_of::<Hand>() == 1);
+
 impl Hand {
     pub const fn empty() -> Self {
         Self([0; HAND_KINDS])

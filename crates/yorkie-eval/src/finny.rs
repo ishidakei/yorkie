@@ -61,6 +61,13 @@ struct FinnyEntry {
     initialized: bool,
 }
 
+// The accumulation is a whole number of cache lines, so an entry's row starts on
+// a line boundary and the feature list and the flag that follow it share the
+// last one. The 39 bytes past the flag are what the 64-byte alignment costs, and
+// buying them back would put the rows of every other entry across a line.
+const _: () = assert!(size_of::<FinnyEntry>() == 3136);
+const _: () = assert!(align_of::<FinnyEntry>() == 64);
+
 impl FinnyEntry {
     fn new() -> Self {
         FinnyEntry {

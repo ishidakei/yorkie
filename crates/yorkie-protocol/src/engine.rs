@@ -23,7 +23,7 @@ use std::io;
 use std::num::NonZeroU64;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -32,8 +32,8 @@ use yorkie_eval::{NetworkParams, NnueError, network_file};
 use yorkie_numa::{CpuIndex, NumaIndex, NumaLayout, SysfsError, mempolicy};
 use yorkie_search::{
     BookConfig, BookHit, EnteringKingConfig, PonderSignal, Prng, QSearch, RootMove, SearchControl,
-    SharedHistories, TimeControl, TimeInput, TimeManagement, WorkerHistories, WorkerResult,
-    WorkerVote, declaration_win, generate_root_moves, probe_book, select_best_worker,
+    SharedHistories, TallySlot, TimeControl, TimeInput, TimeManagement, WorkerHistories,
+    WorkerResult, WorkerVote, declaration_win, generate_root_moves, probe_book, select_best_worker,
 };
 // The PV-line surface: only a `verbose2` build renders one, so only it needs
 // the line's data type, the sink trait the search emits through and the output
@@ -427,10 +427,10 @@ struct SearchHandles {
     /// aggregate node ceiling and the final aggregated `info ... nodes` — both
     /// `verbose2`, like the counters themselves.
     #[cfg(feature = "verbose2")]
-    node_slots: Arc<Vec<AtomicU64>>,
+    node_slots: Arc<Vec<TallySlot>>,
     /// Per-worker best-move-change counters: each worker bumps its own slot at
     /// the root and the main worker folds them all each iteration.
-    bmc_slots: Arc<Vec<AtomicU64>>,
+    bmc_slots: Arc<Vec<TallySlot>>,
 }
 
 impl SearchHandles {
@@ -492,9 +492,10 @@ impl SearchHandles {
     }
 }
 
-/// One zeroed counter per worker.
-fn new_tally(n_threads: usize) -> Arc<Vec<AtomicU64>> {
-    Arc::new((0..n_threads).map(|_| AtomicU64::new(0)).collect())
+/// One zeroed counter per worker, each on a cache line of its own so a worker
+/// publishing to its slot leaves every other worker's slot alone.
+fn new_tally(n_threads: usize) -> Arc<Vec<TallySlot>> {
+    Arc::new((0..n_threads).map(|_| TallySlot::new()).collect())
 }
 
 /// The buffers a coordinator collects its workers into: one [`WorkerResult`] per
@@ -2226,11 +2227,11 @@ struct HelperJob {
     /// `node_slots[index]`. The aggregate they form is read by the node ceiling
     /// and by the search `info` lines, both `verbose2`.
     #[cfg(feature = "verbose2")]
-    node_slots: Arc<Vec<AtomicU64>>,
+    node_slots: Arc<Vec<TallySlot>>,
     /// Per-worker best-move-change counters; the helper `fetch_add`s its own
     /// `bmc_slots[index]` at the root, and the main worker folds every slot
     /// each iteration.
-    bmc_slots: Arc<Vec<AtomicU64>>,
+    bmc_slots: Arc<Vec<TallySlot>>,
     /// This helper's index into `node_slots` / `bmc_slots` (`>= 1`; index 0 is the
     /// main worker).
     index: usize,
@@ -2793,11 +2794,11 @@ struct CoordinatorJob<P: EngineSink> {
     /// this `go` by the engine. The aggregate node ceiling and the final
     /// aggregated `info ... nodes` are the readers, both `verbose2`.
     #[cfg(feature = "verbose2")]
-    node_slots: Arc<Vec<AtomicU64>>,
+    node_slots: Arc<Vec<TallySlot>>,
     /// Per-worker best-move-change counters, same slot-per-worker shape and
     /// zeroed on the same terms: each worker bumps its own slot at the root and
     /// the main worker folds them all each iteration.
-    bmc_slots: Arc<Vec<AtomicU64>>,
+    bmc_slots: Arc<Vec<TallySlot>>,
     /// The persistent helper slots to dispatch to, one per helper.
     helper_slots: Arc<Vec<Arc<HelperSlot>>>,
     /// Each helper's node-shared correction / pawn tables, aligned
@@ -3843,6 +3844,8 @@ mod tests {
 
     /// A fresh empty directory under `$TMPDIR`; the caller removes it.
     fn book_name_fixture_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::AtomicU64;
+
         static CTR: AtomicU64 = AtomicU64::new(0);
         let n = CTR.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(

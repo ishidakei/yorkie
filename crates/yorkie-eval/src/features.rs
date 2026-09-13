@@ -266,6 +266,12 @@ pub(crate) struct FeatureList {
     len: usize,
 }
 
+// The slots and the count, with nothing between them.
+const _: () = assert!(
+    size_of::<FeatureList>()
+        == MAX_ACTIVE_FEATURES * size_of::<FeatureIndex>() + size_of::<usize>()
+);
+
 impl FeatureList {
     pub(crate) const fn new() -> Self {
         Self {
@@ -502,32 +508,42 @@ impl Dirty {
 #[derive(Clone, Copy, Default)]
 pub struct PerspectiveDelta {
     removed: [FeatureIndex; 2],
-    n_removed: usize,
     added: [FeatureIndex; 2],
-    n_added: usize,
+    /// Counts, not indices: each is bounded by the two-slot array it counts, so
+    /// a byte holds it where a machine word would have cost the delta eight.
+    n_removed: u8,
+    n_added: u8,
 }
 
 impl PerspectiveDelta {
     /// Feature columns to subtract from the pre-move accumulator half.
     #[inline]
     pub fn removed(&self) -> &[FeatureIndex] {
-        debug_assert!(self.n_removed <= self.removed.len());
+        let n = self.n_removed as usize;
+        debug_assert!(n <= self.removed.len());
         // SAFETY: the counter is private and only ever bumped alongside a write
         // into the array, which bounds it by the array's own length. Stating
         // that keeps a range check out of the per-node accumulator update.
-        unsafe { core::hint::assert_unchecked(self.n_removed <= self.removed.len()) };
-        &self.removed[..self.n_removed]
+        unsafe { core::hint::assert_unchecked(n <= self.removed.len()) };
+        &self.removed[..n]
     }
 
     /// Feature columns to add to the pre-move accumulator half.
     #[inline]
     pub fn added(&self) -> &[FeatureIndex] {
-        debug_assert!(self.n_added <= self.added.len());
+        let n = self.n_added as usize;
+        debug_assert!(n <= self.added.len());
         // SAFETY: see `removed`.
-        unsafe { core::hint::assert_unchecked(self.n_added <= self.added.len()) };
-        &self.added[..self.n_added]
+        unsafe { core::hint::assert_unchecked(n <= self.added.len()) };
+        &self.added[..n]
     }
 }
+
+// Two columns each way and a byte of count each way: at most two features change
+// per side per move, so the lists are the fixed pair they can need and the delta
+// is built on the stack at every node that updates an accumulator. Sixteen bytes
+// of columns, two of counts, and two the columns' own alignment leaves.
+const _: () = assert!(size_of::<PerspectiveDelta>() == 20);
 
 /// The per-perspective feature delta a move induces, computed straight from the
 /// pre-move position without the [`active_features`] scan. `half(color)` is
@@ -535,6 +551,11 @@ impl PerspectiveDelta {
 pub struct MoveDelta {
     halves: [Option<PerspectiveDelta>; Color::COUNT],
 }
+
+// Two optional halves. A delta is all integers and so offers no spare bit
+// pattern to spell the refreshed case with, which is what the four bytes each
+// half grows by pay for.
+const _: () = assert!(size_of::<MoveDelta>() == 48);
 
 impl MoveDelta {
     /// This move's delta for `perspective`, or `None` if that perspective's own
@@ -628,11 +649,11 @@ impl MoveDelta {
 
             let mut pd = PerspectiveDelta::default();
             for d in removed.iter().flatten() {
-                pd.removed[pd.n_removed] = d.encode(persp, sq_k_code, mirror);
+                pd.removed[pd.n_removed as usize] = d.encode(persp, sq_k_code, mirror);
                 pd.n_removed += 1;
             }
             for d in added.iter().flatten() {
-                pd.added[pd.n_added] = d.encode(persp, sq_k_code, mirror);
+                pd.added[pd.n_added as usize] = d.encode(persp, sq_k_code, mirror);
                 pd.n_added += 1;
             }
             Some(pd)

@@ -32,6 +32,11 @@ pub struct ExtMove {
     pub value: i32,
 }
 
+// A move and its score, with nothing between them: the picker's buffer holds 600
+// of these and both the sort and the compaction move them one whole element at a
+// time.
+const _: () = assert!(size_of::<ExtMove>() == size_of::<Move>() + size_of::<i32>());
+
 /// Where a generator appends the moves it produces.
 ///
 /// Appending is all a generator asks of its output, and the search's move
@@ -711,6 +716,13 @@ pub(crate) struct CheckInfo {
     /// move's king. Empty unless [`Self::in_check`].
     checkers: Bitboard,
 }
+
+// Four cache lines exactly, of which the bitboard sets take 240 bytes; the key,
+// the two king squares and the check flag fill 13 of the 16 that remain, so a
+// predicate that reads a king square alongside a blocker set touches no line it
+// was not going to touch anyway.
+const _: () = assert!(size_of::<CheckInfo>() == 256);
+const _: () = assert!(align_of::<CheckInfo>() == align_of::<Bitboard>());
 
 impl CheckInfo {
     /// The check info of the empty board — what [`Position::empty`] seeds its

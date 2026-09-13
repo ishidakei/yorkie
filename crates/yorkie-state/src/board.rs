@@ -56,6 +56,15 @@ pub struct Board {
     by_pattern: [[Bitboard; PATTERN_COUNT]; Color::COUNT],
 }
 
+// The derived sets come first — they are sixteen-byte-aligned, so ordering by
+// size puts them there — and the 81 squares follow in 243 bytes. The 13 past
+// them are the alignment those sets impose, and the only way to spend them is to
+// pack a piece into fewer than the three bytes its kind, colour and promotion
+// flag occupy, which would trade a byte-wide field read for a shift and a mask
+// at every board access.
+const _: () = assert!(size_of::<Board>() == 624);
+const _: () = assert!(align_of::<Board>() == align_of::<Bitboard>());
+
 /// Board equality compares only the piece placement. The sets are a pure
 /// function of `squares`, so excluding them keeps the comparison to one array
 /// rather than a further ~360 bytes of derived bitboards.

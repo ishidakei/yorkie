@@ -297,12 +297,62 @@ pub struct QSearchOutcome {
 /// asynchronously-set stop flag cannot perturb it.
 const CHECK_INTERVAL: i32 = 512;
 
+/// Width of a cache line on the processors the engine is built for. Two fields
+/// this far apart are never written into the same line, which is what keeps one
+/// worker's stores out of another's way.
+pub const CACHE_LINE: usize = 64;
+
+/// One worker's counter in a per-worker tally, on a cache line of its own.
+///
+/// The workers of a search publish into the same array — each to its own slot,
+/// every checkpoint — and one line holds eight bare counters, so eight workers
+/// packed together would take turns invalidating each other's copy of that line
+/// for stores that never actually meet. The alignment spends 56 bytes per worker
+/// to make each store land where no other worker is reading or writing.
+#[derive(Debug)]
+#[repr(align(64))]
+pub struct TallySlot(AtomicU64);
+
+// One counter per line, so no two workers' stores meet.
+const _: () = assert!(size_of::<TallySlot>() == CACHE_LINE);
+const _: () = assert!(align_of::<TallySlot>() == CACHE_LINE);
+
+impl TallySlot {
+    /// A zeroed slot.
+    pub const fn new() -> Self {
+        TallySlot(AtomicU64::new(0))
+    }
+}
+
+impl Default for TallySlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::ops::Deref for TallySlot {
+    type Target = AtomicU64;
+
+    fn deref(&self) -> &AtomicU64 {
+        &self.0
+    }
+}
+
 /// The shared ponder state for one `go ponder` — `SearchManager::ponder` plus
 /// the `tm.ponderhitTime` its `set_ponderhit` stamps. Behind an [`Arc`], so the
 /// driver thread can clear it while the worker polls it.
 ///
 /// **A pondering search never self-terminates.** Only the shared abort flag or
 /// a `ponderhit` ends it.
+///
+/// All three fields belong to one class — written by the driver thread before or
+/// during the search, read by every worker — and the two a worker polls are
+/// written together by [`Self::ponderhit`], so they are grouped deliberately
+/// onto a single line rather than kept apart. The alignment is what puts a
+/// boundary between that line and whatever the allocator places next to the
+/// signal, the [`Arc`] header among it, whose counts every clone and drop
+/// writes.
+#[repr(align(64))]
 pub struct PonderSignal {
     /// `SearchManager::ponder` — true while `go ponder` is pondering; cleared by
     /// [`Self::ponderhit`].
@@ -318,6 +368,10 @@ pub struct PonderSignal {
     /// from `check_time`, and nothing on the search path may wait.
     hit_at_nanos: AtomicU64,
 }
+
+// One line, holding the whole signal.
+const _: () = assert!(size_of::<PonderSignal>() == CACHE_LINE);
+const _: () = assert!(align_of::<PonderSignal>() == CACHE_LINE);
 
 impl PonderSignal {
     /// A fresh signal, `active` seeded from `limits.ponderMode`
@@ -603,13 +657,13 @@ pub struct QSearch<N: NetworkParams> {
     /// a search `info` line, and both are `verbose2`; the search itself decides
     /// on this worker's own [`Self::nodes`], never on the sum.
     #[cfg(feature = "verbose2")]
-    node_tally: Option<(Arc<Vec<AtomicU64>>, usize)>,
+    node_tally: Option<(Arc<Vec<TallySlot>>, usize)>,
     /// Lazy-SMP shared best-move-change counters, in the same slot-per-worker
     /// shape as `node_tally`. Every worker adds to its own slot; only
     /// the main worker folds *every* slot into `totBestMoveChanges` and zeroes
     /// them, at each iteration end. Relaxed atomics, because the reference's
     /// cross-thread reads here are benign races.
-    best_move_tally: Option<(Arc<Vec<AtomicU64>>, usize)>,
+    best_move_tally: Option<(Arc<Vec<TallySlot>>, usize)>,
 
     /// `pvIdx` — the current MultiPV line index. Read at the root by the
     /// interior-search hooks; `0` on the first line, so those hooks are no-ops
@@ -1018,18 +1072,18 @@ impl<N: NetworkParams> QSearch<N> {
     }
 
     /// Install the Lazy-SMP shared node counters: `slots` holds one
-    /// [`AtomicU64`] per worker and `index` is this worker's slot. Each
+    /// [`TallySlot`] per worker and `index` is this worker's slot. Each
     /// `check_time` checkpoint publishes `self.nodes` there so the main worker's
     /// `go nodes N` ceiling can sum every worker's count (the reference
     /// `threads.nodes_searched()`). Leave unset for the single-worker path.
     #[cfg(feature = "verbose2")]
-    pub fn set_node_tally(&mut self, slots: Arc<Vec<AtomicU64>>, index: usize) {
+    pub fn set_node_tally(&mut self, slots: Arc<Vec<TallySlot>>, index: usize) {
         self.node_tally = Some((slots, index));
     }
 
     /// Install the Lazy-SMP shared best-move-change counters. Leave unset for
     /// the single-worker path, where `best_move_changes` carries the count.
-    pub fn set_best_move_tally(&mut self, slots: Arc<Vec<AtomicU64>>, index: usize) {
+    pub fn set_best_move_tally(&mut self, slots: Arc<Vec<TallySlot>>, index: usize) {
         self.best_move_tally = Some((slots, index));
     }
 
@@ -4928,7 +4982,7 @@ mod tests {
         let _tt = fresh_tt();
 
         // Four workers; the main worker (slot 0) folds them all.
-        let slots: Arc<Vec<AtomicU64>> = Arc::new((0..4).map(|_| AtomicU64::new(0)).collect());
+        let slots: Arc<Vec<TallySlot>> = Arc::new((0..4).map(|_| TallySlot::new()).collect());
         slots[0].store(2, Ordering::Relaxed);
         slots[1].store(3, Ordering::Relaxed);
         slots[2].store(0, Ordering::Relaxed);

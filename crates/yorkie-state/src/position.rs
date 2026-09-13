@@ -202,6 +202,20 @@ pub(crate) struct StateInfo {
     pub repetition_type: RepetitionState,
 }
 
+// Forty-eight bytes, seven of them padding. `do_move` pushes one of these per
+// ply and `undo_move` pops it, so the padding is real, and the look-back that
+// writes `repetition` never reaches past [`MAX_REPETITION_PLY`] — a byte would
+// hold the distance and take the record to forty.
+//
+// It stays at forty-eight because forty measured slower: the record is written
+// whole at every node and its `hands` are compared whole at every look-back
+// step, and only a multiple of sixteen puts every record of the run on the
+// sixteen-byte boundary those whole-record moves want. On a single-thread,
+// nodes-fixed bench the narrow record cost about 2.6% of the search's
+// throughput, which is more than the seven bytes are worth.
+const _: () = assert!(size_of::<StateInfo>() == 48);
+const _: () = assert!(size_of::<StateInfo>().is_multiple_of(16));
+
 #[derive(Debug, Clone)]
 pub struct Position {
     board: Board,
@@ -242,6 +256,14 @@ pub struct Position {
     /// [`PartialEq`] as auxiliary cache state.
     check_info_stack: PlyStack<crate::search_movegen::CheckInfo>,
 }
+
+// One position per worker, so this size is not paid per node — what it pins is
+// which of its parts share a line. The board and the check info are both
+// sixteen-byte-aligned and between them take 880 of the 1056 bytes; the keys,
+// the hands, the side to move and the two stacks' handles follow them, and the
+// fifteen bytes past those are the alignment the board imposes.
+const _: () = assert!(size_of::<Position>() == 1056);
+const _: () = assert!(align_of::<Position>() == align_of::<Board>());
 
 /// Structural equality over the primary state alone. The keys are a derived
 /// cache, so a position built by the direct setters — which leave it stale until

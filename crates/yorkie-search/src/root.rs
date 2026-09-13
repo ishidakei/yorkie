@@ -82,6 +82,14 @@ pub struct RootMove {
     pub effort: u64,
 }
 
+// The move, its PV handle and its per-iteration statistics, with nothing
+// between them. The two fail-bound flags a PV-printing build adds are a ninth
+// eight-byte slot, which is what the second figure records.
+#[cfg(not(feature = "verbose2"))]
+const _: () = assert!(size_of::<RootMove>() == 64);
+#[cfg(feature = "verbose2")]
+const _: () = assert!(size_of::<RootMove>() == 72);
+
 /// `Vec::clone` allocates exactly the length it copies, so a derived clone would
 /// hand the copy a PV buffer that grows again on its first update; `clone` here
 /// keeps `PV_CAPACITY` instead. `clone_from` goes further and writes into the
@@ -177,6 +185,11 @@ pub struct RootOutcome {
 /// raw `rootMoves[0].score` (NOT the USI-clamped `uciScore`), the first PV move
 /// it votes for, the PV length (the truncated-PV guard reads `pv.len() > 2`),
 /// and the worker's `completedDepth` (`0` if it never completed an iteration).
+///
+/// One thread touches a vote: the coordinator derives the whole list from the
+/// results it collected, and it collects those only after every helper it
+/// dispatched has been joined. So the list is ordinary single-thread data and
+/// its fields are ordered by size alone.
 #[derive(Clone, Debug)]
 pub struct WorkerVote {
     /// `rootMoves[0].score` — the raw search score the vote weights by.

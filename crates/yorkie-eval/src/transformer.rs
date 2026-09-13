@@ -61,6 +61,12 @@ pub struct Accumulator {
 /// multiple of one; nothing else makes it so.
 const _: () = assert!((HIDDEN_SIZE * size_of::<i16>()).is_multiple_of(64));
 
+// The two rows and nothing else. A search holds one of these per ply in a single
+// block, so a field added here would push every deeper ply's rows off the line
+// boundary the kernels' 512-bit loads depend on.
+const _: () = assert!(size_of::<Accumulator>() == Color::COUNT * HIDDEN_SIZE * size_of::<i16>());
+const _: () = assert!(align_of::<Accumulator>() == 64);
+
 impl Accumulator {
     /// A zeroed accumulator (both perspectives all-zero).
     pub const fn new() -> Self {
