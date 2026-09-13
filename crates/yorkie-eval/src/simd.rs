@@ -163,12 +163,15 @@ pub mod transformer_kernel {
     target_feature = "avx512bw"
 ))]
 pub mod post_ft_kernel {
+    use std::mem::MaybeUninit;
+
     use super::{avx512_post_ft, scalar_post_ft};
     use crate::types::HIDDEN_SIZE;
 
-    /// Pairwise element-wise multiply for one perspective half.
+    /// Pairwise element-wise multiply for one perspective half, writing every
+    /// lane of `out`.
     #[inline]
-    pub fn ewm_one_perspective(half: &[i16; HIDDEN_SIZE], out: &mut [u8]) {
+    pub fn ewm_one_perspective(half: &[i16; HIDDEN_SIZE], out: &mut [MaybeUninit<u8>]) {
         // SAFETY: this module is compiled only into a build enabling exactly
         // the features the callee's `#[target_feature]` names, and such a build
         // is `-C target-cpu=native`, so it only ever runs on a host with them.

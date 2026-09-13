@@ -18,6 +18,7 @@ use std::arch::x86_64::{
     _mm512_set1_epi16, _mm512_set1_epi32, _mm512_set1_epi64, _mm512_setzero_si512,
     _mm512_slli_epi16, _mm512_srai_epi32, _mm512_srai_epi64, _mm512_zextsi256_si512,
 };
+use std::mem::MaybeUninit;
 
 use crate::simd::scalar_post_ft;
 use crate::types::{
@@ -38,17 +39,26 @@ const EWM_CLAMP_I16: i16 = 127 * 2;
 // On the `i16` domain, `mulhi(sum0 << 7, sum1) == (sum0 * sum1) >> 9`.
 const EWM_PRESHIFT: u32 = 7;
 
+// The element-wise multiply stores whole 32-lane chunks and has no tail path,
+// so a width that is not a multiple of one would leave the end of `out`
+// unwritten — which its caller, handing over an uninitialised buffer, has no
+// way to notice.
+const _: () = assert!(EWM_HALF.is_multiple_of(I16_LANES_PER_M512));
+
 /// Pairwise element-wise multiply for one perspective (see the scalar
-/// [`scalar_post_ft::ewm_one_perspective`] for the exact semantics).
+/// [`scalar_post_ft::ewm_one_perspective`] for the exact semantics). Every lane
+/// of `out` is written, so a caller may hand over a buffer it has not
+/// initialised.
 ///
 /// # Safety
 /// The running CPU must support `avx512f` and `avx512bw`. `out` must be
 /// `HIDDEN_SIZE / 2` long.
 #[target_feature(enable = "avx512f,avx512bw")]
-pub unsafe fn ewm_one_perspective(half: &[i16; HIDDEN_SIZE], out: &mut [u8]) {
+pub unsafe fn ewm_one_perspective(half: &[i16; HIDDEN_SIZE], out: &mut [MaybeUninit<u8>]) {
     debug_assert_eq!(out.len(), EWM_HALF);
-    // SAFETY: `half` holds 2*EWM_HALF i16 and `out` holds EWM_HALF u8.
-    unsafe { ewm_one_perspective_ptr(half.as_ptr(), out.as_mut_ptr()) };
+    // SAFETY: `half` holds 2*EWM_HALF i16 and `out` holds EWM_HALF bytes, which
+    // the store path may write whether or not they carry a value yet.
+    unsafe { ewm_one_perspective_ptr(half.as_ptr(), out.as_mut_ptr().cast::<u8>()) };
 }
 
 /// Clipped ReLU with a scalar fallback for lane counts the kernel cannot tile
@@ -544,11 +554,19 @@ mod tests {
         const HALF: usize = HIDDEN_SIZE / 2;
         for seed in [1u32, 7, 13, 100] {
             let half = seeded_half(seed);
-            let mut avx = [0u8; HALF];
-            let mut sca = [0u8; HALF];
+            let mut avx = [MaybeUninit::<u8>::uninit(); HALF];
+            let mut sca = [MaybeUninit::<u8>::uninit(); HALF];
             // SAFETY: guarded by `require_avx512bw!`; slice lengths match.
             unsafe { ewm_one_perspective(&half, &mut avx) };
             scalar_post_ft::ewm_one_perspective(&half, &mut sca);
+            // SAFETY: both kernels write every lane of the buffer they are
+            // given, and `MaybeUninit<u8>` has the layout of `u8`.
+            let (avx, sca) = unsafe {
+                (
+                    *avx.as_ptr().cast::<[u8; HALF]>(),
+                    *sca.as_ptr().cast::<[u8; HALF]>(),
+                )
+            };
             assert_eq!(avx, sca, "ewm mismatch at seed {seed}");
         }
     }

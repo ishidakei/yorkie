@@ -17,6 +17,8 @@
 //! bytes by pairing lane `j` with lane `j + HIDDEN_SIZE/2`, clamping each to
 //! `[0, 254]`, multiplying, and shifting right by 9.
 
+use std::mem::MaybeUninit;
+
 use yorkie_state::{Color, Move, Position};
 
 use crate::features::{
@@ -30,6 +32,15 @@ use crate::types::{FC_0_INPUT_DIMS, HIDDEN_SIZE, NetworkParams};
 /// Width of the byte buffer the output transform fills: one lane per fc_0
 /// input, i.e. `HIDDEN_SIZE/2` per perspective across the two perspectives.
 pub const FT_OUTPUT_DIMS: usize = FC_0_INPUT_DIMS;
+
+/// The two perspective halves tile the buffer exactly: no lane falls outside
+/// both of them. That is what lets [`Accumulator::output_transform`] take a
+/// buffer nobody has initialised.
+const _: () = assert!(2 * (HIDDEN_SIZE / 2) == FT_OUTPUT_DIMS);
+
+/// The largest byte the fold can produce: both factors clamp to `[0, 254]` and
+/// their product is shifted right by 9.
+const EWM_LANE_MAX: u8 = ((254 * 254) >> 9) as u8;
 
 /// Per-perspective feature-transformer accumulator: one `i16` row of
 /// [`HIDDEN_SIZE`] per perspective, held inline and back to back.
@@ -231,13 +242,36 @@ impl Accumulator {
     }
 
     /// Pack the accumulator into `out`, the byte input buffer for `fc_0`, as
-    /// `[stm-half | ~stm-half]`. See the module docs for the fold.
-    pub fn output_transform(&self, stm: Color, out: &mut [u8; FT_OUTPUT_DIMS]) {
+    /// `[stm-half | ~stm-half]`, and hand it back as the filled array it now
+    /// is. See the module docs for the fold.
+    ///
+    /// `out` arrives uninitialised on purpose. The fold writes every byte of it
+    /// before anything reads one, but a compiler handed an initialised buffer
+    /// cannot see that through the two kernel calls and emits the fill anyway —
+    /// a whole-buffer `memset` at every searched leaf, for bytes that are
+    /// overwritten before they are read.
+    pub fn output_transform<'a>(
+        &self,
+        stm: Color,
+        out: &'a mut [MaybeUninit<u8>; FT_OUTPUT_DIMS],
+    ) -> &'a [u8; FT_OUTPUT_DIMS] {
         const HALF: usize = HIDDEN_SIZE / 2;
-        let stm_half = &self.perspectives[stm.index()];
-        let other_half = &self.perspectives[stm.flip().index()];
-        post_ft_kernel::ewm_one_perspective(stm_half, &mut out[..HALF]);
-        post_ft_kernel::ewm_one_perspective(other_half, &mut out[HALF..]);
+        let (stm_out, other_out) = out.split_at_mut(HALF);
+        post_ft_kernel::ewm_one_perspective(&self.perspectives[stm.index()], stm_out);
+        post_ft_kernel::ewm_one_perspective(&self.perspectives[stm.flip().index()], other_out);
+
+        // SAFETY: the two calls above write `0..HALF` and `HALF..`, each kernel
+        // filling every lane of the slice it is handed, and the halves tile the
+        // buffer (the `const` assertion on `FT_OUTPUT_DIMS` above), so no byte
+        // of `out` is left uninitialised. `MaybeUninit<u8>` has the layout of
+        // `u8`, so the array of one is the array of the other.
+        let filled = unsafe { &*out.as_ptr().cast::<[u8; FT_OUTPUT_DIMS]>() };
+        debug_assert!(
+            filled.iter().all(|&lane| lane <= EWM_LANE_MAX),
+            "a lane above {EWM_LANE_MAX} is not something the fold can write: \
+             the buffer came back part unwritten",
+        );
+        filled
     }
 }
 
@@ -291,6 +325,11 @@ mod tests {
 
     const STARTPOS: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
     const HALF: usize = HIDDEN_SIZE / 2;
+
+    /// An fc_0 input buffer in the state the evaluation hands one over in.
+    fn uninit_buffer() -> [MaybeUninit<u8>; FT_OUTPUT_DIMS] {
+        [MaybeUninit::uninit(); FT_OUTPUT_DIMS]
+    }
 
     // The output-transform clamp ceiling and shift, restated so these tests
     // transcribe the reference formula independently.
@@ -1022,17 +1061,41 @@ mod tests {
         acc.perspectives[Color::White.index()][0] = 250;
         acc.perspectives[Color::White.index()][HALF] = 50;
 
-        let mut out = [0u8; FT_OUTPUT_DIMS];
-        acc.output_transform(Color::Black, &mut out);
+        let mut buf = uninit_buffer();
+        let out = acc.output_transform(Color::Black, &mut buf);
         assert_eq!(out[0], 39);
         assert_eq!(out[HALF], 24);
         assert!(out[1..HALF].iter().all(|&x| x == 0));
         assert!(out[HALF + 1..].iter().all(|&x| x == 0));
 
-        let mut out_w = [0u8; FT_OUTPUT_DIMS];
-        acc.output_transform(Color::White, &mut out_w);
+        let mut buf_w = uninit_buffer();
+        let out_w = acc.output_transform(Color::White, &mut buf_w);
         assert_eq!(out_w[0], 24);
         assert_eq!(out_w[HALF], 39);
+    }
+
+    #[test]
+    fn output_transform_writes_every_lane_of_its_buffer() {
+        // What lets the evaluation hand the transform a buffer nobody filled:
+        // run it over two buffers seeded with different bytes, where any lane
+        // it left alone would keep the byte under it and the two would differ.
+        let mut acc = Accumulator::new();
+        for color in [Color::Black, Color::White] {
+            let half = &mut acc.perspectives[color.index()];
+            for (i, lane) in half.iter_mut().enumerate() {
+                *lane = ((i as i32 * 7 + color.index() as i32) % 500 - 60) as i16;
+            }
+        }
+
+        for stm in [Color::Black, Color::White] {
+            let mut zeros = [MaybeUninit::new(0x00u8); FT_OUTPUT_DIMS];
+            let mut ones = [MaybeUninit::new(0xffu8); FT_OUTPUT_DIMS];
+            assert_eq!(
+                acc.output_transform(stm, &mut zeros),
+                acc.output_transform(stm, &mut ones),
+                "stm {stm:?}: a lane of the buffer survived the transform",
+            );
+        }
     }
 
     #[test]
@@ -1055,8 +1118,8 @@ mod tests {
         black[4] = 100;
         black[HALF + 4] = 50;
 
-        let mut out = [0u8; FT_OUTPUT_DIMS];
-        acc.output_transform(Color::Black, &mut out);
+        let mut buf = uninit_buffer();
+        let out = acc.output_transform(Color::Black, &mut buf);
         assert_eq!(out[0], 0, "negative clamps to zero");
         assert_eq!(out[1], 0, "zero factor yields zero");
         assert_eq!(out[2], 126, "saturated pair");
@@ -1076,8 +1139,8 @@ mod tests {
         }
 
         for stm in [Color::Black, Color::White] {
-            let mut out = [0u8; FT_OUTPUT_DIMS];
-            acc.output_transform(stm, &mut out);
+            let mut buf = uninit_buffer();
+            let out = acc.output_transform(stm, &mut buf);
 
             let order = [stm, stm.flip()];
             for (p, persp) in order.iter().enumerate() {

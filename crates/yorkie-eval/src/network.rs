@@ -15,6 +15,8 @@
 //! pre-ReLU, and is added to L3's single output as a shortcut term. The network
 //! output is then divided by the compiled-in [`FV_SCALE`].
 
+use std::mem::MaybeUninit;
+
 use yorkie_state::{Color, Position, Square};
 
 use crate::features::king_square;
@@ -91,10 +93,10 @@ pub fn evaluate<N: NetworkParams>(net: N, pos: &Position) -> i32 {
 pub fn evaluate_with<N: NetworkParams>(net: N, acc: &Accumulator, pos: &Position) -> i32 {
     let bucket = layer_stack_index(pos);
 
-    let mut transformed = [0u8; FT_OUTPUT_DIMS];
-    acc.output_transform(pos.side_to_move(), &mut transformed);
+    let mut buf = [MaybeUninit::<u8>::uninit(); FT_OUTPUT_DIMS];
+    let transformed = acc.output_transform(pos.side_to_move(), &mut buf);
 
-    let score = per_layer_flow(&transformed, net.stack(bucket));
+    let score = per_layer_flow(transformed, net.stack(bucket));
     // The one site that consumes `FV_SCALE`.
     score / FV_SCALE
 }

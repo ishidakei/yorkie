@@ -11,6 +11,8 @@
 //! here as the per-perspective [`ewm_one_perspective`] helper the caller invokes
 //! twice.
 
+use std::mem::MaybeUninit;
+
 use crate::types::HIDDEN_SIZE;
 
 /// Right-shift applied to the affine output before the clipped ReLU
@@ -76,13 +78,16 @@ pub fn sqr_clipped_relu(input: &[i32], output: &mut [u8]) {
 /// `j + HIDDEN_SIZE/2`, each clamped to `[0, EWM_CLAMP]`, multiplied, then
 /// shifted right by [`EWM_SHIFT`]. Reads `HIDDEN_SIZE` `i16`s, writes
 /// `HIDDEN_SIZE/2` bytes.
-pub fn ewm_one_perspective(half: &[i16; HIDDEN_SIZE], out: &mut [u8]) {
+///
+/// Every lane of `out` is written, so a caller may hand over a buffer it has
+/// not initialised.
+pub fn ewm_one_perspective(half: &[i16; HIDDEN_SIZE], out: &mut [MaybeUninit<u8>]) {
     const HALF: usize = HIDDEN_SIZE / 2;
     debug_assert_eq!(out.len(), HALF);
     for j in 0..HALF {
         let s0 = (half[j] as i32).clamp(0, EWM_CLAMP);
         let s1 = (half[j + HALF] as i32).clamp(0, EWM_CLAMP);
-        out[j] = ((s0 * s1) >> EWM_SHIFT) as u8;
+        out[j].write(((s0 * s1) >> EWM_SHIFT) as u8);
     }
 }
 
@@ -142,6 +147,16 @@ mod tests {
         assert_eq!(out[1], 18);
     }
 
+    /// Run the kernel over a buffer that starts uninitialised, as the output
+    /// transform does, and hand back what it wrote.
+    fn ewm_lanes(half: &[i16; HIDDEN_SIZE]) -> [u8; HIDDEN_SIZE / 2] {
+        let mut out = [MaybeUninit::<u8>::uninit(); HIDDEN_SIZE / 2];
+        ewm_one_perspective(half, &mut out);
+        // SAFETY: the kernel writes every lane of `out`, and `MaybeUninit<u8>`
+        // has the layout of `u8`.
+        unsafe { *out.as_ptr().cast::<[u8; HIDDEN_SIZE / 2]>() }
+    }
+
     #[test]
     fn ewm_one_perspective_clamps_and_shifts() {
         const HALF: usize = HIDDEN_SIZE / 2;
@@ -156,8 +171,7 @@ mod tests {
         half[2] = 30_000;
         half[HALF + 2] = 30_000;
 
-        let mut out = [0u8; HALF];
-        ewm_one_perspective(&half, &mut out);
+        let out = ewm_lanes(&half);
         assert_eq!(out[0], 39);
         assert_eq!(out[1], 0);
         assert_eq!(out[2], 126);
