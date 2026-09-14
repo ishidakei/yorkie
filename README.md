@@ -72,7 +72,7 @@ strip --strip-debug target/release/yorkie
 | ビルド | 読むもの・出すもの |
 | --- | --- |
 | feature なし | 対局で使うコマンドと、対局で使う出力だけ。探索出力は `bestmove` のみ |
-| `verbose1` | ＋受け付けられない入力（認識できないコマンド、不正な `position`、対局では使わない `go` の指定）や定跡ファイルの異常を `info string` で報告する。入力への対処自体はどのビルドでも変わらず、報告するかどうかだけが変わる。あわせて、探索を終える `bestmove` の直前に 1 応答ぶんの統計行を出力する（後述） |
+| `verbose1` | ＋受け付けられない入力（認識できないコマンド、不正な `position`、対局では使わない `go` の指定）や定跡ファイルの異常を `info string` で報告する。入力への対処自体はどのビルドでも変わらず、報告するかどうかだけが変わる。あわせて、探索を終える `bestmove` の直前に 1 応答ぶんの統計行を出力し（後述）、`ponder` 設定が有効なビルドでは `bestmove` のあとに始まる探索の開始と終了を `info string ponder start` / `info string ponder stop` で報告する |
 | `verbose2` | ＋探索の経過と結果を伝える `info` 行（反復深化ごとの PV、`bestmove` 直前の最終 PV、定跡ヒット時の multipv ブロック）を出力し、対局では使わない `go` の指定（`depth` / `nodes` / `movetime` / `infinite` / `mate` / `rtime`）を受け付ける。候補手順を複数本探す `multi_pv` 設定が効くのもこの feature から（これのないビルドには 2 本目を伝える出力がないため、ルート探索は 1 本だけ）。GUI の検討モードに必要な feature |
 | `verbose3` | ＋`tt store` / `tt probe` / `tt children` と `bench` を受け付ける |
 
@@ -317,8 +317,7 @@ TOML ファイルを参照してください。
 | `cpu_assignment` | 文字列 | `"auto"` または CPU リスト | 各ワーカースレッドを固定する論理 CPU を決める。`"auto"` は `cpu_ledger` が「他のビルドが取った」と記録していない CPU の中から `threads` 個を選ぶ。選び方はマシンの L3 キャッシュドメイン（CCD）を順に回り、各ドメインの空き CPU を昇順に 1 つずつ取っていくもので、乱数は入らない。台帳を読み書きするのはこの `"auto"` のときだけで、`cpu_ledger` が空文字列のままの `"auto"` はビルドエラーになる。もう一方の書き方は `0,2,4-7` 形式の明示リストで、ちょうど `threads` 個、すべてオンライン、重複なしであることが条件（違反はビルドエラー）。明示リストは台帳をいっさい読まず、台帳に行も足さない。同じマシン上の他のビルドと CPU が重ならないようにするのは、そのリストを書いた側の責任になる |
 | `cpu_ledger` | 文字列 | 任意 | 同じマシン上の各ビルドが取った CPU を 1 ビルド 1 行で記録するファイル。相対パスはリポジトリのルート基準。読み書きされるのは `cpu_assignment = "auto"` のビルドだけで、台帳を使わない config は空文字列を書く。同じビルドを建て直したときはその行がそのまま使われるので、取り分が増えることはない。ファイルを消すと全 CPU が解放され、割り当てがやり直しになる。ビルド時にのみ読み書きされ、実行時には使われない |
 | `numa_nodes` | 整数または `"auto"` | 1〜1024 または `"auto"` | バイナリをビルドするマシンの NUMA ノード数を指定する。ビルド時にそのマシンのノードと各ノードの CPU を sysfs から読み、そのままバイナリに埋め込む。`"auto"` はビルド時に得たノード数をそのまま採る。整数を書くと、ビルド時に得たノード数がその数と違えばビルドが失敗する（後述） |
-| `usi_ponder` | 真偽値 | `true` / `false` | 先読み（ponder）を有効化する |
-| `stochastic_ponder` | 真偽値 | `true` / `false` | 確率的 ponder を有効化する |
+| `ponder` | 真偽値 | `true` / `false` | 持ち時間つきの `go` に `bestmove` を返したあと、その指し手を進めた局面（相手の手番）を、次のコマンドが来るまで探索し続ける。時間・深さ・ノード数の制限はなく、スレッド数と置換表は通常の探索と同じものを使う。この探索は `bestmove` を出さない（出力は下の `info string ponder …` の 2 行だけで、feature なしのビルドでは何も出ない）。次に来たコマンド（`position` / `go` / `usinewgame` / `isready` / `setoption` / `gameover` / `stop` / `quit`）が、その処理の前にこの探索を止めて回収する。残るのは温まった置換表と履歴表で、次の探索はそこから始まる。相手の手を予測して待つ USI の ponder とは別物で、`USI_Ponder` オプションは（どのビルドでも）公開しない |
 | `book_options_v2` | 真偽値 | `true` / `false` | 定跡オプション 2 群のどちらを有効にするかを選ぶ。`false` は V1 系のキー、`true` は V2 系のキーが効き、選ばれなかった側のキーは型のゼロ値として読まれて効かない |
 | `usi_own_book` | 真偽値 | `true` / `false` | エンジン側で定跡を使う |
 | `narrow_book` | 真偽値 | `true` / `false` | 定跡の採用手を絞り込む（V1 のみ） |
@@ -425,10 +424,10 @@ TOML ファイルを参照してください。
 | `setoption name <名前> value <値>` | どのビルドでも行を読み捨てるだけで、出力も状態変化もない（設定できるオプションが存在しないため。USI は応答を求めていない） |
 | `usinewgame` | 新規対局の開始（出力なし） |
 | `position [startpos \| sfen <SFEN>] [moves <手> …]` | 局面を設定する |
-| `go [btime <ms>] [wtime <ms>] [binc <ms>] [winc <ms>] [byoyomi <ms>] [ponder]` | 探索を開始し `bestmove` を返す。対局で使う持ち時間系の指定はすべて既定ビルドで有効 |
+| `go [btime <ms>] [wtime <ms>] [binc <ms>] [winc <ms>] [byoyomi <ms>]` | 探索を開始し `bestmove <指し手>` を返す。この行は指し手 1 つだけで、どのビルドでもそのあとに何も続かない。対局で使う持ち時間系の指定はすべて既定ビルドで有効。持ち時間を伴う `go`（＝対局の 1 手）に答えたあとの挙動は `ponder` 設定で決まる（上の設定一覧を参照）。`ponder` トークンが付いていた場合は、選ぶものが何もないため読み捨て、残りの行は通常どおり処理する |
 | `go depth <d>` / `go nodes <n>` / `go mate [ms\|infinite]` / `go movetime <ms>` / `go infinite` / `go rtime <ms>` | 対局では使わない探索指定。`verbose2` のあるビルドでのみ有効。それのないビルドでは、このコマンドを丸ごと実行しない（探索を開始しない。feature なしのビルドは何も出力せず、`verbose1` のあるビルドでは `info string go error: …` で報告される） |
 | `stop` | 探索を停止する |
-| `ponderhit` | 先読みが的中したことを通知する |
+| `ponderhit` | 予測した手が指されたことを GUI が伝えるコマンド。このエンジンは手を予測しないため、行を読み捨てるだけで、出力も状態変化もない |
 | `gameover` | 対局終了 |
 | `quit` | 終了する |
 | `bench [ttSizeMB] [threads] [limit] [default\|current\|<fenFile>] [limitType]` | 固定条件での NPS 計測。引数はすべて省略可で、左から順に既定値（`ttSizeMB=1024`, `threads=1`, `limit=15000`, ソース `default`, `limitType=movetime`）で埋められる。`ttSizeMB` は整数かどうかだけを検査して捨てる（置換表の大きさはビルド時に決まっており、計測はそのバイナリの置換表で走る）。引数の位置は固定なので、この引数自体は残る。`verbose3` のビルドでのみ有効 |
@@ -465,7 +464,7 @@ yorkie perft sfen <SFEN> moves <m1> [<m2> …] <depth>
 
 ```
 info string stats alloc=40321
-bestmove 7g7f ponder 3c3d
+bestmove 7g7f
 ```
 
 固定の接頭辞 `info string stats` のあとに `key=value` の項目を半角空白区切りで

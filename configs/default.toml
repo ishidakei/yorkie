@@ -103,10 +103,12 @@ cpu_ledger = ".yorkie-cpu-ledger"
 # not there.
 numa_nodes = "auto"
 
-# Ponder toggles (`USI_Ponder` / `Stochastic_Ponder`). At the option layer these
-# only feed the optimum-time bonus.
-usi_ponder = false
-stochastic_ponder = false
+# Keep searching once the engine has answered a clocked `go`: the position its
+# own move reaches is searched, with no limit, until the next command arrives.
+# The opponent is on their clock then, so the time is free; what the search
+# leaves behind — a warm transposition table and warm history tables — is what
+# the next move's search starts from. No `bestmove` ever comes out of it.
+ponder = true
 
 # ---------------------------------------------------------------------------
 # Opening book

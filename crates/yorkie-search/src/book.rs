@@ -230,13 +230,16 @@ pub struct BookInfoLine {
     pub pv: Vec<Move>,
 }
 
-/// A successful book probe: the chosen move, an optional ponder move, its score,
-/// and the per-candidate info lines to emit at the root.
+/// A successful book probe: the chosen move, its score, and the ponder move and
+/// per-candidate info lines to emit at the root.
 #[derive(Clone, Debug)]
 pub struct BookHit {
     /// The selected (legal, widened) book move.
     pub best: Move,
-    /// The ponder move (legal in the post-best position), if any.
+    /// The ponder move (legal in the post-best position), if any. The reply
+    /// names the chosen move and nothing else, so the only reader is the root
+    /// `pv` line; a build that does not print that line never looks the move up.
+    #[cfg(feature = "verbose2")]
     pub ponder: Option<Move>,
     /// Stored eval of the selected move.
     pub value: i16,
@@ -495,10 +498,12 @@ pub fn probe_book(
     // Ponder fallback: `.ybb` stores no ponder, so play the best move and take
     // the first sorted move of the resulting position, validated for legality
     // there.
+    #[cfg(feature = "verbose2")]
     let ponder = ponder_move(books, ignore_book_ply, pos, config.flipped_book, best.mv);
 
     result.hit = Some(BookHit {
         best: best.mv,
+        #[cfg(feature = "verbose2")]
         ponder,
         value: best.value,
         #[cfg(feature = "verbose2")]
@@ -509,6 +514,7 @@ pub fn probe_book(
 
 /// The ponder move for `best`: probe the post-`best` position, take its first
 /// sorted move, and keep it only if it is legal there.
+#[cfg(feature = "verbose2")]
 fn ponder_move(
     books: &[Book],
     ignore_book_ply: bool,
@@ -1219,6 +1225,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "verbose2")]
     #[test]
     fn pv_and_ponder_follow_the_same_first_hit_path() {
         // Book 0 has the root only; book 1 has the root's child. The PV walk and
@@ -1243,7 +1250,6 @@ mod tests {
             .expect("hit");
         assert_eq!(usi(hit.best), "7g7f");
         assert_eq!(hit.ponder.map(usi), Some("3c3d".to_string()));
-        #[cfg(feature = "verbose2")]
         assert_eq!(
             hit.info_lines[0]
                 .pv
@@ -1379,6 +1385,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "verbose2")]
     #[test]
     fn ponder_fallback_reads_the_child_positions_best() {
         // Two chained entries: startpos → 7g7f, and the post-7g7f position →

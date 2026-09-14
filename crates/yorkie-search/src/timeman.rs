@@ -9,9 +9,9 @@
 //! truncation and `f32` / `f64` points as the C++ code are preserved so the
 //! computed budgets match bit-for-bit given the same inputs.
 //!
-//! With no ponder `ponderhit_time == start_time`, so the
-//! `start_time - ponderhit_time` terms vanish and the same paths run in their
-//! ponder-off shape.
+//! The budget is the same whether or not the engine keeps searching after its
+//! move: there is no ponderhit to convert time already spent into time saved,
+//! so nothing here is worth a bonus that a measurement has not asked for.
 
 use std::time::Instant;
 
@@ -29,9 +29,9 @@ const MOVE_HORIZON: i32 = 160;
 ///
 /// Only what a `go` brings is here. The settings the budget also depends on —
 /// the two network delays, the minimum think time, the slow-mover percentage,
-/// the whole-second rounding, the two ponder toggles and the draw horizon — are
-/// compiled in, so [`TimeManagement::init`] reads them itself instead of being
-/// handed the same values again at every `go`.
+/// the whole-second rounding and the draw horizon — are compiled in, so
+/// [`TimeManagement::init`] reads them itself instead of being handed the same
+/// values again at every `go`.
 #[derive(Clone, Copy, Debug)]
 pub struct TimeInput {
     /// `limits.time[us]` — the side-to-move's remaining main clock in ms.
@@ -71,10 +71,6 @@ struct TimeSettings {
     slow_mover: i64,
     /// `options["RoundUpToFullSecond"]`.
     round_up_to_fullsecond: bool,
-    /// `options["USI_Ponder"]` and `options["Stochastic_Ponder"]`, which between
-    /// them decide the optimum-time bonus.
-    usi_ponder: bool,
-    stochastic_ponder: bool,
     /// The game ply past which a draw is adjudicated, with the reference's
     /// `0 → 100000` unlimited remap applied.
     max_moves_to_draw: i32,
@@ -88,8 +84,6 @@ const COMPILED: TimeSettings = TimeSettings {
     minimum_thinking_time: crate::config::MINIMUM_THINKING_TIME,
     slow_mover: crate::config::SLOW_MOVER,
     round_up_to_fullsecond: crate::config::ROUND_UP_TO_FULL_SECOND,
-    usi_ponder: crate::config::USI_PONDER,
-    stochastic_ponder: crate::config::STOCHASTIC_PONDER,
     max_moves_to_draw: if crate::config::MAX_MOVES_TO_DRAW == 0 {
         100_000
     } else {
@@ -102,16 +96,9 @@ const COMPILED: TimeSettings = TimeSettings {
 pub struct TimeManagement {
     /// `startTime` — the origin for [`Self::elapsed`] (`now() - startTime`).
     pub start_time: Instant,
-    /// `ponderhitTime` — equal to `start_time` until a `ponderhit`, at which
-    /// point the search stamps it to the ponderhit instant (`set_ponderhit`).
-    /// Used by [`Self::set_search_end`].
-    pub ponderhit_time: Instant,
     /// `search_end` [ms from `start_time`]: `0` means "not yet decided"; once
     /// set, the search stops when `search_end <= elapsed`.
     pub search_end: i64,
-    /// `isFinalPush` — in byoyomi with (almost) no main clock, spend it all;
-    /// consumed by [`Self::set_search_end`].
-    pub is_final_push: bool,
     /// True only for the `MTG <= 0` error path, so the driver can emit the
     /// reference `info string Error!` diagnostic.
     pub mtg_error: bool,
@@ -162,16 +149,12 @@ impl TimeManagement {
             minimum_thinking_time,
             slow_mover,
             round_up_to_fullsecond,
-            usi_ponder,
-            stochastic_ponder,
             max_moves_to_draw,
         } = settings;
 
         let mut tm = TimeManagement {
             start_time,
-            ponderhit_time: start_time,
             search_end: 0,
-            is_final_push: false,
             mtg_error: false,
             minimum_time: 0,
             optimum_time: 0,
@@ -277,19 +260,12 @@ impl TimeManagement {
         tm.optimum_time = t1.min(remain_time) * slow_mover / 100;
         tm.maximum_time = t2.min(remain_time);
 
-        // Ponder bonus.
-        if usi_ponder && !stochastic_ponder {
-            tm.optimum_time += tm.optimum_time / 4;
-        }
-
         // Byoyomi with (almost) no main clock: spend it all this move.
-        tm.is_final_push = false;
         if byoyomi_us != 0 && time_us < (byoyomi_us as f64 * 1.2) as i64 {
             let v = byoyomi_us + time_us;
             tm.minimum_time = v;
             tm.optimum_time = v;
             tm.maximum_time = v;
-            tm.is_final_push = true;
         }
 
         // Final clamps: round up minimum/maximum and never exceed remain_time.
@@ -321,20 +297,11 @@ impl TimeManagement {
     /// Fix the search end time from the elapsed time `e` in ms at which the
     /// search decided to stop, rounding the used time up to a full second and
     /// storing it as an offset from `start_time`.
+    ///
+    /// The floor is [`Self::minimum`]: a search that decided to stop before the
+    /// minimum think time still spends it.
     pub fn set_search_end(&mut self, e: i64) {
-        // `startTime - ponderhitTime` in ms (0 without ponder; <= 0 with).
-        let start_minus_ponderhit = -(self
-            .ponderhit_time
-            .saturating_duration_since(self.start_time)
-            .as_millis() as i64);
-        let t1 = e + start_minus_ponderhit;
-        let t2 = if self.is_final_push {
-            self.minimum_time
-        } else {
-            self.minimum_time + start_minus_ponderhit
-        };
-        // `round_up(max(t1, t2)) + ponderhitTime - startTime`.
-        self.search_end = self.round_up(t1.max(t2)) - start_minus_ponderhit;
+        self.search_end = self.round_up(e.max(self.minimum_time));
     }
 
     /// Elapsed time in ms since `startTime`, measured against `now`.
@@ -449,7 +416,6 @@ mod tests {
         assert_eq!(tm.minimum(), 1880);
         assert_eq!(tm.optimum(), 17610);
         assert_eq!(tm.maximum(), 80880);
-        assert!(!tm.is_final_push);
     }
 
     #[test]
@@ -526,8 +492,8 @@ mod tests {
 
     #[test]
     fn final_push_when_time_under_byoyomi_1_2() {
-        // Byoyomi 1000, main clock 500 < 1000*1.2 = 1200: final push spends
-        // byoyomi + time, and isFinalPush is set.
+        // Byoyomi 1000, main clock 500 < 1000*1.2 = 1200: the final push spends
+        // byoyomi + time.
         let input = TimeInput {
             time_us: 500,
             byoyomi_us: 1_000,
@@ -538,7 +504,6 @@ mod tests {
 
         // The main clock is under 1.2× the byoyomi, so the final-push branch
         // fires and every budget collapses to `remain_time`.
-        assert!(tm.is_final_push);
         assert_eq!(tm.minimum(), 380);
         assert_eq!(tm.optimum(), 380);
         assert_eq!(tm.maximum(), 380);
@@ -629,56 +594,6 @@ mod tests {
         assert_eq!(slow.maximum(), baseline.maximum());
     }
 
-    #[test]
-    fn usi_ponder_bonus_adds_a_quarter() {
-        let off = init(&TimeInput {
-            time_us: 600_000,
-            byoyomi_us: 10_000,
-            ply: 1,
-            ..base()
-        });
-        let on = init_settings(
-            &TimeInput {
-                time_us: 600_000,
-                byoyomi_us: 10_000,
-                ply: 1,
-                ..base()
-            },
-            &TimeSettings {
-                usi_ponder: true,
-                stochastic_ponder: false,
-                ..COMPILED
-            },
-        );
-        // The bonus is applied to optimumTime pre-clamp; here the clamp does not
-        // bind, so it is exactly optimum + optimum/4.
-        assert_eq!(on.optimum(), off.optimum() + off.optimum() / 4);
-    }
-
-    #[test]
-    fn usi_ponder_bonus_suppressed_by_stochastic_ponder() {
-        let plain = init(&TimeInput {
-            time_us: 600_000,
-            byoyomi_us: 10_000,
-            ply: 1,
-            ..base()
-        });
-        let both = init_settings(
-            &TimeInput {
-                time_us: 600_000,
-                byoyomi_us: 10_000,
-                ply: 1,
-                ..base()
-            },
-            &TimeSettings {
-                usi_ponder: true,
-                stochastic_ponder: true,
-                ..COMPILED
-            },
-        );
-        assert_eq!(both.optimum(), plain.optimum());
-    }
-
     /// `go rtime` exists only from `verbose2` up, so the budget it draws does
     /// too.
     #[cfg(feature = "verbose2")]
@@ -748,8 +663,8 @@ mod tests {
     }
 
     #[test]
-    fn set_search_end_no_ponder_rounds_elapsed() {
-        // Without ponder search_end = round_up(max(elapsed, minimum())).
+    fn set_search_end_rounds_elapsed() {
+        // search_end = round_up(max(elapsed, minimum())).
         let mut tm = init(&TimeInput {
             time_us: 600_000,
             byoyomi_us: 10_000,
@@ -768,18 +683,18 @@ mod tests {
     }
 
     #[test]
-    fn set_search_end_final_push_uses_minimum_directly() {
+    fn set_search_end_in_byoyomi_is_capped_by_the_remaining_time() {
+        // Byoyomi with (almost) no main clock: the whole of it is this move's
+        // budget, and `round_up`'s cap is what keeps the rounding inside it.
         let mut tm = init(&TimeInput {
             time_us: 500,
             byoyomi_us: 1_000,
             ply: 50,
             ..base()
         });
-        assert!(tm.is_final_push);
-        // minimum() == 380 (clamped to remain_time). Elapsed 100 < minimum: t2
-        // = minimum() = 380 (final push branch); max = 380; round_up: ceil
-        // 1000; max=2000; -120=1880; 1880<380? no; min(1880, remain_time=380)
-        // = 380.
+        // minimum() == 380 (clamped to remain_time). Elapsed 100 < minimum, so
+        // max = 380; round_up: ceil 1000; max=2000; -120=1880; 1880<380? no;
+        // min(1880, remain_time=380) = 380.
         tm.set_search_end(100);
         assert_eq!(tm.search_end, 380);
     }

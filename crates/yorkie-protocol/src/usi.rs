@@ -234,7 +234,7 @@ fn render_reply(payload: &mut BestmoveBuf, reply: Reply) -> &[u8] {
     match reply {
         Reply::Resign => b"resign",
         Reply::Win => b"win",
-        Reply::BestMove { mv, ponder } => payload.compose(mv, ponder),
+        Reply::BestMove { mv } => payload.compose(mv),
     }
 }
 
@@ -310,7 +310,7 @@ impl<W: Write + Send + 'static> EngineSink for UsiSink<W> {
             body.len()
         };
         let mut payload = BestmoveBuf::new();
-        let text = payload.compose(hit.best, hit.ponder);
+        let text = payload.compose(hit.best);
         let mut guard = self.lock();
         #[cfg(feature = "verbose2")]
         let _ = Formatter::new(&mut *guard).info(&bytes[..info]);
@@ -461,7 +461,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
                 Command::GoExtraClause(clause) => self.handle_go_extra_clause(clause)?,
                 Command::Stop => self.handle_stop(),
                 Command::GameOver => self.handle_gameover(),
-                Command::PonderHit => self.handle_ponderhit()?,
+                Command::PonderHit => self.handle_ponderhit(),
                 #[cfg(feature = "verbose3")]
                 Command::Bench(tokens) => self.handle_bench(&tokens)?,
                 #[cfg(feature = "verbose3")]
@@ -548,7 +548,11 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
     /// There is no option to set — every setting was fixed at build time from
     /// the TOML config, and the `usi` reply advertises no options at all. USI
     /// requires no reply, so the line is parsed, consumed and dropped.
+    ///
+    /// A GUI sends these between games, so a search left thinking ahead is
+    /// ended first: the engine answers the next command idle.
     fn handle_setoption(&mut self, _name: &[u8], _value: &[u8]) -> io::Result<()> {
+        self.engine.stop_pondering();
         Ok(())
     }
 
@@ -606,19 +610,23 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
     }
 
     /// `gameover [win|lose|draw]`: the game ended. Treated exactly like `stop`:
-    /// the same flag, releasing a held book reply (`go ponder`/`go infinite`) or
-    /// aborting a running search. Over a shogi GUI an opponent resign during
-    /// `go ponder` arrives as `gameover` without a preceding `stop`; unhandled,
-    /// pondering would never stop. A no-op when idle.
+    /// the same flags, releasing a held book reply (`go infinite`), aborting a
+    /// running search and ending a search thinking ahead. Over a shogi GUI an
+    /// opponent resign arrives as `gameover` without a preceding `stop`;
+    /// unhandled, the engine would keep thinking about a finished game. A no-op
+    /// when idle.
     fn handle_gameover(&mut self) {
         self.handle_stop();
     }
 
-    /// `ponderhit`: the opponent played the predicted move.
-    fn handle_ponderhit(&mut self) -> io::Result<()> {
-        let outcome = self.engine.ponderhit();
-        self.answer_go(outcome)
-    }
+    /// `ponderhit`: a GUI telling the engine the move it predicted was played.
+    ///
+    /// This engine advertises no `USI_Ponder` option and predicts no move, so a
+    /// conforming GUI never sends this and there is nothing for it to confirm:
+    /// the line is consumed and dropped. Whatever the engine is thinking about
+    /// keeps running, and the `position` that follows the opponent's move ends
+    /// it.
+    fn handle_ponderhit(&mut self) {}
 
     /// What a `go` that never started owes the host: the notice and the
     /// `bestmove resign` that stands in for the search.

@@ -1,5 +1,5 @@
-//! The payload of a `bestmove` line — the move the engine plays, and the move
-//! it expects in reply.
+//! The payload of a `bestmove` line — the move the engine plays, and nothing
+//! after it.
 //!
 //! A reply is the last thing a search does, and what it costs is measured
 //! against the search it ends, so the text is composed in a stack buffer sized
@@ -8,11 +8,8 @@
 
 use yorkie_state::{MAX_USI_MOVE_LEN, Move, TextWriter, UsiMoveBuf};
 
-/// What sits between the two moves of a pondering reply.
-const PONDER: &[u8] = b" ponder ";
-
-/// The longest payload: both moves at their widest, with the keyword between.
-const MAX_PAYLOAD: usize = MAX_USI_MOVE_LEN + PONDER.len() + MAX_USI_MOVE_LEN;
+/// The longest payload: one move at its widest.
+const MAX_PAYLOAD: usize = MAX_USI_MOVE_LEN;
 
 /// The stack buffer a payload is composed in.
 pub(crate) struct BestmoveBuf {
@@ -28,16 +25,11 @@ impl BestmoveBuf {
         }
     }
 
-    /// Compose `<mv>`, or `<mv> ponder <mv>` when the reply names a move to
-    /// ponder on, and return the text.
-    pub(crate) fn compose(&mut self, best: Move, ponder: Option<Move>) -> &[u8] {
+    /// Compose `<mv>` and return the text.
+    pub(crate) fn compose(&mut self, best: Move) -> &[u8] {
         let mut mv = UsiMoveBuf::new();
         let mut out = TextWriter::new(&mut self.bytes);
         out.bytes(mv.format(best));
-        if let Some(p) = ponder {
-            out.bytes(PONDER);
-            out.bytes(mv.format(p));
-        }
         debug_assert!(!out.overflowed(), "the widest payload fits MAX_PAYLOAD");
         self.len = out.len();
         &self.bytes[..self.len]
@@ -58,40 +50,35 @@ mod tests {
         )
     }
 
-    #[test]
-    fn a_plain_reply_is_the_move_alone() {
-        let m = mv((6, 6), (6, 5));
-        let mut buf = BestmoveBuf::new();
-        let mut expected = UsiMoveBuf::new();
-        assert_eq!(buf.compose(m, None), expected.format(m));
+    /// The one thing that widens a move: a promotion marker.
+    fn promoting() -> Move {
+        Move::make_promote(
+            Square::new(0, 0).unwrap(),
+            Square::new(8, 8).unwrap(),
+            Piece::new(PieceKind::Pawn, Color::Black),
+        )
     }
 
     #[test]
-    fn a_pondering_reply_names_both_moves() {
-        let (best, ponder) = (mv((6, 6), (6, 5)), mv((2, 2), (2, 3)));
+    fn a_reply_is_the_move_alone() {
+        let m = mv((6, 6), (6, 5));
         let mut buf = BestmoveBuf::new();
-        assert_eq!(buf.compose(best, Some(ponder)), b"7g7f ponder 3c3d");
+        let mut expected = UsiMoveBuf::new();
+        assert_eq!(buf.compose(m), expected.format(m));
     }
 
     #[test]
     fn the_widest_payload_fits_the_buffer() {
-        // Both moves promoting, which is the one thing that widens a move.
-        let promoting = Move::make_promote(
-            Square::new(0, 0).unwrap(),
-            Square::new(8, 8).unwrap(),
-            Piece::new(PieceKind::Pawn, Color::Black),
-        );
         let mut buf = BestmoveBuf::new();
-        let payload = buf.compose(promoting, Some(promoting));
-        assert_eq!(payload, b"1a9i+ ponder 1a9i+");
+        let payload = buf.compose(promoting());
+        assert_eq!(payload, b"1a9i+");
         assert_eq!(payload.len(), MAX_PAYLOAD);
     }
 
     #[test]
     fn a_reused_buffer_carries_nothing_over() {
-        let (best, ponder) = (mv((6, 6), (6, 5)), mv((2, 2), (2, 3)));
         let mut buf = BestmoveBuf::new();
-        assert_eq!(buf.compose(best, Some(ponder)), b"7g7f ponder 3c3d");
-        assert_eq!(buf.compose(ponder, None), b"3c3d");
+        assert_eq!(buf.compose(promoting()), b"1a9i+");
+        assert_eq!(buf.compose(mv((2, 2), (2, 3))), b"3c3d");
     }
 }

@@ -169,7 +169,7 @@ pub struct RootOutcome {
     pub score: Value,
     /// Total nodes searched (`do_move` count); `0` for the skipped exits.
     pub nodes: u64,
-    /// Principal variation (`rootMoves[0].pv`, possibly ponder-extended).
+    /// Principal variation (`rootMoves[0].pv`).
     pub pv: Vec<Move>,
     /// Iterative-deepening depth the reported result was completed at, so a
     /// time-aborted search reports the depth it finished rather than the one it

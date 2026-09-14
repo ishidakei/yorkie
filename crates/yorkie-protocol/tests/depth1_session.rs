@@ -106,18 +106,12 @@ fn depth1_session_matches_reference_startpos_fixture() {
         "real network must load (readyok), got:\n{out}"
     );
 
-    // bestmove (no ponder expected for the single-move startpos PV, but tolerate
-    // one by comparing only the move token).
+    // The reply line is the move and nothing after it.
     let bestmove_line = out
         .lines()
         .find(|l| l.starts_with("bestmove "))
         .unwrap_or_else(|| panic!("missing bestmove in:\n{out}"));
-    let got_best = bestmove_line
-        .strip_prefix("bestmove ")
-        .unwrap()
-        .split_whitespace()
-        .next()
-        .expect("bestmove token");
+    let got_best = bestmove_line.strip_prefix("bestmove ").unwrap();
     assert_eq!(got_best, fixture.bestmove, "bestmove mismatch in:\n{out}");
 
     // The single depth-1 info line carries the score and node count.

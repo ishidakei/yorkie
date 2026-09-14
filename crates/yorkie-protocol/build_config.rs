@@ -352,8 +352,10 @@ const SCHEMA: &[Spec] = &[
         "numa_nodes",
         "(none: the NUMA-node count the build host must have)",
     ),
-    boolean("usi_ponder", "USI_Ponder"),
-    boolean("stochastic_ponder", "Stochastic_Ponder"),
+    boolean(
+        "ponder",
+        "(none: keep searching after the engine's own move until the next command)",
+    ),
     // --- Opening book. `book_options_v2` is the one key with no USI option
     // behind it: it stands in for the reference's pre-handshake profile file,
     // which no build of this engine reads.

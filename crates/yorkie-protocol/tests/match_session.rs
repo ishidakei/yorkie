@@ -2,9 +2,8 @@
 //! (tournament) build does with the commands it does not.
 //!
 //! A bridge in a rated game sends only `usi`, `isready`, `setoption`,
-//! `usinewgame`, `position`, a clock-clause or `ponder` `go`, `stop`,
-//! `ponderhit`, `gameover` and `quit`; everything else arrives with a verbosity
-//! feature.
+//! `usinewgame`, `position`, a clock-clause `go`, `stop`, `ponderhit`,
+//! `gameover` and `quit`; everything else arrives with a verbosity feature.
 //!
 //! [`match_shaped_session_is_byte_identical`] is deliberately *not*
 //! feature-gated: it runs in every build and pins the same bytes, which is the
@@ -83,8 +82,9 @@ fn whole_session_including_the_handshake() {
     );
 }
 
-/// `go ponder` is a match command too: the reply is held until the search is
-/// released, and `ponderhit` releases it.
+/// A bridge may still send `go ponder` and `ponderhit`, and both are match
+/// commands: the `go` is answered exactly as the same line without the token
+/// would be, and the `ponderhit` selects nothing and is answered with nothing.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn go_ponder_and_ponderhit_are_match_commands() {

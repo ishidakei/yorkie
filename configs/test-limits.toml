@@ -27,9 +27,7 @@ fv_scale = 16
 cpu_assignment = "0"
 cpu_ledger = ""
 numa_nodes = "auto"
-usi_ponder = false
-# DIFFERENCE: false in test.toml. The rewind-and-re-issue ponder path.
-stochastic_ponder = true
+ponder = false
 
 # ---------------------------------------------------------------------------
 # Opening book

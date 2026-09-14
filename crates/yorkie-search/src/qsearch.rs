@@ -17,15 +17,22 @@
 //! replacement selection against a cluster a child has since churned, and could
 //! pick a different slot.
 
-use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+use std::num::{NonZeroU16, NonZeroU32};
+// The node ceiling and the PV-output interval: both are `verbose2`, so a build
+// without that feature names neither type.
+#[cfg(feature = "verbose2")]
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+#[cfg(feature = "verbose2")]
+use std::time::Duration;
+use std::time::Instant;
 
 use yorkie_eval::{Accumulator, FinnyCache, MoveDelta, NetworkParams, evaluate_with};
 use yorkie_state::{Color, Move, Piece, PieceKind, Position, RepetitionState, piece_value};
 use yorkie_storage::{Bound, TranspositionTable, TtSlot, Value};
 
+#[cfg(feature = "verbose2")]
 use crate::config::GENERATE_ALL_LEGAL_MOVES;
 use crate::history::{
     ContPlane, ContinuationCorrectionHistory, ContinuationHistory, CorrChannel, CorrPlane,
@@ -338,93 +345,6 @@ impl std::ops::Deref for TallySlot {
     }
 }
 
-/// The shared ponder state for one `go ponder` — `SearchManager::ponder` plus
-/// the `tm.ponderhitTime` its `set_ponderhit` stamps. Behind an [`Arc`], so the
-/// driver thread can clear it while the worker polls it.
-///
-/// **A pondering search never self-terminates.** Only the shared abort flag or
-/// a `ponderhit` ends it.
-///
-/// All three fields belong to one class — written by the driver thread before or
-/// during the search, read by every worker — and the two a worker polls are
-/// written together by [`Self::ponderhit`], so they are grouped deliberately
-/// onto a single line rather than kept apart. The alignment is what puts a
-/// boundary between that line and whatever the allocator places next to the
-/// signal, the [`Arc`] header among it, whose counts every clone and drop
-/// writes.
-#[repr(align(64))]
-pub struct PonderSignal {
-    /// `SearchManager::ponder` — true while `go ponder` is pondering; cleared by
-    /// [`Self::ponderhit`].
-    active: AtomicBool,
-    /// The instant this signal was created, which is the `go`'s own start. It is
-    /// the origin the stamp below counts from, and it is written once, before
-    /// the signal is shared.
-    start: Instant,
-    /// Nanoseconds from `start` to the `ponderhit` (`tm.ponderhitTime = now()`),
-    /// `0` while none has arrived. Stamped **before** the flag is cleared so a
-    /// worker that observes `active == false` always sees the time — the
-    /// reference ordering. An atomic rather than a lock: the search polls this
-    /// from `check_time`, and nothing on the search path may wait.
-    hit_at_nanos: AtomicU64,
-}
-
-// One line, holding the whole signal.
-const _: () = assert!(size_of::<PonderSignal>() == CACHE_LINE);
-const _: () = assert!(align_of::<PonderSignal>() == CACHE_LINE);
-
-impl PonderSignal {
-    /// A fresh signal, `active` seeded from `limits.ponderMode`
-    /// (`pre_start_searching`).
-    pub fn new(active: bool) -> Self {
-        PonderSignal {
-            active: AtomicBool::new(active),
-            start: Instant::now(),
-            hit_at_nanos: AtomicU64::new(0),
-        }
-    }
-
-    /// Rewind a signal for the next `go ponder`: the origin a `ponderhit` is
-    /// timed from moves to now, and no hit has arrived yet.
-    ///
-    /// Exclusive access is what makes this safe to do to a signal that has
-    /// already been shared — a search still holding it would see its own `go`'s
-    /// start time change underneath it.
-    pub fn restart(&mut self, active: bool) {
-        *self = PonderSignal::new(active);
-    }
-
-    /// Whether the search is still pondering.
-    pub fn is_active(&self) -> bool {
-        self.active.load(Ordering::Acquire)
-    }
-
-    /// `set_ponderhit(false)`: stamp the ponderhit instant, then clear the
-    /// flag. The order matters — `check_time` / `set_search_end` read
-    /// `ponderhitTime` after seeing `ponder == false`.
-    pub fn ponderhit(&self) {
-        let nanos = u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        // `Release` here (and `Acquire` in `hit_at`) rather than `Relaxed`, even
-        // though clearing `active` below already publishes this write to a
-        // reader that goes through the flag: the pair makes `hit_at` correct on
-        // its own terms, for a reader that does not. On x86-64 both are plain
-        // moves, so the search path pays nothing for it.
-        self.hit_at_nanos.store(nanos.max(1), Ordering::Release);
-        self.active.store(false, Ordering::Release);
-    }
-
-    /// The stamped ponderhit instant, if a `ponderhit` has arrived. A stamp of
-    /// `0` means none has, which is what makes the field's
-    /// [`NonZeroU64`] reading an [`Option`] with no room
-    /// of its own; the `max(1)` above keeps that value free, at the cost of
-    /// reporting a ponderhit in the same nanosecond as the `go` one nanosecond
-    /// late.
-    fn hit_at(&self) -> Option<Instant> {
-        NonZeroU64::new(self.hit_at_nanos.load(Ordering::Acquire))
-            .map(|nanos| self.start + Duration::from_nanos(nanos.get()))
-    }
-}
-
 /// Time, node and stop controls for one search, mapped by the driver from the
 /// `go` limits. With every field absent there is no early termination, and the
 /// search runs to its depth limit exactly as a build without this machinery
@@ -436,10 +356,6 @@ pub struct SearchControl {
     /// and polled at the `CHECK_INTERVAL` granularity. `None` (the default)
     /// means no external stop is possible.
     pub stop: Option<Arc<AtomicBool>>,
-    /// The shared `go ponder` state, `Some` only on the main worker of one.
-    /// While it is active the search never self-terminates; a `ponderhit`
-    /// clears it and stamps the time, so time management resumes.
-    pub ponder: Option<Arc<PonderSignal>>,
     /// Hard node ceiling (`go nodes N`): abort once the node counter reaches it.
     /// `go nodes` and the `NodesLimit` config key, its only two sources, are
     /// both `verbose2`; without that feature a search is bounded by its clock,
@@ -639,15 +555,6 @@ pub struct QSearch<N: NetworkParams> {
     /// on the single-worker path; under Lazy-SMP the shared per-worker slot
     /// takes its place, so the main worker can sum every worker's count.
     best_move_changes: f64,
-    /// `main_manager()->stopOnPonderhit`. Without ponder it is never set true,
-    /// but the writes are ported so the ponder path needs no search-side
-    /// special case. Reset to `false` per `go`.
-    stop_on_ponderhit: bool,
-    /// Whether this worker has already copied the ponderhit instant out of the
-    /// shared [`PonderSignal`] into `tm.ponderhitTime` (a one-time sync once a
-    /// `ponderhit` clears the ponder flag). Reset to `false` per `go`; stays
-    /// `false` on every non-ponder search, where the sync is a no-op.
-    ponderhit_synced: bool,
     /// Lazy-SMP shared node counters: one slot per worker plus this worker's
     /// index. Each checkpoint publishes to its own slot, and the main worker's
     /// node ceiling sums them, reproducing `threads.nodes_searched()`. `None`
@@ -734,9 +641,6 @@ pub struct WorkerResult {
     /// if none completed). Reported as `info depth` for the chosen worker and fed
     /// to the thread vote.
     pub completed_depth: i32,
-    /// The previous iteration's `pv[1]` — the `extract_ponder_from_tt` fallback
-    /// applied to the chosen worker's length-1 PV.
-    pub ponder_candidate: Option<Move>,
     /// This worker's own node count (`do_move` calls). The driver sums every
     /// worker's count for the aggregated `info ... nodes` output.
     pub nodes: u64,
@@ -976,8 +880,6 @@ impl<N: NetworkParams> QSearch<N> {
             stopped: false,
             completed_depth: 0,
             best_move_changes: 0.0,
-            stop_on_ponderhit: false,
-            ponderhit_synced: false,
             #[cfg(feature = "verbose2")]
             node_tally: None,
             best_move_tally: None,
@@ -1143,12 +1045,6 @@ impl<N: NetworkParams> QSearch<N> {
         }
     }
 
-    /// Whether this search is currently pondering (the shared [`PonderSignal`] is
-    /// installed and still active). `false` on every non-ponder search.
-    fn is_pondering(&self) -> bool {
-        self.control.ponder.as_ref().is_some_and(|p| p.is_active())
-    }
-
     /// Fold this iteration's best-move changes into `tot` and reset for the
     /// next. Under Lazy-SMP only the main worker sums and zeroes every slot; a
     /// helper reaches this too, but takes the no-op arm and leaves its slot for
@@ -1165,26 +1061,6 @@ impl<N: NetworkParams> QSearch<N> {
                 *tot += self.best_move_changes;
                 self.best_move_changes = 0.0;
             }
-        }
-    }
-
-    /// Copy the shared [`PonderSignal`]'s stamped ponderhit instant into
-    /// `tm.ponderhit_time` the first time the ponder flag is seen cleared —
-    /// this port's stand-in for the reference's `set_ponderhit` writing it from
-    /// the USI thread.
-    fn sync_ponderhit(&mut self) {
-        if self.ponderhit_synced {
-            return;
-        }
-        // Copy the stamped instant out without holding a borrow on
-        // `self.control` across the mutation below.
-        let hit = match self.control.ponder.as_ref() {
-            Some(p) if !p.is_active() => p.hit_at(),
-            _ => return,
-        };
-        self.ponderhit_synced = true;
-        if let (Some(hit), Some(tc)) = (hit, self.control.time.as_mut()) {
-            tc.tm.ponderhit_time = hit;
         }
     }
 
@@ -1223,18 +1099,6 @@ impl<N: NetworkParams> QSearch<N> {
             return;
         }
 
-        // While pondering, make no stop decision at all — a `go ponder` search
-        // self-terminates only on `stop` (checked above) or a `ponderhit`. The
-        // stop check deliberately precedes this so `stop` still ends a
-        // pondering search.
-        if self.control.ponder.as_ref().is_some_and(|p| p.is_active()) {
-            return;
-        }
-        // Not (or no longer) pondering: if a `ponderhit` just cleared the flag,
-        // copy its stamped instant into `tm.ponderhitTime` once, before the
-        // `set_search_end` below reads it (the reference set_ponderhit ordering).
-        self.sync_ponderhit();
-
         // The reference gates every time / node stop on completedDepth >= 1 so a
         // `bestmove` is always backed by at least one finished iteration.
         if self.completed_depth < 1 {
@@ -1267,15 +1131,14 @@ impl<N: NetworkParams> QSearch<N> {
             }
             return;
         }
-        // 1./2. the maximum think time (or stopOnPonderhit) is exceeded ⇒ round up
-        // to a whole second via set_search_end rather than stopping now. Every
-        // `go` a build without `verbose2` accepts is clock-managed, so there the
-        // budget alone decides.
+        // 1./2. the maximum think time is exceeded ⇒ round up to a whole second
+        // via set_search_end rather than stopping now. Every `go` a build
+        // without `verbose2` accepts is clock-managed, so there the budget alone
+        // decides.
         #[cfg(feature = "verbose2")]
-        let past_budget =
-            tc.use_time_management && (elapsed > tc.tm.maximum() || self.stop_on_ponderhit);
+        let past_budget = tc.use_time_management && elapsed > tc.tm.maximum();
         #[cfg(not(feature = "verbose2"))]
-        let past_budget = elapsed > tc.tm.maximum() || self.stop_on_ponderhit;
+        let past_budget = elapsed > tc.tm.maximum();
         if past_budget {
             self.control
                 .time
@@ -1969,10 +1832,7 @@ impl<N: NetworkParams> QSearch<N> {
         let result = self.run_worker(pos, root_moves, limit_depth);
 
         // --- back in start_searching (bestThread == this for a single worker) ---
-        let mut best = result.best;
-        let mut work = pos.clone();
-        // Extend a length-1 PV with a ponder move (TT, then ponder_candidate).
-        self.extract_ponder(&mut work, &mut best, result.ponder_candidate);
+        let best = result.best;
 
         RootOutcome {
             best_move: best.mv,
@@ -2018,8 +1878,6 @@ impl<N: NetworkParams> QSearch<N> {
         // `pre_start_searching` / per-thread reset).
         self.completed_depth = 0;
         self.best_move_changes = 0.0;
-        self.stop_on_ponderhit = false;
-        self.ponderhit_synced = false;
         // lowPlyHistory is refilled to 98 per `go`.
         self.histories.low_ply.fill(98);
 
@@ -2087,10 +1945,6 @@ impl<N: NetworkParams> QSearch<N> {
             best_previous_score
         };
         let mut iter_value = [iter_seed; 4];
-
-        // `ponder_candidate` — the previous iteration's `pv[1]`, a fallback
-        // for `extract_ponder_from_tt` on a length-1 final PV.
-        let mut ponder_candidate: Option<Move> = None;
 
         // The reference's Skill-driven `max(multiPV, 4)` bump is skipped:
         // Skill is disabled in the non-Stockfish build.
@@ -2246,10 +2100,6 @@ impl<N: NetworkParams> QSearch<N> {
                 break;
             }
 
-            if root_moves[0].pv.len() > 1 {
-                ponder_candidate = Some(root_moves[0].pv[1]);
-            }
-
             self.fold_best_move_changes(&mut tot_best_move_changes);
 
             // Whether there is time for another iteration. Only the main
@@ -2268,15 +2118,7 @@ impl<N: NetworkParams> QSearch<N> {
                 .time
                 .as_ref()
                 .is_some_and(|tc| tc.tm.search_end == 0);
-            if time_managed && !self.stopped && !self.stop_on_ponderhit {
-                // The reference stamps `tm.ponderhitTime` on the USI thread, so
-                // every later time decision sees it at once. This port
-                // reconciles it lazily, and the checkpoint interval would
-                // otherwise leave a window in which the block below reaches
-                // `set_search_end` with a go-origin ponderhit time.
-                self.sync_ponderhit();
-
-                let pondering = self.is_pondering();
+            if time_managed && !self.stopped {
                 // `nodesEffort` divides by this worker's OWN node counter,
                 // not the all-worker aggregate.
                 let own_nodes = self.nodes.max(1);
@@ -2322,22 +2164,16 @@ impl<N: NetworkParams> QSearch<N> {
                     total_time = total_time.min(502.0);
                 }
 
-                // Over budget: while pondering, arm `stop_on_ponderhit` so
-                // the first `check_time` after the ponderhit stops; otherwise
-                // fix the end time rather than stopping now.
+                // Over budget: fix the end time rather than stopping now.
                 if elapsed as f64 > total_time.min(maximum) {
-                    if pondering {
-                        self.stop_on_ponderhit = true;
-                    } else {
-                        self.control
-                            .time
-                            .as_mut()
-                            .expect("time control present")
-                            .tm
-                            .set_search_end(elapsed);
-                    }
+                    self.control
+                        .time
+                        .as_mut()
+                        .expect("time control present")
+                        .tm
+                        .set_search_end(elapsed);
                 } else {
-                    increase_depth = pondering || elapsed as f64 <= total_time * 0.503;
+                    increase_depth = elapsed as f64 <= total_time * 0.503;
                 }
             }
 
@@ -2358,7 +2194,6 @@ impl<N: NetworkParams> QSearch<N> {
         WorkerResult {
             best,
             completed_depth,
-            ponder_candidate,
             nodes: self.nodes,
             #[cfg(feature = "verbose2")]
             uci_pv_sent,
@@ -2453,7 +2288,6 @@ impl<N: NetworkParams> QSearch<N> {
                 beta = alpha;
                 alpha = (best_value - delta).max(-VALUE_INFINITE);
                 failed_high_cnt = 0;
-                self.stop_on_ponderhit = false;
             } else if best_value >= beta {
                 alpha = (beta - delta).max(alpha);
                 beta = (best_value + delta).min(VALUE_INFINITE);
@@ -2686,49 +2520,6 @@ impl<N: NetworkParams> QSearch<N> {
             pos.undo_move(m, undo);
         }
         moves
-    }
-
-    /// `RootMove::extract_ponder_from_tt`: when the final PV is a bare
-    /// bestmove, play it and look for a legal ponder move — first the child TT
-    /// entry's move, then on a miss the `ponder_candidate`.
-    ///
-    /// Public so the Lazy-SMP driver can apply it to the *chosen* worker's PV
-    /// after the thread vote.
-    pub fn extract_ponder(
-        &mut self,
-        pos: &mut Position,
-        best: &mut RootMove,
-        ponder_candidate: Option<Move>,
-    ) {
-        if best.pv.len() != 1 {
-            return;
-        }
-        let pv0 = best.pv[0];
-        if !pv0.is_ok() {
-            return;
-        }
-        let undo = pos.do_move(pv0);
-        let key = pos.key();
-        let side = pos.side_to_move().index() as u8;
-        let (found, data, _writer) = TranspositionTable::shared().probe(key, side);
-        if found {
-            // Push the child TT move only if it is playable here.
-            if let Some(m) = data.move16.and_then(|m16| pos.to_move(m16))
-                && m.is_ok()
-                && pos.pseudo_legal::<GENERATE_ALL_LEGAL_MOVES>(m)
-                && pos.is_legal(m)
-            {
-                best.pv.push(m);
-            }
-        } else if let Some(candidate) = ponder_candidate.filter(|m| m.is_ok()) {
-            // Fall back to the previous iteration's pv[1].
-            let mut legal: Vec<Move> = Vec::new();
-            pos.generate_legal_all(&mut legal);
-            if legal.contains(&candidate) {
-                best.pv.push(candidate);
-            }
-        }
-        pos.undo_move(pv0, undo);
     }
 }
 
@@ -5027,78 +4818,6 @@ mod tests {
         solo.fold_best_move_changes(&mut stot);
         assert_eq!(stot, 8.0);
         assert_eq!(solo.best_move_changes, 0.0);
-    }
-
-    // A `ponderhit` arriving between `check_time` checkpoints must be
-    // reflected by the very next budget decision, not only after the next
-    // checkpoint — hence the `sync_ponderhit` call at the budget-block entry.
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn sync_ponderhit_copies_the_stamped_instant_before_the_budget_decision() {
-        let net = zero_net();
-        let _tt = fresh_tt();
-        let start = Instant::now();
-
-        // A ponderhit has arrived (flag cleared, instant stamped) but no checkpoint
-        // has synced it yet.
-        let sig = Arc::new(PonderSignal::new(true));
-        sig.ponderhit();
-        let stamped = sig.hit_at().expect("ponderhit stamped an instant");
-
-        // Any budget at all will do — the assertions are about the rounding
-        // origin, not the times — so a plain clock stands in for the `go
-        // movetime` a build below `verbose2` cannot be given.
-        let input = crate::timeman::TimeInput {
-            time_us: 1000,
-            inc_us: 0,
-            byoyomi_us: 0,
-            #[cfg(feature = "verbose2")]
-            movetime: 0,
-            #[cfg(feature = "verbose2")]
-            rtime: 0,
-            ply: 1,
-            start_time: start,
-        };
-        let tm = TimeManagement::init(
-            &input,
-            #[cfg(feature = "verbose2")]
-            &mut crate::book::Prng::new(1),
-        );
-        assert_eq!(
-            tm.ponderhit_time, tm.start_time,
-            "unsynced: the rounding origin is still go-time"
-        );
-
-        let mut q = QSearch::new(net.network());
-        q.set_control(SearchControl {
-            stop: None,
-            ponder: Some(Arc::clone(&sig)),
-            #[cfg(feature = "verbose2")]
-            node_limit: None,
-            time: Some(TimeControl {
-                tm,
-                #[cfg(feature = "verbose2")]
-                use_time_management: true,
-                #[cfg(feature = "verbose2")]
-                movetime: None,
-                best_previous_score: VALUE_INFINITE,
-                best_previous_average_score: VALUE_INFINITE,
-                previous_time_reduction: 0.85,
-            }),
-        });
-
-        // The budget-block sync copies the stamped instant into `tm.ponderhit_time`.
-        q.sync_ponderhit();
-        let synced = q.control.time.as_ref().unwrap().tm.ponderhit_time;
-        assert_eq!(
-            synced, stamped,
-            "the sync copies the stamped ponderhit instant"
-        );
-        assert_ne!(synced, start, "the rounding origin advanced off go-time");
-
-        // Idempotent: a later `check_time` sync is a no-op.
-        q.sync_ponderhit();
-        assert_eq!(q.control.time.as_ref().unwrap().tm.ponderhit_time, stamped);
     }
 
     // Depth-1 root — the pre-search skipped exits. Both return before any

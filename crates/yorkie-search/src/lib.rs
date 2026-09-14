@@ -44,9 +44,7 @@ pub use history::{
     TtMoveHistory, apply_gravity,
 };
 pub use movepick::{MovePicker, PickerScratch};
-pub use qsearch::{
-    PonderSignal, QSearch, QSearchOutcome, SearchControl, TallySlot, TimeControl, WorkerResult,
-};
+pub use qsearch::{QSearch, QSearchOutcome, SearchControl, TallySlot, TimeControl, WorkerResult};
 // The per-game evaluation noise: only a build that carries it.
 #[cfg(feature = "random")]
 pub use qsearch::{new_game_seed, noise};

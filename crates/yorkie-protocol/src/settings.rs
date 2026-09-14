@@ -153,9 +153,9 @@ check_accessors! {
     /// Emit a PV on a fail-high / fail-low (`OutputFailLHPV`).
     #[cfg(feature = "verbose2")]
     output_fail_lh_pv => OUTPUT_FAIL_LH_PV;
-    /// Stochastic-ponder toggle (`Stochastic_Ponder`), which also decides
-    /// whether a `go ponder` rewinds the retained position by one move.
-    stochastic_ponder => STOCHASTIC_PONDER;
+    /// Keep searching after the engine's own move, until the next command
+    /// arrives (`ponder`).
+    ponder => PONDER;
 }
 
 text_accessors! {

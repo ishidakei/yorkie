@@ -6,9 +6,9 @@
 //! its handles, the placed transposition table and evaluation network, the
 //! opening book, the per-game seeds and the time-management carry-forward; it
 //! offers [`Engine::set_position`], [`Engine::go`], [`Engine::stop`],
-//! [`Engine::ponderhit`], [`Engine::new_game`] and [`Engine::ready`] as plain
-//! functions over typed arguments and typed results. Nothing here knows what a
-//! reply line looks like.
+//! [`Engine::new_game`] and [`Engine::ready`] as plain functions over typed
+//! arguments and typed results. Nothing here knows what a reply line looks
+//! like.
 //!
 //! Where the engine has something to say — a reply, an initialisation notice, a
 //! diagnostic — it says it through [`EngineSink`], a generic parameter rather
@@ -26,12 +26,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+// The only wait this engine ever does is the one that holds a `go infinite`
+// reply, and that clause arrives with `verbose2`.
+#[cfg(feature = "verbose2")]
+use std::time::Duration;
+use std::time::Instant;
 
 use yorkie_eval::{NetworkParams, NnueError, network_file};
 use yorkie_numa::{CpuIndex, NumaIndex, NumaLayout, SysfsError, mempolicy};
 use yorkie_search::{
-    BookConfig, BookHit, EnteringKingConfig, PonderSignal, Prng, QSearch, RootMove, SearchControl,
+    BookConfig, BookHit, EnteringKingConfig, Prng, QSearch, RootMove, SearchControl,
     SharedHistories, TallySlot, TimeControl, TimeInput, TimeManagement, WorkerHistories,
     WorkerResult, WorkerVote, declaration_win, generate_root_moves, probe_book, select_best_worker,
 };
@@ -109,6 +113,17 @@ const BOOK_DIAGNOSTIC_BYTES: usize = 256;
 /// Legal moves the widest shogi position offers, which is what the replay's
 /// legality buffer is built to hold (the reference's `MAX_MOVES`).
 const MAX_LEGAL_MOVES: usize = 600;
+
+/// The game ply past which the search adjudicates a draw, with the reference's
+/// `0 → unlimited` remap — the same horizon the search itself compiles in.
+///
+/// A position past it is a game end, so there is nothing to think ahead about
+/// from there.
+const DRAW_HORIZON: i32 = if config::MAX_MOVES_TO_DRAW == 0 {
+    100_000
+} else {
+    config::MAX_MOVES_TO_DRAW as i32
+};
 
 /// A position command in the form the engine replays it from: where the game
 /// starts, and the moves that reached the position it names, already parsed and
@@ -211,9 +226,6 @@ pub struct GoParams {
     pub byoyomi: Option<u64>,
     #[cfg(feature = "verbose2")]
     pub infinite: bool,
-    /// Think on the predicted position; hold the reply until the prediction is
-    /// confirmed or the search is stopped.
-    pub ponder: bool,
     /// Mate-search mode with a time budget in milliseconds, where
     /// [`MATE_UNLIMITED_MS`] stands for unlimited.
     #[cfg(feature = "verbose2")]
@@ -348,15 +360,14 @@ struct LoadedBook {
 struct ActiveSearch {
     handle: JoinHandle<SearchState>,
     stop: Arc<AtomicBool>,
-    /// The shared `go ponder` state (`Some` only for a `go ponder`). A plain
-    /// `ponderhit` clears it (`set_ponderhit(false)`), turning the pondering
-    /// search into a normal time-managed one; `None` means this was not a ponder
-    /// search, and a stray `ponderhit` falls back to a `stop`.
-    ponder: Option<Arc<PonderSignal>>,
-    /// Suppresses the coordinator's reply (and final PV) for the
-    /// Stochastic_Ponder ponderhit teardown, which stops the rewound search
-    /// without emitting anything.
-    suppress: Arc<AtomicBool>,
+    /// The stop flag of the thinking-ahead search this worker runs once it has
+    /// replied, which is a different search and so takes a flag of its own: the
+    /// one above is already set by the time the reply is out, both by the
+    /// coordinator ending its helpers and by a search that stopped itself.
+    ponder_stop: Arc<AtomicBool>,
+    /// Raised by the worker while it is thinking ahead, so the command that
+    /// ends that search knows to join the worker rather than leave it running.
+    pondering: Arc<AtomicBool>,
     /// Set by the coordinator *inside* the critical section that writes the
     /// reply, so this search counts as finished from the moment that reply is
     /// on the wire.
@@ -413,12 +424,11 @@ struct SearchState {
 struct SearchHandles {
     /// The one shared stop flag every worker polls.
     stop: Arc<AtomicBool>,
-    /// The `go ponder` state. Handed to a search only when the `go` carries
-    /// `ponder`; every other `go` leaves it behind, inert.
-    ponder: Arc<PonderSignal>,
-    /// The Stochastic_Ponder teardown flag: set to drop a rewound search's
-    /// reply.
-    suppress_reply: Arc<AtomicBool>,
+    /// The stop flag of the thinking-ahead search that follows a reply — see
+    /// [`ActiveSearch::ponder_stop`].
+    ponder_stop: Arc<AtomicBool>,
+    /// Raised while a worker is thinking ahead — see [`ActiveSearch::pondering`].
+    pondering: Arc<AtomicBool>,
     /// Raised when a search's reply reaches the output sink. Its only reader is
     /// the `verbose3` table-inspection commands' idle check.
     #[cfg(feature = "verbose3")]
@@ -438,8 +448,8 @@ impl SearchHandles {
     fn new(n_threads: usize) -> Self {
         SearchHandles {
             stop: Arc::new(AtomicBool::new(false)),
-            ponder: Arc::new(PonderSignal::new(false)),
-            suppress_reply: Arc::new(AtomicBool::new(false)),
+            ponder_stop: Arc::new(AtomicBool::new(false)),
+            pondering: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "verbose3")]
             reply_sent: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "verbose2")]
@@ -458,15 +468,11 @@ impl SearchHandles {
         self.bmc_slots = new_tally(n_threads);
     }
 
-    /// Clear every flag and zero every counter for a search about to start, and
-    /// seed the ponder state from whether this `go` is a `go ponder`.
-    ///
-    /// Returns the ponder handle to install on the search, which is `None` for
-    /// every `go` that is not pondering — the distinction a stray `ponderhit`
-    /// falls back on.
-    fn arm(&mut self, ponder_mode: bool) -> Option<Arc<PonderSignal>> {
+    /// Clear every flag and zero every counter for a search about to start.
+    fn arm(&mut self) {
         self.stop.store(false, Ordering::Relaxed);
-        self.suppress_reply.store(false, Ordering::Relaxed);
+        self.ponder_stop.store(false, Ordering::Relaxed);
+        self.pondering.store(false, Ordering::Relaxed);
         #[cfg(feature = "verbose3")]
         self.reply_sent.store(false, Ordering::Relaxed);
         #[cfg(feature = "verbose2")]
@@ -476,19 +482,6 @@ impl SearchHandles {
         for slot in self.bmc_slots.iter() {
             slot.store(0, Ordering::Relaxed);
         }
-        if !ponder_mode {
-            return None;
-        }
-        // The signal times a `ponderhit` from the `go` that started pondering,
-        // so a reused one is restarted here rather than merely re-flagged. The
-        // previous search has been joined, which leaves this handle the only
-        // one — and a signal that somehow still had a reader would be unsafe to
-        // rewind, so that case takes a fresh one.
-        match Arc::get_mut(&mut self.ponder) {
-            Some(signal) => signal.restart(true),
-            None => self.ponder = Arc::new(PonderSignal::new(true)),
-        }
-        Some(Arc::clone(&self.ponder))
     }
 }
 
@@ -535,9 +528,8 @@ impl VoteBuffers {
 /// decided here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reply {
-    /// The chosen move, and the move the engine expects the opponent to answer
-    /// with when it has one.
-    BestMove { mv: Move, ponder: Option<Move> },
+    /// The chosen move.
+    BestMove { mv: Move },
     /// The position is lost — the reference's `ResignValue` verdict, a root with
     /// no legal move, or a `go` with no network loaded.
     Resign,
@@ -780,9 +772,7 @@ pub struct Engine<P: EngineSink> {
     /// to move alternated, which flips the sign of the persisted previous scores
     /// before they seed the next search.
     last_game_ply: i32,
-    /// The last position command in parsed form (`last_position_cmd_string`),
-    /// retained so a Stochastic_Ponder `go ponder` can rewind it by one move
-    /// and a Stochastic_Ponder `ponderhit` can re-apply the real position.
+    /// The last position command in parsed form (`last_position_cmd_string`).
     last_position: RetainedPosition,
     /// Where the position command being read is assembled. A malformed line
     /// must leave both the current position and the retained command exactly as
@@ -799,9 +789,6 @@ pub struct Engine<P: EngineSink> {
     /// Both are built once, to the widest position's move count.
     legal_buf: Vec<Move>,
     pseudo_buf: Vec<ExtMove>,
-    /// The last `go` request (`last_go_cmd_string`), retained so a
-    /// Stochastic_Ponder `ponderhit` can re-issue it with `ponder` stripped.
-    last_go: Option<GoParams>,
     /// The worker thread pool: a main-worker slot plus `Threads − 1` persistent
     /// helper threads, each parked until a `go` dispatches it a job. The main
     /// worker is the per-`go` coordinator thread [`Self::go`] spawns.
@@ -912,7 +899,6 @@ impl<P: EngineSink> Engine<P> {
             scratch_pos: Position::startpos(),
             legal_buf: Vec::with_capacity(MAX_LEGAL_MOVES),
             pseudo_buf: Vec::with_capacity(MAX_LEGAL_MOVES),
-            last_go: None,
             pool,
             pool_threads: threads,
             numa_layout,
@@ -1014,7 +1000,11 @@ impl<P: EngineSink> Engine<P> {
     /// transposition table, which is what a new game's clear wants.
     pub fn finish_search_join(&mut self) {
         if let Some(active) = self.search.take() {
+            // Both flags: the worker may be searching for its reply, or thinking
+            // ahead past one it has already given, and the join below waits for
+            // whichever it is.
             active.stop.store(true, Ordering::Relaxed);
+            active.ponder_stop.store(true, Ordering::Relaxed);
             let state = active
                 .handle
                 .join()
@@ -1428,11 +1418,15 @@ impl<P: EngineSink> Engine<P> {
     /// happens in the scratch pair and the two installs are the last thing done.
     /// The refusal names what it refused, borrowed from the caller's own text,
     /// so a protocol layer can report it without copying anything.
+    ///
+    /// A worker still thinking ahead from the previous move is ended first: the
+    /// game has moved on, and the next `go` must not have to wait for it.
     pub fn set_position<'a>(
         &mut self,
         sfen: PositionSfen<'a>,
         moves: &'a [u8],
     ) -> Result<(), PositionRefusal<'a>> {
+        self.stop_pondering();
         let Self {
             pending_position: pending,
             scratch_pos: scratch,
@@ -1457,33 +1451,11 @@ impl<P: EngineSink> Engine<P> {
             pending.moves.push(parsed);
         }
         // Both installs are a swap: what they displace becomes the next
-        // command's scratch, buffers and all. The retained command
-        // (`last_position_cmd_string`) is what the Stochastic_Ponder rewind /
-        // re-issue replays.
+        // command's scratch, buffers and all, so a game's `position` commands
+        // reach the allocator only for the first of them.
         std::mem::swap(&mut self.pos, &mut self.scratch_pos);
         std::mem::swap(&mut self.last_position, &mut self.pending_position);
         Ok(())
-    }
-
-    /// Rebuild the retained `position` command's first `plies` moves and install
-    /// the result as the current position — the Stochastic_Ponder rewind and
-    /// re-issue, which reach for a position the command list already describes.
-    ///
-    /// The retained moves were verified when the command arrived, so only its
-    /// SFEN can still be refused; that leaves the current position untouched.
-    fn install_retained_position(&mut self, plies: usize) {
-        let Self {
-            last_position: retained,
-            scratch_pos: scratch,
-            ..
-        } = self;
-        if retained.start_into(scratch).is_err() {
-            return;
-        }
-        for &mv in &retained.moves[..plies] {
-            scratch.do_move(mv);
-        }
-        std::mem::swap(&mut self.pos, &mut self.scratch_pos);
     }
 
     /// Start a new game: reclaim any search, empty the table, rebuild the
@@ -1520,7 +1492,6 @@ impl<P: EngineSink> Engine<P> {
         // `last_position` default is the reference's `"position startpos"`).
         self.last_game_ply = 0;
         self.last_position.reset();
-        self.last_go = None;
         // Reset the helper workers' game-scoped histories too.
         // The reference `search_clear` clears every worker; here the helper
         // histories live in the pool threads, so recreating the pool gives them
@@ -1540,20 +1511,20 @@ impl<P: EngineSink> Engine<P> {
     /// the sink from there. [`GoOutcome::NoNetwork`] means nothing was started,
     /// and the caller owes the host the reply itself.
     pub fn go(&mut self, params: GoParams) -> GoOutcome {
+        // The clock starts when the request arrives, so it is stamped before
+        // anything this `go` does — including ending a search left thinking
+        // ahead, whose stop and join are then spent on this move's own budget
+        // rather than quietly outside it.
+        let received = Instant::now();
         // A new `go` supersedes any lingering search; reclaim its state first.
         self.finish_search_join();
 
-        // Retain this `go` for a later Stochastic_Ponder re-issue.
-        self.last_go = Some(params.clone());
+        // Whether this `go` is answered with a move and then thought past: a
+        // clocked request in a build that thinks ahead at all.
+        let ponder_after_reply = self.settings.ponder() && is_a_game_move(&params);
 
-        // Stochastic_Ponder `go ponder`: ponder one move earlier than the
-        // retained position (drop its last move); `ponderMode` stays set.
-        if params.ponder && self.settings.stochastic_ponder() {
-            self.apply_stochastic_ponder_rewind();
-        }
-
-        // The ply the search actually runs at (rewound under Stochastic_Ponder),
-        // carried so a completed real search updates `last_game_ply`.
+        // The ply the search runs at, carried so a completed real search updates
+        // `last_game_ply`.
         let game_ply = self.pos.ply() as i32;
 
         // Build the coordinator job (option-seeded limits, all per-`go`
@@ -1561,18 +1532,19 @@ impl<P: EngineSink> Engine<P> {
         // to answer.
         let Some(job) = self.prepare_coordinator_job(
             params,
+            received,
+            ponder_after_reply,
             #[cfg(feature = "verbose2")]
             false,
         ) else {
             return GoOutcome::NoNetwork;
         };
 
-        // The handles the main loop signals on `stop` / `ponderhit` / a
-        // Stochastic_Ponder teardown; cloned out of the job before it moves into
-        // the worker thread.
+        // The handles the main loop signals on; cloned out of the job before it
+        // moves into the worker thread.
         let stop_for_active = Arc::clone(&job.stop);
-        let ponder_for_active = job.ponder.as_ref().map(Arc::clone);
-        let suppress_for_active = Arc::clone(&job.suppress_reply);
+        let ponder_stop_for_active = Arc::clone(&job.ponder.stop);
+        let pondering_for_active = Arc::clone(&job.ponder.pondering);
         #[cfg(feature = "verbose3")]
         let sent_for_active = Arc::clone(&job.reply_sent);
         // The coordinator's own system node, resolved before the thread starts
@@ -1590,8 +1562,8 @@ impl<P: EngineSink> Engine<P> {
         self.search = Some(ActiveSearch {
             handle,
             stop: stop_for_active,
-            ponder: ponder_for_active,
-            suppress: suppress_for_active,
+            ponder_stop: ponder_stop_for_active,
+            pondering: pondering_for_active,
             #[cfg(feature = "verbose3")]
             reply_sent: sent_for_active,
             game_ply,
@@ -1599,28 +1571,39 @@ impl<P: EngineSink> Engine<P> {
         GoOutcome::Started
     }
 
-    /// Stochastic_Ponder `go ponder` rewind: reconstruct the retained position
-    /// with its last move dropped and install it as the search root. A
-    /// best-effort trim — an empty move list (nothing to rewind) or a rebuild
-    /// failure leaves the current position untouched.
-    fn apply_stochastic_ponder_rewind(&mut self) {
-        let plies = self.last_position.moves.len();
-        if plies == 0 {
-            return;
+    /// End the thinking-ahead search, if one is running, before the command
+    /// that arrived is handled.
+    ///
+    /// Raising the flag is what ends the search; the join is what leaves the
+    /// session idle, and is taken only once the worker has said it is thinking
+    /// ahead — during a real search this must not wait for the reply. A worker
+    /// that raises the flag just after this looked stops on the flag anyway and
+    /// is reclaimed by the next command that needs its state.
+    pub fn stop_pondering(&mut self) {
+        if let Some(active) = &self.search {
+            active.ponder_stop.store(true, Ordering::Relaxed);
+            if active.pondering.load(Ordering::Relaxed) {
+                self.finish_search_join();
+            }
         }
-        self.install_retained_position(plies - 1);
     }
 
     /// Build the [`CoordinatorJob`] for one search — the shared preamble of both
     /// `go` and `bench`.
     ///
     /// Returns `None` when no network is loaded; the caller emits the resign or
-    /// notice appropriate to its context. `disable_pv_interval` forces the
-    /// per-iteration PV interval to zero so every iteration prints, and is set
-    /// only by `bench`; there is no such interval to force below `verbose2`.
+    /// notice appropriate to its context. `received` is the instant the request
+    /// arrived, which is where its clock starts. `ponder_after_reply` asks the
+    /// coordinator to keep searching once it has replied — never for a
+    /// measurement run, which has to end when its position does.
+    /// `disable_pv_interval` forces the per-iteration PV interval to zero so
+    /// every iteration prints, and is set only by `bench`; there is no such
+    /// interval to force below `verbose2`.
     fn prepare_coordinator_job(
         &mut self,
         limits: GoParams,
+        received: Instant,
+        ponder_after_reply: bool,
         #[cfg(feature = "verbose2")] disable_pv_interval: bool,
     ) -> Option<CoordinatorJob<P>> {
         // Nothing propagates the NNUE fixed-point scale here: the reference's
@@ -1664,7 +1647,7 @@ impl<P: EngineSink> Engine<P> {
         // for those and for `go movetime`, and is `None` otherwise (fixed depth
         // / nodes / infinite / mate), where the search runs unbounded by time.
         let us = self.pos.side_to_move();
-        let now = Instant::now();
+        let now = received;
         // Every `go` a build without `verbose2` can be given is bounded by the
         // clock: the six clauses that bound a search any other way, and the two
         // config keys that seed two of them, all need that feature. Such a build
@@ -1690,11 +1673,10 @@ impl<P: EngineSink> Engine<P> {
 
         // Side-flip continuity: when the side to move alternated between the
         // last completed search and this one — an odd
-        // `last_game_ply - game_ply`, as a Stochastic_Ponder rewind / re-issue
-        // produces — negate the persisted previous scores (each unless it is
-        // the `VALUE_INFINITE` first-move sentinel) before they seed
-        // `iterValue` / `fallingEval`. On the normal same-side case the parity
-        // is even and the scores pass through unchanged.
+        // `last_game_ply - game_ply` — negate the persisted previous scores
+        // (each unless it is the `VALUE_INFINITE` first-move sentinel) before
+        // they seed `iterValue` / `fallingEval`. On the normal same-side case
+        // the parity is even and the scores pass through unchanged.
         let flip_previous = (self.last_game_ply - self.pos.ply() as i32) & 1 != 0;
         let best_prev_score = match self.best_previous_score {
             VALUE_INFINITE => VALUE_INFINITE,
@@ -1759,14 +1741,10 @@ impl<P: EngineSink> Engine<P> {
                 previous_time_reduction: self.previous_time_reduction,
             })
         };
-        // Clear the session's flags and counters for this search, and take the
-        // `go ponder` signal (`ponderMode`) it hands the main worker's control,
-        // so that it — and the coordinator's hold loop — can be driven by a
-        // later `ponderhit`. `None` on every non-ponder `go`.
-        let ponder = self.handles.arm(limits.ponder);
+        // Clear the session's flags and counters for this search.
+        self.handles.arm();
         let control = SearchControl {
             stop: Some(Arc::clone(&self.handles.stop)),
-            ponder: ponder.as_ref().map(Arc::clone),
             // A ceiling of zero nodes and a ceiling of one end the same
             // search: the first completed iteration precedes the first
             // consultation of the ceiling either way.
@@ -1865,9 +1843,8 @@ impl<P: EngineSink> Engine<P> {
         let pos = self.pos.clone();
 
         // Book state for this `go`: the loaded book (cheap `Arc` clone), the
-        // `USI_OwnBook` gate, a fresh seed, and whether a book reply must be
-        // held for `stop`/`ponderhit` (`go ponder`/`infinite`). The selection
-        // settings are [`BOOK_CONFIG`] and travel with no job.
+        // `USI_OwnBook` gate and a fresh seed. The selection settings are
+        // [`BOOK_CONFIG`] and travel with no job.
         let book = self.book.as_ref().map(Arc::clone);
         let own_book = self.settings.usi_own_book();
         self.book_seed = self
@@ -1876,19 +1853,32 @@ impl<P: EngineSink> Engine<P> {
             .wrapping_add(1);
         let book_seed = self.book_seed;
         // Whether the coordinator holds its reply (book or searched) until
-        // `stop` / `ponderhit`: `go ponder` (until the ponder flag clears) or
-        // `go infinite` (the SKIP_SEARCH wait loop). Only `verbose2` has the
-        // second of those, so below it `go ponder` is the whole rule.
+        // `stop`: `go infinite` (the SKIP_SEARCH wait loop), which is the only
+        // request that holds one and arrives with `verbose2`.
         #[cfg(feature = "verbose2")]
         let infinite = limits.infinite;
-        // The Stochastic_Ponder teardown flag: when set, the coordinator emits
-        // no reply (nor final PV) for this search. Raised alongside it, the flag
-        // saying this `go`'s reply reached the output sink; the table-inspection
-        // commands' idle check is that one's only reader, so only their feature
-        // has it. Both were cleared for this search by `arm` above.
-        let suppress_reply = Arc::clone(&self.handles.suppress_reply);
+        // The flag saying this `go`'s reply reached the output sink; the
+        // table-inspection commands' idle check is its only reader, so only
+        // their feature has it. Cleared for this search by `arm` above.
         #[cfg(feature = "verbose3")]
         let reply_sent = Arc::clone(&self.handles.reply_sent);
+
+        // What the coordinator keeps searching on once its reply is out. The
+        // handles are the session's own, cleared by `arm` above like the rest.
+        let ponder = PonderJob {
+            enabled: ponder_after_reply,
+            stop: Arc::clone(&self.handles.ponder_stop),
+            pondering: Arc::clone(&self.handles.pondering),
+            helper_slots: Arc::clone(&helper_slots),
+            helper_shared: Arc::clone(&helper_shared),
+            #[cfg(feature = "verbose2")]
+            node_slots: Arc::clone(&self.handles.node_slots),
+            bmc_slots: Arc::clone(&self.handles.bmc_slots),
+            #[cfg(feature = "random")]
+            random_seed: self.random_seed,
+            #[cfg(feature = "verbose2")]
+            multi_pv,
+        };
 
         // Precompute the entering-king thresholds from the root position,
         // mirroring the reference `set_ekr` on the root worker. The rule itself
@@ -1925,7 +1915,6 @@ impl<P: EngineSink> Engine<P> {
             ponder,
             #[cfg(feature = "verbose2")]
             infinite,
-            suppress_reply,
             #[cfg(feature = "verbose3")]
             reply_sent,
             entering_king,
@@ -1950,8 +1939,9 @@ impl<P: EngineSink> Engine<P> {
     #[cfg(feature = "verbose3")]
     pub fn bench_run_one(&mut self, params: GoParams) -> Option<u64> {
         // The measurement command is `verbose3`, so the PV interval it disables
-        // always exists.
-        let job = self.prepare_coordinator_job(params, true)?;
+        // always exists. A measurement position is answered and left: a search
+        // that outlived it would be measured into the next one.
+        let job = self.prepare_coordinator_job(params, Instant::now(), false, true)?;
         let node = self.worker_plan.system_nodes[0];
         let outcome = with_eval_network!(node, |net| run_coordinated(net, job));
         // Return the session state the job borrowed (the async path reclaims
@@ -1964,62 +1954,40 @@ impl<P: EngineSink> Engine<P> {
 
     /// Ask the running search to abort promptly, releasing a held reply.
     ///
-    /// It emits its reply and its state is reclaimed on the next command that
-    /// needs it. With no search running this is a silent no-op.
+    /// A search that has not replied yet emits its reply and its state is
+    /// reclaimed on the next command that needs it. A worker thinking ahead
+    /// stops with nothing to say and is joined here, so `stop` leaves the
+    /// session idle. With no search running this is a silent no-op.
     pub fn stop(&mut self) {
         if let Some(active) = &self.search {
             active.stop.store(true, Ordering::Relaxed);
         }
+        self.stop_pondering();
     }
+}
 
-    /// The opponent played the predicted move.
-    ///
-    /// Plain path: clear the ponder flag so the pondering search continues under
-    /// time management; a held book reply's coordinator wait loop polls the same
-    /// flag, so this releases it. Stochastic_Ponder path: tear the rewound
-    /// ponder search down without emitting, restore the real position, and
-    /// re-issue the retained `go` with `ponder` stripped — which is the one way
-    /// this can report [`GoOutcome::NoNetwork`], from the re-issue.
-    pub fn ponderhit(&mut self) -> GoOutcome {
-        let stochastic = self.settings.stochastic_ponder()
-            && self.search.as_ref().is_some_and(|a| a.ponder.is_some());
-        if stochastic {
-            return self.stochastic_ponderhit();
-        }
-
-        if let Some(active) = &self.search {
-            match &active.ponder {
-                // set_ponderhit(false): stamp the ponderhit time and clear the flag.
-                Some(p) => p.ponderhit(),
-                // Not a ponder search (a stray `ponderhit` during e.g. `go
-                // infinite`): fall back to a stop so any held reply is released.
-                None => active.stop.store(true, Ordering::Relaxed),
-            }
-        }
-        GoOutcome::Started
-    }
-
-    /// Stochastic_Ponder `ponderhit`: suppress the rewound ponder search's
-    /// output, stop and join it, re-apply the real current position, and
-    /// re-issue the retained `go` without its `ponder` token — a normal timed
-    /// search of which exactly one reply reaches the host.
-    fn stochastic_ponderhit(&mut self) -> GoOutcome {
-        // Suppress the rewound search's reply before stopping it.
-        if let Some(active) = &self.search {
-            active.suppress.store(true, Ordering::Relaxed);
-        }
-        self.finish_search_join();
-
-        // Re-apply the real (current) position.
-        self.install_retained_position(self.last_position.moves.len());
-
-        // Re-issue the retained `go` with `ponder` stripped.
-        if let Some(mut go) = self.last_go.clone() {
-            go.ponder = false;
-            return self.go(go);
-        }
-        GoOutcome::Started
-    }
+/// Whether `params` asks for a move in a game rather than an analysis: it names
+/// a clock, and no clause that bounds the search by something else.
+///
+/// The distinction is what decides whether the engine keeps searching once it
+/// has answered — the opponent's clock is only running after a real move.
+fn is_a_game_move(params: &GoParams) -> bool {
+    let clocked = params.btime.is_some()
+        || params.wtime.is_some()
+        || params.byoyomi.is_some()
+        || params.binc.is_some()
+        || params.winc.is_some();
+    // The clauses that bound a search by something other than the clock all
+    // arrive with `verbose2`; without it a `go` naming a clock is a game move
+    // and there is nothing further to ask.
+    #[cfg(feature = "verbose2")]
+    let clocked = clocked
+        && params.depth.is_none()
+        && params.nodes.is_none()
+        && params.mate.is_none()
+        && params.movetime.is_none()
+        && !params.infinite;
+    clocked
 }
 
 /// The two book extensions the reference's name resolution knows about.
@@ -2134,63 +2102,43 @@ fn resolve_book_filename_with_ybb_fallback(requested: &Path) -> PathBuf {
     requested.to_path_buf()
 }
 
-/// The SKIP_SEARCH hold condition, shared by the book-hit and the searched
-/// reply: a `go ponder` holds until its flag clears, a `go infinite` until
-/// `stop`. `go infinite` arrives with `verbose2`, so without that feature the
-/// ponder flag is the whole condition.
-fn reply_is_held(
-    ponder: Option<&Arc<PonderSignal>>,
-    #[cfg(feature = "verbose2")] infinite: bool,
-) -> bool {
-    let held = ponder.is_some_and(|p| p.is_active());
-    #[cfg(feature = "verbose2")]
-    let held = held || infinite;
-    held
+/// The SKIP_SEARCH hold, shared by the book-hit and the searched reply: a `go
+/// infinite` withholds its reply until `stop`, reusing the async-stop machinery
+/// rather than busy-waiting.
+///
+/// `go infinite` is the only request that holds a reply and it arrives with
+/// `verbose2`, so a build without that feature never waits here at all.
+#[cfg(feature = "verbose2")]
+fn hold_reply(stop: &AtomicBool, infinite: bool) {
+    while infinite && !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// Answer a book hit the way the reference does on `search_skipped`: the
-/// surviving candidates first, then — after the ponder/infinite hold — the
+/// surviving candidates first, then — after the `go infinite` hold — the
 /// terminal reply.
 ///
-/// Under `go ponder` / `go infinite` the reply is held until `stop` or a
-/// `ponderhit`, reusing the async-stop machinery rather than busy-waiting.
 /// `time_ms` is stamped once, when the book answered, so the hold does not
 /// inflate the elapsed time attributed to the reply.
 ///
-/// The candidate report is `verbose2`; the hold and the reply are not, so a
-/// default build answers a book hit with the move and nothing else.
-#[allow(clippy::too_many_arguments)]
+/// The candidate report is `verbose2`; the reply is not, so a default build
+/// answers a book hit with the move and nothing else.
 fn emit_book_hit<P: EngineSink>(
     sink: &P,
     hit: &BookHit,
     #[cfg(feature = "verbose2")] hashfull: u32,
     #[cfg(feature = "verbose2")] time_ms: u64,
-    ponder: Option<&Arc<PonderSignal>>,
     #[cfg(feature = "verbose2")] infinite: bool,
-    stop: &AtomicBool,
-    suppress_reply: &AtomicBool,
+    #[cfg(feature = "verbose2")] stop: &AtomicBool,
     #[cfg(feature = "verbose3")] sent: &AtomicBool,
 ) {
     // Reported immediately, like the reference's in-probe isRoot block.
     #[cfg(feature = "verbose2")]
     sink.book_candidates(hit, hashfull, time_ms);
 
-    // `go ponder` / `go infinite`: hold the reply until `stop`, or until a
-    // `ponderhit` clears the ponder flag (the SKIP_SEARCH wait loop).
-    while !stop.load(Ordering::Relaxed)
-        && reply_is_held(
-            ponder,
-            #[cfg(feature = "verbose2")]
-            infinite,
-        )
-    {
-        std::thread::sleep(Duration::from_millis(1));
-    }
-
-    // A Stochastic_Ponder teardown suppresses all output for this reply.
-    if suppress_reply.load(Ordering::Relaxed) {
-        return;
-    }
+    #[cfg(feature = "verbose2")]
+    hold_reply(stop, infinite);
 
     sink.book_reply(
         hit,
@@ -2360,9 +2308,6 @@ fn helper_loop<N: NetworkParams>(net: N, slot: Arc<HelperSlot>) {
             let mut qs = QSearch::with_histories(net, histories_in);
             qs.set_control(SearchControl {
                 stop: Some(Arc::clone(&job.stop)),
-                // Helpers never run `check_time` (only the main worker ponders), so
-                // they need no ponder signal — they stop when the coordinator does.
-                ponder: None,
                 #[cfg(feature = "verbose2")]
                 node_limit: None,
                 time: None,
@@ -2763,6 +2708,149 @@ fn write_thread_allocation_information(
     write_cpu_list(&plan.distinct_cpus(), out);
 }
 
+/// Thinking ahead: what the coordinator searches once it has answered, and the
+/// handles that search runs under.
+///
+/// The engine plays a move and the opponent's clock starts; the position that
+/// move reaches is the one position certain to matter next, so the same workers
+/// keep searching it — with no limit — until the next command arrives. Nothing
+/// comes out of that search: what it leaves behind is a warm transposition
+/// table and warm history tables, which is what the next `go` starts from.
+struct PonderJob {
+    /// Whether this `go` is thought past at all: the `ponder` setting, and a
+    /// request that was a move in a game ([`is_a_game_move`]).
+    enabled: bool,
+    /// The stop flag this search runs under — see [`ActiveSearch::ponder_stop`].
+    stop: Arc<AtomicBool>,
+    /// Raised while this search runs — see [`ActiveSearch::pondering`].
+    pondering: Arc<AtomicBool>,
+    /// The helper slots, dispatched to again for this search.
+    helper_slots: Arc<Vec<Arc<HelperSlot>>>,
+    /// Each helper's node-shared tables, aligned with `helper_slots`.
+    helper_shared: Arc<Vec<Arc<SharedHistories>>>,
+    /// The per-worker node counters, published to as in any other search. What
+    /// they hold has already been read by the reply this search follows.
+    #[cfg(feature = "verbose2")]
+    node_slots: Arc<Vec<TallySlot>>,
+    /// The per-worker best-move-change counters.
+    bmc_slots: Arc<Vec<TallySlot>>,
+    /// The game's evaluation-noise seed, the same one the reply was searched
+    /// under.
+    #[cfg(feature = "random")]
+    random_seed: u64,
+    /// The `MultiPV` value the engine's own searches run at: this is the same
+    /// search a `go` gets, aimed at a position one ply further on.
+    #[cfg(feature = "verbose2")]
+    multi_pv: usize,
+}
+
+impl PonderJob {
+    /// Search on from `pos` with `played` applied, until the stop flag is
+    /// raised or the search ends by itself, and hand the histories back.
+    ///
+    /// Nothing is emitted here but the two `verbose1` markers: this search has
+    /// no reply to give, and a `bestmove` out of it would be a second answer to
+    /// a question the host already had answered.
+    fn run<P: EngineSink, N: NetworkParams>(
+        self,
+        net: N,
+        histories: WorkerHistories,
+        sink: &P,
+        pos: &Position,
+        played: Move,
+    ) -> WorkerHistories {
+        // The sink is here for those markers alone, so a build that prints
+        // neither touches it at all.
+        #[cfg(not(feature = "verbose1"))]
+        let _ = sink;
+        if !self.enabled || !played.is_ok() {
+            return histories;
+        }
+        // The command that ends this search may have arrived while the reply
+        // was being written, in which case there is nothing to start.
+        if self.stop.load(Ordering::Relaxed) {
+            return histories;
+        }
+        let mut root = pos.clone();
+        root.do_move(played);
+        // A position the engine reads as a game end has nothing to think about:
+        // no legal reply to the move just played, or past the draw horizon.
+        if root.ply() as i32 > DRAW_HORIZON {
+            return histories;
+        }
+        let root_moves = generate_root_moves(&root);
+        if root_moves.is_empty() {
+            return histories;
+        }
+
+        self.pondering.store(true, Ordering::Relaxed);
+        #[cfg(feature = "verbose1")]
+        sink.diagnostic(b"ponder start");
+        // The generation is advanced exactly as it is for a `go`: this is a
+        // search of its own, and what it stores belongs to it.
+        TranspositionTable::shared().new_search();
+        let entering_king = EnteringKingConfig::new(&root);
+
+        for (h, slot) in self.helper_slots.iter().enumerate() {
+            slot.assign(HelperJob {
+                pos: root.clone(),
+                root_moves: root_moves.clone(),
+                #[cfg(feature = "verbose2")]
+                limit_depth: SEARCH_MAX_DEPTH,
+                stop: Arc::clone(&self.stop),
+                #[cfg(feature = "verbose2")]
+                node_slots: Arc::clone(&self.node_slots),
+                bmc_slots: Arc::clone(&self.bmc_slots),
+                index: h + 1,
+                entering_king,
+                #[cfg(feature = "verbose2")]
+                mate_mode: false,
+                #[cfg(feature = "random")]
+                random_seed: self.random_seed,
+                #[cfg(feature = "verbose2")]
+                multi_pv: self.multi_pv,
+                shared: Arc::clone(&self.helper_shared[h]),
+            });
+        }
+
+        let mut qs = QSearch::with_histories(net, histories);
+        // No clock and no ceiling: the stop flag is the whole of this search's
+        // control, exactly as `go infinite` is.
+        qs.set_control(SearchControl {
+            stop: Some(Arc::clone(&self.stop)),
+            #[cfg(feature = "verbose2")]
+            node_limit: None,
+            time: None,
+        });
+        #[cfg(feature = "verbose2")]
+        qs.set_node_tally(Arc::clone(&self.node_slots), 0);
+        qs.set_best_move_tally(Arc::clone(&self.bmc_slots), 0);
+        qs.set_entering_king(entering_king);
+        #[cfg(feature = "verbose2")]
+        qs.set_mate_mode(false);
+        #[cfg(feature = "random")]
+        qs.set_random(RANDOM_AMPLITUDE, self.random_seed);
+        #[cfg(feature = "verbose2")]
+        qs.set_multi_pv(self.multi_pv);
+        // No PV sink: the main worker of this search prints nothing either.
+        qs.run_worker(&root, root_moves, SEARCH_MAX_DEPTH);
+
+        // Whatever ended this search ends the helpers with it, and each is
+        // collected before the thread returns — a slot left holding a result
+        // belongs to no search.
+        self.stop.store(true, Ordering::Relaxed);
+        for slot in self.helper_slots.iter() {
+            slot.collect();
+        }
+        // The marker goes out before the flag is lowered, so a session that
+        // reads "no longer thinking ahead" has already been told it stopped.
+        #[cfg(feature = "verbose1")]
+        sink.diagnostic(b"ponder stop");
+        self.pondering.store(false, Ordering::Relaxed);
+        qs.into_histories()
+    }
+}
+
 /// The bundle [`Engine::go`] hands its coordinator thread — grouped
 /// into one struct so [`run_coordinated`] stays a single-argument call.
 struct CoordinatorJob<P: EngineSink> {
@@ -2815,22 +2903,17 @@ struct CoordinatorJob<P: EngineSink> {
     own_book: bool,
     /// The seed for this `go`'s book PRNG (deterministic within a session).
     book_seed: u64,
-    /// The shared `go ponder` signal (`Some` only for a `go ponder`): the
-    /// coordinator's hold loop runs while it is active, and the reply is withheld
-    /// until a ponderhit clears it (or the stop flag fires).
-    ponder: Option<Arc<PonderSignal>>,
+    /// What this coordinator keeps searching on once its reply is out.
+    ponder: PonderJob,
     /// `limits.infinite` — hold the reply until `stop` regardless of the clock
     /// (the SKIP_SEARCH wait loop). Only a `verbose2` build can parse the
     /// clause that sets it.
     #[cfg(feature = "verbose2")]
     infinite: bool,
-    /// The Stochastic_Ponder teardown flag: when set the coordinator emits no
-    /// reply (nor final PV) for this search.
-    suppress_reply: Arc<AtomicBool>,
     /// Stamped `true` in the same output-lock critical section that writes this
     /// search's reply, so the engine can tell "reply is out" from "thread
-    /// has exited" (see [`ActiveSearch::reply_sent`]). A suppressed reply
-    /// never sets it — nothing went out. `verbose3`, like the reader.
+    /// has exited" (see [`ActiveSearch::reply_sent`]). `verbose3`, like the
+    /// reader.
     #[cfg(feature = "verbose3")]
     reply_sent: Arc<AtomicBool>,
     /// The entering-king declaration thresholds snapshot for this `go`.
@@ -2914,7 +2997,6 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
         ponder,
         #[cfg(feature = "verbose2")]
         infinite,
-        suppress_reply,
         #[cfg(feature = "verbose3")]
         reply_sent,
         entering_king,
@@ -2969,12 +3051,13 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     // Rule-aware declaration shortcut. Point / `None` rules yield
     // `Move::win()` (emitted as the bare `win` token); `TryRule`
     // yields the actual king move onto the try square, which must be emitted
-    // verbatim so the host plays it.
+    // verbatim so the host plays it. Either way the game is decided by the
+    // reply, so nothing is thought past it.
     if let Some(mv) = declaration_win(&pos, &entering_king) {
         let declared = if mv == Move::win() {
             Reply::Win
         } else {
-            Reply::BestMove { mv, ponder: None }
+            Reply::BestMove { mv }
         };
         sink.reply(
             declared,
@@ -2993,8 +3076,7 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     // Opening-book probe — once, on the coordinator, BEFORE any helper starts
     // (the on-the-fly read path is not thread-safe by design). The
     // `USI_OwnBook` gate and a loaded book are both required. On a hit we emit
-    // and return without searching, holding the reply for `go ponder` /
-    // `go infinite`.
+    // and return without searching, holding the reply for `go infinite`.
     if own_book && let Some(loaded) = &book {
         let mut prng = Prng::new(book_seed);
         let probed = probe_book(
@@ -3028,14 +3110,16 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
                 TranspositionTable::shared().hashfull(0),
                 #[cfg(feature = "verbose2")]
                 book_time_ms,
-                ponder.as_ref(),
                 #[cfg(feature = "verbose2")]
                 infinite,
+                #[cfg(feature = "verbose2")]
                 &stop,
-                &suppress_reply,
                 #[cfg(feature = "verbose3")]
                 &reply_sent,
             );
+            // A book move is thought past like any other: the opponent's reply
+            // may leave the book, and a warm table costs nothing.
+            let histories = ponder.run(net, histories, &sink, &pos, hit.best);
             return CoordinatedOutcome {
                 histories,
                 vote_buffers,
@@ -3095,21 +3179,11 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     let depth = SEARCH_MAX_DEPTH;
     let main_result = qs.run_worker(&pos, root_moves, depth);
 
-    // Ponder / infinite hold (the SKIP_SEARCH wait loop): do not emit
-    // the reply while still pondering or under `go infinite`. A plain
-    // `ponderhit` clears the ponder flag mid-search, so the main worker usually
-    // returns already un-pondering; this catches the case where the search
-    // finished (mate found / depth ceiling) while a `ponderhit` had not yet
-    // arrived.
-    while !stop.load(Ordering::Relaxed)
-        && reply_is_held(
-            ponder.as_ref(),
-            #[cfg(feature = "verbose2")]
-            infinite,
-        )
-    {
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    // The `go infinite` hold (the SKIP_SEARCH wait loop): the reply waits for
+    // `stop`, which catches the search that ended by itself — a mate found, the
+    // depth ceiling reached — before one arrived.
+    #[cfg(feature = "verbose2")]
+    hold_reply(&stop, infinite);
 
     // Signal the helpers the search is over, then wait for and collect each one.
     // They observe the shared stop at their next checkpoint and finish promptly.
@@ -3152,8 +3226,7 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
         select_best_worker(&votes)
     };
     let chosen_result = &results[chosen];
-    let mut best = chosen_result.best.clone();
-    let ponder_candidate = chosen_result.ponder_candidate;
+    let best = chosen_result.best.clone();
     // The chosen worker's MultiPV lines and completed depth feed the final `info`
     // PV block and nothing else, so a default build neither clones nor keeps
     // them.
@@ -3170,14 +3243,6 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     let out_best_previous_score = chosen_result.best.score;
     let out_best_previous_average_score = chosen_result.best.average_score;
     let out_previous_time_reduction = results[0].time_reduction;
-
-    // Ponder-extend the CHOSEN worker's length-1 PV via the shared TT.
-    #[cfg(feature = "verbose2")]
-    let ponder_before = best.pv.len();
-    let mut work = pos.clone();
-    qs.extract_ponder(&mut work, &mut best, ponder_candidate);
-    #[cfg(feature = "verbose2")]
-    let ponder_extended = best.pv.len() != ponder_before;
 
     // `ResignValue` is decided *before* the final PV output, because a
     // resign-by-value forces that PV out so the GUI can see the score behind the
@@ -3202,12 +3267,11 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     #[cfg(feature = "verbose2")]
     {
         // `uciPvSent` is the main worker's flag; it is cleared when the chosen
-        // PV was ponder-extended, or when the chosen worker is not the main one
-        // and so never emitted its PV.
-        let uci_pv_sent = results[0].uci_pv_sent && !ponder_extended && chosen == 0;
+        // worker is not the main one and so never emitted its PV.
+        let uci_pv_sent = results[0].uci_pv_sent && chosen == 0;
         if !uci_pv_sent || resign_by_value {
-            // Reflect the (possibly ponder-extended) chosen line back into line 0
-            // so this re-emits the exact PV the reply will play.
+            // Reflect the chosen line back into line 0 so this re-emits the exact
+            // PV the reply will play.
             if let Some(line0) = pv_lines.get_mut(0) {
                 *line0 = best.clone();
             }
@@ -3217,35 +3281,32 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
         }
     }
 
-    // The reply — the ponder move is the chosen line's second PV move.
     // Resigning replaces the whole reply (the reference makes the search look
-    // skipped and stacks `Move::resign()`), so it carries no ponder move.
+    // skipped and stacks `Move::resign()`).
     let reply = if resign_by_value {
         Reply::Resign
     } else {
-        Reply::BestMove {
-            mv: best.mv,
-            ponder: (best.pv.len() >= 2).then(|| best.pv[1]),
-        }
+        Reply::BestMove { mv: best.mv }
     };
 
-    // A Stochastic_Ponder teardown stops the rewound search without emitting
-    // its reply; the fresh re-issued `go` produces the single reply the
-    // GUI sees. The `time_state` below is still returned so the rewound
-    // search's score / ply seed the re-issue's side-flip continuity.
-    if !suppress_reply.load(Ordering::Relaxed) {
-        sink.reply(
-            reply,
-            #[cfg(feature = "verbose3")]
-            &reply_sent,
-        );
-    }
+    sink.reply(
+        reply,
+        #[cfg(feature = "verbose3")]
+        &reply_sent,
+    );
 
     // Consume the search (ending the `&tt` / `&net` borrows) and reclaim the main
-    // worker's histories for the engine, paired with the aggregate node total for
-    // the `bench` accumulation and the time-management carry-forward.
+    // worker's histories, which the thinking-ahead search below searches on with
+    // — the reply is out and flushed, so nothing it does delays the host.
+    // Resigning ends the game, so only a played move is thought past.
+    let histories = qs.into_histories();
+    let histories = match reply {
+        Reply::BestMove { mv } => ponder.run(net, histories, &sink, &pos, mv),
+        Reply::Resign | Reply::Win => histories,
+    };
+
     CoordinatedOutcome {
-        histories: qs.into_histories(),
+        histories,
         vote_buffers: VoteBuffers { results, votes },
         #[cfg(feature = "verbose3")]
         nodes: total_nodes,
@@ -3273,8 +3334,8 @@ mod tests {
     }
 
     /// What a refused command must leave behind, read off the engine itself: the
-    /// position of the last accepted one, and that command still retained for
-    /// the Stochastic_Ponder paths that replay it.
+    /// position of the last accepted one, and that command still retained in the
+    /// buffers the next one is replayed into.
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_refused_position_leaves_the_accepted_one_in_place() {
@@ -3519,18 +3580,17 @@ mod tests {
         let stop = Arc::clone(&handles.stop);
         let bmc = Arc::clone(&handles.bmc_slots);
         handles.stop.store(true, Ordering::Relaxed);
-        handles.suppress_reply.store(true, Ordering::Relaxed);
+        handles.ponder_stop.store(true, Ordering::Relaxed);
+        handles.pondering.store(true, Ordering::Relaxed);
         handles.bmc_slots[2].store(9, Ordering::Relaxed);
         #[cfg(feature = "verbose2")]
         handles.node_slots[1].store(9, Ordering::Relaxed);
 
-        assert!(
-            handles.arm(false).is_none(),
-            "no ponder signal for a plain go"
-        );
+        handles.arm();
 
         assert!(!handles.stop.load(Ordering::Relaxed));
-        assert!(!handles.suppress_reply.load(Ordering::Relaxed));
+        assert!(!handles.ponder_stop.load(Ordering::Relaxed));
+        assert!(!handles.pondering.load(Ordering::Relaxed));
         assert!(
             handles
                 .bmc_slots
@@ -3549,22 +3609,6 @@ mod tests {
         assert!(
             Arc::ptr_eq(&stop, &handles.stop) && Arc::ptr_eq(&bmc, &handles.bmc_slots),
             "the flags and counters are cleared in place, not rebuilt"
-        );
-    }
-
-    #[test]
-    fn each_ponder_go_starts_from_an_unhit_signal() {
-        let mut handles = SearchHandles::new(1);
-        let first = handles.arm(true).expect("a `go ponder` carries the signal");
-        assert!(first.is_active());
-        first.ponderhit();
-        assert!(!first.is_active());
-        drop(first);
-
-        let second = handles.arm(true).expect("a `go ponder` carries the signal");
-        assert!(
-            second.is_active(),
-            "the next ponder search starts pondering rather than inheriting a hit"
         );
     }
 
@@ -3743,8 +3787,8 @@ mod tests {
         engine.search = Some(ActiveSearch {
             handle,
             stop: Arc::new(AtomicBool::new(false)),
-            ponder: None,
-            suppress: Arc::new(AtomicBool::new(false)),
+            ponder_stop: Arc::new(AtomicBool::new(false)),
+            pondering: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "verbose3")]
             reply_sent: Arc::new(AtomicBool::new(true)),
             game_ply: 20,
@@ -3779,8 +3823,8 @@ mod tests {
         engine.search = Some(ActiveSearch {
             handle,
             stop: Arc::new(AtomicBool::new(false)),
-            ponder: None,
-            suppress: Arc::new(AtomicBool::new(false)),
+            ponder_stop: Arc::new(AtomicBool::new(false)),
+            pondering: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "verbose3")]
             reply_sent: Arc::new(AtomicBool::new(true)),
             game_ply: 3,

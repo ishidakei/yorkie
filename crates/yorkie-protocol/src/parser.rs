@@ -22,7 +22,7 @@ use yorkie_state::text::{atoi_u64, split_token, trim_ascii_whitespace};
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
 
 /// The `go` clauses that arrive with `verbose2`: everything here is analysis
-/// or tooling, not the clock clauses and `ponder` a game bridge sends.
+/// or tooling, not the clock clauses a game bridge sends.
 ///
 /// Without that feature these tokens are **rejected**, not ignored: silently
 /// dropping the clause would turn `go depth 4` into an unbounded, clock-less
@@ -68,10 +68,11 @@ pub enum Command<'a> {
     Stop,
     /// `gameover [win|lose|draw]` — the game ended. The optional result token
     /// is ignored; the command is treated exactly like `stop`: over a shogi
-    /// GUI, an opponent resign during `go ponder` arrives as `gameover` without
-    /// a preceding `stop`, so it must release a held reply.
+    /// GUI, an opponent resign arrives as `gameover` without a preceding
+    /// `stop`, so it must end whatever is running.
     GameOver,
-    /// `ponderhit` — the opponent played the pondered move; commit the search.
+    /// `ponderhit` — a GUI telling the engine its predicted move was played.
+    /// Nothing here predicts one, so the command selects nothing.
     PonderHit,
     /// `bench [ttSizeMB] [threads] [limit] [default|current|<fenFile>]
     /// [limitType]` — the reproducible NPS benchmark. The raw trailing tokens
@@ -209,8 +210,12 @@ fn parse_go<'a>(line: &'a [u8], args: &'a [u8]) -> Command<'a> {
                 limits.infinite = true;
                 rest = after_key;
             }
+            // `go ponder`: the engine does not wait to be told when to think
+            // ahead — it starts on its own once it has answered — so there is
+            // nothing for the token to select. The specification has an engine
+            // ignore a token it does not act on and read the rest of the line,
+            // which is what dropping it here does.
             b"ponder" => {
-                limits.ponder = true;
                 rest = after_key;
             }
             // `go mate [ms|infinite]`: the token after `mate` is a millisecond
@@ -675,25 +680,23 @@ mod tests {
         assert_eq!(parse_line(b"ponderhit\n"), Command::PonderHit);
     }
 
+    /// The `ponder` token selects nothing, so a `go` carrying it parses into
+    /// exactly the `go` that does not.
     #[test]
-    fn parses_go_ponder() {
+    fn a_go_ponder_parses_as_the_plain_go() {
+        assert_eq!(parse_line(b"go ponder"), Command::Go(GoParams::default()));
         let expected = GoParams {
-            ponder: true,
-            ..Default::default()
-        };
-        assert_eq!(parse_line(b"go ponder"), Command::Go(expected));
-    }
-
-    #[test]
-    fn parses_go_ponder_with_time() {
-        let expected = GoParams {
-            ponder: true,
             btime: Some(1000),
             wtime: Some(1000),
             ..Default::default()
         };
         assert_eq!(
             parse_line(b"go ponder btime 1000 wtime 1000"),
+            Command::Go(expected.clone())
+        );
+        // And in either order: the token is dropped wherever it stands.
+        assert_eq!(
+            parse_line(b"go btime 1000 ponder wtime 1000"),
             Command::Go(expected)
         );
     }
@@ -790,19 +793,18 @@ mod tests {
         assert_eq!(parse_line(b"go"), Command::Go(GoParams::default()));
         assert_eq!(
             parse_line(b"go btime 60000 wtime 60000 binc 1000 winc 1000 byoyomi 5000"),
+            // Every field this build has, so there is nothing left to default.
             Command::Go(GoParams {
                 btime: Some(60000),
                 wtime: Some(60000),
                 binc: Some(1000),
                 winc: Some(1000),
                 byoyomi: Some(5000),
-                ..Default::default()
             })
         );
         assert_eq!(
             parse_line(b"go ponder btime 1000 wtime 1000"),
             Command::Go(GoParams {
-                ponder: true,
                 btime: Some(1000),
                 wtime: Some(1000),
                 ..Default::default()

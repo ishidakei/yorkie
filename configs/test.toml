@@ -43,8 +43,12 @@ cpu_assignment = "0"
 # playing on it.
 cpu_ledger = ""
 numa_nodes = "auto"
-usi_ponder = false
-stochastic_ponder = false
+# TEST VALUE: the play config says `true`. A test drives one search at a time
+# and reads the transcript it produced; a search that outlives its `bestmove`
+# would take CPU from the next test and warm the table the next one measures.
+# The ponder search has session tests of its own, which drive a build of this
+# config's sibling that turns it on.
+ponder = false
 
 # ---------------------------------------------------------------------------
 # Opening book
