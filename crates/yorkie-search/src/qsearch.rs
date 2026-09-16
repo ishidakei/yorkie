@@ -17,7 +17,7 @@
 //! replacement selection against a cluster a child has since churned, and could
 //! pick a different slot.
 
-use std::num::{NonZeroU16, NonZeroU32};
+use std::num::{NonZeroI32, NonZeroU16, NonZeroU32};
 // The node ceiling and the PV-output interval: both are `verbose2`, so a build
 // without that feature names neither type.
 #[cfg(feature = "verbose2")]
@@ -77,14 +77,29 @@ const DEPTH_UNSEARCHED: i32 = -2;
 const FUTILITY_MARGIN: Value = 328;
 /// SEE cutoff for a capture with no futility exemption.
 const SEE_CAPTURE_MARGIN: i32 = -73;
-/// The `MaxMovesToDraw` horizon this binary plays under: the game ply past
-/// which every interior / qsearch node adjudicates an unconditional draw. A
-/// configured `0` means unlimited, which the reference rewrites to `100000`.
-const MAX_MOVES_TO_DRAW: i32 = if crate::config::MAX_MOVES_TO_DRAW == 0 {
-    100_000
-} else {
-    crate::config::MAX_MOVES_TO_DRAW as i32
-};
+/// The `MaxMovesToDraw` limit this binary plays under, when one is configured:
+/// the game ply past which every interior / qsearch node adjudicates an
+/// unconditional draw. A configured `0` means unlimited and compiles to `None`.
+///
+/// The reference expresses "unlimited" as a ply count no game reaches
+/// (`100000`) and compares against it like any other limit. That compare is
+/// unreachable but not removable: the game ply is a run-time value, so every
+/// node pays for a test whose answer the setting already fixed. `None` fixes it
+/// where the compiler can see it — see [`is_past_move_limit`].
+const MOVE_LIMIT: Option<NonZeroI32> = NonZeroI32::new(crate::config::MAX_MOVES_TO_DRAW as i32);
+
+/// Whether `game_ply` is past the configured [`MOVE_LIMIT`], so that the node
+/// holding that position is an unconditional draw.
+///
+/// With no limit configured this is a constant `false`, and the draw clauses
+/// calling it fold away to the search's own `MAX_PLY` horizon.
+#[inline(always)]
+const fn is_past_move_limit(game_ply: u16) -> bool {
+    match MOVE_LIMIT {
+        Some(limit) => game_ply as i32 > limit.get(),
+        None => false,
+    }
+}
 
 /// Entries in the `reductions[]` table — `1..600` are filled, `[0]` is 0.
 const REDUCTIONS_LEN: usize = 600;
@@ -1489,7 +1504,7 @@ impl<N: NetworkParams> QSearch<N> {
             }
         }
         // The reference's `depth <= -16 → draw` measure is `#if 0`: not ported.
-        if ply >= MAX_PLY || pos.ply() as i32 > MAX_MOVES_TO_DRAW {
+        if ply >= MAX_PLY || is_past_move_limit(pos.ply()) {
             // The move limit is a rule of the tournament and could be set
             // differently; the `MAX_PLY` search horizon is not, so only the
             // first marks the value it produces.
@@ -2823,7 +2838,7 @@ impl<N: NetworkParams> QSearch<N> {
             // The reference folds `threads.stop` into this return: an
             // aborted non-root node yields the draw score without touching the
             // TT.
-            if self.stopped || ply >= MAX_PLY || pos.ply() as i32 > MAX_MOVES_TO_DRAW {
+            if self.stopped || ply >= MAX_PLY || is_past_move_limit(pos.ply()) {
                 // The move limit is a rule of the tournament and could be set
                 // differently; neither an abort nor the `MAX_PLY` search
                 // horizon is, so only the first marks the value it produces.
@@ -4757,15 +4772,15 @@ mod tests {
                 "the search's own ply horizon is not a rule of the game"
             );
 
-            // The move-limit draw. `max_moves_to_draw = 0` means unlimited,
-            // which the reference spells as a ply count no game reaches, so
-            // there this branch is unreachable and the node is an ordinary one.
-            const GAME_PLY: i32 = 60;
+            // The move-limit draw. `max_moves_to_draw = 0` means unlimited, and
+            // then no game ply reaches a limit at all: this branch is compiled
+            // out and the node is an ordinary one.
+            const GAME_PLY: u16 = 60;
             let mut past = pos("4k4/9/9/9/9/9/9/9/4K4 b - 60");
             q.root_us = past.side_to_move();
             q.nodes = 0;
             q.qsearch_at(&mut past, 0, -1, 0);
-            if GAME_PLY > MAX_MOVES_TO_DRAW {
+            if is_past_move_limit(GAME_PLY) {
                 assert_eq!(
                     q.marks,
                     ValueMarks {
@@ -5025,34 +5040,41 @@ mod tests {
         assert_eq!(out.nodes, 0);
     }
 
-    // MaxMovesToDraw horizon — the compiled setting, with the reference's
-    // `0 → 100000` remap applied. The fixtures below sit at a game ply the
-    // horizon may or may not be under, so each asserts the behaviour of its own
-    // side of it.
+    // MaxMovesToDraw — the compiled setting. The fixtures below sit at a game
+    // ply the configured limit may or may not be under, so each asserts the
+    // behaviour of its own side of it.
 
     #[test]
-    fn an_unlimited_horizon_is_the_references_sentinel() {
-        // `0` means unlimited, which the reference expresses as a ply count no
-        // game reaches rather than as a true infinity.
+    fn an_unlimited_setting_leaves_no_limit_to_reach() {
         if crate::config::MAX_MOVES_TO_DRAW == 0 {
-            assert_eq!(MAX_MOVES_TO_DRAW, 100_000);
+            assert_eq!(MOVE_LIMIT, None);
+            // No ply a position can carry is adjudicated a draw by a limit,
+            // including the widest one the counter can hold.
+            assert!(!is_past_move_limit(0));
+            assert!(!is_past_move_limit(u16::MAX));
         } else {
-            assert_eq!(
-                i64::from(MAX_MOVES_TO_DRAW),
-                crate::config::MAX_MOVES_TO_DRAW
-            );
+            let limit = MOVE_LIMIT
+                .expect("a non-zero setting configures a limit")
+                .get();
+            assert_eq!(i64::from(limit), crate::config::MAX_MOVES_TO_DRAW);
+            // The limit is the last ply still played; the one past it draws.
+            // A limit a `u16` ply counter cannot reach has no such pair.
+            if let Some(past) = u16::try_from(limit).ok().and_then(|l| l.checked_add(1)) {
+                assert!(!is_past_move_limit(past - 1));
+                assert!(is_past_move_limit(past));
+            }
         }
     }
 
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn qsearch_adjudicates_a_draw_past_the_horizon() {
-        // Startpos at game ply 60, Black to move. Past the horizon the ply-0
+    fn qsearch_adjudicates_a_draw_past_the_move_limit() {
+        // Startpos at game ply 60, Black to move. Past the limit the ply-0
         // qsearch node adjudicates an unconditional draw before any eval or
         // `do_move`, worth `draw contempt + value_draw(0)`; below it the node
         // runs a real qsearch, which at startpos has no capture and stands pat
         // on the zero-eval network.
-        const GAME_PLY: i32 = 60;
+        const GAME_PLY: u16 = 60;
         let net = zero_net();
         let _tt = fresh_tt();
         let mut p = pos("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 60");
@@ -5060,29 +5082,32 @@ mod tests {
             let mut q = QSearch::new(net.network());
             q.run(&mut p, -VALUE_INFINITE, VALUE_INFINITE, true, true)
         };
-        if GAME_PLY > MAX_MOVES_TO_DRAW {
+        if is_past_move_limit(GAME_PLY) {
             assert_eq!(
                 out.value,
                 DRAW_CONTEMPT_BLACK + value_draw(0),
                 "forced-draw value = draw contempt + value_draw(0)"
             );
-            assert_eq!(out.nodes, 0, "the horizon draw returns before any do_move");
+            assert_eq!(
+                out.nodes, 0,
+                "the move-limit draw returns before any do_move"
+            );
         } else {
             assert_eq!(
                 out.value, 0,
-                "an unreached horizon ⇒ zero-eval stand-pat, not the draw exit"
+                "an unreached limit ⇒ zero-eval stand-pat, not the draw exit"
             );
         }
     }
 
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn run_root_sees_a_mate_only_below_the_horizon() {
+    fn run_root_sees_a_mate_only_below_the_move_limit() {
         // A gold-drop head mate (`G*8a`) at game ply 100: the White king on 9a
         // is not in check at the root, and dropping the supported gold beside it
-        // is mate. Past the horizon every interior node adjudicates a draw
-        // before the mate is seen.
-        const GAME_PLY: i32 = 100;
+        // is mate. Past the limit every interior node adjudicates a draw before
+        // the mate is seen.
+        const GAME_PLY: u16 = 100;
         let net = zero_net();
         let p = pos("k8/9/G1N6/9/9/9/9/9/8K b G 100");
         let _tt = fresh_tt();
@@ -5090,10 +5115,10 @@ mod tests {
             let mut q = QSearch::new(net.network());
             q.run_root(&p, 2)
         };
-        if GAME_PLY > MAX_MOVES_TO_DRAW {
+        if is_past_move_limit(GAME_PLY) {
             assert!(
                 !is_decisive(out.score),
-                "the horizon must suppress the mate, got score {}",
+                "the move limit must suppress the mate, got score {}",
                 out.score
             );
             assert!(
@@ -5104,7 +5129,7 @@ mod tests {
         } else {
             assert!(
                 is_win(out.score),
-                "an unreached horizon must find the mate, got score {}",
+                "an unreached limit must find the mate, got score {}",
                 out.score
             );
         }
