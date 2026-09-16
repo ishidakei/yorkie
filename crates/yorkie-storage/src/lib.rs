@@ -29,6 +29,8 @@ pub use arena::{ARENA_SUB_ALIGN, ArenaLayout, ArenaSlice, LargePageArena, Sectio
 pub use book::{Book, BookError, BookMove};
 pub use large_page::{LARGE_PAGE_ALIGN, LargePageArray, LargePageBox, Zeroable, advise_huge_pages};
 pub use mapped::map_file_onto;
+#[cfg(feature = "verbose3")]
+pub use tt::ValueMarks;
 pub use tt::{
     Bound, CLUSTER_COUNT, DEPTH_NONE, Depth, TABLE_BYTES, TT_ALIGN, TTData, TTWriter,
     TranspositionTable, TtSlot, VALUE_NONE, Value,

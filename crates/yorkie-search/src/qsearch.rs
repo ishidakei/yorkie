@@ -30,6 +30,8 @@ use std::time::Instant;
 
 use yorkie_eval::{Accumulator, FinnyCache, MoveDelta, NetworkParams, evaluate_with};
 use yorkie_state::{Color, Move, Piece, PieceKind, Position, RepetitionState, piece_value};
+#[cfg(feature = "verbose3")]
+use yorkie_storage::ValueMarks;
 use yorkie_storage::{Bound, TranspositionTable, TtSlot, Value};
 
 #[cfg(feature = "verbose2")]
@@ -600,21 +602,22 @@ pub struct QSearch<N: NetworkParams> {
     #[cfg(feature = "verbose2")]
     last_pv_info_time: Instant,
 
-    /// The path-dependence mark carried on the return path: on return from
-    /// [`Self::search`] or [`Self::qsearch`] it is the mark of the value that
-    /// call returned, and while a node runs it is that node's mark so far.
+    /// The value marks carried on the return path: on return from
+    /// [`Self::search`] or [`Self::qsearch`] they are the marks of the value
+    /// that call returned, and while a node runs they are that node's marks so
+    /// far.
     ///
-    /// A node clears it on entry, sets it where its value comes out of a
-    /// repetition judgement or out of a marked table entry, and folds in the
-    /// mark of every child that moved its window. [`Self::tt_store`] writes
-    /// whatever it holds at the moment of the store. A sub-search overwrites
-    /// it, so a caller that must keep its own mark across one saves it and
-    /// restores it through [`Self::child_path_dep`].
+    /// A node clears them on entry, sets one where its value comes out of the
+    /// corresponding rule check or out of a marked table entry, and folds in
+    /// the marks of every child that moved its window. [`Self::tt_store`]
+    /// writes whatever they hold at the moment of the store. A sub-search
+    /// overwrites them, so a caller that must keep its own across one saves
+    /// them and restores them through [`Self::child_marks`].
     ///
-    /// **No search decision reads it.** It exists so a `tt probe` can say
-    /// which entries a repetition judgement is behind.
+    /// **No search decision reads them.** They exist so a `tt probe` can say
+    /// which rules an entry's value is behind.
     #[cfg(feature = "verbose3")]
-    path_dep: bool,
+    marks: ValueMarks,
 
     /// The evaluation-noise amplitude for this game, in the unit the search
     /// scores in: [`Self::static_eval`] offsets every position by
@@ -894,7 +897,7 @@ impl<N: NetworkParams> QSearch<N> {
             #[cfg(feature = "verbose2")]
             last_pv_info_time: Instant::now(),
             #[cfg(feature = "verbose3")]
-            path_dep: false,
+            marks: ValueMarks::NONE,
             #[cfg(feature = "random")]
             random_amplitude: 0,
             #[cfg(feature = "random")]
@@ -1351,8 +1354,8 @@ impl<N: NetworkParams> QSearch<N> {
     /// re-probe) keeps the stored TT state bit-identical to the reference even
     /// when a child has since churned the cluster — the write-slot-drift fix.
     ///
-    /// The entry takes the storing node's current `path_dep`, so the
-    /// mark travels with the value it belongs to.
+    /// The entry takes the storing node's current `marks`, so they travel with
+    /// the value they belong to.
     #[allow(clippy::too_many_arguments)]
     fn tt_store(
         &mut self,
@@ -1377,17 +1380,17 @@ impl<N: NetworkParams> QSearch<N> {
             eval,
             generation,
             #[cfg(feature = "verbose3")]
-            self.path_dep,
+            self.marks,
         );
     }
 
-    /// Hand back the path-dependence mark of the value a sub-search just
-    /// returned, restoring `node_mark` — the mark the calling node had built up
-    /// before it — as the live one.
+    /// Hand back the marks of the value a sub-search just returned, restoring
+    /// `node_marks` — the marks the calling node had built up before it — as
+    /// the live ones.
     #[cfg(feature = "verbose3")]
     #[inline]
-    fn child_path_dep(&mut self, node_mark: bool) -> bool {
-        std::mem::replace(&mut self.path_dep, node_mark)
+    fn child_marks(&mut self, node_marks: ValueMarks) -> ValueMarks {
+        std::mem::replace(&mut self.marks, node_marks)
     }
 
     /// Widen a stored 16-bit move against `pos` and validate it: the unique
@@ -1439,10 +1442,10 @@ impl<N: NetworkParams> QSearch<N> {
         let pv_node = self.pv_node;
 
         // The node starts unmarked; every return below leaves this holding the
-        // mark of the value it returns.
+        // marks of the value it returns.
         #[cfg(feature = "verbose3")]
         {
-            self.path_dep = false;
+            self.marks = ValueMarks::NONE;
         }
 
         // Poll the stop flag / hard deadline at the reference `check_time`
@@ -1474,7 +1477,7 @@ impl<N: NetworkParams> QSearch<N> {
             // dependent by construction — this is where the mark originates.
             #[cfg(feature = "verbose3")]
             {
-                self.path_dep = true;
+                self.marks.path_dep = true;
             }
             if draw_type == RepetitionState::Draw {
                 // Ordinary repetition: the ±1 dither.
@@ -1487,6 +1490,13 @@ impl<N: NetworkParams> QSearch<N> {
         }
         // The reference's `depth <= -16 → draw` measure is `#if 0`: not ported.
         if ply >= MAX_PLY || pos.ply() as i32 > MAX_MOVES_TO_DRAW {
+            // The move limit is a rule of the tournament and could be set
+            // differently; the `MAX_PLY` search horizon is not, so only the
+            // first marks the value it produces.
+            #[cfg(feature = "verbose3")]
+            if ply < MAX_PLY {
+                self.marks.move_limit = true;
+            }
             return self.draw_value(RepetitionState::Draw, us) + value_draw(self.nodes);
         }
 
@@ -1517,10 +1527,10 @@ impl<N: NetworkParams> QSearch<N> {
             && bound_matches(tt_data.bound, tt_value >= beta)
         {
             // The stored value re-enters the search as this node's value, so
-            // it brings its mark with it.
+            // it brings its marks with it.
             #[cfg(feature = "verbose3")]
             {
-                self.path_dep = tt_data.path_dep;
+                self.marks = tt_data.marks;
             }
             return tt_value;
         }
@@ -1682,10 +1692,10 @@ impl<N: NetworkParams> QSearch<N> {
                 ContinuationCorrectionHistory::plane_index(moved, mv.to_sq());
             self.push_accumulator(pos, &acc_delta);
             #[cfg(feature = "verbose3")]
-            let node_path_dep = self.path_dep;
+            let node_marks = self.marks;
             let value = -self.qsearch(pos, ply + 1, -beta, -alpha, scratch);
             #[cfg(feature = "verbose3")]
-            let child_path_dep = self.child_path_dep(node_path_dep);
+            let child_marks = self.child_marks(node_marks);
             pos.undo_move(mv, undo);
             self.pop_accumulator();
 
@@ -1701,12 +1711,10 @@ impl<N: NetworkParams> QSearch<N> {
             if value > best_value {
                 best_value = value;
                 if value > alpha {
-                    // The child moved this node's window, so its mark becomes
+                    // The child moved this node's window, so its marks become
                     // this node's too.
                     #[cfg(feature = "verbose3")]
-                    {
-                        self.path_dep |= child_path_dep;
-                    }
+                    self.marks.merge(child_marks);
                     best_move = Some(mv);
                     if pv_node {
                         self.update_pv(ply, mv);
@@ -1816,6 +1824,15 @@ impl<N: NetworkParams> QSearch<N> {
                 Move::win(),
                 "run_root is only driven with point/None entering-king rules"
             );
+            // The score below is the declaration rule's, so it carries that
+            // rule's mark like any other value derived through the check.
+            #[cfg(feature = "verbose3")]
+            {
+                self.marks = ValueMarks {
+                    decl_rule: true,
+                    ..ValueMarks::NONE
+                };
+            }
             return RootOutcome {
                 best_move: Move::win(),
                 score: mate_in(1),
@@ -2749,10 +2766,10 @@ impl<N: NetworkParams> QSearch<N> {
         }
 
         // The node starts unmarked; every return below leaves this holding the
-        // mark of the value it returns.
+        // marks of the value it returns.
         #[cfg(feature = "verbose3")]
         {
-            self.path_dep = false;
+            self.marks = ValueMarks::NONE;
         }
 
         depth = depth.min(MAX_PLY - 1);
@@ -2796,7 +2813,7 @@ impl<N: NetworkParams> QSearch<N> {
                 // originates.
                 #[cfg(feature = "verbose3")]
                 {
-                    self.path_dep = true;
+                    self.marks.path_dep = true;
                 }
                 if draw_type == RepetitionState::Draw {
                     return self.draw_value(RepetitionState::Draw, us) + value_draw(self.nodes);
@@ -2807,6 +2824,13 @@ impl<N: NetworkParams> QSearch<N> {
             // aborted non-root node yields the draw score without touching the
             // TT.
             if self.stopped || ply >= MAX_PLY || pos.ply() as i32 > MAX_MOVES_TO_DRAW {
+                // The move limit is a rule of the tournament and could be set
+                // differently; neither an abort nor the `MAX_PLY` search
+                // horizon is, so only the first marks the value it produces.
+                #[cfg(feature = "verbose3")]
+                if !self.stopped && ply < MAX_PLY {
+                    self.marks.move_limit = true;
+                }
                 return self.draw_value(RepetitionState::Draw, us) + value_draw(self.nodes);
             }
 
@@ -2903,10 +2927,10 @@ impl<N: NetworkParams> QSearch<N> {
                 }
             }
             // The stored value re-enters the search as this node's value, so
-            // it brings its mark with it.
+            // it brings its marks with it.
             #[cfg(feature = "verbose3")]
             {
-                self.path_dep = tt_data.path_dep;
+                self.marks = tt_data.marks;
             }
             return tt_value;
         }
@@ -2933,6 +2957,12 @@ impl<N: NetworkParams> QSearch<N> {
             return best_value;
         }
         if (tt_move.is_none() || pv_node) && declaration_win(pos, &self.entering_king).is_some() {
+            // The value is the declaration rule's; a node that asked and was
+            // told no is not marked.
+            #[cfg(feature = "verbose3")]
+            {
+                self.marks.decl_rule = true;
+            }
             return mate_in(ply + 1);
         }
 
@@ -3068,7 +3098,7 @@ impl<N: NetworkParams> QSearch<N> {
                 // the reference's prefetch inside `do_null_move`.
                 TranspositionTable::shared().prefetch(pos.key(), pos.side_to_move().index() as u8);
                 #[cfg(feature = "verbose3")]
-                let node_path_dep = self.path_dep;
+                let node_marks = self.marks;
                 let null_value = -self.search(
                     pos,
                     ply + 1,
@@ -3083,16 +3113,14 @@ impl<N: NetworkParams> QSearch<N> {
                 );
                 // The null child is the only thing a returned `null_value`
                 // comes from; the verification search below only gates it, so
-                // its own mark goes nowhere.
+                // its own marks go nowhere.
                 #[cfg(feature = "verbose3")]
-                let null_path_dep = self.child_path_dep(node_path_dep);
+                let null_marks = self.child_marks(node_marks);
                 pos.undo_null_move();
                 if null_value >= beta && !is_win(null_value) {
                     if self.nmp_min_ply != 0 || depth < 16 {
                         #[cfg(feature = "verbose3")]
-                        {
-                            self.path_dep |= null_path_dep;
-                        }
+                        self.marks.merge(null_marks);
                         return null_value;
                     }
                     debug_assert_eq!(
@@ -3104,7 +3132,7 @@ impl<N: NetworkParams> QSearch<N> {
                     // same stack cell, no `do_move`.
                     self.nmp_min_ply = ply + 3 * (depth - r) / 4;
                     #[cfg(feature = "verbose3")]
-                    let node_path_dep = self.path_dep;
+                    let node_marks = self.marks;
                     let v = self.search(
                         pos,
                         ply,
@@ -3117,20 +3145,18 @@ impl<N: NetworkParams> QSearch<N> {
                         None,
                         scratch,
                     );
-                    // A re-entry on this node's own ply: it overwrites the
-                    // live mark, which is restored here rather than kept, since
+                    // A re-entry on this node's own ply: it overwrites the live
+                    // marks, which are restored here rather than kept, since
                     // `v` gates the return without being returned.
                     #[cfg(feature = "verbose3")]
                     {
-                        self.path_dep = node_path_dep;
+                        self.marks = node_marks;
                     }
                     self.nmp_min_ply = 0;
 
                     if v >= beta {
                         #[cfg(feature = "verbose3")]
-                        {
-                            self.path_dep |= null_path_dep;
-                        }
+                        self.marks.merge(null_marks);
                         return null_value;
                     }
                 }
@@ -3180,7 +3206,7 @@ impl<N: NetworkParams> QSearch<N> {
                     self.pv_node = false;
                     self.set_read_tt(true);
                     #[cfg(feature = "verbose3")]
-                    let node_path_dep = self.path_dep;
+                    let node_marks = self.marks;
                     let mut value =
                         -self.qsearch(pos, ply + 1, -prob_cut_beta, -prob_cut_beta + 1, scratch);
                     if value >= prob_cut_beta && prob_cut_depth > 0 {
@@ -3198,17 +3224,15 @@ impl<N: NetworkParams> QSearch<N> {
                         );
                     }
                     #[cfg(feature = "verbose3")]
-                    let child_path_dep = self.child_path_dep(node_path_dep);
+                    let child_marks = self.child_marks(node_marks);
                     pos.undo_move(mv, undo);
                     self.pop_accumulator();
                     if value >= prob_cut_beta {
                         // The child cut this node off, so the entry stored from
                         // its value and the value returned below both carry its
-                        // mark.
+                        // marks.
                         #[cfg(feature = "verbose3")]
-                        {
-                            self.path_dep |= child_path_dep;
-                        }
+                        self.marks.merge(child_marks);
                         self.tt_store(
                             tt_slot,
                             pos_key,
@@ -3386,7 +3410,7 @@ impl<N: NetworkParams> QSearch<N> {
                 self.pv_node = false;
                 self.set_read_tt(true);
                 #[cfg(feature = "verbose3")]
-                let node_path_dep = self.path_dep;
+                let node_marks = self.marks;
                 let s_value = self.search(
                     pos,
                     ply,
@@ -3399,10 +3423,10 @@ impl<N: NetworkParams> QSearch<N> {
                     None,
                     scratch,
                 );
-                // A re-entry on this node's own ply, so its mark is held aside
+                // A re-entry on this node's own ply, so its marks are held aside
                 // and folded in only where `s_value` becomes this node's value.
                 #[cfg(feature = "verbose3")]
-                let singular_path_dep = self.child_path_dep(node_path_dep);
+                let singular_marks = self.child_marks(node_marks);
                 self.stack[s].excluded_move = None;
 
                 if s_value < singular_beta {
@@ -3437,9 +3461,7 @@ impl<N: NetworkParams> QSearch<N> {
                         .tt_move
                         .update((-424 - 107 * depth).max(-3375));
                     #[cfg(feature = "verbose3")]
-                    {
-                        self.path_dep |= singular_path_dep;
-                    }
+                    self.marks.merge(singular_marks);
                     return s_value;
                 } else if tt_value >= beta {
                     extension = -3;
@@ -3497,10 +3519,10 @@ impl<N: NetworkParams> QSearch<N> {
             // Step 17. Late-move reduction / extension.
             //
             // Several searches of this one move can run below; each overwrites
-            // the live mark, so the last one — the one `value` comes from — is
+            // the live marks, so the last one — the one `value` comes from — is
             // the one left standing when the move's result is folded in.
             #[cfg(feature = "verbose3")]
-            let node_path_dep = self.path_dep;
+            let node_marks = self.marks;
             let mut value: Value = best_value;
             if depth >= 2 && move_count > 1 {
                 let d = ((new_depth - r / 1024).min(new_depth + 2)).max(1) + pv_node as i32;
@@ -3595,7 +3617,7 @@ impl<N: NetworkParams> QSearch<N> {
             }
 
             #[cfg(feature = "verbose3")]
-            let child_path_dep = self.child_path_dep(node_path_dep);
+            let child_marks = self.child_marks(node_marks);
 
             // Step 19. Undo move.
             pos.undo_move(mv, undo);
@@ -3692,12 +3714,10 @@ impl<N: NetworkParams> QSearch<N> {
                 best_value = value;
                 if value + inc > alpha {
                     // The child moved this node's window — it raised `alpha`,
-                    // or cut the node off below — so its mark becomes this
+                    // or cut the node off below — so its marks become this
                     // node's too.
                     #[cfg(feature = "verbose3")]
-                    {
-                        self.path_dep |= child_path_dep;
-                    }
+                    self.marks.merge(child_marks);
                     best_move = Some(mv);
                     // Update the node PV even on a fail high, but not at the
                     // root, whose PV is the RootMove's.
@@ -3970,7 +3990,7 @@ mod tests {
             eval,
             generation,
             #[cfg(feature = "verbose3")]
-            false,
+            ValueMarks::NONE,
         );
     }
 
@@ -4584,10 +4604,10 @@ mod tests {
         assert_eq!(q.qsearch_at(&mut p, 6, -1, 0), -2);
     }
 
-    /// The `verbose3` path-dependence mark: where it comes from, how it rides
-    /// through the table, and the rule by which a child hands it to its parent.
+    /// The `verbose3` value marks: where each comes from, how they ride through
+    /// the table, and the rule by which a child hands them to its parent.
     #[cfg(feature = "verbose3")]
-    mod path_dependence_mark {
+    mod value_marks {
         use super::*;
 
         /// White to move, its king on 9a in check from the black rook on 9e,
@@ -4596,20 +4616,49 @@ mod tests {
         /// from nothing else.
         const IN_CHECK_WITH_EVASIONS: &str = "k8/9/9/9/R8/9/9/9/8K w - 1";
 
-        /// [`prewrite`] with the entry's path-dependence mark.
+        /// Black's king on 5b with twelve pieces in the enemy field and a rook
+        /// in hand — 32 points, past either point rule's threshold — against a
+        /// lone White king in the far corner. White is to move and can declare
+        /// nothing (one piece in its own enemy field), so a search of this
+        /// position meets the declaration only one ply down, whatever White
+        /// plays.
+        const WHITE_TO_MOVE_BEFORE_A_BLACK_DECLARATION: &str =
+            "+R+R+B+B5/3GKG3/2SGGGS2/9/9/9/9/9/8k w R 1";
+
+        /// Each flag on its own, so a test cannot pass by carrying the wrong
+        /// one.
+        const EVERY_MARK: [ValueMarks; 3] = [
+            ValueMarks {
+                path_dep: true,
+                decl_rule: false,
+                move_limit: false,
+            },
+            ValueMarks {
+                path_dep: false,
+                decl_rule: true,
+                move_limit: false,
+            },
+            ValueMarks {
+                path_dep: false,
+                decl_rule: false,
+                move_limit: true,
+            },
+        ];
+
+        /// [`prewrite`] with the entry's value marks.
         fn prewrite_marked(
             table: &TranspositionTable,
             p: &Position,
             value: Value,
             bound: Bound,
-            path_dep: bool,
+            marks: ValueMarks,
         ) {
             let key = p.key();
             let side = p.side_to_move().index() as u8;
             let generation = table.generation();
             let (_f, _d, w) = table.probe(key, side);
             w.write(
-                key, value, false, bound, DEPTH_QS, None, 0, generation, path_dep,
+                key, value, false, bound, DEPTH_QS, None, 0, generation, marks,
             );
         }
 
@@ -4620,12 +4669,12 @@ mod tests {
             p: &Position,
             value: Value,
             bound: Bound,
-            path_dep: bool,
+            marks: ValueMarks,
         ) {
             let mut child = p.clone();
             for mv in legal_moves(p) {
                 let undo = child.do_move(mv);
-                prewrite_marked(table, &child, value, bound, path_dep);
+                prewrite_marked(table, &child, value, bound, marks);
                 child.undo_move(mv, undo);
             }
         }
@@ -4652,7 +4701,8 @@ mod tests {
             p
         }
 
-        /// A repetition judgement is the only source of the mark.
+        /// A repetition judgement is the only source of the path-dependence
+        /// mark, and it sets that one alone.
         #[cfg_attr(miri, ignore)]
         #[test]
         fn a_repetition_judgement_marks_the_value_it_produces() {
@@ -4668,43 +4718,105 @@ mod tests {
 
             q.nodes = 0;
             q.qsearch_at(&mut p, 6, -1, 0);
-            assert!(q.path_dep, "the repetition draw is a path-dependent value");
+            assert_eq!(
+                q.marks,
+                ValueMarks {
+                    path_dep: true,
+                    ..ValueMarks::NONE
+                },
+                "the repetition draw is a path-dependent value and nothing else"
+            );
 
             // The same position, reached at a ply the judgement does not apply
             // to: an ordinary node, and an unmarked value.
             q.nodes = 0;
             q.qsearch_at(&mut p, 4, -1, 0);
-            assert!(!q.path_dep);
+            assert_eq!(q.marks, ValueMarks::NONE);
+        }
+
+        /// The move limit is a rule of the tournament, so the draw it forces is
+        /// marked; the `MAX_PLY` search horizon in the same condition is not a
+        /// rule and leaves the value unmarked.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn the_move_limit_draw_is_marked_and_the_ply_horizon_is_not() {
+            let net = zero_net();
+            let _tt = fresh_tt();
+            let mut q = QSearch::new(net.network());
+            q.pv_node = false;
+
+            // The horizon draw, at a game ply well inside any configured move
+            // limit, so only `ply >= MAX_PLY` can have produced it.
+            let mut p = pos(TWO_KINGS);
+            q.root_us = p.side_to_move();
+            q.nodes = 0;
+            q.qsearch_at(&mut p, MAX_PLY, -1, 0);
+            assert_eq!(
+                q.marks,
+                ValueMarks::NONE,
+                "the search's own ply horizon is not a rule of the game"
+            );
+
+            // The move-limit draw. `max_moves_to_draw = 0` means unlimited,
+            // which the reference spells as a ply count no game reaches, so
+            // there this branch is unreachable and the node is an ordinary one.
+            const GAME_PLY: i32 = 60;
+            let mut past = pos("4k4/9/9/9/9/9/9/9/4K4 b - 60");
+            q.root_us = past.side_to_move();
+            q.nodes = 0;
+            q.qsearch_at(&mut past, 0, -1, 0);
+            if GAME_PLY > MAX_MOVES_TO_DRAW {
+                assert_eq!(
+                    q.marks,
+                    ValueMarks {
+                        move_limit: true,
+                        ..ValueMarks::NONE
+                    },
+                    "past the limit the draw carries the move-limit mark alone"
+                );
+            } else {
+                assert_eq!(
+                    q.marks,
+                    ValueMarks::NONE,
+                    "an unreached limit leaves an ordinary, unmarked node"
+                );
+            }
         }
 
         /// A marked entry read back as a node's value re-enters the search
         /// marked, and the node that took it hands the mark to its parent when
         /// the child moved the parent's window. Here the child cuts the parent
-        /// off, and the parent's own entry is stored marked.
+        /// off, and the parent's own entry is stored marked — a round trip of
+        /// every flag through the table.
         #[cfg_attr(miri, ignore)]
         #[test]
         fn a_marked_child_that_moves_the_window_marks_the_node() {
             let net = zero_net();
-            let table = fresh_tt();
             let p = pos(IN_CHECK_WITH_EVASIONS);
             assert!(p.in_check(), "the fixture must be in check");
             assert!(!legal_moves(&p).is_empty(), "and must have an evasion");
 
-            // Each child cuts off on an upper bound of -500, so the node sees
-            // +500 — above its beta of 1.
-            seed_every_child(&table, &p, -500, Bound::Upper, true);
+            for marks in EVERY_MARK {
+                let table = fresh_tt();
+                // Each child cuts off on an upper bound of -500, so the node
+                // sees +500 — above its beta of 1.
+                seed_every_child(&table, &p, -500, Bound::Upper, marks);
 
-            let (value, marked) = {
-                let mut q = QSearch::new(net.network());
-                let out = q.run(&mut p.clone(), 0, 1, false, true);
-                (out.value, q.path_dep)
-            };
-            assert!(value > 0, "the node fails high on the marked child");
-            assert!(marked, "and returns a marked value");
+                let (value, node_marks) = {
+                    let mut q = QSearch::new(net.network());
+                    let out = q.run(&mut p.clone(), 0, 1, false, true);
+                    (out.value, q.marks)
+                };
+                assert!(value > 0, "the node fails high on the marked child");
+                assert_eq!(node_marks, marks, "and returns a value marked {marks:?}");
 
-            let (found, data) = probe_root(&table, &p);
-            assert!(found);
-            assert!(data.path_dep, "the stored entry carries the node's mark");
+                let (found, data) = probe_root(&table, &p);
+                assert!(found);
+                assert_eq!(
+                    data.marks, marks,
+                    "the stored entry carries the node's marks"
+                );
+            }
         }
 
         /// The complement of the rule: a marked child whose value stays at or
@@ -4713,24 +4825,79 @@ mod tests {
         #[test]
         fn a_marked_child_at_or_below_alpha_leaves_the_node_unmarked() {
             let net = zero_net();
-            let table = fresh_tt();
             let p = pos(IN_CHECK_WITH_EVASIONS);
 
-            // Each child cuts off on a lower bound of +500, so the node sees
-            // -500 — never above its alpha of 0.
-            seed_every_child(&table, &p, 500, Bound::Lower, true);
+            for marks in EVERY_MARK {
+                let table = fresh_tt();
+                // Each child cuts off on a lower bound of +500, so the node
+                // sees -500 — never above its alpha of 0.
+                seed_every_child(&table, &p, 500, Bound::Lower, marks);
 
-            let (value, marked) = {
+                let (value, node_marks) = {
+                    let mut q = QSearch::new(net.network());
+                    let out = q.run(&mut p.clone(), 0, 1, false, true);
+                    (out.value, q.marks)
+                };
+                assert!(value < 0, "every child fails low");
+                assert_eq!(
+                    node_marks,
+                    ValueMarks::NONE,
+                    "no child's {marks:?} reaches the node"
+                );
+
+                let (found, data) = probe_root(&table, &p);
+                assert!(found);
+                assert_eq!(data.marks, ValueMarks::NONE);
+            }
+        }
+
+        /// The root shortcut answers out of the declaration rule, so the score
+        /// it hands back is marked as that rule's.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn a_root_declaration_marks_the_score_it_returns() {
+            let net = zero_net();
+            let _tt = fresh_tt();
+            let p = pos("+R+R+B+B5/3GKG3/2SGGGS2/9/9/9/9/9/4k4 b R 1");
+            let mut q = QSearch::new(net.network());
+            let out = q.run_root(&p, 1);
+            assert_eq!(out.kind, RootKind::DeclarationWin);
+            assert_eq!(
+                q.marks,
+                ValueMarks {
+                    decl_rule: true,
+                    ..ValueMarks::NONE
+                }
+            );
+        }
+
+        /// The in-search check one ply down: the child's value is the
+        /// declaration rule's, and it reaches the root's entry because it moved
+        /// the root's window.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn a_declaration_below_the_root_marks_the_entry_above_it() {
+            let net = zero_net();
+            let table = fresh_tt();
+            let p = pos(WHITE_TO_MOVE_BEFORE_A_BLACK_DECLARATION);
+            assert!(
+                declaration_win(&p, &EnteringKingConfig::new(&p)).is_none(),
+                "the side to move must have nothing to declare"
+            );
+
+            let out = {
                 let mut q = QSearch::new(net.network());
-                let out = q.run(&mut p.clone(), 0, 1, false, true);
-                (out.value, q.path_dep)
+                q.run_root(&p, 2)
             };
-            assert!(value < 0, "every child fails low");
-            assert!(!marked, "so no child's mark reaches the node");
+            assert_eq!(out.kind, RootKind::Normal);
 
             let (found, data) = probe_root(&table, &p);
-            assert!(found);
-            assert!(!data.path_dep);
+            assert!(found, "the root stores its entry");
+            assert!(
+                data.marks.decl_rule,
+                "the declaration one ply down reaches the root's entry"
+            );
+            assert!(!data.marks.path_dep);
         }
     }
 

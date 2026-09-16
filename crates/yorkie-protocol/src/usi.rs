@@ -910,7 +910,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
             move16,
             args.eval,
             generation,
-            args.path_dep,
+            args.marks,
         );
 
         // Verify rather than assume. A `move none` write is excluded from the
@@ -924,7 +924,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
             && data.depth == args.depth
             && data.bound == args.bound
             && data.is_pv == args.pv
-            && data.path_dep == args.path_dep
+            && data.marks == args.marks
             && (move16.is_none() || data.move16 == move16);
         if stored {
             self.out.info_string(b"tt store ok")
@@ -1021,7 +1021,7 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
 
 /// The labelled body shared by `tt probe hit` and `tt child` lines:
 /// `move <usi|none> value <score> depth <d> bound <b> eval <score> pv <bool>
-/// pathdep <0|1>`.
+/// pathdep <0|1> declrule <0|1> movelimit <0|1>`.
 ///
 /// `legal` is the legal-move list of the position the entry belongs to, used to
 /// widen the stored 16-bit fragment exactly as the search does: a fragment with
@@ -1060,7 +1060,11 @@ fn write_tt_entry_fields(out: &mut TextWriter<'_>, data: &TTData, legal: &[Move]
             &b"false"[..]
         })
         .bytes(b" pathdep ")
-        .u64(u64::from(data.path_dep));
+        .u64(u64::from(data.marks.path_dep))
+        .bytes(b" declrule ")
+        .u64(u64::from(data.marks.decl_rule))
+        .bytes(b" movelimit ")
+        .u64(u64::from(data.marks.move_limit));
 }
 
 /// One score field of a `tt` output line: `cp <n>` / `mate <n>` in the same USI

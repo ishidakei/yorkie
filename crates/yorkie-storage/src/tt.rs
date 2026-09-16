@@ -92,29 +92,36 @@
 //! still meant for the gap between games, when nothing else is: emptying
 //! entries a search is reading costs it nodes, not correctness.
 //!
-//! # The path-dependence mark (`verbose3`)
+//! # The value marks (`verbose3`)
 //!
-//! A stored value can depend on the move history by which its position was
-//! reached, because a repetition judgement reads that history. At `verbose3`
-//! each entry carries one bit recording that its value and best move were
-//! derived through such a judgement, so an outside inspector can tell those
-//! entries apart. Nothing in the table reads the bit: it is not part of an
-//! entry's identity, it does not enter the replacement priority, and a probe
-//! hits or misses regardless of it.
+//! A stored value can depend on more than its position: on the move history by
+//! which the position was reached, because a repetition judgement reads that
+//! history, and on a rule a later tournament may set differently — the
+//! entering-king declaration rule, or the move limit past which a game is a
+//! draw. At `verbose3` each entry carries a `ValueMarks`, one bit per such
+//! source, recording which of them its value and best move were derived
+//! through, so an outside inspector can tell those entries apart. Nothing in
+//! the table reads the bits: they are not part of an entry's identity, they do
+//! not enter the replacement priority, and a probe hits or misses regardless of
+//! them.
 //!
-//! The two layouts keep it in different places, because only one of them has a
-//! spare byte:
+//! The two layouts keep them in different places, because only one of them has
+//! a spare byte:
 //!
 //! | | default | `tt-entry16` |
 //! |---|---|---|
-//! | where the bit lives | the cluster's two padding bytes, as an `AtomicU16` whose bit `i` belongs to `entry[i]` | bit 0 of the stored key |
-//! | what it costs | nothing — the bytes were padding | the key drops to 63 bits, so the false-hit rate is 2⁻⁶³ |
+//! | where the bits live | the cluster's two padding bytes, as an `AtomicU16` holding three bits per entry | the stored key's top three bits |
+//! | what they cost | nothing — the bytes were padding | nothing — the cluster index has already checked those bits |
 //!
-//! In the default layout the bit and the entry are separate words, so a reader
-//! can briefly see a new entry beside the old bit under contention — the same
-//! tearing the six entry fields already permit, and acceptable for a
-//! diagnostic. Under `tt-entry16` the bit is written with the key, in one
-//! store.
+//! A `tt-entry16` hit stays exact: the cluster a key maps to is decided by its
+//! top bits and a probe reads that cluster alone, so two keys differing only
+//! there are never candidates for the same entry, and the 61 bits the entry
+//! keeps are the whole of what a match still has to turn on.
+//!
+//! In the default layout the marks and the entry are separate words, so a
+//! reader can briefly see a new entry beside the old marks under contention —
+//! the same tearing the six entry fields already permit, and acceptable for a
+//! diagnostic. Under `tt-entry16` they are written with the key, in one store.
 
 use std::mem::{offset_of, size_of};
 use std::num::NonZeroU16;
@@ -187,14 +194,14 @@ type TteKey = u64;
 #[cfg(feature = "tt-entry16")]
 type AtomicTteKey = AtomicU64;
 /// Narrow `key` to what an entry stores. That is the whole key, except at
-/// `verbose3`, where bit 0 of the stored key is the path-dependence mark and
-/// the identity is the remaining 63 bits.
+/// `verbose3`, where the stored key's top [`MARK_BITS`] bits are the value
+/// marks and the identity is the bits below them.
 #[cfg(feature = "tt-entry16")]
 #[inline]
 fn tte_key(key: u64) -> TteKey {
     #[cfg(feature = "verbose3")]
     {
-        key & !1
+        key & !MARK_FIELD
     }
     #[cfg(not(feature = "verbose3"))]
     {
@@ -217,14 +224,14 @@ const CLUSTER_PADDING: usize = 0;
 
 /// Whether a stored key identifies the same position as `k`.
 ///
-/// Plain equality, except where the stored key's bit 0 is the path-dependence
-/// mark rather than part of the hash, in which case both sides are compared
-/// with it cleared.
+/// Plain equality, except where the stored key's top bits are the value marks
+/// rather than part of the hash, in which case both sides are compared with
+/// them cleared.
 #[inline]
 fn key_matches(stored: TteKey, k: TteKey) -> bool {
     #[cfg(all(feature = "tt-entry16", feature = "verbose3"))]
     {
-        stored & !1 == k & !1
+        stored & !MARK_FIELD == k & !MARK_FIELD
     }
     #[cfg(not(all(feature = "tt-entry16", feature = "verbose3")))]
     {
@@ -260,6 +267,84 @@ impl Bound {
     }
 }
 
+/// Bits one entry's [`ValueMarks`] occupy.
+#[cfg(feature = "verbose3")]
+const MARK_BITS: usize = 3;
+/// The low bits of a packed [`ValueMarks`], as a mask.
+#[cfg(feature = "verbose3")]
+const MARK_MASK: u8 = (1 << MARK_BITS) - 1;
+/// Where a `tt-entry16` stored key keeps the marks: its top [`MARK_BITS`] bits.
+#[cfg(all(feature = "verbose3", feature = "tt-entry16"))]
+const MARK_SHIFT: u32 = u64::BITS - MARK_BITS as u32;
+/// [`MARK_MASK`] in place at [`MARK_SHIFT`] — the stored-key bits that are the
+/// marks rather than the hash.
+#[cfg(all(feature = "verbose3", feature = "tt-entry16"))]
+const MARK_FIELD: TteKey = (MARK_MASK as TteKey) << MARK_SHIFT;
+
+/// What a stored value was derived through, carried beside the value so a
+/// caller reading entries back out of the table can tell which of them a change
+/// in the rules would invalidate.
+///
+/// Each flag is a *sufficient* sign, not an exact one: a value with every flag
+/// clear may still have been influenced indirectly — through a move pruned
+/// against a bound that itself came from one of these — and a flagged value may
+/// not depend on the rule at all.
+///
+/// **No search decision reads these.** They travel with a value and are written
+/// beside it; nothing consults them, so a build carrying them searches the same
+/// tree as one without.
+#[cfg(feature = "verbose3")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ValueMarks {
+    /// The value was derived through at least one repetition judgement on the
+    /// path the search took to this position.
+    pub path_dep: bool,
+    /// The value was derived through the entering-king declaration check. Which
+    /// rule was in force is a compile-time constant of the binary, so one flag
+    /// covers it.
+    pub decl_rule: bool,
+    /// The value was derived through the move-limit draw. The `MAX_PLY` search
+    /// horizon in the same condition is not a rule of the game and does not set
+    /// it.
+    pub move_limit: bool,
+}
+
+#[cfg(feature = "verbose3")]
+impl ValueMarks {
+    /// Nothing marked — what a node starts with and what a miss reports.
+    pub const NONE: ValueMarks = ValueMarks {
+        path_dep: false,
+        decl_rule: false,
+        move_limit: false,
+    };
+
+    /// Fold `other`'s flags in, for a value that was derived through another.
+    #[inline]
+    pub fn merge(&mut self, other: ValueMarks) {
+        self.path_dep |= other.path_dep;
+        self.decl_rule |= other.decl_rule;
+        self.move_limit |= other.move_limit;
+    }
+
+    /// The flags packed into [`MARK_BITS`] bits, for whichever spare bits the
+    /// entry layout keeps them in.
+    #[inline]
+    fn bits(self) -> u8 {
+        self.path_dep as u8 | (self.decl_rule as u8) << 1 | (self.move_limit as u8) << 2
+    }
+
+    /// The inverse of [`Self::bits`]. Bits above [`MARK_MASK`] are ignored, so
+    /// every input is a valid value.
+    #[inline]
+    fn from_bits(bits: u8) -> ValueMarks {
+        ValueMarks {
+            path_dep: bits & 1 != 0,
+            decl_rule: bits & 0b10 != 0,
+            move_limit: bits & 0b100 != 0,
+        }
+    }
+}
+
 /// A decoded copy of an entry's payload — the reference's `TTData`. By value:
 /// nothing here borrows the table.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -278,13 +363,9 @@ pub struct TTData {
     pub bound: Bound,
     /// Whether this was a PV node.
     pub is_pv: bool,
-    /// Whether [`Self::value`] and [`Self::move16`] were derived through at
-    /// least one repetition judgement on the path the search took to this
-    /// position. A sufficient sign of path dependence, not an exact one: an
-    /// unmarked value may still differ on another path, and a marked one may
-    /// not.
+    /// What [`Self::value`] and [`Self::move16`] were derived through.
     #[cfg(feature = "verbose3")]
-    pub path_dep: bool,
+    pub marks: ValueMarks,
 }
 
 impl TTData {
@@ -299,7 +380,7 @@ impl TTData {
             bound: Bound::None,
             is_pv: false,
             #[cfg(feature = "verbose3")]
-            path_dep: false,
+            marks: ValueMarks::NONE,
         }
     }
 }
@@ -367,10 +448,10 @@ impl TTEntry {
             depth: DEPTH_NONE + self.depth8.load(REL) as Depth,
             bound: Bound::from_u8((gen_bound8 & BOUND_MASK) >> BOUND_SHIFT),
             is_pv: (gen_bound8 & PV_MASK) != 0,
-            // The mark is not an entry field; [`Cluster::read`] fills it in
-            // from wherever the layout keeps it.
+            // The marks are not an entry field; [`Cluster::read`] fills them in
+            // from wherever the layout keeps them.
             #[cfg(feature = "verbose3")]
-            path_dep: false,
+            marks: ValueMarks::NONE,
         }
     }
 
@@ -414,9 +495,10 @@ struct Cluster {
     /// empty one, so they stay zero for the life of the table.
     #[cfg(any(not(feature = "verbose3"), feature = "tt-entry16"))]
     _padding: [u8; CLUSTER_PADDING],
-    /// The entries' path-dependence marks, bit `i` belonging to `entry[i]`.
-    /// It occupies the two bytes the cluster has to spare, and is 2-aligned
-    /// there, so the cluster is still 32 bytes and no entry moves.
+    /// The entries' [`ValueMarks`], [`MARK_BITS`] bits each, `entry[i]`'s
+    /// starting at bit `MARK_BITS · i`. It occupies the two bytes the cluster
+    /// has to spare, and is 2-aligned there, so the cluster is still 32 bytes
+    /// and no entry moves.
     #[cfg(all(feature = "verbose3", not(feature = "tt-entry16")))]
     marks: AtomicU16,
 }
@@ -435,8 +517,8 @@ impl Cluster {
         }
     }
 
-    /// Decode `slot`'s payload (`TTEntry::read`), including the mark, which is
-    /// not an entry field.
+    /// Decode `slot`'s payload (`TTEntry::read`), including the marks, which
+    /// are not an entry field.
     #[inline]
     fn read(&self, slot: usize) -> TTData {
         #[cfg(not(feature = "verbose3"))]
@@ -446,7 +528,7 @@ impl Cluster {
         #[cfg(feature = "verbose3")]
         {
             let mut data = self.entry[slot].read();
-            data.path_dep = self.path_dep(slot);
+            data.marks = self.marks(slot);
             data
         }
     }
@@ -467,8 +549,8 @@ impl Cluster {
     /// per-thread one.
     ///
     /// The old fields are each read once before any store, so the replacement
-    /// decision sees the pre-save entry state. `path_dep` follows the payload:
-    /// it is written exactly when the payload is, and left alone when the
+    /// decision sees the pre-save entry state. `marks` follow the payload: they
+    /// are written exactly when the payload is, and left alone when the
     /// replacement condition declines the store.
     #[inline]
     #[allow(clippy::too_many_arguments)]
@@ -483,12 +565,12 @@ impl Cluster {
         m: Option<NonZeroU16>,
         ev: Value,
         curr_generation: u8,
-        #[cfg(feature = "verbose3")] path_dep: bool,
+        #[cfg(feature = "verbose3")] marks: ValueMarks,
     ) {
-        // The stored key's bit 0 is the mark here, and `tte_key` has already
-        // cleared it out of `k`.
+        // The stored key's top bits are the marks here, and `tte_key` has
+        // already cleared them out of `k`.
         #[cfg(all(feature = "verbose3", feature = "tt-entry16"))]
-        let k = k | path_dep as TteKey;
+        let k = k | (marks.bits() as TteKey) << MARK_SHIFT;
 
         let entry = &self.entry[slot];
         let old_key = entry.key.load(REL);
@@ -520,37 +602,39 @@ impl Cluster {
             entry.value16.store(v as i16, REL);
             entry.eval16.store(ev as i16, REL);
             #[cfg(all(feature = "verbose3", not(feature = "tt-entry16")))]
-            self.set_path_dep(slot, path_dep);
+            self.set_marks(slot, marks);
         }
     }
 }
 
 #[cfg(feature = "verbose3")]
 impl Cluster {
-    /// `slot`'s path-dependence mark.
+    /// `slot`'s value marks.
     #[inline]
-    fn path_dep(&self, slot: usize) -> bool {
+    fn marks(&self, slot: usize) -> ValueMarks {
         #[cfg(not(feature = "tt-entry16"))]
         {
-            self.marks.load(REL) & (1 << slot) != 0
+            ValueMarks::from_bits((self.marks.load(REL) >> (MARK_BITS * slot)) as u8 & MARK_MASK)
         }
         #[cfg(feature = "tt-entry16")]
         {
-            self.entry[slot].key.load(REL) & 1 != 0
+            ValueMarks::from_bits((self.entry[slot].key.load(REL) >> MARK_SHIFT) as u8)
         }
     }
 
-    /// Write `slot`'s mark, leaving its neighbours' bits alone: every entry in
-    /// the cluster shares this word, and their writers race.
+    /// Write `slot`'s marks, leaving its neighbours' bits alone: every entry in
+    /// the cluster shares this word, and their writers race. The read-modify-
+    /// write is one atomic update rather than a clear and a set, so no reader
+    /// sees a neighbour's field half-written.
     #[cfg(not(feature = "tt-entry16"))]
     #[inline]
-    fn set_path_dep(&self, slot: usize, path_dep: bool) {
-        let bit = 1u16 << slot;
-        if path_dep {
-            self.marks.fetch_or(bit, REL);
-        } else {
-            self.marks.fetch_and(!bit, REL);
-        }
+    fn set_marks(&self, slot: usize, marks: ValueMarks) {
+        let shift = MARK_BITS * slot;
+        let field = u16::from(marks.bits()) << shift;
+        let mask = u16::from(MARK_MASK) << shift;
+        let _ = self
+            .marks
+            .fetch_update(REL, REL, |w| Some((w & !mask) | field));
     }
 }
 
@@ -584,9 +668,22 @@ const _: () = assert!(offset_of!(TTEntry, value16) == KEY_SIZE + 4);
 const _: () = assert!(offset_of!(TTEntry, eval16) == KEY_SIZE + 6);
 
 // The mark word sits in the cluster's spare bytes, where its 2-byte alignment
-// is satisfied, so the cluster neither grows nor shifts an entry.
+// is satisfied, so the cluster neither grows nor shifts an entry, and every
+// entry's field fits inside it.
 #[cfg(all(feature = "verbose3", not(feature = "tt-entry16")))]
 const _: () = assert!(offset_of!(Cluster, marks) == size_of::<TTEntry>() * CLUSTER_SIZE);
+#[cfg(all(feature = "verbose3", not(feature = "tt-entry16")))]
+const _: () = assert!(MARK_BITS * CLUSTER_SIZE <= u16::BITS as usize);
+
+// The wide layout's marks take the stored key's top bits, which costs identity
+// nothing only while the cluster index decides those bits for it. The keys
+// reaching one cluster lie in a single interval of length `2⁶⁵ / CLUSTER_COUNT`
+// — `2⁶⁴ / CLUSTER_COUNT` per index, and the side to move replaces index bit 0,
+// so two adjacent indices share a cluster — while two keys differing only in
+// their top `MARK_BITS` bits are at least `2⁶¹` apart. Sixteen clusters or more
+// keep that interval short enough that no cluster holds both.
+#[cfg(all(feature = "verbose3", feature = "tt-entry16"))]
+const _: () = assert!(CLUSTER_COUNT >= 16);
 
 /// Base alignment of the table: a 2 MiB huge-page boundary, so the array starts
 /// where a `MADV_HUGEPAGE` hint over it can be honoured. The linker places the
@@ -945,7 +1042,7 @@ impl TranspositionTable {
         mv: Option<NonZeroU16>,
         eval: Value,
         generation: u8,
-        #[cfg(feature = "verbose3")] path_dep: bool,
+        #[cfg(feature = "verbose3")] marks: ValueMarks,
     ) {
         self.clusters[slot.cluster].save(
             slot.entry,
@@ -958,7 +1055,7 @@ impl TranspositionTable {
             eval,
             generation,
             #[cfg(feature = "verbose3")]
-            path_dep,
+            marks,
         );
     }
 
@@ -968,9 +1065,9 @@ impl TranspositionTable {
     /// while the table is being inspected from the outside, which is what the
     /// `verbose3` feature is for, so it is compiled only there.
     ///
-    /// The path-dependence marks are part of what the table stores and so are
-    /// mixed in: in the default layout as the cluster's mark word, and under
-    /// `tt-entry16` inside the key each entry already contributes.
+    /// The value marks are part of what the table stores and so are mixed in:
+    /// in the default layout as the cluster's mark word, and under `tt-entry16`
+    /// inside the key each entry already contributes.
     #[cfg(feature = "verbose3")]
     pub fn checksum(&self) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1005,7 +1102,7 @@ pub struct TtSlot {
 
 /// A single-use handle for writing one entry (`TTWriter`). It addresses the
 /// cluster and a slot in it rather than the entry alone, because an entry's
-/// path-dependence mark can live outside the entry.
+/// value marks can live outside the entry.
 pub struct TTWriter<'a> {
     cluster: &'a Cluster,
     slot: usize,
@@ -1032,7 +1129,7 @@ impl<'a> TTWriter<'a> {
         mv: Option<NonZeroU16>,
         eval: Value,
         generation: u8,
-        #[cfg(feature = "verbose3")] path_dep: bool,
+        #[cfg(feature = "verbose3")] marks: ValueMarks,
     ) {
         self.cluster.save(
             self.slot,
@@ -1045,7 +1142,7 @@ impl<'a> TTWriter<'a> {
             eval,
             generation,
             #[cfg(feature = "verbose3")]
-            path_dep,
+            marks,
         );
     }
 }

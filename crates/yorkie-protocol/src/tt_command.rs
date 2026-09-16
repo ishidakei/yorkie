@@ -26,14 +26,14 @@
 //! the same numbers as an `info … score cp N` line. That mapping is lossy in
 //! both directions, so a `cp` round trip quantises; `mate` arguments are exact.
 //!
-//! The entry's path-dependence mark is on the surface too: `tt store` takes an
-//! optional `pathdep <0|1>` (`0` when omitted) and `tt probe` / `tt children`
-//! report it, so an entry's mark can be written and read from outside without
-//! a search having to produce it.
+//! The entry's value marks are on the surface too: `tt store` takes an optional
+//! `pathdep <0|1>`, `declrule <0|1>` and `movelimit <0|1>` (`0` when omitted)
+//! and `tt probe` / `tt children` report them, so an entry's marks can be
+//! written and read from outside without a search having to produce them.
 
 use yorkie_state::TextWriter;
 use yorkie_state::text::atoi_i64;
-use yorkie_storage::{Bound, DEPTH_NONE, Depth, Value};
+use yorkie_storage::{Bound, DEPTH_NONE, Depth, Value, ValueMarks};
 
 use crate::engine::PAWN_VALUE;
 use crate::usi::{VALUE_MATE, VALUE_TB_WIN_IN_MAX_PLY};
@@ -66,6 +66,8 @@ pub enum TtClause {
     Eval,
     EvalCp,
     PathDep,
+    DeclRule,
+    MoveLimit,
 }
 
 impl TtClause {
@@ -82,6 +84,8 @@ impl TtClause {
             Self::Eval => b"eval",
             Self::EvalCp => b"eval cp",
             Self::PathDep => b"pathdep",
+            Self::DeclRule => b"declrule",
+            Self::MoveLimit => b"movelimit",
         }
     }
 
@@ -96,6 +100,8 @@ impl TtClause {
             Self::Bound => b"bound <exact|lower|upper>",
             Self::Eval | Self::EvalCp => b"eval <cp>",
             Self::PathDep => b"pathdep <0|1>",
+            Self::DeclRule => b"declrule <0|1>",
+            Self::MoveLimit => b"movelimit <0|1>",
         }
     }
 }
@@ -126,7 +132,11 @@ pub enum TtParseError<'a> {
     },
     DepthOutOfRange(i64),
     UnknownBound(&'a [u8]),
-    BadPathDep(&'a [u8]),
+    /// A mark clause whose operand was neither `0` nor `1`.
+    BadMark {
+        clause: TtClause,
+        token: &'a [u8],
+    },
     UnexpectedToken(&'a [u8]),
     DuplicateClause(TtClause),
     MissingClause(TtClause),
@@ -194,8 +204,10 @@ impl TtParseError<'_> {
                     .bytes(token)
                     .bytes(b"`; expected `exact`, `lower` or `upper`");
             }
-            Self::BadPathDep(token) => {
-                out.bytes(b"`pathdep` takes `0` or `1`, found `")
+            Self::BadMark { clause, token } => {
+                out.byte(b'`')
+                    .bytes(clause.name())
+                    .bytes(b"` takes `0` or `1`, found `")
                     .bytes(token)
                     .bytes(b"`");
             }
@@ -262,8 +274,8 @@ pub struct TtStoreArgs<'a> {
     /// Static eval in internal units (the entry's `eval16` field).
     pub eval: Value,
     pub pv: bool,
-    /// The entry's path-dependence mark (`false` when the clause is omitted).
-    pub path_dep: bool,
+    /// The entry's value marks; each is `false` when its clause is omitted.
+    pub marks: ValueMarks,
 }
 
 /// One parsed `tt` invocation.
@@ -337,6 +349,8 @@ fn parse_store<'a>(tokens: &[&'a [u8]]) -> Result<TtStoreArgs<'a>, TtParseError<
     let mut eval: Option<Value> = None;
     let mut pv = false;
     let mut path_dep: Option<bool> = None;
+    let mut decl_rule: Option<bool> = None;
+    let mut move_limit: Option<bool> = None;
 
     let mut i = 0;
     while i < tokens.len() {
@@ -400,7 +414,26 @@ fn parse_store<'a>(tokens: &[&'a [u8]]) -> Result<TtStoreArgs<'a>, TtParseError<
             }
             b"pathdep" => {
                 reject_duplicate(&path_dep, TtClause::PathDep)?;
-                path_dep = Some(parse_path_dep(operand(tokens, i, TtClause::PathDep)?)?);
+                path_dep = Some(parse_mark(
+                    operand(tokens, i, TtClause::PathDep)?,
+                    TtClause::PathDep,
+                )?);
+                i += 2;
+            }
+            b"declrule" => {
+                reject_duplicate(&decl_rule, TtClause::DeclRule)?;
+                decl_rule = Some(parse_mark(
+                    operand(tokens, i, TtClause::DeclRule)?,
+                    TtClause::DeclRule,
+                )?);
+                i += 2;
+            }
+            b"movelimit" => {
+                reject_duplicate(&move_limit, TtClause::MoveLimit)?;
+                move_limit = Some(parse_mark(
+                    operand(tokens, i, TtClause::MoveLimit)?,
+                    TtClause::MoveLimit,
+                )?);
                 i += 2;
             }
             other => return Err(TtParseError::UnexpectedToken(other)),
@@ -415,16 +448,24 @@ fn parse_store<'a>(tokens: &[&'a [u8]]) -> Result<TtStoreArgs<'a>, TtParseError<
         bound: bound.ok_or(TtParseError::MissingClause(TtClause::Bound))?,
         eval: eval.ok_or(TtParseError::MissingClause(TtClause::Eval))?,
         pv,
-        path_dep: path_dep.unwrap_or(false),
+        marks: ValueMarks {
+            path_dep: path_dep.unwrap_or(false),
+            decl_rule: decl_rule.unwrap_or(false),
+            move_limit: move_limit.unwrap_or(false),
+        },
     })
 }
 
-/// The `pathdep` operand: the same `0` / `1` spelling the field is reported in.
-fn parse_path_dep<'a>(tok: &'a [u8]) -> Result<bool, TtParseError<'a>> {
+/// A mark clause's operand: the same `0` / `1` spelling the field is reported
+/// in.
+fn parse_mark<'a>(tok: &'a [u8], clause: TtClause) -> Result<bool, TtParseError<'a>> {
     match tok {
         b"0" => Ok(false),
         b"1" => Ok(true),
-        other => Err(TtParseError::BadPathDep(other)),
+        other => Err(TtParseError::BadMark {
+            clause,
+            token: other,
+        }),
     }
 }
 
@@ -603,13 +644,13 @@ mod tests {
                 bound: Bound::Exact,
                 eval: 45,
                 pv: true,
-                path_dep: false,
+                marks: ValueMarks::NONE,
             })
         );
     }
 
     #[test]
-    fn pv_and_pathdep_default_to_false_and_cp_synonym_is_accepted() {
+    fn pv_and_the_marks_default_to_false_and_cp_synonym_is_accepted() {
         let cmd = parse("store startpos move none value cp 0 depth 0 bound lower eval cp 0")
             .expect("parses");
         assert_eq!(
@@ -622,42 +663,86 @@ mod tests {
                 bound: Bound::Lower,
                 eval: 0,
                 pv: false,
-                path_dep: false,
+                marks: ValueMarks::NONE,
             })
         );
     }
 
     #[test]
-    fn pathdep_takes_zero_or_one_and_nothing_else() {
-        let stored = |arg: &str| -> Result<bool, ()> {
+    fn a_mark_clause_takes_zero_or_one_and_nothing_else() {
+        let stored = |clause: &str, arg: &str| -> Result<ValueMarks, ()> {
             let line = format!(
-                "store startpos move none value 0 depth 1 bound exact eval 0 pathdep {arg}"
+                "store startpos move none value 0 depth 1 bound exact eval 0 {clause} {arg}"
             );
             let tokens = toks(&line);
             match parse_tt(&tokens) {
-                Ok(TtCommand::Store(args)) => Ok(args.path_dep),
+                Ok(TtCommand::Store(args)) => Ok(args.marks),
                 Ok(_) => panic!("`store` parses as a store"),
                 Err(_) => Err(()),
             }
         };
-        assert_eq!(stored("1"), Ok(true));
-        assert_eq!(stored("0"), Ok(false));
+        // Each clause sets its own flag and leaves the other two clear.
+        for (clause, set) in [
+            (
+                "pathdep",
+                ValueMarks {
+                    path_dep: true,
+                    ..ValueMarks::NONE
+                },
+            ),
+            (
+                "declrule",
+                ValueMarks {
+                    decl_rule: true,
+                    ..ValueMarks::NONE
+                },
+            ),
+            (
+                "movelimit",
+                ValueMarks {
+                    move_limit: true,
+                    ..ValueMarks::NONE
+                },
+            ),
+        ] {
+            assert_eq!(stored(clause, "1"), Ok(set));
+            assert_eq!(stored(clause, "0"), Ok(ValueMarks::NONE));
 
-        for arg in ["true", "2", "-1", "yes"] {
-            assert!(stored(arg).is_err(), "`pathdep {arg}` must be rejected");
+            for arg in ["true", "2", "-1", "yes"] {
+                assert!(
+                    stored(clause, arg).is_err(),
+                    "`{clause} {arg}` must be rejected"
+                );
+            }
+            // Operand-less and duplicated, as every other clause is checked.
+            let base = "store startpos move none value 0 depth 1 bound exact eval 0";
+            assert!(parse(&format!("{base} {clause}")).is_err());
+            assert!(parse(&format!("{base} {clause} 1 {clause} 0")).is_err());
+            // `probe` / `children` take a position clause and nothing else.
+            assert!(parse(&format!("probe startpos {clause} 1")).is_err());
         }
-        // Operand-less and duplicated, as every other clause is checked.
-        assert!(
-            parse("store startpos move none value 0 depth 1 bound exact eval 0 pathdep").is_err()
-        );
-        assert!(
+
+        // All three at once, each landing on its own flag.
+        assert_eq!(
             parse(
-                "store startpos move none value 0 depth 1 bound exact eval 0 pathdep 1 pathdep 0"
-            )
-            .is_err()
+                "store startpos move none value 0 depth 1 bound exact eval 0 \
+                 pathdep 1 declrule 0 movelimit 1"
+            ),
+            Ok(TtCommand::Store(TtStoreArgs {
+                position: TtPosition::StartPos,
+                mv: b"none",
+                value: 0,
+                depth: 1,
+                bound: Bound::Exact,
+                eval: 0,
+                pv: false,
+                marks: ValueMarks {
+                    path_dep: true,
+                    decl_rule: false,
+                    move_limit: true,
+                },
+            }))
         );
-        // `probe` / `children` take a position clause and nothing else.
-        assert!(parse("probe startpos pathdep 1").is_err());
     }
 
     #[test]

@@ -42,6 +42,8 @@ use std::num::NonZeroU16;
 use std::ops::Deref;
 use std::sync::{Mutex, MutexGuard};
 
+#[cfg(feature = "verbose3")]
+use yorkie_storage::ValueMarks;
 use yorkie_storage::{Bound, CLUSTER_COUNT, DEPTH_NONE, TT_ALIGN, TTData, TranspositionTable};
 
 /// Entries per 32-byte cluster, restating the crate-private `CLUSTER_SIZE`.
@@ -124,7 +126,7 @@ fn store(
         eval,
         generation,
         #[cfg(feature = "verbose3")]
-        false,
+        ValueMarks::NONE,
     );
 }
 
@@ -150,7 +152,7 @@ fn store_probe_round_trip_every_field() {
         -654,
         tt_generation_zero(),
         #[cfg(feature = "verbose3")]
-        false,
+        ValueMarks::NONE,
     );
 
     // Hit: every field survives the round trip.
@@ -262,30 +264,29 @@ fn replacement_evicts_lowest_priority_entry() {
     //   slot 1: frag 4, depth  5 → depth8  8, priority  8   ← lowest
     //
     // The cluster is now full, so a miss replaces slot 1 (frag 4).
-    //
-    // The fragments are spaced by two because key bit 0 is the
-    // path-dependence mark at `verbose3`, so consecutive ones would name the
-    // same entry there.
     let tt = fresh_tt();
     let side = 0;
     let hi = 100;
 
-    store(&tt, key(hi, 2), side, 0, false, Bound::Lower, 10, 1, 0);
-    store(&tt, key(hi, 4), side, 0, false, Bound::Lower, 5, 2, 0);
+    store(&tt, key(hi, 8), side, 0, false, Bound::Lower, 10, 1, 0);
+    store(&tt, key(hi, 16), side, 0, false, Bound::Lower, 5, 2, 0);
 
     // Both present before the eviction.
-    assert!(tt.probe(key(hi, 2), side).0);
-    assert!(tt.probe(key(hi, 4), side).0);
+    assert!(tt.probe(key(hi, 8), side).0);
+    assert!(tt.probe(key(hi, 16), side).0);
 
-    // Miss on frag 6 → writer targets the evicted slot; write frag 6 there.
-    store(&tt, key(hi, 6), side, 0, false, Bound::Lower, 1, 3, 0);
+    // Miss on frag 24 → writer targets the evicted slot; write frag 24 there.
+    store(&tt, key(hi, 24), side, 0, false, Bound::Lower, 1, 3, 0);
 
     assert!(
-        !tt.probe(key(hi, 4), side).0,
-        "frag 4 (depth 5) should have been evicted"
+        !tt.probe(key(hi, 16), side).0,
+        "frag 16 (depth 5) should have been evicted"
     );
-    assert!(tt.probe(key(hi, 2), side).0, "frag 2 should survive");
-    assert!(tt.probe(key(hi, 6), side).0, "frag 6 should now be present");
+    assert!(tt.probe(key(hi, 8), side).0, "frag 8 should survive");
+    assert!(
+        tt.probe(key(hi, 24), side).0,
+        "frag 24 should now be present"
+    );
 }
 
 #[cfg_attr(miri, ignore)]
@@ -344,45 +345,44 @@ fn generation_aging_lowers_replacement_priority() {
 #[cfg(feature = "tt-entry16")]
 fn generation_aging_lowers_replacement_priority() {
     // After three new_search() bumps the table is at generation 3:
-    //   P: frag 2, depth 20, gen 0 → depth8 23, age 3, priority 23 − 24 = −1  ← lowest
-    //   Q: frag 4, depth  3, gen 3 → depth8  6, age 0, priority  6
+    //   P: frag 8, depth 20, gen 0 → depth8 23, age 3, priority 23 − 24 = −1  ← lowest
+    //   Q: frag 16, depth  3, gen 3 → depth8  6, age 0, priority  6
     //
     // Without aging P's priority would be 23 — higher than Q's 6, so Q would be
     // the victim. Aging flips the order and the miss evicts P instead.
-    //
-    // The fragments are spaced by two because key bit 0 is the
-    // path-dependence mark at `verbose3`, so consecutive ones would name the
-    // same entry there.
     let tt = fresh_tt();
     let side = 0;
     let hi = 200;
 
     // P written at generation 0.
     assert_eq!(tt.generation(), 0);
-    store(&tt, key(hi, 2), side, 0, false, Bound::Lower, 20, 1, 0);
+    store(&tt, key(hi, 8), side, 0, false, Bound::Lower, 20, 1, 0);
 
     // Advance to generation 3, then write Q.
     tt.new_search();
     tt.new_search();
     tt.new_search();
     assert_eq!(tt.generation(), 3);
-    store(&tt, key(hi, 4), side, 0, false, Bound::Lower, 3, 2, 0);
+    store(&tt, key(hi, 16), side, 0, false, Bound::Lower, 3, 2, 0);
 
     // Sanity: both occupy the cluster.
-    assert!(tt.probe(key(hi, 2), side).0);
-    assert!(tt.probe(key(hi, 4), side).0);
+    assert!(tt.probe(key(hi, 8), side).0);
+    assert!(tt.probe(key(hi, 16), side).0);
 
-    // Miss → evicts the aged, deep entry P (frag 2), not the shallow fresh Q.
-    store(&tt, key(hi, 6), side, 0, false, Bound::Lower, 1, 3, 3);
+    // Miss → evicts the aged, deep entry P (frag 8), not the shallow fresh Q.
+    store(&tt, key(hi, 24), side, 0, false, Bound::Lower, 1, 3, 3);
     assert!(
-        !tt.probe(key(hi, 2), side).0,
+        !tt.probe(key(hi, 8), side).0,
         "aged deep entry P should be evicted"
     );
     assert!(
-        tt.probe(key(hi, 4), side).0,
+        tt.probe(key(hi, 16), side).0,
         "fresh shallow entry Q should survive"
     );
-    assert!(tt.probe(key(hi, 6), side).0, "frag 6 should now be present");
+    assert!(
+        tt.probe(key(hi, 24), side).0,
+        "frag 24 should now be present"
+    );
 }
 
 /// The entry-count half of the `tt-entry16` trade, as behaviour rather than a
@@ -394,10 +394,7 @@ fn a_cluster_holds_exactly_cluster_size_positions() {
     let side = 0;
     let hi = 555;
 
-    // Fragments are spaced by two: under `verbose3` the wide layout spends key
-    // bit 0 on the path-dependence mark, so a family of consecutive fragments
-    // would hold two positions that are one and the same entry there.
-    let frag = |i: u16| i * 2;
+    let frag = |i: u16| i * 8;
 
     // Equal depth throughout, so nothing is preferentially retained and the
     // test turns purely on capacity.
@@ -553,11 +550,9 @@ fn a_cleared_table_reads_back_all_misses() {
     let tt = fresh_tt();
     for hi in 0..2048u64 {
         for side in 0..2u8 {
-            // A fragment that is nonzero *above bit 0* cannot match a zeroed
-            // entry's `key == 0`, so the probe takes the true miss path. Bit 0
-            // is excluded because the `verbose3` wide layout stores the
-            // path-dependence mark there rather than the hash.
-            let k = key(hi, (hi as u16).wrapping_mul(7) | 2);
+            // A nonzero fragment cannot match a zeroed entry's `key == 0`, so
+            // the probe takes the true miss path.
+            let k = key(hi, (hi as u16).wrapping_mul(7) | 8);
             let (found, data, _) = tt.probe(k, side);
             assert!(!found, "cleared table entry occupied at hi={hi}");
             assert_eq!(data, miss_sentinel());
@@ -654,7 +649,7 @@ fn miss_sentinel() -> TTData {
         bound: Bound::None,
         is_pv: false,
         #[cfg(feature = "verbose3")]
-        path_dep: false,
+        marks: ValueMarks::NONE,
     }
 }
 
@@ -810,16 +805,39 @@ mod narrow_key_identity {
     }
 }
 
-/// The per-entry path-dependence mark, which exists only at `verbose3`. The
-/// search's rule for *when* an entry is marked is the Search layer's; what is
-/// pinned here is that a mark written for one entry comes back for that entry
-/// and no other, follows the payload through the replacement policy, and is
-/// part of what [`TranspositionTable::checksum`] summarises.
+/// The per-entry value marks, which exist only at `verbose3`. The search's
+/// rule for *when* an entry is marked is the Search layer's; what is pinned
+/// here is that marks written for one entry come back for that entry and no
+/// other, follow the payload through the replacement policy, and are part of
+/// what [`TranspositionTable::checksum`] summarises.
 #[cfg(feature = "verbose3")]
-mod path_dependence_mark {
+mod value_marks {
     use super::*;
 
-    /// [`store`], with the mark it leaves unmarked spelled out.
+    /// One flag set and the other two clear, so a test naming a flag cannot
+    /// pass on a layout that confuses it with its neighbour.
+    const PATH_DEP: ValueMarks = ValueMarks {
+        path_dep: true,
+        decl_rule: false,
+        move_limit: false,
+    };
+    const DECL_RULE: ValueMarks = ValueMarks {
+        path_dep: false,
+        decl_rule: true,
+        move_limit: false,
+    };
+    const MOVE_LIMIT: ValueMarks = ValueMarks {
+        path_dep: false,
+        decl_rule: false,
+        move_limit: true,
+    };
+    const ALL: ValueMarks = ValueMarks {
+        path_dep: true,
+        decl_rule: true,
+        move_limit: true,
+    };
+
+    /// [`store`], with the marks it leaves clear spelled out.
     #[allow(clippy::too_many_arguments)]
     fn store_marked(
         tt: &TranspositionTable,
@@ -831,7 +849,7 @@ mod path_dependence_mark {
         depth: i32,
         mv: u16,
         eval: i32,
-        path_dep: bool,
+        marks: ValueMarks,
     ) {
         let generation = tt.generation();
         let (_, _, w) = tt.probe(k, side);
@@ -844,16 +862,41 @@ mod path_dependence_mark {
             NonZeroU16::new(mv),
             eval,
             generation,
-            path_dep,
+            marks,
         );
     }
 
-    /// `CLUSTER_ENTRIES` keys that share one cluster, spaced so no two of them
-    /// differ only in the key bit the wide layout spends on the mark.
+    /// `CLUSTER_ENTRIES` keys that share one cluster.
     fn cluster_family(hi: u64) -> Vec<u64> {
         (0..CLUSTER_ENTRIES)
             .map(|i| key(hi, 0x10 + (i as u16) * 0x10))
             .collect()
+    }
+
+    /// Each flag survives the round trip on its own, so none of them is stored
+    /// over another.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn every_mark_reads_back_independently() {
+        let tt = fresh_tt();
+        let side = 0;
+        let k = key(64, 0x0102);
+
+        for marks in [
+            ValueMarks::NONE,
+            PATH_DEP,
+            DECL_RULE,
+            MOVE_LIMIT,
+            ALL,
+            ValueMarks {
+                path_dep: false,
+                decl_rule: true,
+                move_limit: true,
+            },
+        ] {
+            store_marked(&tt, k, side, 10, false, Bound::Exact, 8, 0x11, 0, marks);
+            assert_eq!(tt.probe(k, side).1.marks, marks);
+        }
     }
 
     #[cfg_attr(miri, ignore)]
@@ -863,16 +906,27 @@ mod path_dependence_mark {
         let side = 0;
         let k = key(64, 0x0102);
 
-        store_marked(&tt, k, side, 10, false, Bound::Exact, 8, 0x11, 0, true);
-        assert!(tt.probe(k, side).1.path_dep);
+        store_marked(&tt, k, side, 10, false, Bound::Exact, 8, 0x11, 0, ALL);
+        assert_eq!(tt.probe(k, side).1.marks, ALL);
 
-        // The same slot, rewritten unmarked: the mark follows the payload
+        // The same slot, rewritten unmarked: the marks follow the payload
         // rather than accumulating.
-        store_marked(&tt, k, side, 20, false, Bound::Exact, 8, 0x11, 0, false);
+        store_marked(
+            &tt,
+            k,
+            side,
+            20,
+            false,
+            Bound::Exact,
+            8,
+            0x11,
+            0,
+            ValueMarks::NONE,
+        );
         let (found, data, _) = tt.probe(k, side);
         assert!(found);
         assert_eq!(data.value, 20);
-        assert!(!data.path_dep);
+        assert_eq!(data.marks, ValueMarks::NONE);
     }
 
     /// A miss carries no mark, whatever the entry it would replace holds.
@@ -884,7 +938,7 @@ mod path_dependence_mark {
 
         store_marked(
             &tt,
-            key(70, 0x0001),
+            key(70, 0x0010),
             side,
             10,
             false,
@@ -892,14 +946,14 @@ mod path_dependence_mark {
             8,
             0x11,
             0,
-            true,
+            ALL,
         );
-        let (found, data, _) = tt.probe(key(70, 0x0002), side);
+        let (found, data, _) = tt.probe(key(70, 0x0020), side);
         assert!(!found);
         assert_eq!(data, miss_sentinel());
     }
 
-    /// Every entry of one cluster carries its own mark. In the default layout
+    /// Every entry of one cluster carries its own marks. In the default layout
     /// they share a single word, so this is what says the per-slot writes do
     /// not clobber each other.
     #[cfg_attr(miri, ignore)]
@@ -908,9 +962,11 @@ mod path_dependence_mark {
         let tt = fresh_tt();
         let side = 1;
         let family = cluster_family(88);
+        // A different flag per slot, so neither an all-set nor an all-clear
+        // word would pass, and a field written at the wrong offset lands on a
+        // neighbour that expects something else.
+        let expected = |i: usize| [PATH_DEP, DECL_RULE, MOVE_LIMIT][i % 3];
 
-        // Alternate the marks, so neither an all-set nor an all-clear word
-        // would pass.
         for (i, &k) in family.iter().enumerate() {
             store_marked(
                 &tt,
@@ -922,17 +978,17 @@ mod path_dependence_mark {
                 8,
                 0x20 + i as u16,
                 0,
-                i % 2 == 0,
+                expected(i),
             );
         }
         for (i, &k) in family.iter().enumerate() {
             let (found, data, _) = tt.probe(k, side);
             assert!(found, "entry {i} must still be there");
             assert_eq!(data.value, i as i32);
-            assert_eq!(data.path_dep, i % 2 == 0, "entry {i} carries its own mark");
+            assert_eq!(data.marks, expected(i), "entry {i} carries its own marks");
         }
 
-        // Rewriting one entry's mark leaves its neighbours' alone.
+        // Rewriting one entry's marks leaves its neighbours' alone.
         store_marked(
             &tt,
             family[0],
@@ -943,16 +999,20 @@ mod path_dependence_mark {
             8,
             0x20,
             0,
-            false,
+            ValueMarks::NONE,
         );
         for (i, &k) in family.iter().enumerate() {
-            let expected = i != 0 && i % 2 == 0;
-            assert_eq!(tt.probe(k, side).1.path_dep, expected, "entry {i}");
+            let want = if i == 0 {
+                ValueMarks::NONE
+            } else {
+                expected(i)
+            };
+            assert_eq!(tt.probe(k, side).1.marks, want, "entry {i}");
         }
     }
 
-    /// A write the replacement policy declines leaves the mark as it is, like
-    /// every other field of the entry it kept.
+    /// A write the replacement policy declines leaves the marks as they are,
+    /// like every other field of the entry it kept.
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_declined_write_leaves_the_mark_alone() {
@@ -960,14 +1020,25 @@ mod path_dependence_mark {
         let side = 0;
         let k = key(96, 0x0303);
 
-        store_marked(&tt, k, side, 10, true, Bound::Exact, 40, 0x11, 0, true);
+        store_marked(&tt, k, side, 10, true, Bound::Exact, 40, 0x11, 0, ALL);
         // Shallow, non-exact, same position and generation: declined.
-        store_marked(&tt, k, side, 99, false, Bound::Lower, 1, 0x22, 0, false);
+        store_marked(
+            &tt,
+            k,
+            side,
+            99,
+            false,
+            Bound::Lower,
+            1,
+            0x22,
+            0,
+            ValueMarks::NONE,
+        );
 
         let (found, data, _) = tt.probe(k, side);
         assert!(found);
         assert_eq!(data.value, 10, "the declined write kept the deep entry");
-        assert!(data.path_dep, "and with it the mark");
+        assert_eq!(data.marks, ALL, "and with it the marks");
     }
 
     #[cfg_attr(miri, ignore)]
@@ -978,7 +1049,7 @@ mod path_dependence_mark {
         let empty = tt.checksum();
 
         for &k in &cluster_family(112) {
-            store_marked(&tt, k, side, 1, false, Bound::Exact, 8, 0x11, 0, true);
+            store_marked(&tt, k, side, 1, false, Bound::Exact, 8, 0x11, 0, ALL);
         }
         tt.clear();
         assert_eq!(
@@ -988,12 +1059,12 @@ mod path_dependence_mark {
         );
     }
 
-    /// The checksum summarises everything the table stores, the mark included,
+    /// The checksum summarises everything the table stores, the marks included,
     /// so two runs that differ in nothing else still differ in it.
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn the_checksum_covers_the_mark() {
-        let checksum_with = |path_dep: bool| {
+    fn the_checksum_covers_every_mark() {
+        let checksum_with = |marks: ValueMarks| {
             let tt = fresh_tt();
             store_marked(
                 &tt,
@@ -1005,30 +1076,88 @@ mod path_dependence_mark {
                 8,
                 0x11,
                 0,
-                path_dep,
+                marks,
             );
             tt.checksum()
         };
-        assert_eq!(checksum_with(false), checksum_with(false));
-        assert_ne!(checksum_with(false), checksum_with(true));
+        let empty = checksum_with(ValueMarks::NONE);
+        assert_eq!(empty, checksum_with(ValueMarks::NONE));
+        for marks in [PATH_DEP, DECL_RULE, MOVE_LIMIT] {
+            assert_ne!(empty, checksum_with(marks), "{marks:?} must reach the sum");
+        }
     }
 
-    /// Under `tt-entry16` the mark is bit 0 of the stored key, so identity is
-    /// the remaining 63 bits: two keys differing only there share an entry.
-    /// That is the whole price of putting it in the key.
+    /// Under `tt-entry16` the marks are the stored key's top three bits: the
+    /// entry writes them over whatever the position key had there, and reads
+    /// them back from the same place. Each bit is exercised with the key's own
+    /// bit set, so an entry that kept the key's bit instead of the mark reads
+    /// back a mark it was never given.
     #[cfg(feature = "tt-entry16")]
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn the_wide_layout_spends_key_bit_zero_on_the_mark() {
+    fn the_wide_layout_spends_the_keys_top_bits_on_the_marks() {
         let tt = fresh_tt();
         let side = 0;
-        let a = key(144, 0x0500);
-        let b = a | 1;
 
-        store_marked(&tt, a, side, 11, false, Bound::Exact, 8, 0x11, 0, true);
-        let (found, data, _) = tt.probe(b, side);
-        assert!(found, "bit 0 is the mark, not part of the identity");
-        assert_eq!(data.value, 11);
-        assert!(data.path_dep);
+        for bit in 0..3u32 {
+            // `hi` sits at the top of the key, so its bit `CLUSTER_BITS − 1` is
+            // key bit 63. The low bit keeps the cluster away from the one the
+            // previous iteration used.
+            let k = key((1u64 << (CLUSTER_BITS - 1 - bit)) | 1, 0x0500);
+            assert_eq!((k >> (63 - bit)) & 1, 1, "key bit {} must be set", 63 - bit);
+
+            for marks in [ValueMarks::NONE, PATH_DEP, ALL] {
+                store_marked(&tt, k, side, 11, false, Bound::Exact, 8, 0x11, 0, marks);
+                let (found, data, _) = tt.probe(k, side);
+                assert!(found, "the marks are not part of the identity");
+                assert_eq!(data.value, 11);
+                assert_eq!(data.marks, marks, "key bit {} is a mark", 63 - bit);
+            }
+        }
+    }
+
+    /// The premise that costs the top bits nothing: the cluster a key reaches
+    /// is decided by those same bits, so two keys differing only there are
+    /// never candidates for one entry and the stored key never has to tell
+    /// them apart.
+    #[cfg(feature = "tt-entry16")]
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn keys_differing_only_in_their_top_bits_reach_different_clusters() {
+        let tt = fresh_tt();
+        let side = 0;
+        let base = key(1, 0x0500);
+        assert_eq!(
+            base >> 61,
+            0,
+            "the base key leaves the top three bits clear"
+        );
+
+        for pattern in 1..8u64 {
+            let other = base | (pattern << 61);
+            store_marked(&tt, base, side, 11, false, Bound::Exact, 8, 0x11, 0, ALL);
+            store_marked(
+                &tt,
+                other,
+                side,
+                22,
+                false,
+                Bound::Exact,
+                8,
+                0x22,
+                0,
+                ValueMarks::NONE,
+            );
+
+            let (found_base, data_base, _) = tt.probe(base, side);
+            assert!(found_base, "{pattern:#b}: the base key keeps its entry");
+            assert_eq!(data_base.value, 11);
+            assert_eq!(data_base.marks, ALL);
+
+            let (found_other, data_other, _) = tt.probe(other, side);
+            assert!(found_other, "{pattern:#b}: the sibling keeps its own");
+            assert_eq!(data_other.value, 22);
+            assert_eq!(data_other.marks, ValueMarks::NONE);
+        }
     }
 }
