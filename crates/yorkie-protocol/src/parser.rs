@@ -15,7 +15,7 @@ use crate::engine::MATE_UNLIMITED_MS;
 use crate::engine::{GoParams, PositionSfen};
 #[cfg(feature = "verbose2")]
 use yorkie_state::text::atoi_u32;
-use yorkie_state::text::{atoi_u64, split_token, trim_ascii_whitespace};
+use yorkie_state::text::{atoi_u64, split_token};
 
 /// Input-validation limit: lines longer than this become
 /// `Command::TooLong` and are not parsed further.
@@ -123,7 +123,7 @@ pub fn parse_line(input: &[u8]) -> Command<'_> {
     if input.len() > MAX_LINE_BYTES {
         return Command::TooLong;
     }
-    let trimmed = trim_ascii_whitespace(input);
+    let trimmed = input.trim_ascii();
     if trimmed.is_empty() {
         return unknown(b"");
     }

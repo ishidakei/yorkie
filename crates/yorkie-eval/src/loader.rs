@@ -418,8 +418,8 @@ mod tests {
 
     #[test]
     fn ft_scale_doubles_biases_and_weights() {
-        let biases: [i16; 5] = [0, 1, -1, 16_383, -16_384];
-        let weight_row: [i16; 5] = [0, 1, -1, 16_383, -16_384];
+        let biases: [i16; _] = [0, 1, -1, 16_383, -16_384];
+        let weight_row: [i16; _] = [0, 1, -1, 16_383, -16_384];
         let mut weights = Vec::with_capacity(SCALE_DIMS.hidden_size * SCALE_DIMS.num_features);
         for _ in 0..SCALE_DIMS.num_features {
             weights.extend_from_slice(&weight_row);
@@ -428,7 +428,7 @@ mod tests {
         let bytes = build_bytes_with_ft(&SCALE_DIMS, ARCH_STRING, &biases, &weights);
         let (net, _warnings) = network_from_bytes(&bytes, &SCALE_DIMS).expect("should parse");
 
-        let expected_row: [i16; 5] = [0, 2, -2, 32_766, -32_768];
+        let expected_row: [i16; _] = [0, 2, -2, 32_766, -32_768];
         assert_eq!(net.ft_biases(), &expected_row[..]);
         assert_eq!(net.ft_weights().len(), weights.len());
         for chunk in net.ft_weights().chunks(expected_row.len()) {
@@ -438,7 +438,7 @@ mod tests {
 
     #[test]
     fn ft_scale_rejects_overflow_bias() {
-        let biases: [i16; 5] = [16_384, 0, 0, 0, 0];
+        let biases: [i16; _] = [16_384, 0, 0, 0, 0];
         let weights = vec![0i16; SCALE_DIMS.hidden_size * SCALE_DIMS.num_features];
 
         let bytes = build_bytes_with_ft(&SCALE_DIMS, ARCH_STRING, &biases, &weights);

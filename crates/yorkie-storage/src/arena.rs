@@ -194,8 +194,12 @@ impl LargePageArena {
         // comes from `base_nonnull()`, so the pointer carries the allocation's
         // raw, write-capable provenance rather than a reference reborrow.
         unsafe {
-            let p = self.backing.base_nonnull().as_ptr().add(section.offset) as *mut T;
-            slice::from_raw_parts_mut(p, section.len)
+            let p = self
+                .backing
+                .base_nonnull()
+                .byte_add(section.offset)
+                .cast::<T>();
+            slice::from_raw_parts_mut(p.as_ptr(), section.len)
         }
     }
 
@@ -220,9 +224,14 @@ impl LargePageArena {
         // so `base + offset` is a non-null, `T`-aligned pointer into the arena.
         // The base comes from `base_nonnull()`, so it carries the allocation's
         // raw, write-capable provenance — the view may later write through it.
-        let p = unsafe { self.backing.base_nonnull().as_ptr().add(section.offset) as *mut T };
+        let ptr = unsafe {
+            self.backing
+                .base_nonnull()
+                .byte_add(section.offset)
+                .cast::<T>()
+        };
         ArenaSlice {
-            ptr: NonNull::new(p).expect("arena base pointer is non-null"),
+            ptr,
             len: section.len,
             _marker: PhantomData,
         }

@@ -152,7 +152,7 @@ mod tests {
             let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
             assert!(!ptr.is_null(), "allocation of {size} bytes failed");
             assert_eq!(
-                ptr as usize % LARGE_PAGE_ALIGN,
+                ptr.addr() % LARGE_PAGE_ALIGN,
                 0,
                 "global allocator returned a pointer not {LARGE_PAGE_ALIGN}-aligned for {size} bytes",
             );

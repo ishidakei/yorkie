@@ -301,9 +301,8 @@ fn can_king_escape(
     own: Bb,
 ) -> bool {
     let attacker = king_color.flip();
-    let king_sq = match try_find_king(board, king_color) {
-        Some(s) => s,
-        None => return false,
+    let Some(king_sq) = try_find_king(board, king_color) else {
+        return false;
     };
     let mut occ = base_occ.with(to);
     if from.is_some() {
@@ -325,9 +324,8 @@ fn can_king_escape(
 /// pinned off its line? (`can_piece_capture`; `pinned` is `king_color`'s pin
 /// set, `slide` the occupancy.)
 fn can_piece_capture(board: &Board, king_color: Color, to: Square, pinned: Bb, slide: Bb) -> bool {
-    let king_sq = match try_find_king(board, king_color) {
-        Some(s) => s,
-        None => return false,
+    let Some(king_sq) = try_find_king(board, king_color) else {
+        return false;
     };
     let attackers = attackers_of_color(board, to, slide, king_color).sub(both_kings(board));
     for from in attackers.iter() {

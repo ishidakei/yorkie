@@ -13,11 +13,12 @@
 //! they skip on a host without the features. The kernels are exact, not
 //! approximate: whichever the build selects, the output is bit-identical.
 //!
-//! Every AVX-512 entry point is an `unsafe fn` with a `#[target_feature]`
-//! attribute, sound to call only when those features are present. The wrappers
-//! here are the sole non-test callers, and each `unsafe` call sits behind a
-//! `cfg(target_feature = ...)` naming exactly what its callee enables, so no
-//! `unsafe` escapes the SIMD modules.
+//! Every AVX-512 entry point carries a `#[target_feature]` attribute naming
+//! what it needs. A global target feature does not satisfy that requirement —
+//! only a `#[target_feature]` on the calling function does — so the wrappers
+//! here, which are the sole non-test callers, each name the CPU as the reason
+//! in an `unsafe` block sitting behind a `cfg(target_feature = ...)` for
+//! exactly the callee's set. No `unsafe` escapes the SIMD modules.
 
 use crate::features::FeatureIndex;
 use crate::types::HIDDEN_SIZE;
@@ -48,8 +49,8 @@ pub mod avx512_post_ft;
 pub(crate) fn ft_column(weights: &[i16], idx: FeatureIndex) -> &[i16; HIDDEN_SIZE] {
     let base = idx as usize * HIDDEN_SIZE;
     weights[base..base + HIDDEN_SIZE]
-        .try_into()
-        .expect("a HIDDEN_SIZE-long subslice converts to the array of that width")
+        .as_array()
+        .expect("a HIDDEN_SIZE-long subslice borrows as the array of that width")
 }
 
 /// Which kernel backend this build compiled into the forward pass.
@@ -175,20 +176,21 @@ pub mod post_ft_kernel {
         // SAFETY: this module is compiled only into a build enabling exactly
         // the features the callee's `#[target_feature]` names, and such a build
         // is `-C target-cpu=native`, so it only ever runs on a host with them.
+        // `out` is one half of the output buffer, `HIDDEN_SIZE / 2` bytes wide.
         unsafe { avx512_post_ft::ewm_one_perspective(half, out) }
     }
 
     /// Clipped ReLU.
     #[inline]
     pub fn clipped_relu(input: &[i32], output: &mut [u8]) {
-        // SAFETY: see `ewm_one_perspective`.
+        // SAFETY: see `ewm_one_perspective`; the two slices are equally long.
         unsafe { avx512_post_ft::clipped_relu(input, output) }
     }
 
     /// Squared clipped ReLU.
     #[inline]
     pub fn sqr_clipped_relu(input: &[i32], output: &mut [u8]) {
-        // SAFETY: see `ewm_one_perspective`.
+        // SAFETY: see `ewm_one_perspective`; the two slices are equally long.
         unsafe { avx512_post_ft::sqr_clipped_relu(input, output) }
     }
 

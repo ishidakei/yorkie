@@ -255,10 +255,9 @@ impl Book {
         let mut left = 0u64;
         let mut right = self.record_count;
         while left < right {
-            let middle = left + (right - left) / 2;
-            let entry = match self.read_index_entry(middle)? {
-                Some(e) => e,
-                None => return Ok(None),
+            let middle = u64::midpoint(left, right);
+            let Some(entry) = self.read_index_entry(middle)? else {
+                return Ok(None);
             };
             match packed[..].cmp(&entry.packed[..]) {
                 std::cmp::Ordering::Less => right = middle,
@@ -308,18 +307,16 @@ impl Book {
     /// out-of-range moves region; `Err` only on an I/O error.
     fn read_moves(&self, entry: &IndexEntry) -> Result<Option<Vec<BookMove>>, BookError> {
         let record_size = self.move_record_size();
-        let absolute = match self.moves_base.checked_add(entry.moves_offset) {
-            Some(a) => a,
-            None => return Ok(None),
+        let Some(absolute) = self.moves_base.checked_add(entry.moves_offset) else {
+            return Ok(None);
         };
         let total = u64::from(entry.move_count) * record_size;
 
         match &self.source {
             Source::Memory(data) => {
                 let start = absolute as usize;
-                let end = match start.checked_add(total as usize) {
-                    Some(e) => e,
-                    None => return Ok(None),
+                let Some(end) = start.checked_add(total as usize) else {
+                    return Ok(None);
                 };
                 match data.get(start..end) {
                     Some(region) => Ok(Some(decode_moves(
@@ -372,10 +369,8 @@ fn moves_base(record_count: u64) -> Result<u64, BookError> {
 
 /// Parse a 44-byte index record (`buf.len() >= 44`).
 fn parse_index_entry(buf: &[u8]) -> IndexEntry {
-    let mut packed = [0u8; 32];
-    packed.copy_from_slice(&buf[..32]);
     IndexEntry {
-        packed,
+        packed: *buf.first_chunk().expect("a 44-byte index record"),
         moves_offset: read_u64_le(&buf[32..40]),
         ply: read_u16_le(&buf[40..42]),
         move_count: read_u16_le(&buf[42..44]),
@@ -427,14 +422,12 @@ fn read_at(mut file: &File, offset: u64, buf: &mut [u8]) -> Result<bool, BookErr
 
 /// Read a little-endian `u16` from a 2-byte slice (`b.len() >= 2`).
 fn read_u16_le(b: &[u8]) -> u16 {
-    u16::from_le_bytes([b[0], b[1]])
+    u16::from_le_bytes(*b.first_chunk().expect("a 2-byte little-endian field"))
 }
 
 /// Read a little-endian `u64` from an 8-byte slice (`b.len() >= 8`).
 fn read_u64_le(b: &[u8]) -> u64 {
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&b[..8]);
-    u64::from_le_bytes(bytes)
+    u64::from_le_bytes(*b.first_chunk().expect("an 8-byte little-endian field"))
 }
 
 #[cfg(test)]

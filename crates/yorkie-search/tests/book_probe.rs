@@ -37,7 +37,7 @@ struct ExpectedPos {
 
 #[derive(Deserialize)]
 struct ExpectedMove {
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     usi: String,
     move16: u16,
     value: i16,

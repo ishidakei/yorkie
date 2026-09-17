@@ -423,7 +423,7 @@ fn capture_process_affinity() -> BTreeSet<CpuIndex> {
     let mut cpus = BTreeSet::new();
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
-        let size = std::mem::size_of::<libc::cpu_set_t>();
+        let size = size_of::<libc::cpu_set_t>();
         let status = libc::sched_getaffinity(0, size, &mut set as *mut libc::cpu_set_t);
         if status != 0 {
             // Soft error: assume all system threads are available rather than
@@ -509,7 +509,7 @@ fn pin_current_thread(cpu: CpuIndex) {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_ZERO(&mut set);
         libc::CPU_SET(cpu, &mut set);
-        let size = std::mem::size_of::<libc::cpu_set_t>();
+        let size = size_of::<libc::cpu_set_t>();
         let status = libc::sched_setaffinity(0, size, &set as *const libc::cpu_set_t);
         if status != 0 {
             panic!(
@@ -661,7 +661,7 @@ mod tests {
         let mut cpus = BTreeSet::new();
         unsafe {
             let mut set: libc::cpu_set_t = std::mem::zeroed();
-            let size = std::mem::size_of::<libc::cpu_set_t>();
+            let size = size_of::<libc::cpu_set_t>();
             let status = libc::sched_getaffinity(0, size, &mut set as *mut libc::cpu_set_t);
             assert_eq!(status, 0, "sched_getaffinity failed in test");
             for c in 0..(size * 8) {

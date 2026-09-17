@@ -210,7 +210,7 @@ impl Move {
     /// # Panics
     /// Panics if the encoded `to` index is out of range; this cannot happen
     /// for a `Move` produced by the constructors in this module.
-    pub fn to_sq(self) -> Square {
+    pub const fn to_sq(self) -> Square {
         Square::from_index((self.to_bits() & 0x7f) as u8).expect("Move::to_sq: malformed move data")
     }
 
@@ -219,7 +219,7 @@ impl Move {
     /// # Panics
     /// Panics if `self.is_drop()` (the bits hold a `PieceType` code, not a
     /// square) or if the encoded `from` index is out of range.
-    pub fn from_sq(self) -> Square {
+    pub const fn from_sq(self) -> Square {
         debug_assert!(!self.is_drop(), "Move::from_sq called on a drop");
         Square::from_index(((self.to_bits() >> 7) & 0x7f) as u8)
             .expect("Move::from_sq: malformed move data")
@@ -247,7 +247,7 @@ impl Move {
     ///
     /// # Panics
     /// Panics if `!self.is_drop()` or if the encoded code is not 1..=7.
-    pub fn dropped_piece_kind(self) -> PieceKind {
+    pub const fn dropped_piece_kind(self) -> PieceKind {
         debug_assert!(
             self.is_drop(),
             "Move::dropped_piece_kind called on a non-drop"
@@ -264,7 +264,7 @@ impl Move {
     /// # Panics
     /// Panics if the upper 5 bits encode an invalid piece (e.g. on
     /// `MOVE_NONE`, where they are zero).
-    pub fn moved_piece_after(self) -> Piece {
+    pub const fn moved_piece_after(self) -> Piece {
         let code = (self.to_bits() >> 16) & 0x1F;
         let color = if (code & PIECE_WHITE) != 0 {
             Color::White

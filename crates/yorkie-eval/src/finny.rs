@@ -234,7 +234,7 @@ mod tests {
                 assert!(entry.accumulation == ZEROED, "entry is not zeroed");
                 assert!(entry.active.is_empty());
 
-                let row = entry.accumulation.as_ptr() as usize;
+                let row = entry.accumulation.as_ptr().addr();
                 assert_eq!(
                     row % 64,
                     0,

@@ -173,9 +173,8 @@ fn reveal_sliders(
 /// snipers whose single blocker is one of `c`'s own pieces. Both are computed
 /// over the full pre-move board.
 pub(crate) fn slider_blockers(board: &crate::board::Board, c: Color) -> (Bitboard, Bitboard) {
-    let ksq = match try_find_king(board, c) {
-        Some(s) => s,
-        None => return (Bitboard::EMPTY, Bitboard::EMPTY),
+    let Some(ksq) = try_find_king(board, c) else {
+        return (Bitboard::EMPTY, Bitboard::EMPTY);
     };
     let enemy = c.flip();
 

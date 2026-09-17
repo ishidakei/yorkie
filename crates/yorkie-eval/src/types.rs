@@ -389,20 +389,17 @@ mod tests {
     /// Every parameter sub-array's `(start_addr, byte_len)`.
     fn sub_arrays(net: &PtrNetwork) -> Vec<(usize, usize)> {
         let mut v = vec![
-            (net.ft_biases().as_ptr() as usize, net.ft_biases().len() * 2),
-            (
-                net.ft_weights().as_ptr() as usize,
-                net.ft_weights().len() * 2,
-            ),
+            (net.ft_biases().as_ptr().addr(), net.ft_biases().len() * 2),
+            (net.ft_weights().as_ptr().addr(), net.ft_weights().len() * 2),
         ];
         for i in 0..LAYER_STACKS {
             let s = net.stack(i);
-            v.push((s.fc_0_biases().as_ptr() as usize, s.fc_0_biases().len() * 4));
-            v.push((s.fc_0_weights().as_ptr() as usize, s.fc_0_weights().len()));
-            v.push((s.fc_1_biases().as_ptr() as usize, s.fc_1_biases().len() * 4));
-            v.push((s.fc_1_weights().as_ptr() as usize, s.fc_1_weights().len()));
-            v.push((s.fc_2_biases().as_ptr() as usize, s.fc_2_biases().len() * 4));
-            v.push((s.fc_2_weights().as_ptr() as usize, s.fc_2_weights().len()));
+            v.push((s.fc_0_biases().as_ptr().addr(), s.fc_0_biases().len() * 4));
+            v.push((s.fc_0_weights().as_ptr().addr(), s.fc_0_weights().len()));
+            v.push((s.fc_1_biases().as_ptr().addr(), s.fc_1_biases().len() * 4));
+            v.push((s.fc_1_weights().as_ptr().addr(), s.fc_1_weights().len()));
+            v.push((s.fc_2_biases().as_ptr().addr(), s.fc_2_biases().len() * 4));
+            v.push((s.fc_2_weights().as_ptr().addr(), s.fc_2_weights().len()));
         }
         v
     }

@@ -49,11 +49,7 @@ pub(crate) fn render(buf: &mut StatsBuf, alloc: u64) -> Option<&[u8]> {
     }
     debug_assert!(!out.overflowed(), "the widest line fits MAX_LINE");
     let len = out.len();
-    if carried {
-        Some(&buf.bytes[..len])
-    } else {
-        None
-    }
+    carried.then_some(&buf.bytes[..len])
 }
 
 #[cfg(test)]

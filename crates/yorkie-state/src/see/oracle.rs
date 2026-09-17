@@ -187,10 +187,10 @@ fn reveal_xray(
     let dr = (removed_sq.rank() as i8 - to.rank() as i8).signum();
     let mut cur = to;
     loop {
-        cur = match step_signed(cur, df, dr) {
-            Some(s) => s,
-            None => return 0,
+        let Some(next) = step_signed(cur, df, dr) else {
+            return 0;
         };
+        cur = next;
         if occupied.contains(cur) {
             if let Some(piece) = board.get(cur)
                 && piece_attacks(piece, cur, to, occupied)
@@ -236,9 +236,8 @@ fn is_sniper_type(piece: Piece, df: i8, dr: i8, king_color: Color) -> bool {
 /// A scalar `update_slider_blockers(c)`: returns
 /// `(blockersForKing[c], pinners[~c])`.
 pub(crate) fn slider_blockers_scalar(board: &crate::board::Board, c: Color) -> (u128, u128) {
-    let ksq = match try_find_king(board, c) {
-        Some(s) => s,
-        None => return (0, 0),
+    let Some(ksq) = try_find_king(board, c) else {
+        return (0, 0);
     };
     let enemy = c.flip();
     let mut blockers: u128 = 0;

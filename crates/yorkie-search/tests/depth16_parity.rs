@@ -58,7 +58,7 @@ struct FixtureJson {
     nodes: u64,
     /// The principal variation (desirable but not gated).
     #[serde(default)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pv: Vec<String>,
 }
 

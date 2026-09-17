@@ -27,8 +27,7 @@ unsafe impl<T: Copy + Sync> Sync for Aligned64<T> {}
 impl<T: Copy> Aligned64<T> {
     /// `Layout` for `len` elements at 64-byte alignment.
     fn layout(len: usize) -> Layout {
-        Layout::from_size_align(len * std::mem::size_of::<T>(), ALIGN)
-            .expect("NNUE buffer layout overflow")
+        Layout::from_size_align(len * size_of::<T>(), ALIGN).expect("NNUE buffer layout overflow")
     }
 
     /// Allocates a zeroed, 64-byte-aligned buffer of `len` elements.
@@ -36,7 +35,8 @@ impl<T: Copy> Aligned64<T> {
         if len == 0 {
             // Use ALIGN as the sentinel so an empty buffer still reports a non-null, 64-aligned base.
             return Self {
-                ptr: NonNull::new(ALIGN as *mut T).expect("ALIGN sentinel is non-null"),
+                ptr: NonNull::new(std::ptr::without_provenance_mut(ALIGN))
+                    .expect("ALIGN sentinel is non-null"),
                 len: 0,
             };
         }
@@ -107,7 +107,7 @@ mod tests {
 
     fn assert_aligned<T: Copy>(buf: &Aligned64<T>) {
         assert_eq!(
-            buf.as_ptr() as usize % ALIGN,
+            buf.as_ptr().addr() % ALIGN,
             0,
             "base pointer is not 64-byte aligned"
         );

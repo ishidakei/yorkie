@@ -8,13 +8,11 @@
 //! out, which is also why a line carrying bytes that are not valid UTF-8 cannot
 //! end a session.
 //!
-//! Numbers are read and written digit by digit rather than through the
-//! formatting machinery, so composing a line reaches no allocator and pulls in
-//! no formatter.
+//! Numbers are spelled into a fixed buffer on the stack and read digit by
+//! digit, so composing a line reaches no allocator and instantiates no
+//! `Formatter`.
 
-/// The widest decimal a `u64` spells, which is also the widest an `i64` spells
-/// without its sign.
-const MAX_U64_DIGITS: usize = 20;
+use core::fmt::NumBuffer;
 
 /// A fixed-capacity buffer ASCII text is composed into.
 ///
@@ -87,8 +85,8 @@ impl<'a> TextWriter<'a> {
 
     /// Append `value` as ASCII decimal digits.
     pub fn u64(&mut self, value: u64) -> &mut Self {
-        let mut digits = [0u8; MAX_U64_DIGITS];
-        self.bytes(decimal(value, &mut digits))
+        let mut digits = NumBuffer::new();
+        self.bytes(value.format_into(&mut digits).as_bytes())
     }
 
     /// Append `value` as ASCII decimal digits, preceded by `-` when negative.
@@ -102,8 +100,8 @@ impl<'a> TextWriter<'a> {
     /// Append `value` as exactly `width` ASCII decimal digits, zero-padded on
     /// the left; a value too wide for the field keeps all of its digits.
     pub fn u64_padded(&mut self, value: u64, width: usize) -> &mut Self {
-        let mut digits = [0u8; MAX_U64_DIGITS];
-        let text = decimal(value, &mut digits);
+        let mut digits = NumBuffer::new();
+        let text = value.format_into(&mut digits).as_bytes();
         for _ in text.len()..width {
             self.byte(b'0');
         }
@@ -163,21 +161,6 @@ pub const fn is_printable(byte: u8) -> bool {
 /// Whether `byte` separates two tokens of a command line.
 pub const fn is_token_separator(byte: u8) -> bool {
     byte == b' ' || byte == b'\t'
-}
-
-/// `value`'s ASCII decimal digits, written into the tail of `digits`.
-fn decimal(value: u64, digits: &mut [u8; MAX_U64_DIGITS]) -> &[u8] {
-    let mut i = digits.len();
-    let mut v = value;
-    loop {
-        i -= 1;
-        digits[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        if v == 0 {
-            break;
-        }
-    }
-    &digits[i..]
 }
 
 /// The unsigned decimal `text` spells, or `None` when it is empty, carries a
@@ -247,19 +230,6 @@ fn trim_leading_separators(text: &[u8]) -> &[u8] {
         .position(|&b| !is_token_separator(b))
         .unwrap_or(text.len());
     &text[start..]
-}
-
-/// `text` without leading or trailing ASCII whitespace.
-pub fn trim_ascii_whitespace(text: &[u8]) -> &[u8] {
-    let start = text
-        .iter()
-        .position(|&b| !b.is_ascii_whitespace())
-        .unwrap_or(text.len());
-    let end = text
-        .iter()
-        .rposition(|&b| !b.is_ascii_whitespace())
-        .map_or(start, |i| i + 1);
-    &text[start..end]
 }
 
 /// The tokens of `text`, separated by runs of ASCII whitespace and skipping
@@ -437,9 +407,9 @@ mod tests {
 
     #[test]
     fn whitespace_trims_from_both_ends() {
-        assert_eq!(trim_ascii_whitespace(b"  usi \r\n"), b"usi");
-        assert_eq!(trim_ascii_whitespace(b"   "), b"");
-        assert_eq!(trim_ascii_whitespace(b""), b"");
+        assert_eq!(b"  usi \r\n".trim_ascii(), b"usi");
+        assert_eq!(b"   ".trim_ascii(), b"");
+        assert_eq!(b"".trim_ascii(), b"");
     }
 
     #[test]

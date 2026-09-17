@@ -179,7 +179,7 @@ impl<W: Write + Send + 'static> UsiSink<W> {
     #[cfg(feature = "verbose3")]
     fn info_string_lines(&self, text: &[u8]) -> io::Result<()> {
         for line in text.split(|&b| b == b'\n') {
-            if !yorkie_state::text::trim_ascii_whitespace(line).is_empty() {
+            if !line.trim_ascii().is_empty() {
                 self.info_string(line)?;
             }
         }

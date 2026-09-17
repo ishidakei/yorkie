@@ -67,9 +67,8 @@ const fn ref_code_to_slot(pc: usize) -> Option<usize> {
     } else {
         (1, local - 8)
     };
-    let kind = match ref_kind_to_index(ref_pt) {
-        Some(k) => k,
-        None => return None,
+    let Some(kind) = ref_kind_to_index(ref_pt) else {
+        return None;
     };
     Some((promo * Color::COUNT + color) * PieceKind::COUNT + kind)
 }

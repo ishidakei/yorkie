@@ -80,7 +80,7 @@ mod tests {
         let mut weights = vec![0i16; HIDDEN_SIZE * 4].into_boxed_slice();
         fill_weights(&mut weights, 11);
 
-        let indices: [FeatureIndex; 3] = [0, 2, 3];
+        let indices: [FeatureIndex; _] = [0, 2, 3];
         add_features(&mut out, &weights, &indices);
         sub_features(&mut out, &weights, &indices);
         assert_eq!(out, initial);
@@ -94,7 +94,7 @@ mod tests {
             weights[i] = if i % 2 == 0 { 1 } else { -1 };
             weights[HIDDEN_SIZE + i] = 2;
         }
-        let indices: [FeatureIndex; 2] = [0, 1];
+        let indices: [FeatureIndex; _] = [0, 1];
         add_features(&mut out, &weights, &indices);
         for (i, &o) in out.iter().enumerate() {
             let expected = (if i % 2 == 0 { 1 } else { -1 }) + 2;
@@ -106,7 +106,7 @@ mod tests {
     fn empty_indices_do_not_mutate() {
         let mut out = [5i16; HIDDEN_SIZE];
         let weights = vec![99i16; HIDDEN_SIZE].into_boxed_slice();
-        let indices: [FeatureIndex; 0] = [];
+        let indices: [FeatureIndex; _] = [];
         add_features(&mut out, &weights, &indices);
         sub_features(&mut out, &weights, &indices);
         assert!(out.iter().all(|&x| x == 5));
@@ -125,8 +125,8 @@ mod tests {
         let mut weights = vec![0i16; HIDDEN_SIZE * 8].into_boxed_slice();
         fill_weights(&mut weights, 23);
 
-        let added: [FeatureIndex; 1] = [3];
-        let removed: [FeatureIndex; 1] = [6];
+        let added: [FeatureIndex; _] = [3];
+        let removed: [FeatureIndex; _] = [6];
 
         let initial = seeded_initial(7);
 
@@ -145,9 +145,9 @@ mod tests {
         let mut weights = vec![0i16; HIDDEN_SIZE * 8].into_boxed_slice();
         fill_weights(&mut weights, 31);
 
-        let added: [FeatureIndex; 1] = [2];
-        let removed_a: [FeatureIndex; 1] = [5];
-        let removed_b: [FeatureIndex; 1] = [7];
+        let added: [FeatureIndex; _] = [2];
+        let removed_a: [FeatureIndex; _] = [5];
+        let removed_b: [FeatureIndex; _] = [7];
 
         let initial = seeded_initial(19);
 

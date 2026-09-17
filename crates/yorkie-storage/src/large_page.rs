@@ -57,7 +57,7 @@ unsafe impl<T: Zeroable, const N: usize> Zeroable for [T; N] {}
 
 /// Round `min_bytes` up to a whole multiple of [`LARGE_PAGE_ALIGN`].
 pub(crate) const fn rounded_size(min_bytes: usize) -> usize {
-    min_bytes.div_ceil(LARGE_PAGE_ALIGN) * LARGE_PAGE_ALIGN
+    min_bytes.next_multiple_of(LARGE_PAGE_ALIGN)
 }
 
 /// Allocate a zeroed block of at least `min_bytes` under the module's
@@ -80,7 +80,7 @@ pub(crate) fn alloc_zeroed_large(min_bytes: usize) -> (NonNull<u8>, Layout) {
 
     // Best-effort, as the reference's is: a refused hint leaves the block
     // exactly as it was.
-    advise_huge_pages(ptr.as_ptr() as usize, size);
+    advise_huge_pages(ptr.as_ptr().addr(), size);
 
     (ptr, layout)
 }
@@ -202,7 +202,7 @@ impl<T: Zeroable> LargePageArray<T> {
     /// consumer hands it to the kernel as a range descriptor and never
     /// dereferences it.
     pub fn backing_region(&self) -> Option<(usize, usize)> {
-        (self.len != 0).then(|| (self.ptr.as_ptr() as usize, self.layout.size()))
+        (self.len != 0).then(|| (self.ptr.as_ptr().addr(), self.layout.size()))
     }
 
     /// Copy `src` into a fresh large-page-backed array of the same length.
@@ -296,7 +296,7 @@ impl<T: Zeroable> LargePageBox<T> {
     /// [`LargePageArray::backing_region`]. Always present, since a
     /// [`LargePageBox`] holds one non-ZST `T`.
     pub fn backing_region(&self) -> (usize, usize) {
-        (self.ptr.as_ptr() as usize, self.layout.size())
+        (self.ptr.as_ptr().addr(), self.layout.size())
     }
 }
 
@@ -361,7 +361,7 @@ mod tests {
             let buf = LargePageArray::<i16>::zeroed(len);
             assert_eq!(buf.len(), len);
             assert_eq!(
-                buf.as_ptr() as usize % LARGE_PAGE_ALIGN,
+                buf.as_ptr().addr() % LARGE_PAGE_ALIGN,
                 0,
                 "base pointer not {LARGE_PAGE_ALIGN}-aligned for len {len}",
             );
@@ -377,7 +377,7 @@ mod tests {
         let buf = LargePageArray::<i16>::zeroed(0);
         assert_eq!(buf.len(), 0);
         assert!(buf.is_empty());
-        assert_eq!(buf.as_ptr() as usize % align_of::<i16>(), 0);
+        assert_eq!(buf.as_ptr().addr() % align_of::<i16>(), 0);
     }
 
     #[test]
@@ -387,14 +387,14 @@ mod tests {
             *slot = i as i32;
         }
         assert_eq!(buf[63], 63);
-        assert_eq!(buf.as_ptr() as usize % LARGE_PAGE_ALIGN, 0);
+        assert_eq!(buf.as_ptr().addr() % LARGE_PAGE_ALIGN, 0);
     }
 
     #[test]
     fn from_slice_preserves_bytes_and_aligns() {
         let src: Vec<i16> = (0..1000i32).map(|i| (i - 500) as i16).collect();
         let buf = LargePageArray::<i16>::from_slice(&src);
-        assert_eq!(buf.as_ptr() as usize % LARGE_PAGE_ALIGN, 0);
+        assert_eq!(buf.as_ptr().addr() % LARGE_PAGE_ALIGN, 0);
         assert_eq!(&*buf, &src[..]);
     }
 
@@ -402,7 +402,7 @@ mod tests {
     fn box_is_aligned_and_zeroed() {
         let boxed = LargePageBox::<[[i16; 4]; 2]>::zeroed();
         assert_eq!(
-            (&*boxed as *const _ as usize) % LARGE_PAGE_ALIGN,
+            std::ptr::from_ref(&*boxed).addr() % LARGE_PAGE_ALIGN,
             0,
             "box base pointer not {LARGE_PAGE_ALIGN}-aligned",
         );
@@ -417,7 +417,7 @@ mod tests {
         let (addr, bytes) = buf
             .backing_region()
             .expect("a non-empty array owns a block");
-        assert_eq!(addr, buf.as_ptr() as usize);
+        assert_eq!(addr, buf.as_ptr().addr());
         assert_eq!(addr % LARGE_PAGE_ALIGN, 0, "base must be page-aligned");
         assert_eq!(bytes, rounded_size(7 * size_of::<i16>()));
         assert_eq!(bytes, LARGE_PAGE_ALIGN);
@@ -430,7 +430,7 @@ mod tests {
     fn box_backing_region_names_the_whole_rounded_block() {
         let boxed = LargePageBox::<[[i16; 4]; 2]>::zeroed();
         let (addr, bytes) = boxed.backing_region();
-        assert_eq!(addr, &*boxed as *const _ as usize);
+        assert_eq!(addr, std::ptr::from_ref(&*boxed).addr());
         assert_eq!(addr % LARGE_PAGE_ALIGN, 0, "base must be page-aligned");
         assert_eq!(bytes, rounded_size(size_of::<[[i16; 4]; 2]>()));
     }

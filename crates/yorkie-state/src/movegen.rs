@@ -46,6 +46,9 @@ const ROOK_DIRS: &[(i8, i8)] = &[(0, -1), (0, 1), (1, 0), (-1, 0)];
 #[cfg(test)]
 const NO_DIRS: &[(i8, i8)] = &[];
 
+// The range check below is the whole bound, so `checked_add_signed` would only
+// add an overflow test it already subsumes — in a walk inlined throughout move
+// generation.
 pub(crate) fn step_signed(sq: Square, df: i8, dr: i8) -> Option<Square> {
     let f = sq.file() as i8 + df;
     let r = sq.rank() as i8 + dr;
@@ -156,10 +159,10 @@ fn scan_slider(
 ) -> bool {
     let mut cur = sq;
     loop {
-        cur = match step_signed(cur, df, dr) {
-            Some(s) => s,
-            None => return false,
+        let Some(next) = step_signed(cur, df, dr) else {
+            return false;
         };
+        cur = next;
         match board.get(cur) {
             None => continue,
             Some(p) => {

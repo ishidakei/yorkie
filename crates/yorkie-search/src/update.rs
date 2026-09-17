@@ -348,7 +348,7 @@ pub fn update_quiet_histories(
 /// `update_continuation_histories(ss - 1, …)` stays in range. `prior_capture`
 /// is a caller argument because this module does not model the Position's
 /// captured-piece stack.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn update_all_stats(
     hist: &mut WorkerHistories,
     pos: &Position,

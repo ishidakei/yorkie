@@ -51,8 +51,8 @@ const _: () = assert!(EWM_HALF.is_multiple_of(I16_LANES_PER_M512));
 /// initialised.
 ///
 /// # Safety
-/// The running CPU must support `avx512f` and `avx512bw`. `out` must be
-/// `HIDDEN_SIZE / 2` long.
+/// `out` must be `HIDDEN_SIZE / 2` long: the kernel writes that many bytes
+/// through a raw pointer rather than through `out` itself.
 #[target_feature(enable = "avx512f,avx512bw")]
 pub unsafe fn ewm_one_perspective(half: &[i16; HIDDEN_SIZE], out: &mut [MaybeUninit<u8>]) {
     debug_assert_eq!(out.len(), EWM_HALF);
@@ -65,8 +65,8 @@ pub unsafe fn ewm_one_perspective(half: &[i16; HIDDEN_SIZE], out: &mut [MaybeUni
 /// (`< 16` or not a multiple of 16).
 ///
 /// # Safety
-/// The running CPU must support `avx512f` and `avx512bw`. `input.len()` must
-/// equal `output.len()`.
+/// `input.len()` must equal `output.len()`: a tiled length is taken from the
+/// input and written through a raw pointer into the output.
 #[target_feature(enable = "avx512f,avx512bw")]
 pub unsafe fn clipped_relu(input: &[i32], output: &mut [u8]) {
     debug_assert_eq!(input.len(), output.len());
@@ -74,15 +74,15 @@ pub unsafe fn clipped_relu(input: &[i32], output: &mut [u8]) {
         scalar_post_ft::clipped_relu(input, output);
         return;
     }
-    // SAFETY: target_feature gate ensures F+BW; length is a nonzero multiple of 16.
+    // SAFETY: the early return above leaves a length that is a nonzero
+    // multiple of 16, and it is the length of both slices.
     unsafe { clipped_relu_kernel(input, output) }
 }
 
 /// Squared clipped ReLU with the same scalar fallback as [`clipped_relu`].
 ///
 /// # Safety
-/// The running CPU must support `avx512f` and `avx512bw`. `input.len()` must
-/// equal `output.len()`.
+/// See [`clipped_relu`].
 #[target_feature(enable = "avx512f,avx512bw")]
 pub unsafe fn sqr_clipped_relu(input: &[i32], output: &mut [u8]) {
     debug_assert_eq!(input.len(), output.len());
@@ -90,19 +90,17 @@ pub unsafe fn sqr_clipped_relu(input: &[i32], output: &mut [u8]) {
         scalar_post_ft::sqr_clipped_relu(input, output);
         return;
     }
-    // SAFETY: target_feature gate ensures F+BW; length is a nonzero multiple of 16.
+    // SAFETY: the early return above leaves a length that is a nonzero
+    // multiple of 16, and it is the length of both slices.
     unsafe { sqr_clipped_relu_kernel(input, output) }
 }
 
 /// Full `fc_0 → ReLU/SqrReLU → fc_1 → ReLU → fc_2 → shortcut` chain in one
-/// `target_feature` body. Bit-identical to the per-layer scalar flow.
-///
-/// # Safety
-/// The running CPU must support `avx512f`, `avx512bw`, and `avx512vnni`. The
-/// bias/weight slices must have the SFNN-1536 layer-stack shapes (checked by the
-/// `debug_assert`s below).
+/// `target_feature` body. Bit-identical to the per-layer scalar flow. The
+/// bias/weight slices have the SFNN-1536 layer-stack shapes, which the
+/// `debug_assert`s below name.
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
-pub unsafe fn fused_fc_chain(
+pub fn fused_fc_chain(
     transformed: &[u8; FC_0_INPUT_DIMS],
     fc_0_biases: &[i32],
     fc_0_weights: &[i8],
@@ -128,7 +126,8 @@ pub unsafe fn fused_fc_chain(
     );
 
     let mut fc_0_out = [0i32; FC_0_OUTPUT_DIMS];
-    // SAFETY: target_feature gate ensures F+BW+VNNI; FC_0_INPUT_DIMS is a multiple of 64.
+    // SAFETY: FC_0_INPUT_DIMS is a multiple of 64 and is the width of
+    // `transformed`.
     unsafe {
         affine_avx512_vnni(
             &mut fc_0_out,
@@ -152,16 +151,15 @@ pub unsafe fn fused_fc_chain(
     fc_1_in[HIDDEN1_DIMS..2 * HIDDEN1_DIMS].copy_from_slice(&ac_0);
 
     let mut fc_1_out = [0i32; FC_1_OUTPUT_DIMS];
-    // SAFETY: target_feature gate ensures F+BW+VNNI.
-    unsafe { affine_padded32_avx512_vnni(&mut fc_1_out, fc_1_biases, fc_1_weights, &fc_1_in) };
+    affine_padded32_avx512_vnni(&mut fc_1_out, fc_1_biases, fc_1_weights, &fc_1_in);
 
     let mut ac_1 = [0u8; FC_1_OUTPUT_DIMS];
-    // SAFETY: target_feature gate ensures F+BW; FC_1_OUTPUT_DIMS == 32 is a multiple of 16.
+    // SAFETY: FC_1_OUTPUT_DIMS == 32 is a multiple of 16, and is the length of
+    // both slices.
     unsafe { clipped_relu_kernel(&fc_1_out, &mut ac_1) };
 
     let mut fc_2_out = [0i32; FC_2_OUTPUT_DIMS];
-    // SAFETY: target_feature gate ensures F+BW+VNNI; ac_1.len() == 32.
-    unsafe { affine_padded32_avx512_vnni(&mut fc_2_out, fc_2_biases, fc_2_weights, &ac_1) };
+    affine_padded32_avx512_vnni(&mut fc_2_out, fc_2_biases, fc_2_weights, &ac_1);
 
     // Shortcut: matches the per-layer flow's wrapping_add byte-for-byte.
     fc_2_out[0].wrapping_add(fc_0_out[HIDDEN1_DIMS])
@@ -274,7 +272,7 @@ unsafe fn sqr_clipped_relu_kernel(input: &[i32], output: &mut [u8]) {
 
 // VNNI affine for fc_1/fc_2 (in_dims=32); zextsi256_si512 zero-extends so one dpbusd suffices.
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
-unsafe fn affine_padded32_avx512_vnni(
+fn affine_padded32_avx512_vnni(
     output: &mut [i32],
     biases: &[i32],
     weights: &[i8],
@@ -465,7 +463,7 @@ mod tests {
     #[test]
     fn clipped_relu_matches_scalar_on_boundary_values() {
         require_avx512bw!();
-        let inputs: [i32; 16] = [
+        let inputs: [i32; _] = [
             -1_000_000,
             -64,
             -1,
@@ -498,7 +496,7 @@ mod tests {
     #[test]
     fn sqr_clipped_relu_matches_scalar_on_boundary_values() {
         require_avx512bw!();
-        let inputs: [i32; 16] = [
+        let inputs: [i32; _] = [
             0,
             1,
             724,
@@ -560,13 +558,8 @@ mod tests {
             unsafe { ewm_one_perspective(&half, &mut avx) };
             scalar_post_ft::ewm_one_perspective(&half, &mut sca);
             // SAFETY: both kernels write every lane of the buffer they are
-            // given, and `MaybeUninit<u8>` has the layout of `u8`.
-            let (avx, sca) = unsafe {
-                (
-                    *avx.as_ptr().cast::<[u8; HALF]>(),
-                    *sca.as_ptr().cast::<[u8; HALF]>(),
-                )
-            };
+            // given.
+            let (avx, sca) = unsafe { (avx.assume_init_ref(), sca.assume_init_ref()) };
             assert_eq!(avx, sca, "ewm mismatch at seed {seed}");
         }
     }

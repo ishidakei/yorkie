@@ -101,50 +101,43 @@ pub fn evaluate_with<N: NetworkParams>(net: N, acc: &Accumulator, pos: &Position
     score / FV_SCALE
 }
 
-/// Layer-stack forward pass over the transformed byte buffer, returning the raw
-/// network output before [`FV_SCALE`].
-///
-/// A build with AVX-512 VNNI runs the whole chain through one fused kernel;
-/// otherwise the per-layer flow below runs. The two are byte-for-byte
-/// equivalent.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512bw",
-    target_feature = "avx512vnni"
-))]
-fn per_layer_flow(transformed: &[u8; FC_0_INPUT_DIMS], stack: NetStack) -> i32 {
-    // Imported here rather than at module scope, where the `use` would be
-    // unused on a non-VNNI build.
-    use crate::simd;
-
-    // SAFETY: this arm is compiled only into a build enabling exactly the
-    // features `fused_fc_chain`'s `#[target_feature]` names, and such a build
-    // is `-C target-cpu=native`, so it only ever runs on a host providing them.
-    // The stack slices carry the layer-stack shapes the kernel expects.
-    unsafe {
-        simd::avx512_post_ft::fused_fc_chain(
-            transformed,
-            stack.fc_0_biases(),
-            stack.fc_0_weights(),
-            stack.fc_1_biases(),
-            stack.fc_1_weights(),
-            stack.fc_2_biases(),
-            stack.fc_2_weights(),
-        )
+// A build with AVX-512 VNNI runs the whole chain through one fused kernel;
+// otherwise the unfused per-layer flow below runs. The two are byte-for-byte
+// equivalent.
+std::cfg_select! {
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vnni"
+    ) => {
+        /// Layer-stack forward pass over the transformed byte buffer, returning
+        /// the raw network output before [`FV_SCALE`].
+        fn per_layer_flow(transformed: &[u8; FC_0_INPUT_DIMS], stack: NetStack) -> i32 {
+            // SAFETY: this arm is compiled only into a build enabling exactly
+            // the features `fused_fc_chain`'s `#[target_feature]` names, and
+            // such a build is `-C target-cpu=native`, so it only ever runs on a
+            // host providing them.
+            unsafe {
+                crate::simd::avx512_post_ft::fused_fc_chain(
+                    transformed,
+                    stack.fc_0_biases(),
+                    stack.fc_0_weights(),
+                    stack.fc_1_biases(),
+                    stack.fc_1_weights(),
+                    stack.fc_2_biases(),
+                    stack.fc_2_weights(),
+                )
+            }
+        }
     }
-}
-
-/// Layer-stack forward pass — non-VNNI arm (the VNNI arm above carries the
-/// documentation).
-#[cfg(not(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512bw",
-    target_feature = "avx512vnni"
-)))]
-fn per_layer_flow(transformed: &[u8; FC_0_INPUT_DIMS], stack: NetStack) -> i32 {
-    per_layer_flow_unfused(transformed, stack)
+    _ => {
+        /// Layer-stack forward pass over the transformed byte buffer, returning
+        /// the raw network output before [`FV_SCALE`].
+        fn per_layer_flow(transformed: &[u8; FC_0_INPUT_DIMS], stack: NetStack) -> i32 {
+            per_layer_flow_unfused(transformed, stack)
+        }
+    }
 }
 
 /// The unfused layer-stack forward pass. Compiled unconditionally so the tests

@@ -327,12 +327,12 @@ fn parse_position_clause<'a, 't>(
     match tokens.split_first() {
         Some((&b"startpos", rest)) => Ok((TtPosition::StartPos, rest)),
         Some((&b"sfen", rest)) => {
-            if rest.len() < 4 {
+            let Some((fields, rest)) = rest.split_at_checked(4) else {
                 return Err(TtParseError::ShortSfenClause);
-            }
+            };
             Ok((
-                TtPosition::Sfen([rest[0], rest[1], rest[2], rest[3]]),
-                &rest[4..],
+                TtPosition::Sfen(*fields.as_array().expect("a four-token sfen clause")),
+                rest,
             ))
         }
         Some((other, _)) => Err(TtParseError::UnknownPositionClause(other)),

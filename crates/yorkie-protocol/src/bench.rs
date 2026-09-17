@@ -179,7 +179,7 @@ pub fn parse_bench<'a>(
             })?;
             let fens: Vec<Vec<u8>> = text
                 .split(|&b| b == b'\n')
-                .map(yorkie_state::text::trim_ascii_whitespace)
+                .map(<[u8]>::trim_ascii)
                 .filter(|line| !line.is_empty())
                 .map(<[u8]>::to_vec)
                 .collect();

@@ -223,7 +223,7 @@ fn root_move_order(a: &RootMove, b: &RootMove) -> std::cmp::Ordering {
 /// It decides whether a PV line is printed and nothing else, so it exists only
 /// in a build that prints one.
 #[cfg(feature = "verbose2")]
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn fail_lh_pv_gate(
     main_thread: bool,
     multi_pv: usize,
@@ -853,7 +853,6 @@ impl<N: NetworkParams> QSearch<N> {
                     cell
                 })
                 .collect::<Vec<_>>()
-                .into_boxed_slice()
                 .try_into()
                 .map_err(|_| ())
                 .expect("STACK_LEN cells collected"),
@@ -865,7 +864,6 @@ impl<N: NetworkParams> QSearch<N> {
             acc_stack: (0..ACC_LEN)
                 .map(|_| Accumulator::new())
                 .collect::<Vec<_>>()
-                .into_boxed_slice()
                 .try_into()
                 .map_err(|_| ())
                 .expect("ACC_LEN slots collected"),
@@ -877,7 +875,6 @@ impl<N: NetworkParams> QSearch<N> {
                 (0..PICKER_SCRATCH_LEN)
                     .map(|_| PickerScratch::new())
                     .collect::<Vec<_>>()
-                    .into_boxed_slice()
                     .try_into()
                     .map_err(|_| ())
                     .expect("PICKER_SCRATCH_LEN buffers collected"),
@@ -1371,7 +1368,7 @@ impl<N: NetworkParams> QSearch<N> {
     ///
     /// The entry takes the storing node's current `marks`, so they travel with
     /// the value they belong to.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn tt_store(
         &mut self,
         slot: TtSlot,
@@ -2244,6 +2241,9 @@ impl<N: NetworkParams> QSearch<N> {
     /// the active tail `[pv_idx..]`. Below `verbose2` the root is single-line:
     /// the searched line is `root_moves[0]`, the head is empty, and the whole
     /// list is the active tail.
+    // The argument count crosses the lint's threshold only in a build that
+    // compiles the `verbose2` reporting parameters, so this cannot be an
+    // `expect`.
     #[allow(clippy::too_many_arguments)]
     fn aspiration_search(
         &mut self,
@@ -2753,7 +2753,7 @@ impl<N: NetworkParams> QSearch<N> {
     /// `rootNode` flag. `scratch` holds the picker buffers still free: this
     /// node takes one for each picker it builds and passes the rest to
     /// everything it searches, the same-ply singular re-entry included.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn search(
         &mut self,
         pos: &mut Position,
@@ -3980,7 +3980,7 @@ mod tests {
             .collect()
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn prewrite(
         table: &TranspositionTable,
         p: &Position,

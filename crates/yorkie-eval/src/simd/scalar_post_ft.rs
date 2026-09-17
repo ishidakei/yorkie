@@ -152,9 +152,10 @@ mod tests {
     fn ewm_lanes(half: &[i16; HIDDEN_SIZE]) -> [u8; HIDDEN_SIZE / 2] {
         let mut out = [MaybeUninit::<u8>::uninit(); HIDDEN_SIZE / 2];
         ewm_one_perspective(half, &mut out);
-        // SAFETY: the kernel writes every lane of `out`, and `MaybeUninit<u8>`
-        // has the layout of `u8`.
-        unsafe { *out.as_ptr().cast::<[u8; HIDDEN_SIZE / 2]>() }
+        // SAFETY: the kernel writes every lane of `out`.
+        *unsafe { out.assume_init_ref() }
+            .as_array()
+            .expect("the buffer is HIDDEN_SIZE / 2 lanes wide")
     }
 
     #[test]

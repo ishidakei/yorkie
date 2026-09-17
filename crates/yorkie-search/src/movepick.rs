@@ -527,7 +527,6 @@ impl<'a> MovePicker<'a> {
         self.end_generated = self.end_captures;
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn from_parts(
         kind: Kind,
         tt: Option<Move>,
@@ -809,9 +808,7 @@ mod twin {
     }
 
     fn take_scratch() -> PickerScratch {
-        let mut scratch = SCRATCH_POOL
-            .with(|pool| pool.borrow_mut().pop())
-            .unwrap_or_default();
+        let mut scratch = SCRATCH_POOL.with_borrow_mut(Vec::pop).unwrap_or_default();
         scratch.clear();
         scratch
     }
@@ -844,7 +841,7 @@ mod twin {
     impl Drop for TwinMovePicker {
         fn drop(&mut self) {
             let scratch = std::mem::take(&mut self.scratch);
-            SCRATCH_POOL.with(|pool| pool.borrow_mut().push(scratch));
+            SCRATCH_POOL.with_borrow_mut(|pool| pool.push(scratch));
         }
     }
 

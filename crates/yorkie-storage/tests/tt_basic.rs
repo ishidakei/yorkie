@@ -102,7 +102,7 @@ fn key_mid(hi: u64, mid: u64, frag: u16) -> u64 {
 
 /// Probe `k` and store through the returned writer, at the table's current
 /// generation, leaving the entry unmarked.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn store(
     tt: &TranspositionTable,
     k: u64,
@@ -838,7 +838,7 @@ mod value_marks {
     };
 
     /// [`store`], with the marks it leaves clear spelled out.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn store_marked(
         tt: &TranspositionTable,
         k: u64,

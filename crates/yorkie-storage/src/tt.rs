@@ -553,7 +553,7 @@ impl Cluster {
     /// are written exactly when the payload is, and left alone when the
     /// replacement condition declines the store.
     #[inline]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn save(
         &self,
         slot: usize,
@@ -730,7 +730,7 @@ pub const TABLE_BYTES: usize = CLUSTER_COUNT * size_of::<Cluster>();
 /// onto `0..clusterCount` without a power-of-two table size.
 #[inline]
 fn mul_hi64(a: u64, b: u64) -> u64 {
-    ((a as u128 * b as u128) >> 64) as u64
+    a.carrying_mul(b, 0).1
 }
 
 /// Cluster index for `key` with `side_to_move` folded into bit 0
@@ -870,7 +870,7 @@ impl TranspositionTable {
     /// descriptor and never dereferences it.
     #[inline]
     pub fn backing_region(&self) -> (usize, usize) {
-        (std::ptr::from_ref(self) as usize, TABLE_STORAGE_BYTES)
+        (std::ptr::from_ref(self).addr(), TABLE_STORAGE_BYTES)
     }
 
     /// Zero every entry and reset the generation (`TranspositionTable::clear`).
@@ -1030,7 +1030,7 @@ impl TranspositionTable {
     /// than re-selected, so it lands on that slot even when a child has since
     /// overwritten the entry.
     #[inline]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn write_at(
         &self,
         slot: TtSlot,
@@ -1081,8 +1081,8 @@ impl TranspositionTable {
                 mix(e.depth8.load(REL) as u64);
                 mix(e.gen_bound8.load(REL) as u64);
                 mix(e.move16.load(REL) as u64);
-                mix(e.value16.load(REL) as u16 as u64);
-                mix(e.eval16.load(REL) as u16 as u64);
+                mix(e.value16.load(REL).cast_unsigned() as u64);
+                mix(e.eval16.load(REL).cast_unsigned() as u64);
             }
             #[cfg(not(feature = "tt-entry16"))]
             mix(cluster.marks.load(REL) as u64);
@@ -1118,7 +1118,7 @@ impl<'a> TTWriter<'a> {
     /// (`TTWriter::write`). `key` is the full 64-bit position key, of which the
     /// entry keeps whatever its layout stores.
     #[inline]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn write(
         self,
         key: u64,

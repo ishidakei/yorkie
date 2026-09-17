@@ -996,9 +996,8 @@ impl Position {
         if m.is_drop() {
             return false;
         }
-        let eks = match ci.enemy_king {
-            Some(k) => k,
-            None => return false,
+        let Some(eks) = ci.enemy_king else {
+            return false;
         };
         let from = m.from_sq();
         let enemy = self.side_to_move().flip();
@@ -1053,9 +1052,8 @@ impl Position {
             (ci.own_king, ci.blockers[us.index()])
         };
         let from = m.from_sq();
-        let oks = match own_king {
-            Some(k) => k,
-            None => return false,
+        let Some(oks) = own_king else {
+            return false;
         };
         !pinned.test(from) || aligned(oks, from, m.to_sq())
     }
@@ -1133,9 +1131,8 @@ impl Position {
         let board = self.board();
 
         if m.is_drop() {
-            let pr = match m.dropped_piece_kind_checked() {
-                Some(k) => k,
-                None => return false,
+            let Some(pr) = m.dropped_piece_kind_checked() else {
+                return false;
             };
             if m.moved_piece_after() != Piece::new(pr, us) {
                 return false;
@@ -1154,9 +1151,8 @@ impl Position {
                     return false;
                 }
                 let checksq = checkers.squares().next().unwrap();
-                let oks = match own_king {
-                    Some(k) => k,
-                    None => return false,
+                let Some(oks) = own_king else {
+                    return false;
                 };
                 if !between_set(checksq, oks).test(to) {
                     return false;
@@ -1183,9 +1179,8 @@ impl Position {
             if is_non_promotable_piece(pc) {
                 return false;
             }
-            let promoted = match Piece::promoted(pc.kind, pc.color) {
-                Some(p) => p,
-                None => return false,
+            let Some(promoted) = Piece::promoted(pc.kind, pc.color) else {
+                return false;
             };
             if m.moved_piece_after() != promoted {
                 return false;
@@ -1242,9 +1237,8 @@ impl Position {
                     return false;
                 }
                 let checksq = checkers.squares().next().unwrap();
-                let oks = match own_king {
-                    Some(k) => k,
-                    None => return false,
+                let Some(oks) = own_king else {
+                    return false;
                 };
                 let target = between_set(checksq, oks) | Bitboard::from_square(checksq);
                 if !target.test(to) {
@@ -1278,6 +1272,8 @@ impl Position {
         // Uchifuzume: only possible when the dropped pawn checks the enemy king,
         // i.e. `to` is the unique square from which our pawn attacks that king.
         if let Some(ek) = try_find_king(board, us.flip()) {
+            // The range check is the whole bound, so the cast is cheaper here
+            // than `checked_add_signed`'s overflow test.
             let dr: i16 = if us == Color::Black { 1 } else { -1 };
             let r = ek.rank() as i16 + dr;
             if (0..Square::RANKS as i16).contains(&r)
@@ -1339,9 +1335,8 @@ impl Position {
             );
             (ci.own_king, ci.checkers)
         };
-        let ksq = match ksq {
-            Some(k) => k,
-            None => return,
+        let Some(ksq) = ksq else {
+            return;
         };
         let king = board.get(ksq).unwrap();
 
@@ -1696,9 +1691,8 @@ impl Position {
     pub(crate) fn gives_direct_check_reference(&self, m: Move) -> bool {
         let board = self.board();
         let stm = self.side_to_move();
-        let eks = match try_find_king(board, stm.flip()) {
-            Some(k) => k,
-            None => return false,
+        let Some(eks) = try_find_king(board, stm.flip()) else {
+            return false;
         };
         let piece = m.moved_piece_after();
         let to = m.to_sq();

@@ -22,15 +22,9 @@ use crate::types::HIDDEN_SIZE;
 const NUM_CHUNKS: usize = HIDDEN_SIZE / 32;
 const LANES: usize = 32;
 
-/// # Safety
-/// The running CPU must support `avx512f` and `avx512bw`. Every referenced
-/// weight column must be `HIDDEN_SIZE` long.
+/// Add each active feature's FT weight column into `out`.
 #[target_feature(enable = "avx512f,avx512bw")]
-pub unsafe fn add_features(
-    out: &mut [i16; HIDDEN_SIZE],
-    weights: &[i16],
-    indices: &[FeatureIndex],
-) {
+pub fn add_features(out: &mut [i16; HIDDEN_SIZE], weights: &[i16], indices: &[FeatureIndex]) {
     let out_ptr = out.as_mut_ptr();
     for &idx in indices {
         let col_ptr = ft_column(weights, idx).as_ptr();
@@ -51,14 +45,9 @@ pub unsafe fn add_features(
     }
 }
 
-/// # Safety
-/// See [`add_features`].
+/// Subtract each feature's FT weight column from `out`.
 #[target_feature(enable = "avx512f,avx512bw")]
-pub unsafe fn sub_features(
-    out: &mut [i16; HIDDEN_SIZE],
-    weights: &[i16],
-    indices: &[FeatureIndex],
-) {
+pub fn sub_features(out: &mut [i16; HIDDEN_SIZE], weights: &[i16], indices: &[FeatureIndex]) {
     let out_ptr = out.as_mut_ptr();
     for &idx in indices {
         let col_ptr = ft_column(weights, idx).as_ptr();
@@ -77,10 +66,9 @@ pub unsafe fn sub_features(
     }
 }
 
-/// # Safety
-/// See [`add_features`].
+/// Fused single-add / single-sub delta.
 #[target_feature(enable = "avx512f,avx512bw")]
-pub unsafe fn add_sub_features(
+pub fn add_sub_features(
     out: &mut [i16; HIDDEN_SIZE],
     weights: &[i16],
     added: FeatureIndex,
@@ -103,10 +91,9 @@ pub unsafe fn add_sub_features(
     }
 }
 
-/// # Safety
-/// See [`add_features`].
+/// Fused single-add / double-sub delta.
 #[target_feature(enable = "avx512f,avx512bw")]
-pub unsafe fn add_sub_sub_features(
+pub fn add_sub_sub_features(
     out: &mut [i16; HIDDEN_SIZE],
     weights: &[i16],
     added: FeatureIndex,
@@ -169,7 +156,7 @@ mod tests {
         require_avx512bw!();
         let mut weights = vec![0i16; HIDDEN_SIZE * 8].into_boxed_slice();
         fill_weights(&mut weights, 17);
-        let indices: [FeatureIndex; 4] = [0, 2, 5, 7];
+        let indices: [FeatureIndex; _] = [0, 2, 5, 7];
         let initial = seeded_initial(3);
 
         let mut avx = initial;
@@ -187,7 +174,7 @@ mod tests {
         require_avx512bw!();
         let mut weights = vec![0i16; HIDDEN_SIZE * 8].into_boxed_slice();
         fill_weights(&mut weights, 29);
-        let indices: [FeatureIndex; 3] = [1, 3, 6];
+        let indices: [FeatureIndex; _] = [1, 3, 6];
         let initial = seeded_initial(13);
 
         let mut avx = initial;
@@ -205,8 +192,8 @@ mod tests {
         require_avx512bw!();
         let mut weights = vec![0i16; HIDDEN_SIZE * 8].into_boxed_slice();
         fill_weights(&mut weights, 23);
-        let added: [FeatureIndex; 1] = [3];
-        let removed: [FeatureIndex; 1] = [6];
+        let added: [FeatureIndex; _] = [3];
+        let removed: [FeatureIndex; _] = [6];
         let initial = seeded_initial(7);
 
         let mut avx = initial;
@@ -224,9 +211,9 @@ mod tests {
         require_avx512bw!();
         let mut weights = vec![0i16; HIDDEN_SIZE * 8].into_boxed_slice();
         fill_weights(&mut weights, 31);
-        let added: [FeatureIndex; 1] = [2];
-        let removed_a: [FeatureIndex; 1] = [5];
-        let removed_b: [FeatureIndex; 1] = [7];
+        let added: [FeatureIndex; _] = [2];
+        let removed_a: [FeatureIndex; _] = [5];
+        let removed_b: [FeatureIndex; _] = [7];
         let initial = seeded_initial(19);
 
         let mut avx = initial;

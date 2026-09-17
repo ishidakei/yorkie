@@ -123,7 +123,7 @@ mod tests {
         // A block this test owns, standing in for the region the engine's
         // network is declared at.
         let target = LargePageArray::<u8>::zeroed(LARGE_PAGE_ALIGN);
-        let addr = target.as_ptr() as usize;
+        let addr = target.as_ptr().addr();
         // SAFETY: `target` is this test's own block, nothing else reads it, and
         // it is large-page aligned and long enough.
         let mapped =
@@ -157,7 +157,7 @@ mod tests {
         let target = LargePageArray::<u8>::zeroed(LARGE_PAGE_ALIGN);
         // SAFETY: `target` is this test's own block and long enough for the
         // range asked for; the call refuses before touching it.
-        let err = unsafe { map_file_onto(target.as_ptr() as usize, 4096, &path, 0) }
+        let err = unsafe { map_file_onto(target.as_ptr().addr(), 4096, &path, 0) }
             .expect_err("must refuse");
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
         let _ = std::fs::remove_file(&path);

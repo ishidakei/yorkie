@@ -598,7 +598,7 @@ fn declaration_win_try(pos: &Position) -> Option<Move> {
 
     // 2) no *own* piece occupies the try square (an enemy piece there is a
     //    capture-try and does not block).
-    if matches!(pos.board().get(try_sq), Some(p) if p.color == us) {
+    if pos.board().get(try_sq).is_some_and(|p| p.color == us) {
         return None;
     }
 
@@ -620,7 +620,9 @@ fn find_king(pos: &Position, us: Color) -> Option<Square> {
     (0..Square::COUNT as u8)
         .filter_map(Square::from_index)
         .find(|&sq| {
-            matches!(pos.board().get(sq), Some(p) if p.color == us && p.kind == PieceKind::King)
+            pos.board()
+                .get(sq)
+                .is_some_and(|p| p.color == us && p.kind == PieceKind::King)
         })
 }
 

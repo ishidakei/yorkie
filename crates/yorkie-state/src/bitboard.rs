@@ -1033,113 +1033,121 @@ impl Bitboard256 {
     }
 }
 
-/// Broadcast one [`Bitboard`]'s lanes into both halves.
-///
-/// SAFETY: gated on `target_feature = "avx2"` (statically enabled by the
-/// release `target-cpu=native`); the `transmute`s only bit-cast between
-/// `[u64; N]` and the equally-sized `__m128i` / `__m256i`.
-#[cfg(target_feature = "avx2")]
-fn bb256_broadcast(a: [u64; 2]) -> [u64; 4] {
-    use core::arch::x86_64::{__m128i, __m256i, _mm256_broadcastsi128_si256};
-    unsafe {
-        let va: __m128i = core::mem::transmute(a);
-        core::mem::transmute::<__m256i, [u64; 4]>(_mm256_broadcastsi128_si256(va))
-    }
-}
+// The AVX2 arm pins the intrinsic each operation is ported to; the other
+// arm names the scalar twin below in its place.
+std::cfg_select! {
+    target_feature = "avx2" => {
+        /// Broadcast one [`Bitboard`]'s lanes into both halves.
+        ///
+        /// SAFETY: gated on `target_feature = "avx2"` (statically enabled by the
+        /// release `target-cpu=native`); the `transmute`s only bit-cast between
+        /// `[u64; N]` and the equally-sized `__m128i` / `__m256i`.
+        fn bb256_broadcast(a: [u64; 2]) -> [u64; 4] {
+            use core::arch::x86_64::{__m128i, __m256i, _mm256_broadcastsi128_si256};
+            unsafe {
+                let va: __m128i = core::mem::transmute(a);
+                core::mem::transmute::<__m256i, [u64; 4]>(_mm256_broadcastsi128_si256(va))
+            }
+        }
 
-/// Bitboard256 `AND` (pin `_mm256_and_si256`). SAFETY: as [`bb256_broadcast`].
-#[cfg(target_feature = "avx2")]
-fn bb256_and(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
-    use core::arch::x86_64::{__m256i, _mm256_and_si256};
-    unsafe {
-        let va: __m256i = core::mem::transmute(a);
-        let vb: __m256i = core::mem::transmute(b);
-        core::mem::transmute(_mm256_and_si256(va, vb))
-    }
-}
+        /// Bitboard256 `AND` (pin `_mm256_and_si256`). SAFETY: as [`bb256_broadcast`].
+        fn bb256_and(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
+            use core::arch::x86_64::{__m256i, _mm256_and_si256};
+            unsafe {
+                let va: __m256i = core::mem::transmute(a);
+                let vb: __m256i = core::mem::transmute(b);
+                core::mem::transmute(_mm256_and_si256(va, vb))
+            }
+        }
 
-/// Bitboard256 `OR` (pin `_mm256_or_si256`). SAFETY: as [`bb256_broadcast`].
-#[cfg(target_feature = "avx2")]
-fn bb256_or(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
-    use core::arch::x86_64::{__m256i, _mm256_or_si256};
-    unsafe {
-        let va: __m256i = core::mem::transmute(a);
-        let vb: __m256i = core::mem::transmute(b);
-        core::mem::transmute(_mm256_or_si256(va, vb))
-    }
-}
+        /// Bitboard256 `OR` (pin `_mm256_or_si256`). SAFETY: as [`bb256_broadcast`].
+        fn bb256_or(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
+            use core::arch::x86_64::{__m256i, _mm256_or_si256};
+            unsafe {
+                let va: __m256i = core::mem::transmute(a);
+                let vb: __m256i = core::mem::transmute(b);
+                core::mem::transmute(_mm256_or_si256(va, vb))
+            }
+        }
 
-/// Bitboard256 `XOR` (pin `_mm256_xor_si256`). SAFETY: as [`bb256_broadcast`].
-#[cfg(target_feature = "avx2")]
-fn bb256_xor(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
-    use core::arch::x86_64::{__m256i, _mm256_xor_si256};
-    unsafe {
-        let va: __m256i = core::mem::transmute(a);
-        let vb: __m256i = core::mem::transmute(b);
-        core::mem::transmute(_mm256_xor_si256(va, vb))
-    }
-}
+        /// Bitboard256 `XOR` (pin `_mm256_xor_si256`). SAFETY: as [`bb256_broadcast`].
+        fn bb256_xor(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
+            use core::arch::x86_64::{__m256i, _mm256_xor_si256};
+            unsafe {
+                let va: __m256i = core::mem::transmute(a);
+                let vb: __m256i = core::mem::transmute(b);
+                core::mem::transmute(_mm256_xor_si256(va, vb))
+            }
+        }
 
-/// Byte-reverse each 128-bit half. SAFETY: as [`bb256_broadcast`]; the shuffle
-/// mask reverses all 16 bytes within each half.
-#[cfg(target_feature = "avx2")]
-fn bb256_byte_reverse(a: [u64; 4]) -> [u64; 4] {
-    use core::arch::x86_64::{__m256i, _mm256_set_epi8, _mm256_shuffle_epi8};
-    unsafe {
-        let va: __m256i = core::mem::transmute(a);
-        let shuffle = _mm256_set_epi8(
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-            11, 12, 13, 14, 15,
-        );
-        core::mem::transmute(_mm256_shuffle_epi8(va, shuffle))
-    }
-}
+        /// Byte-reverse each 128-bit half. SAFETY: as [`bb256_broadcast`]; the shuffle
+        /// mask reverses all 16 bytes within each half.
+        fn bb256_byte_reverse(a: [u64; 4]) -> [u64; 4] {
+            use core::arch::x86_64::{__m256i, _mm256_set_epi8, _mm256_shuffle_epi8};
+            unsafe {
+                let va: __m256i = core::mem::transmute(a);
+                let shuffle = _mm256_set_epi8(
+                    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                    11, 12, 13, 14, 15,
+                );
+                core::mem::transmute(_mm256_shuffle_epi8(va, shuffle))
+            }
+        }
 
-/// Bitboard256 `unpack`, per 128-bit lane. SAFETY: as [`bb256_broadcast`].
-#[cfg(target_feature = "avx2")]
-fn bb256_unpack(hi_in: [u64; 4], lo_in: [u64; 4]) -> ([u64; 4], [u64; 4]) {
-    use core::arch::x86_64::{__m256i, _mm256_unpackhi_epi64, _mm256_unpacklo_epi64};
-    unsafe {
-        let vh: __m256i = core::mem::transmute(hi_in);
-        let vl: __m256i = core::mem::transmute(lo_in);
-        let hi_out: [u64; 4] = core::mem::transmute(_mm256_unpackhi_epi64(vl, vh));
-        let lo_out: [u64; 4] = core::mem::transmute(_mm256_unpacklo_epi64(vl, vh));
-        (hi_out, lo_out)
-    }
-}
+        /// Bitboard256 `unpack`, per 128-bit lane. SAFETY: as [`bb256_broadcast`].
+        fn bb256_unpack(hi_in: [u64; 4], lo_in: [u64; 4]) -> ([u64; 4], [u64; 4]) {
+            use core::arch::x86_64::{__m256i, _mm256_unpackhi_epi64, _mm256_unpacklo_epi64};
+            unsafe {
+                let vh: __m256i = core::mem::transmute(hi_in);
+                let vl: __m256i = core::mem::transmute(lo_in);
+                let hi_out: [u64; 4] = core::mem::transmute(_mm256_unpackhi_epi64(vl, vh));
+                let lo_out: [u64; 4] = core::mem::transmute(_mm256_unpacklo_epi64(vl, vh));
+                (hi_out, lo_out)
+            }
+        }
 
-/// Bitboard256 pairwise 128-bit decrement: each lane index `i` decrements the
-/// pair `[lo_in[i], hi_in[i]]`. SAFETY: as [`bb256_broadcast`].
-#[cfg(target_feature = "avx2")]
-fn bb256_pair_decrement(hi_in: [u64; 4], lo_in: [u64; 4]) -> ([u64; 4], [u64; 4]) {
-    use core::arch::x86_64::{
-        __m256i, _mm256_add_epi64, _mm256_cmpeq_epi64, _mm256_set1_epi64x, _mm256_setzero_si256,
-    };
-    unsafe {
-        let vh: __m256i = core::mem::transmute(hi_in);
-        let vl: __m256i = core::mem::transmute(lo_in);
-        let hi_out: [u64; 4] = core::mem::transmute(_mm256_add_epi64(
-            vh,
-            _mm256_cmpeq_epi64(vl, _mm256_setzero_si256()),
-        ));
-        let lo_out: [u64; 4] =
-            core::mem::transmute(_mm256_add_epi64(vl, _mm256_set1_epi64x(-1i64)));
-        (hi_out, lo_out)
-    }
-}
+        /// Bitboard256 pairwise 128-bit decrement: each lane index `i` decrements the
+        /// pair `[lo_in[i], hi_in[i]]`. SAFETY: as [`bb256_broadcast`].
+        fn bb256_pair_decrement(hi_in: [u64; 4], lo_in: [u64; 4]) -> ([u64; 4], [u64; 4]) {
+            use core::arch::x86_64::{
+                __m256i, _mm256_add_epi64, _mm256_cmpeq_epi64, _mm256_set1_epi64x, _mm256_setzero_si256,
+            };
+            unsafe {
+                let vh: __m256i = core::mem::transmute(hi_in);
+                let vl: __m256i = core::mem::transmute(lo_in);
+                let hi_out: [u64; 4] = core::mem::transmute(_mm256_add_epi64(
+                    vh,
+                    _mm256_cmpeq_epi64(vl, _mm256_setzero_si256()),
+                ));
+                let lo_out: [u64; 4] =
+                    core::mem::transmute(_mm256_add_epi64(vl, _mm256_set1_epi64x(-1i64)));
+                (hi_out, lo_out)
+            }
+        }
 
-/// Merge the two halves into one [`Bitboard`] by OR.
-/// SAFETY: as [`bb256_broadcast`].
-#[cfg(target_feature = "avx2")]
-fn bb256_merge(a: [u64; 4]) -> [u64; 2] {
-    use core::arch::x86_64::{
-        __m128i, __m256i, _mm_or_si128, _mm256_castsi256_si128, _mm256_extracti128_si256,
-    };
-    unsafe {
-        let va: __m256i = core::mem::transmute(a);
-        let lo: __m128i = _mm256_castsi256_si128(va);
-        let hi: __m128i = _mm256_extracti128_si256::<1>(va);
-        core::mem::transmute(_mm_or_si128(lo, hi))
+        /// Merge the two halves into one [`Bitboard`] by OR.
+        /// SAFETY: as [`bb256_broadcast`].
+        fn bb256_merge(a: [u64; 4]) -> [u64; 2] {
+            use core::arch::x86_64::{
+                __m128i, __m256i, _mm_or_si128, _mm256_castsi256_si128, _mm256_extracti128_si256,
+            };
+            unsafe {
+                let va: __m256i = core::mem::transmute(a);
+                let lo: __m128i = _mm256_castsi256_si128(va);
+                let hi: __m128i = _mm256_extracti128_si256::<1>(va);
+                core::mem::transmute(_mm_or_si128(lo, hi))
+            }
+        }
+    }
+    _ => {
+        use bb256_and_scalar as bb256_and;
+        use bb256_broadcast_scalar as bb256_broadcast;
+        use bb256_byte_reverse_scalar as bb256_byte_reverse;
+        use bb256_merge_scalar as bb256_merge;
+        use bb256_or_scalar as bb256_or;
+        use bb256_pair_decrement_scalar as bb256_pair_decrement;
+        use bb256_unpack_scalar as bb256_unpack;
+        use bb256_xor_scalar as bb256_xor;
     }
 }
 
@@ -1201,23 +1209,6 @@ fn bb256_pair_decrement_scalar(hi_in: [u64; 4], lo_in: [u64; 4]) -> ([u64; 4], [
 fn bb256_merge_scalar(a: [u64; 4]) -> [u64; 2] {
     [a[0] | a[2], a[1] | a[3]]
 }
-
-#[cfg(not(target_feature = "avx2"))]
-use bb256_and_scalar as bb256_and;
-#[cfg(not(target_feature = "avx2"))]
-use bb256_broadcast_scalar as bb256_broadcast;
-#[cfg(not(target_feature = "avx2"))]
-use bb256_byte_reverse_scalar as bb256_byte_reverse;
-#[cfg(not(target_feature = "avx2"))]
-use bb256_merge_scalar as bb256_merge;
-#[cfg(not(target_feature = "avx2"))]
-use bb256_or_scalar as bb256_or;
-#[cfg(not(target_feature = "avx2"))]
-use bb256_pair_decrement_scalar as bb256_pair_decrement;
-#[cfg(not(target_feature = "avx2"))]
-use bb256_unpack_scalar as bb256_unpack;
-#[cfg(not(target_feature = "avx2"))]
-use bb256_xor_scalar as bb256_xor;
 
 /// `[sq][i]` is the four diagonal step effects packed as the `Bitboard256` pair
 /// `[LU, RU, LD, RD]` in 64-bit lane `i`, with RU and RD stored byte-reversed.
@@ -2108,7 +2099,6 @@ mod twin {
     #[derive(Clone, Copy, PartialEq, Eq, Default, Hash, Debug)]
     pub(super) struct Twin(pub u128);
 
-    #[allow(dead_code)]
     impl Twin {
         pub const EMPTY: Twin = Twin(0);
         pub const FULL: Twin = Twin(MASK);

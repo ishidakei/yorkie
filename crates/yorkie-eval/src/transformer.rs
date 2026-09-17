@@ -269,9 +269,10 @@ impl Accumulator {
         // SAFETY: the two calls above write `0..HALF` and `HALF..`, each kernel
         // filling every lane of the slice it is handed, and the halves tile the
         // buffer (the `const` assertion on `FT_OUTPUT_DIMS` above), so no byte
-        // of `out` is left uninitialised. `MaybeUninit<u8>` has the layout of
-        // `u8`, so the array of one is the array of the other.
-        let filled = unsafe { &*out.as_ptr().cast::<[u8; FT_OUTPUT_DIMS]>() };
+        // of `out` is left uninitialised.
+        let filled = unsafe { out.assume_init_ref() }
+            .as_array()
+            .expect("the buffer is FT_OUTPUT_DIMS lanes wide");
         debug_assert!(
             filled.iter().all(|&lane| lane <= EWM_LANE_MAX),
             "a lane above {EWM_LANE_MAX} is not something the fold can write: \
@@ -350,7 +351,7 @@ mod tests {
             assert_eq!(half.len(), HIDDEN_SIZE);
             assert!(half.iter().all(|&x| x == 0));
             assert_eq!(
-                half.as_ptr() as usize % 64,
+                half.as_ptr().addr() % 64,
                 0,
                 "{color:?} half is not 64-byte aligned"
             );
@@ -367,7 +368,7 @@ mod tests {
 
         const SLOTS: usize = 4;
         let stack: Vec<Accumulator> = (0..SLOTS).map(|_| Accumulator::new()).collect();
-        let row = |slot: &Accumulator, color| slot.perspective(color).as_ptr() as usize;
+        let row = |slot: &Accumulator, color| slot.perspective(color).as_ptr().addr();
 
         for slot in &stack {
             assert_eq!(
