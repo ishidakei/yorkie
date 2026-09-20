@@ -3670,6 +3670,14 @@ impl<N: NetworkParams> QSearch<N> {
                 if move_count == 1 || value > alpha {
                     rm.score = value;
                     rm.uci_score = value;
+                    // The marks of the value just recorded, kept with it: the
+                    // reply reports the marks of the move it plays, which is
+                    // this record rather than whatever the live marks hold once
+                    // the search has finished.
+                    #[cfg(feature = "verbose3")]
+                    {
+                        rm.marks = child_marks;
+                    }
                     rm.sel_depth = self.sel_depth;
                     // The two flags decide only which bound marker a PV line
                     // carries; the `uci_score` clamps beside them feed the

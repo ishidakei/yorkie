@@ -50,6 +50,8 @@ use yorkie_search::new_game_seed;
 use yorkie_state::{
     ExtMove, Move, Position, SfenError, TextWriter, parse_sfen_into, parse_usi_move,
 };
+#[cfg(feature = "verbose3")]
+use yorkie_storage::ValueMarks;
 use yorkie_storage::{Book, TranspositionTable, Value};
 // The per-reply allocation tally: raised by the counting global allocator this
 // feature installs, and cleared where an interval starts.
@@ -681,11 +683,21 @@ pub trait EngineSink: Clone + Send + 'static {
 
     /// The engine's reply to a search request.
     ///
+    /// `marks` are the value marks of the score the reply rests on — what the
+    /// played move's value was derived through — for the statistics line to
+    /// report, so a caller reading the stream learns them without a second probe
+    /// of a root entry that may since have been replaced.
+    ///
     /// `sent` is raised before the output lock is released, so the reply
     /// becoming visible and the search counting as finished are one indivisible
     /// step downstream; its only reader is the `verbose3` table-inspection
     /// commands' idle check.
-    fn reply(&self, reply: Reply, #[cfg(feature = "verbose3")] sent: &AtomicBool);
+    fn reply(
+        &self,
+        reply: Reply,
+        #[cfg(feature = "verbose3")] marks: ValueMarks,
+        #[cfg(feature = "verbose3")] sent: &AtomicBool,
+    );
 
     /// A book hit's surviving candidates, reported as the probe answers and
     /// before any hold.
@@ -3036,6 +3048,10 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     if root_moves.is_empty() {
         sink.reply(
             Reply::Resign,
+            // Nothing was searched and no rule was consulted: the position
+            // simply has no move.
+            #[cfg(feature = "verbose3")]
+            ValueMarks::NONE,
             #[cfg(feature = "verbose3")]
             &reply_sent,
         );
@@ -3061,6 +3077,13 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
         };
         sink.reply(
             declared,
+            // The reply *is* the declaration rule's outcome, so it carries that
+            // rule's mark the way any value derived through the check does.
+            #[cfg(feature = "verbose3")]
+            ValueMarks {
+                decl_rule: true,
+                ..ValueMarks::NONE
+            },
             #[cfg(feature = "verbose3")]
             &reply_sent,
         );
@@ -3291,6 +3314,10 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
 
     sink.reply(
         reply,
+        // The chosen worker's root move, whose score the reply plays on — a
+        // resign by value included, since that decision reads the same score.
+        #[cfg(feature = "verbose3")]
+        best.marks,
         #[cfg(feature = "verbose3")]
         &reply_sent,
     );

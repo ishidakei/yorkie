@@ -10,6 +10,8 @@
 
 use yorkie_state::{Color, ExtMove, Move, PieceKind, Position, Square};
 use yorkie_storage::Value;
+#[cfg(feature = "verbose3")]
+use yorkie_storage::ValueMarks;
 
 use crate::config::GENERATE_ALL_LEGAL_MOVES;
 
@@ -61,6 +63,12 @@ pub struct RootMove {
     /// The USI-reported score (equals `score`, or the clamped window bound on a
     /// fail high/low).
     pub uci_score: Value,
+    /// What [`Self::score`] was derived through, recorded with the score it
+    /// belongs to. The reply reads the played move's marks off here rather than
+    /// off the searching node's live marks, which by then hold whatever the last
+    /// node to return was carrying.
+    #[cfg(feature = "verbose3")]
+    pub marks: ValueMarks,
     /// Previous iteration's `score` (the sort tie-break). All `-VALUE_INFINITE`
     /// in the single depth-1 iteration.
     pub previous_score: Value,
@@ -84,7 +92,9 @@ pub struct RootMove {
 
 // The move, its PV handle and its per-iteration statistics, with nothing
 // between them. The two fail-bound flags a PV-printing build adds are a ninth
-// eight-byte slot, which is what the second figure records.
+// eight-byte slot, which is what the second figure records; the three value
+// marks of a `verbose3` build are three more bytes of that same slot, so the
+// figure covers them too.
 #[cfg(not(feature = "verbose2"))]
 const _: () = assert!(size_of::<RootMove>() == 64);
 #[cfg(feature = "verbose2")]
@@ -108,6 +118,10 @@ impl Clone for RootMove {
         self.pv.extend_from_slice(&source.pv);
         self.score = source.score;
         self.uci_score = source.uci_score;
+        #[cfg(feature = "verbose3")]
+        {
+            self.marks = source.marks;
+        }
         self.previous_score = source.previous_score;
         self.average_score = source.average_score;
         self.mean_squared_score = source.mean_squared_score;
@@ -132,6 +146,8 @@ impl RootMove {
             pv,
             score: -VALUE_INFINITE,
             uci_score: -VALUE_INFINITE,
+            #[cfg(feature = "verbose3")]
+            marks: ValueMarks::NONE,
             previous_score: -VALUE_INFINITE,
             average_score: -VALUE_INFINITE,
             mean_squared_score: MEAN_SQUARED_INIT,
@@ -719,6 +735,14 @@ mod tests {
             src.score_lowerbound = true;
             src.score_upperbound = true;
         }
+        #[cfg(feature = "verbose3")]
+        {
+            src.marks = ValueMarks {
+                path_dep: true,
+                decl_rule: false,
+                move_limit: true,
+            };
+        }
 
         let copy = src.clone();
         assert_eq!(copy.pv.capacity(), PV_CAPACITY);
@@ -746,6 +770,8 @@ mod tests {
             assert!(slot.score_lowerbound);
             assert!(slot.score_upperbound);
         }
+        #[cfg(feature = "verbose3")]
+        assert_eq!(slot.marks, src.marks);
     }
 
     /// The `GenerateAllLegalMoves` setting this binary compiled, which is what

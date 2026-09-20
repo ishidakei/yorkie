@@ -35,7 +35,7 @@ use yorkie_state::{Position, SfenBuf, parse_sfen, parse_sfen_fields_into, parse_
 #[cfg(feature = "verbose2")]
 use yorkie_storage::Value;
 #[cfg(feature = "verbose3")]
-use yorkie_storage::{TTData, TranspositionTable, VALUE_NONE};
+use yorkie_storage::{TTData, TranspositionTable, VALUE_NONE, ValueMarks};
 // The per-reply allocation tally: raised by the counting global allocator this
 // feature installs, and read by the statistics line that reports it.
 #[cfg(feature = "verbose1")]
@@ -209,13 +209,17 @@ impl<W: Write + Send + 'static> UsiSink<W> {
     /// network — preceded by the statistics of the interval it ends.
     ///
     /// No search is in flight on this path, so there is no "reply is out" flag
-    /// for it to stamp.
+    /// for it to stamp, and no value behind the reply for marks to describe.
     fn reply_now(&self, reply: Reply) -> io::Result<()> {
         let mut payload = BestmoveBuf::new();
         let text = render_reply(&mut payload, reply);
         let mut guard = self.lock();
         #[cfg(feature = "verbose1")]
-        emit_stats(&mut *guard);
+        emit_stats(
+            &mut *guard,
+            #[cfg(feature = "verbose3")]
+            ValueMarks::NONE,
+        );
         Formatter::new(&mut *guard).bestmove(text)
     }
 
@@ -253,14 +257,23 @@ impl<W: Write + Send + 'static> EngineSink for UsiSink<W> {
         let _ = self.info_string(msg);
     }
 
-    fn reply(&self, reply: Reply, #[cfg(feature = "verbose3")] sent: &AtomicBool) {
+    fn reply(
+        &self,
+        reply: Reply,
+        #[cfg(feature = "verbose3")] marks: ValueMarks,
+        #[cfg(feature = "verbose3")] sent: &AtomicBool,
+    ) {
         // Composed before the lock is taken, so the composing's own allocations
         // stay inside the interval the statistics line reports.
         let mut payload = BestmoveBuf::new();
         let text = render_reply(&mut payload, reply);
         let mut guard = self.lock();
         #[cfg(feature = "verbose1")]
-        emit_stats(&mut *guard);
+        emit_stats(
+            &mut *guard,
+            #[cfg(feature = "verbose3")]
+            marks,
+        );
         let _ = Formatter::new(&mut *guard).bestmove(text);
         #[cfg(feature = "verbose3")]
         sent.store(true, Ordering::Relaxed);
@@ -315,9 +328,14 @@ impl<W: Write + Send + 'static> EngineSink for UsiSink<W> {
         #[cfg(feature = "verbose2")]
         let _ = Formatter::new(&mut *guard).info(&bytes[..info]);
         // After that line, so the statistics cover composing it too, and directly
-        // before the reply.
+        // before the reply. No search ran, so the reply rests on no value of the
+        // engine's own and carries no mark.
         #[cfg(feature = "verbose1")]
-        emit_stats(&mut *guard);
+        emit_stats(
+            &mut *guard,
+            #[cfg(feature = "verbose3")]
+            ValueMarks::NONE,
+        );
         let _ = Formatter::new(&mut *guard).bestmove(text);
         #[cfg(feature = "verbose3")]
         sent.store(true, Ordering::Relaxed);
@@ -1127,9 +1145,14 @@ fn write_pv_info<W: Write + ?Sized>(w: &mut W, info: &PvInfo) -> io::Result<()> 
 }
 
 #[cfg(feature = "verbose1")]
-fn emit_stats<W: Write + ?Sized>(w: &mut W) {
+fn emit_stats<W: Write + ?Sized>(w: &mut W, #[cfg(feature = "verbose3")] marks: ValueMarks) {
     let mut buf = StatsBuf::new();
-    if let Some(line) = crate::stats::render(&mut buf, take_alloc_count()) {
+    if let Some(line) = crate::stats::render(
+        &mut buf,
+        take_alloc_count(),
+        #[cfg(feature = "verbose3")]
+        marks,
+    ) {
         let _ = Formatter::new(w).composed_line(line);
     }
 }
