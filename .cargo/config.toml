@@ -4,5 +4,10 @@ xtask = "run --quiet -p xtask --"
 # Every build of this repo runs on the machine that produced it — binaries are
 # never distributed across machines — so compile for the exact host CPU by
 # default. Applies to every profile.
+#
+# jump-tables=no: a compare-and-branch tree over the move picker's stages and
+# the other dense matches predicts better on current x86-64 cores than one
+# indirect jump through a table; measured at +1.4 % search throughput with
+# identical search output. The measurement is written up in the design notes.
 [build]
-rustflags = ["-C", "target-cpu=native"]
+rustflags = ["-C", "target-cpu=native", "-C", "jump-tables=no"]
