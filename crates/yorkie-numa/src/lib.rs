@@ -98,15 +98,24 @@ fn path_bytes(_path: &Path) -> &[u8] {
 
 /// The [`SysfsOptions`] describing the whole machine under `root`.
 ///
-/// Fail-loud: a tree without the two `online` files is not a machine whose
-/// layout can be read, and answering "one node" for it would be a wrong answer
-/// where a missing one is called for.
+/// Fail-loud, with one exception:
+///
+/// - a tree whose `devices/system/cpu/online` cannot be read, or lists no CPU,
+///   is not a machine whose layout can be read, and is refused;
+/// - a tree with no `devices/system/node` directory at all is a kernel built
+///   without NUMA support, which is one node holding every online CPU — the
+///   answer [`NumaLayout::of_machine`] gives for it — and is accepted;
+/// - a tree that has the `devices/system/node` directory but no readable
+///   `online` file in it is untrustworthy rather than NUMA-less, and is refused,
+///   since answering "one node" for it would be a wrong answer where a missing
+///   one is called for.
 pub fn machine_sysfs_options(root: &Path) -> Result<SysfsOptions, SysfsError> {
     let cpu_online = Path::new("devices/system/cpu/online");
+    let node_dir = Path::new("devices/system/node");
     let node_online = Path::new("devices/system/node/online");
     let online = read_sysfs(root, cpu_online)
         .ok_or_else(|| SysfsError::Unreadable(root.join(cpu_online)))?;
-    if read_sysfs(root, node_online).is_none() {
+    if root.join(node_dir).is_dir() && read_sysfs(root, node_online).is_none() {
         return Err(SysfsError::Unreadable(root.join(node_online)));
     }
     let online_cpus: BTreeSet<CpuIndex> = parse_cpu_list(&online).into_iter().collect();

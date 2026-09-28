@@ -70,7 +70,7 @@ fn a_node_without_a_cpulist_falls_back_to_one_node() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_tree_without_a_node_list_falls_back_to_one_node() {
-    let layout = NumaLayout::of_machine(&opts("no_online", all_cpus(4)));
+    let layout = NumaLayout::of_machine(&opts("no_node_tree", all_cpus(4)));
     assert_eq!(layout.nodes, vec![(0..4).collect::<Vec<_>>()]);
 }
 
@@ -131,8 +131,8 @@ fn machine_options_describe_every_online_cpu() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn machine_options_refuse_a_root_without_sysfs() {
-    // A tree that cannot say which CPUs or which nodes exist gets no answer at
-    // all, rather than the guessed single node the detection path falls back to.
+    // A tree that cannot say which CPUs exist gets no answer at all, rather than
+    // the guessed single node the detection path falls back to.
     let err =
         yorkie_numa::machine_sysfs_options(&fixture("missing_cpulist")).expect_err("no cpu list");
     let message = refusal_message(&err);
@@ -140,7 +140,27 @@ fn machine_options_refuse_a_root_without_sysfs() {
         message.contains("devices/system/cpu/online"),
         "message: {message}"
     );
-    let err = yorkie_numa::machine_sysfs_options(&fixture("no_online")).expect_err("no node list");
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn machine_options_read_a_tree_without_a_node_directory_as_one_node() {
+    // A kernel built without NUMA support has no `devices/system/node` at all:
+    // that machine is one node holding every online CPU.
+    let o = yorkie_numa::machine_sysfs_options(&fixture("no_node_tree")).expect("a NUMA-less tree");
+    assert_eq!(o.online_cpus, all_cpus(4));
+    let layout = NumaLayout::of_machine(&o);
+    assert_eq!(layout.nodes, vec![vec![0, 1, 2, 3]]);
+    assert_eq!(layout.system_nodes, vec![0]);
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn machine_options_refuse_a_node_directory_without_a_node_list() {
+    // The node directory exists but cannot say which nodes are online: that tree
+    // is untrustworthy, not NUMA-less.
+    let err = yorkie_numa::machine_sysfs_options(&fixture("node_without_online"))
+        .expect_err("no node list");
     let message = refusal_message(&err);
     assert!(
         message.contains("devices/system/node/online"),

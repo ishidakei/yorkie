@@ -91,7 +91,8 @@ cpu_ledger = ".yorkie-cpu-ledger"
 # building machine's sysfs and compiled in, so the engine never discovers it at
 # run time. Building therefore needs a Linux host whose `/sys` reports a
 # topology; a host without NUMA hardware still reports one node and builds
-# normally.
+# normally, and a kernel built without NUMA support, whose sysfs has no
+# `devices/system/node` directory at all, is read as one node too.
 #
 # `"auto"` takes whatever that machine has. An integer additionally requires the
 # resolved count to equal it, so a config pinned to the machine the engine plays

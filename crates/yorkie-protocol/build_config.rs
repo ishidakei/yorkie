@@ -740,7 +740,8 @@ fn generate(
                             "cannot resolve the NUMA layout of this host: {e}\n       \
                              the engine compiles the layout of the machine it is built on into \
                              the binary, so building it needs a Linux host whose sysfs reports \
-                             one"
+                             one, or reports none at all (no `devices/system/node` \
+                             directory), which counts as one node"
                         ),
                     )
                 })?;
