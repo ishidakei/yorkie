@@ -127,6 +127,8 @@ fn store(
         generation,
         #[cfg(feature = "verbose3")]
         ValueMarks::NONE,
+        #[cfg(feature = "verbose1")]
+        &mut 0,
     );
 }
 
@@ -153,6 +155,8 @@ fn store_probe_round_trip_every_field() {
         tt_generation_zero(),
         #[cfg(feature = "verbose3")]
         ValueMarks::NONE,
+        #[cfg(feature = "verbose1")]
+        &mut 0,
     );
 
     // Hit: every field survives the round trip.
@@ -873,6 +877,7 @@ mod value_marks {
             eval,
             generation,
             marks,
+            &mut 0,
         );
     }
 

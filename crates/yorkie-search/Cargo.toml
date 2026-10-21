@@ -31,7 +31,10 @@ yorkie-eval = { path = "../yorkie-eval", features = ["source-network"] }
 # crate without that feature rather than merely unused:
 #
 #   - `verbose1` — the book probe's diagnostic message bodies, which the Protocol
-#     layer turns into `info string` lines.
+#     layer turns into `info string` lines, and each worker's counts of the
+#     transposition-table stores that wrote an entry and of the static-eval
+#     stores that found the position's eval already there, which the per-reply
+#     statistics line reports.
 #   - `verbose2` — everything behind a search `info` line: the PV-output sink,
 #     configuration and line assembly, the root moves' fail-bound flags, the book
 #     hit's per-candidate lines, and the transposition table's `hashfull`
@@ -52,7 +55,7 @@ yorkie-eval = { path = "../yorkie-eval", features = ["source-network"] }
 [features]
 random = []
 tt-entry16 = ["yorkie-storage/tt-entry16"]
-verbose1 = []
+verbose1 = ["yorkie-storage/verbose1"]
 verbose2 = ["verbose1", "yorkie-storage/verbose2"]
 verbose3 = ["verbose2", "yorkie-storage/verbose3"]
 

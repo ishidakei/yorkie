@@ -55,7 +55,7 @@ use crate::engine::{
 use crate::formatter::Formatter;
 use crate::parser::{Command, MAX_LINE_BYTES, parse_line};
 #[cfg(feature = "verbose1")]
-use crate::stats::StatsBuf;
+use crate::stats::{StatsBuf, clear_search_counts, take_search_counts};
 
 /// The public values used in the `id name` / `id author` lines.
 ///
@@ -508,7 +508,10 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
                 // the pool, and none of that belongs to a reply: the first
                 // reported interval starts here.
                 #[cfg(feature = "verbose1")]
-                clear_alloc_count();
+                {
+                    clear_alloc_count();
+                    clear_search_counts();
+                }
                 Ok(())
             }
             ReadyOutcome::LoadFailed(reason) => {
@@ -840,6 +843,7 @@ fn emit_stats<W: Write + ?Sized>(w: &mut W, #[cfg(feature = "verbose3")] marks: 
     if let Some(line) = crate::stats::render(
         &mut buf,
         take_alloc_count(),
+        take_search_counts(),
         #[cfg(feature = "verbose3")]
         marks,
     ) {

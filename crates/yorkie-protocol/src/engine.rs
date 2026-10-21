@@ -1456,9 +1456,14 @@ impl<P: EngineSink> Engine<P> {
         // consistent with the recreated helpers.
         self.rebuild_pool();
         // The pool and the history tables just rebuilt are a new game's setup,
-        // not the first move's work, so they are not counted against it.
+        // not the first move's work, so they are not counted against it. The
+        // join above ended any search of the last game, whose counts go the
+        // same way.
         #[cfg(feature = "verbose1")]
-        clear_alloc_count();
+        {
+            clear_alloc_count();
+            crate::stats::clear_search_counts();
+        }
     }
 
     /// Start a search under `params`.
@@ -2775,6 +2780,11 @@ impl PonderJob {
         #[cfg(feature = "verbose2")]
         qs.set_multi_pv(self.multi_pv);
         // No PV sink: the main worker of this search prints nothing either.
+        // The reply this search follows is already out, so what each of its
+        // workers did counts towards the next one.
+        #[cfg(feature = "verbose1")]
+        crate::stats::add_search([&qs.run_worker(&root, root_moves, SEARCH_MAX_DEPTH)]);
+        #[cfg(not(feature = "verbose1"))]
         qs.run_worker(&root, root_moves, SEARCH_MAX_DEPTH);
 
         // Whatever ended this search ends the helpers with it, and each is
@@ -2782,6 +2792,9 @@ impl PonderJob {
         // belongs to no search.
         self.stop.store(true, Ordering::Relaxed);
         for slot in self.helper_slots.iter() {
+            #[cfg(feature = "verbose1")]
+            crate::stats::add_search([&slot.collect()]);
+            #[cfg(not(feature = "verbose1"))]
             slot.collect();
         }
         // The marker goes out before the flag is lowered, so a session that
@@ -3138,6 +3151,9 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     for slot in helper_slots.iter() {
         results.push(slot.collect());
     }
+    // Every worker's counts go to the interval the reply below ends.
+    #[cfg(feature = "verbose1")]
+    crate::stats::add_search(&results);
 
     // Aggregated node count for the `info` line and for `bench` — every worker's
     // exact final count (the reference `threads.nodes_searched()`). Both readers

@@ -42,7 +42,10 @@ libc = "0.2"
 #   - `verbose1` — the counting global allocator and the process-wide tally it
 #     raises, which the per-reply statistics line reports. Without it the
 #     `#[global_allocator]` is mimalloc itself, and neither the wrapper type nor
-#     the counter is compiled.
+#     the counter is compiled. It also adds the store's report back to the
+#     storing thread — a count it raises when the payload is written — and the
+#     check whether an entry already holds a position's static eval, both of
+#     which feed the same line.
 #   - `verbose2` — the occupancy statistic the search `info` lines carry, so
 #     without it the crate compiles without `TranspositionTable::hashfull` at
 #     all.

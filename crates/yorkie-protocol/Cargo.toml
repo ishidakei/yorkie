@@ -66,8 +66,10 @@ serde_json = "~1.0"
 # discard.
 #
 #   - `verbose1` → `yorkie-search/verbose1` — the book probe's diagnostic
-#     message bodies — and `yorkie-storage/verbose1` — the counting global
-#     allocator behind the per-reply statistics line.
+#     message bodies and each worker's search counts — and
+#     `yorkie-storage/verbose1` — the counting global allocator and the
+#     transposition table's report of a written entry, both behind the per-reply
+#     statistics line.
 #   - `verbose2` → `yorkie-search/verbose2` (and through it
 #     `yorkie-storage/verbose2`) — the PV-output surface, the root moves' fail
 #     bounds, the book hit's per-candidate lines, and the transposition table's

@@ -445,6 +445,15 @@ pub struct QSearch<N: NetworkParams> {
     /// difference of it, and the time-management block divides by this worker's
     /// own count. The ceilings that read it are gated; the count itself is not.
     nodes: u64,
+    /// Transposition-table stores this worker made whose replacement condition
+    /// held, since the search started. Reported, never read by the search.
+    #[cfg(feature = "verbose1")]
+    tt_updates: u64,
+    /// Bare static-eval stores this worker made into an entry that already held
+    /// the same position's static eval, since the search started. Reported,
+    /// never read by the search.
+    #[cfg(feature = "verbose1")]
+    eval_dups: u64,
     /// `selDepth`.
     sel_depth: i32,
     /// `nmpMinPly`: while a null-move verification search runs, the ply below
@@ -662,6 +671,14 @@ pub struct WorkerResult {
     /// This worker's own node count (`do_move` calls). The driver sums every
     /// worker's count for the aggregated `info ... nodes` output.
     pub nodes: u64,
+    /// This worker's transposition-table stores whose replacement condition
+    /// held, for the per-reply statistics line.
+    #[cfg(feature = "verbose1")]
+    pub tt_updates: u64,
+    /// This worker's bare static-eval stores into an entry that already held the
+    /// same position's static eval, for the per-reply statistics line.
+    #[cfg(feature = "verbose1")]
+    pub eval_dups: u64,
     /// Whether this worker (only meaningful for the main worker) already
     /// emitted the last completed iteration's final PV during iterative
     /// deepening — the reference `uciPvSent` return of `iterative_deepening`.
@@ -836,6 +853,10 @@ impl<N: NetworkParams> QSearch<N> {
         Self {
             net,
             nodes: 0,
+            #[cfg(feature = "verbose1")]
+            tt_updates: 0,
+            #[cfg(feature = "verbose1")]
+            eval_dups: 0,
             sel_depth: 0,
             nmp_min_ply: 0,
             pv_node: false,
@@ -1393,7 +1414,18 @@ impl<N: NetworkParams> QSearch<N> {
             generation,
             #[cfg(feature = "verbose3")]
             self.marks,
+            #[cfg(feature = "verbose1")]
+            &mut self.tt_updates,
         );
+    }
+
+    /// Count the bare static-eval store about to go into `slot` as a duplicate
+    /// when the entry already holds this position's static eval — read before
+    /// the store, so it is the entry as the store finds it.
+    #[cfg(feature = "verbose1")]
+    #[inline]
+    fn count_eval_dup(&mut self, slot: TtSlot, key: u64) {
+        self.eval_dups += u64::from(TranspositionTable::shared().holds_eval_at(slot, key));
     }
 
     /// Hand back the marks of the value a sub-search just returned, restoring
@@ -1605,6 +1637,8 @@ impl<N: NetworkParams> QSearch<N> {
                     best_value = (best_value + beta) / 2;
                 }
                 if !tt_hit {
+                    #[cfg(feature = "verbose1")]
+                    self.count_eval_dup(tt_slot, pos_key);
                     self.tt_store(
                         tt_slot,
                         pos_key,
@@ -1897,6 +1931,11 @@ impl<N: NetworkParams> QSearch<N> {
         self.root_us = root_pos.side_to_move();
         self.set_read_tt(true);
         self.nodes = 0;
+        #[cfg(feature = "verbose1")]
+        {
+            self.tt_updates = 0;
+            self.eval_dups = 0;
+        }
         self.sel_depth = 0;
         self.last_iteration_pv.clear();
         // Fresh abort state for this `go`; the counter is seeded so the first
@@ -2224,6 +2263,10 @@ impl<N: NetworkParams> QSearch<N> {
             best,
             completed_depth,
             nodes: self.nodes,
+            #[cfg(feature = "verbose1")]
+            tt_updates: self.tt_updates,
+            #[cfg(feature = "verbose1")]
+            eval_dups: self.eval_dups,
             #[cfg(feature = "verbose2")]
             uci_pv_sent,
             #[cfg(feature = "verbose2")]
@@ -3021,6 +3064,8 @@ impl<N: NetworkParams> QSearch<N> {
                 unadjusted_static_eval = self.static_eval(pos);
                 static_eval = to_corrected_static_eval(unadjusted_static_eval, correction_value);
                 eval = static_eval;
+                #[cfg(feature = "verbose1")]
+                self.count_eval_dup(tt_slot, pos_key);
                 self.tt_store(
                     tt_slot,
                     pos_key,
@@ -4014,6 +4059,8 @@ mod tests {
             generation,
             #[cfg(feature = "verbose3")]
             ValueMarks::NONE,
+            #[cfg(feature = "verbose1")]
+            &mut 0,
         );
     }
 
@@ -4681,7 +4728,7 @@ mod tests {
             let generation = table.generation();
             let (_f, _d, w) = table.probe(key, side);
             w.write(
-                key, value, false, bound, DEPTH_QS, None, 0, generation, marks,
+                key, value, false, bound, DEPTH_QS, None, 0, generation, marks, &mut 0,
             );
         }
 

@@ -409,8 +409,9 @@ impl TTEntry {
     /// An unoccupied entry. A `const fn` rather than a `Default` impl, because
     /// the miri build's table is a `static` whose initialiser is a constant
     /// expression and `Default::default` is not one. Every other build states
-    /// the table's zeros to the assembler and needs no initialiser at all.
-    #[cfg(miri)]
+    /// the table's zeros to the assembler and needs no initialiser at all; the
+    /// unit tests build clusters of their own from it.
+    #[cfg(any(miri, all(test, feature = "verbose1")))]
     const fn empty() -> TTEntry {
         TTEntry {
             key: AtomicTteKey::new(0),
@@ -492,8 +493,9 @@ struct Cluster {
 
 impl Cluster {
     /// An empty cluster: the all-zero bit pattern the table starts as. Needed
-    /// only where the table is a Rust `static` — see [`TTEntry::empty`].
-    #[cfg(miri)]
+    /// only where the table is a Rust `static` — see [`TTEntry::empty`] — and
+    /// by the unit tests that store into a cluster of their own.
+    #[cfg(any(miri, all(test, feature = "verbose1")))]
     const fn empty() -> Cluster {
         Cluster {
             entry: [const { TTEntry::empty() }; CLUSTER_SIZE],
@@ -539,6 +541,11 @@ impl Cluster {
     /// decision sees the pre-save entry state. `marks` follow the payload: they
     /// are written exactly when the payload is, and left alone when the
     /// replacement condition declines the store.
+    ///
+    /// `updates` is the storing thread's own count of stores that wrote the
+    /// payload, raised by one when this one does. A store that only rewrites
+    /// the move leaves it alone. The table is shared, so the count lives with
+    /// the caller rather than in here.
     #[inline]
     #[expect(clippy::too_many_arguments)]
     fn save(
@@ -553,6 +560,7 @@ impl Cluster {
         ev: Value,
         curr_generation: u8,
         #[cfg(feature = "verbose3")] marks: ValueMarks,
+        #[cfg(feature = "verbose1")] updates: &mut u64,
     ) {
         // The stored key's top bits are the marks here, and `tte_key` has
         // already cleared them out of `k`.
@@ -590,7 +598,20 @@ impl Cluster {
             entry.eval16.store(ev as i16, REL);
             #[cfg(all(feature = "verbose3", not(feature = "tt-entry16")))]
             self.set_marks(slot, marks);
+            #[cfg(feature = "verbose1")]
+            {
+                *updates += 1;
+            }
         }
+    }
+
+    /// Whether `slot` holds the position `k` names with a static eval in it.
+    /// The key and the eval are each read once.
+    #[cfg(feature = "verbose1")]
+    #[inline]
+    fn holds_eval(&self, slot: usize, k: TteKey) -> bool {
+        let entry = &self.entry[slot];
+        key_matches(entry.key.load(REL), k) && entry.eval16.load(REL) as Value != VALUE_NONE
     }
 }
 
@@ -1016,6 +1037,11 @@ impl TranspositionTable {
     /// replacement policy as [`TTWriter::write`]. Addressed by index rather
     /// than re-selected, so it lands on that slot even when a child has since
     /// overwritten the entry.
+    ///
+    /// `updates`, at `verbose1`, is the storing thread's own count of stores
+    /// whose replacement condition held, raised by one when this one's does —
+    /// into an entry for another position or an empty one included. A store
+    /// that only rewrites the move does not count.
     #[inline]
     #[expect(clippy::too_many_arguments)]
     pub fn write_at(
@@ -1030,6 +1056,7 @@ impl TranspositionTable {
         eval: Value,
         generation: u8,
         #[cfg(feature = "verbose3")] marks: ValueMarks,
+        #[cfg(feature = "verbose1")] updates: &mut u64,
     ) {
         self.clusters[slot.cluster].save(
             slot.entry,
@@ -1043,7 +1070,18 @@ impl TranspositionTable {
             generation,
             #[cfg(feature = "verbose3")]
             marks,
+            #[cfg(feature = "verbose1")]
+            updates,
         );
+    }
+
+    /// Whether the entry [`Self::locate`] captured holds the position `key`
+    /// names, with a static eval in it — read before a store into that entry,
+    /// to tell whether the store repeats an eval the table already had.
+    #[cfg(feature = "verbose1")]
+    #[inline]
+    pub fn holds_eval_at(&self, slot: TtSlot, key: u64) -> bool {
+        self.clusters[slot.cluster].holds_eval(slot.entry, tte_key(key))
     }
 }
 
@@ -1071,7 +1109,8 @@ impl<'a> TTWriter<'a> {
 
     /// Store data into the targeted entry, subject to the replacement policy
     /// (`TTWriter::write`). `key` is the full 64-bit position key, of which the
-    /// entry keeps whatever its layout stores.
+    /// entry keeps whatever its layout stores. `updates` is counted as
+    /// [`TranspositionTable::write_at`] counts it.
     #[inline]
     #[expect(clippy::too_many_arguments)]
     pub fn write(
@@ -1085,6 +1124,7 @@ impl<'a> TTWriter<'a> {
         eval: Value,
         generation: u8,
         #[cfg(feature = "verbose3")] marks: ValueMarks,
+        #[cfg(feature = "verbose1")] updates: &mut u64,
     ) {
         self.cluster.save(
             self.slot,
@@ -1098,6 +1138,8 @@ impl<'a> TTWriter<'a> {
             generation,
             #[cfg(feature = "verbose3")]
             marks,
+            #[cfg(feature = "verbose1")]
+            updates,
         );
     }
 }
@@ -1185,5 +1227,171 @@ mod static_table_tests {
                 assert_eq!(ci & 1, side as usize, "bit 0 carries the side to move");
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "verbose1"))]
+mod store_count_tests {
+    //! The two counts a `verbose1` build takes at a store: whether the store
+    //! wrote the payload, and whether the entry it went into already held the
+    //! position's static eval. Each test stores into a cluster of its own, so
+    //! nothing here touches the shared table.
+
+    use super::*;
+
+    /// The depth the search stores a bare static eval at.
+    const DEPTH_UNSEARCHED: Depth = -2;
+
+    /// Two positions' stored keys, both non-zero so neither matches an empty
+    /// entry.
+    fn this() -> TteKey {
+        tte_key(0x0123_4567_89ab_cdef)
+    }
+    fn other() -> TteKey {
+        tte_key(0x0fed_cba9_8765_4321)
+    }
+
+    /// Store into slot 0 of `cluster` and return how many payload writes the
+    /// store counted: 0 or 1.
+    #[expect(clippy::too_many_arguments)]
+    fn store(
+        cluster: &Cluster,
+        k: TteKey,
+        pv: bool,
+        b: Bound,
+        d: Depth,
+        m: u16,
+        ev: Value,
+        generation: u8,
+    ) -> u64 {
+        let mut updates = 0;
+        cluster.save(
+            0,
+            k,
+            0,
+            pv,
+            b,
+            d,
+            NonZeroU16::new(m),
+            ev,
+            generation,
+            #[cfg(feature = "verbose3")]
+            ValueMarks::NONE,
+            &mut updates,
+        );
+        updates
+    }
+
+    /// A cluster whose slot 0 holds `this()` at depth 10 in generation 0, with
+    /// a static eval of 50.
+    fn holding_depth_10() -> Cluster {
+        let cluster = Cluster::empty();
+        assert_eq!(
+            store(&cluster, this(), false, Bound::Lower, 10, 7, 50, 0),
+            1
+        );
+        cluster
+    }
+
+    #[test]
+    fn a_store_into_an_empty_entry_counts() {
+        let cluster = Cluster::empty();
+        assert_eq!(store(&cluster, this(), false, Bound::Upper, 1, 0, 0, 0), 1);
+    }
+
+    #[test]
+    fn a_store_over_another_position_counts() {
+        let cluster = holding_depth_10();
+        assert_eq!(store(&cluster, other(), false, Bound::Upper, 1, 0, 0, 0), 1);
+    }
+
+    #[test]
+    fn an_exact_store_counts_at_any_depth() {
+        let cluster = holding_depth_10();
+        assert_eq!(store(&cluster, this(), false, Bound::Exact, 0, 0, 0, 0), 1);
+    }
+
+    /// Depth 10 is stored as 13, so a same-generation store of the same
+    /// position replaces it when `d + 3 + 2·pv > 9`.
+    #[test]
+    fn a_store_counts_only_above_the_depth_threshold() {
+        for (d, pv, counted) in [
+            (7, false, true),
+            (6, false, false),
+            (5, true, true),
+            (4, true, false),
+        ] {
+            let cluster = holding_depth_10();
+            assert_eq!(
+                store(&cluster, this(), pv, Bound::Lower, d, 0, 0, 0),
+                u64::from(counted),
+                "depth {d}, pv {pv}"
+            );
+            let expected_depth = if counted { d } else { 10 };
+            assert_eq!(cluster.read(0).depth, expected_depth, "depth {d}, pv {pv}");
+        }
+    }
+
+    #[test]
+    fn a_store_over_an_older_generation_counts() {
+        let cluster = holding_depth_10();
+        assert_eq!(store(&cluster, this(), false, Bound::Lower, 0, 0, 0, 1), 1);
+    }
+
+    #[test]
+    fn a_store_that_only_rewrites_the_move_does_not_count() {
+        let cluster = holding_depth_10();
+        assert_eq!(store(&cluster, this(), false, Bound::Lower, 1, 9, 0, 0), 0);
+        let data = cluster.read(0);
+        assert_eq!(data.move16, NonZeroU16::new(9), "the move was rewritten");
+        assert_eq!(data.depth, 10, "the payload was not");
+        assert_eq!(data.eval, 50);
+    }
+
+    /// The check the search makes before a bare static-eval store, then the
+    /// store itself: whether the entry already held this position's eval is
+    /// decided by the entry as it was, whether or not the store then replaces
+    /// the payload.
+    fn eval_store(cluster: &Cluster, generation: u8) -> (bool, u64) {
+        let duplicate = cluster.holds_eval(0, this());
+        let updates = store(
+            cluster,
+            this(),
+            false,
+            Bound::None,
+            DEPTH_UNSEARCHED,
+            0,
+            60,
+            generation,
+        );
+        (duplicate, updates)
+    }
+
+    #[test]
+    fn an_eval_store_over_the_same_positions_eval_is_a_duplicate() {
+        // Same generation and a deeper entry: the store declines the payload.
+        assert_eq!(eval_store(&holding_depth_10(), 0), (true, 0));
+        // A newer generation: the store replaces it.
+        assert_eq!(eval_store(&holding_depth_10(), 1), (true, 1));
+    }
+
+    #[test]
+    fn an_entry_without_an_eval_is_not_a_duplicate() {
+        let cluster = Cluster::empty();
+        assert_eq!(
+            store(&cluster, this(), false, Bound::Lower, 10, 7, VALUE_NONE, 0),
+            1
+        );
+        assert_eq!(eval_store(&cluster, 0), (false, 0));
+    }
+
+    #[test]
+    fn an_entry_for_another_position_is_not_a_duplicate() {
+        let cluster = Cluster::empty();
+        assert_eq!(
+            store(&cluster, other(), false, Bound::Lower, 10, 7, 50, 0),
+            1
+        );
+        assert_eq!(eval_store(&cluster, 0), (false, 1));
     }
 }

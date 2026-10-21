@@ -5,6 +5,10 @@
 //! allocator and writes the line at all; a build without it is covered by
 //! `info_gating.rs`, which pins that no such line appears.
 //!
+//! Beside `alloc` the line counts what the searches of the interval did —
+//! `nodes`, `tt_update` and `eval_dup` — and leaves out any of them that is
+//! zero, as a reply that ran no search shows.
+//!
 //! The line is written by taking the counter, so what the previous reply
 //! reported can never be reported again — the two numbers below being drawn from
 //! two separate searches is the observable form of that.
@@ -27,22 +31,39 @@ fn stats_items(line: &str) -> Option<Vec<&str>> {
     Some(line.strip_prefix(STATS_PREFIX)?.split(' ').collect())
 }
 
-/// The `(index, count)` of every `info string stats` line in `out`. An omitted
-/// item is a zero one, `alloc` included.
+/// The four counted items, in the order the line writes them.
+const COUNT_KEYS: [&str; 4] = ["alloc", "nodes", "tt_update", "eval_dup"];
+
+/// The value of the `key` item on the statistics line `line`. An omitted item
+/// is a zero one.
+fn stats_count(line: &str, key: &str) -> u64 {
+    let items = stats_items(line).unwrap_or_else(|| panic!("{line:?} is no statistics line"));
+    items
+        .iter()
+        .find_map(|item| item.strip_prefix(key)?.strip_prefix('='))
+        .map_or(0, |n| {
+            n.parse()
+                .unwrap_or_else(|e| panic!("{line:?} must carry a count for {key}: {e}"))
+        })
+}
+
+/// The `(index, alloc count)` of every `info string stats` line in `out`.
 fn stats_lines(out: &str) -> Vec<(usize, u64)> {
     out.lines()
         .enumerate()
-        .filter_map(|(i, l)| {
-            let items = stats_items(l)?;
-            let n = items
-                .iter()
-                .find_map(|item| item.strip_prefix("alloc="))
-                .map_or(0, |n| {
-                    n.parse()
-                        .unwrap_or_else(|e| panic!("{l:?} must carry a count: {e}"))
-                });
-            Some((i, n))
-        })
+        .filter(|(_, l)| l.starts_with(STATS_PREFIX))
+        .map(|(i, l)| (i, stats_count(l, "alloc")))
+        .collect()
+}
+
+/// The counted items of a statistics line, as `(key, value)` in the order they
+/// were written.
+fn counted_items(line: &str) -> Vec<(&str, &str)> {
+    stats_items(line)
+        .unwrap_or_else(|| panic!("{line:?} is no statistics line"))
+        .into_iter()
+        .filter_map(|item| item.split_once('='))
+        .filter(|(key, _)| COUNT_KEYS.contains(key))
         .collect()
 }
 
@@ -97,6 +118,98 @@ fn every_reply_reports_the_allocations_of_its_own_interval() {
     }
 }
 
+/// A reply that searched reports what its search did: nodes searched and
+/// entries written. Every item the line carries is a non-zero count, in the
+/// line's order — a zero one is left out rather than written.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_searched_reply_reports_its_nodes_and_table_updates() {
+    let _tt = common::serial_tt();
+    stage_configured_eval_dir();
+    let out = drive(
+        "usi\n\
+         isready\n\
+         usinewgame\n\
+         position startpos moves 7g7f 3c3d\n\
+         go byoyomi 1000\n\
+         quit\n",
+    );
+    assert!(
+        out.contains("readyok\n"),
+        "the network must load in:\n{out}"
+    );
+    let line = out
+        .lines()
+        .find(|l| l.starts_with(STATS_PREFIX))
+        .unwrap_or_else(|| panic!("a statistics line must be in:\n{out}"));
+
+    assert!(stats_count(line, "nodes") > 0, "{line:?} in:\n{out}");
+    assert!(stats_count(line, "tt_update") > 0, "{line:?} in:\n{out}");
+
+    let items = counted_items(line);
+    let mut order = items
+        .iter()
+        .map(|(key, _)| COUNT_KEYS.iter().position(|k| k == key));
+    assert!(
+        order.clone().is_sorted(),
+        "the counted items come in the order {COUNT_KEYS:?}, got {line:?}"
+    );
+    assert!(
+        order.all(|at| at.is_some()),
+        "only known items, got {line:?}"
+    );
+    for (key, value) in items {
+        assert_ne!(value, "0", "a zero {key} is omitted, got {line:?}");
+    }
+}
+
+/// With one search thread, the reply's `nodes` is the count the search's own
+/// last `info` line reported: the line before it reports the whole search, and
+/// the statistics line reports every search of the interval, which here is
+/// that one.
+#[cfg(feature = "verbose2")]
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_single_threaded_replys_nodes_are_its_last_info_lines() {
+    use common::StreamHarness;
+    use yorkie_protocol::config;
+
+    assert_eq!(config::THREADS, 1, "this pins a single-threaded search");
+    let _tt = common::serial_tt();
+    stage_configured_eval_dir();
+    let h = StreamHarness::start();
+    h.send("usi");
+    h.send("isready");
+    assert!(
+        h.wait_until(30_000, |o| o.contains("readyok")),
+        "network must load and ack readyok"
+    );
+    h.send("position startpos moves 7g7f 3c3d");
+    h.send("go depth 4");
+    assert!(
+        h.wait_until(60_000, |o| o.contains("bestmove ")),
+        "the search must finish; got:\n{}",
+        h.output()
+    );
+    let out = h.quit_join();
+
+    let info_nodes = out
+        .lines()
+        .filter(|l| l.starts_with("info depth "))
+        .filter_map(|l| {
+            let mut words = l.split(' ');
+            words.find(|w| *w == "nodes")?;
+            words.next()?.parse::<u64>().ok()
+        })
+        .next_back()
+        .unwrap_or_else(|| panic!("the search must report its nodes in:\n{out}"));
+    let line = out
+        .lines()
+        .find(|l| l.starts_with(STATS_PREFIX))
+        .unwrap_or_else(|| panic!("a statistics line must be in:\n{out}"));
+    assert_eq!(stats_count(line, "nodes"), info_nodes, "in:\n{out}");
+}
+
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_reply_that_starts_no_search_still_reports_its_interval() {
@@ -118,6 +231,12 @@ fn a_reply_that_starts_no_search_still_reports_its_interval() {
         bestmoves[0],
         "the statistics line must directly precede the bestmove in:\n{out}"
     );
+    // No search ran, so its counts are zero and left off the line.
+    let line = out.lines().nth(stats[0].0).expect("the statistics line");
+    for key in ["nodes", "tt_update", "eval_dup"] {
+        assert_eq!(stats_count(line, key), 0, "{line:?} in:\n{out}");
+        assert!(!line.contains(key), "a zero {key} is omitted, got {line:?}");
+    }
 }
 
 /// The three items a `verbose3` build adds: what the value the reply rests on —
@@ -271,10 +390,15 @@ mod value_marks {
         let out = h.quit_join();
 
         let items = reply_items(&out);
-        assert_eq!(items.len(), 1, "one item only, in:\n{out}");
         assert!(
-            items[0].starts_with("alloc="),
-            "and that item is the count, in:\n{out}"
+            items.iter().any(|item| item.starts_with("alloc=")),
+            "the line carries its counts, in:\n{out}"
+        );
+        assert!(
+            items.iter().all(|item| item
+                .split_once('=')
+                .is_some_and(|(key, _)| COUNT_KEYS.contains(&key))),
+            "and nothing but its counts, in:\n{out}"
         );
     }
 }
