@@ -629,8 +629,8 @@ pub struct QSearch<N: NetworkParams> {
     /// overwrites them, so a caller that must keep its own across one saves
     /// them and restores them through [`Self::child_marks`].
     ///
-    /// **No search decision reads them.** They exist so a `tt probe` can say
-    /// which rules an entry's value is behind.
+    /// **No search decision reads them.** They exist so the reply can say which
+    /// rules the value it rests on is behind.
     #[cfg(feature = "verbose3")]
     marks: ValueMarks,
 

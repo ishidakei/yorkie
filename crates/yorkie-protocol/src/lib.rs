@@ -10,9 +10,6 @@ pub(crate) mod settings;
 /// The per-reply statistics line, which only a `verbose1` build writes.
 #[cfg(feature = "verbose1")]
 pub(crate) mod stats;
-/// The feature-gated `tt` command family — present only under `verbose3`.
-#[cfg(feature = "verbose3")]
-pub mod tt_command;
 pub mod usi;
 
 #[cfg(feature = "verbose3")]
@@ -20,8 +17,6 @@ pub use bench::{BENCH_DEFAULT_POSITIONS, BenchConfig, BenchParseError, parse_ben
 pub use engine::{Engine, EngineSink, GoOutcome, GoParams, PositionSfen, ReadyOutcome, Reply};
 pub use formatter::Formatter;
 pub use parser::{Command, parse_line};
-#[cfg(feature = "verbose3")]
-pub use tt_command::{TtCommand, TtParseError, TtPosition, TtStoreArgs, parse_tt};
 pub use usi::UsiEngine;
 
 /// Serialises the tests that drive a session.

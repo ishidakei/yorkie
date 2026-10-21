@@ -22,9 +22,7 @@ use yorkie_storage::ValueMarks;
 /// What every line starts with.
 const PREFIX: &[u8] = b"info string stats";
 
-/// The three mark items, in the order they are written. The keys are the ones
-/// `tt probe` spells, so a reader needs one vocabulary for the marks of a value
-/// in the table and the marks of the value a reply rests on.
+/// The three mark items, in the order they are written.
 #[cfg(feature = "verbose3")]
 const MARK_ITEMS: [&[u8]; 3] = [b" pathdep=1", b" declrule=1", b" movelimit=1"];
 
@@ -166,7 +164,7 @@ mod tests {
         }
 
         /// Every combination of the three, each written only when it is set and
-        /// always in the `tt probe` order.
+        /// always in the same order.
         #[test]
         fn each_combination_writes_the_items_that_are_set() {
             let expected: [&[u8]; 8] = [

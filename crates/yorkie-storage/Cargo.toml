@@ -46,8 +46,8 @@ libc = "0.2"
 #   - `verbose2` — the occupancy statistic the search `info` lines carry, so
 #     without it the crate compiles without `TranspositionTable::hashfull` at
 #     all.
-#   - `verbose3` — `TranspositionTable::checksum`, which pins the table's
-#     contents for an outside inspector and has no in-game reader.
+#   - `verbose3` — the per-entry value marks the statistics line's marks are
+#     carried through.
 #
 # They keep the implication chain of the Protocol layer, and all are off by
 # default. None changes anything else about the table.

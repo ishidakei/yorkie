@@ -81,13 +81,6 @@ pub enum Command<'a> {
     /// `verbose3` only, so the default build cannot even name the command.
     #[cfg(feature = "verbose3")]
     Bench(Vec<&'a [u8]>),
-    /// `tt <store|probe|children> …` — the verbosity-gated transposition-table
-    /// read/write commands (`verbose3`). Like [`Command::Bench`] the trailing
-    /// tokens are carried verbatim; [`crate::tt_command::parse_tt`] gives them
-    /// meaning. The variant exists only with that feature, so a build without it
-    /// cannot even name the command.
-    #[cfg(feature = "verbose3")]
-    Tt(Vec<&'a [u8]>),
     Quit,
     /// A line no arm recognised. The line is retained only so the `verbose1`
     /// diagnostic can echo it back; without that feature nothing can print it,
@@ -112,8 +105,8 @@ fn unknown(_line: &[u8]) -> Command<'static> {
     Command::Unknown
 }
 
-/// The tokens of `args`, for the two `verbose3` commands that carry their
-/// arguments to a parser of their own.
+/// The tokens of `args`, for the `verbose3` command that carries its arguments
+/// to a parser of its own.
 #[cfg(feature = "verbose3")]
 fn tokens(args: &[u8]) -> Vec<&[u8]> {
     yorkie_state::text::tokens(args).collect()
@@ -144,15 +137,10 @@ pub fn parse_line(input: &[u8]) -> Command<'_> {
         // The trailing `bench` tokens are preserved verbatim for the semantic
         // parse in `crate::bench` (which fills defaults and validates them).
         // `verbose3` only: without that feature this arm does not exist and
-        // `bench …` falls through to `Command::Unknown`, exactly like `tt`.
+        // `bench …` falls through to `Command::Unknown` like any other
+        // unrecognised line.
         #[cfg(feature = "verbose3")]
         b"bench" => Command::Bench(tokens(rest)),
-        // `verbose3` only. Without that feature this arm does not exist, so
-        // `tt …` falls through to `Command::Unknown` like any other unrecognised
-        // line — the default build's behaviour is byte-identical to before the
-        // command existed.
-        #[cfg(feature = "verbose3")]
-        b"tt" => Command::Tt(tokens(rest)),
         _ => unknown(trimmed),
     }
 }
@@ -738,8 +726,7 @@ mod tests {
     }
 
     /// Below `verbose3` — the default build: `bench` is not a command token at
-    /// all, so it reaches the `Unknown` catch-all like any other stray line,
-    /// exactly as `tt` does.
+    /// all, so it reaches the `Unknown` catch-all like any other stray line.
     #[cfg(not(feature = "verbose3"))]
     #[test]
     fn bench_is_not_a_command_below_verbose3() {
@@ -817,28 +804,15 @@ mod tests {
         );
     }
 
-    /// Below `verbose3` — the default build: `tt` is not a command token at all,
-    /// so it reaches the `Unknown` catch-all exactly like any other stray line.
-    #[cfg(not(feature = "verbose3"))]
+    /// `tt` is not a command token in any build, so it reaches the `Unknown`
+    /// catch-all like any other stray line.
     #[test]
-    fn tt_is_not_a_command_below_verbose3() {
+    fn tt_is_not_a_command() {
         assert_eq!(
             parse_line(b"tt probe startpos"),
             unknown(b"tt probe startpos")
         );
         assert_eq!(parse_line(b"tt"), unknown(b"tt"));
-    }
-
-    /// At `verbose3`: `tt` splits into verbatim tokens for
-    /// [`crate::tt_command::parse_tt`], mirroring how `bench` is handled.
-    #[cfg(feature = "verbose3")]
-    #[test]
-    fn parses_tt_tokens_verbatim_at_verbose3() {
-        assert_eq!(
-            parse_line(b"tt probe startpos"),
-            Command::Tt(vec![&b"probe"[..], &b"startpos"[..]])
-        );
-        assert_eq!(parse_line(b"tt"), Command::Tt(Vec::new()));
     }
 
     #[test]

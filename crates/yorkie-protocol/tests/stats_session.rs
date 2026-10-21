@@ -138,9 +138,6 @@ mod value_marks {
     /// and its value a repetition judgement's.
     const PERPETUAL_CHECK: &str = "4k4/R8/9/9/9/9/9/9/8K b - 1";
     const PERPETUAL_CYCLE: &str = "9b9a 5a5b 9a9b 5b5a 9b9a 5a5b 9a9b 5b5a 9b9a 5a5b 9a9b";
-    /// Where [`PERPETUAL_CYCLE`] leaves the game: White to move, in check, one
-    /// escape away from the repetition.
-    const PERPETUAL_ROOT: &str = "9/R3k4/9/9/9/9/9/9/8K w - 12";
 
     /// Black's king on 5b with twelve pieces in the enemy field and a rook in
     /// hand — 32 points, past either point rule's threshold — against a lone
@@ -190,35 +187,14 @@ mod value_marks {
     }
 
     /// Whether the reply's statistics line carries each mark, in the order
-    /// `tt probe` spells them.
+    /// `pathdep`, `declrule`, `movelimit`.
     fn reply_marks(out: &str) -> [bool; 3] {
         let items = reply_items(out);
         ["pathdep=1", "declrule=1", "movelimit=1"].map(|item| items.contains(&item))
     }
 
-    /// The `pathdep` / `declrule` / `movelimit` triple of the `tt probe` reply
-    /// in `out`, or `None` when the probe missed.
-    fn probed_marks(out: &str) -> Option<[bool; 3]> {
-        let line = out
-            .lines()
-            .find(|l| l.starts_with("info string tt probe "))
-            .unwrap_or_else(|| panic!("a probe reply must be in:\n{out}"))
-            .to_string();
-        if !line.contains(" pathdep ") {
-            return None;
-        }
-        let items: Vec<&str> = line.split(' ').collect();
-        Some(["pathdep", "declrule", "movelimit"].map(|key| {
-            let at = items
-                .iter()
-                .position(|item| *item == key)
-                .unwrap_or_else(|| panic!("{key} must be in: {line}"));
-            items[at + 1] == "1"
-        }))
-    }
-
     /// A reply whose move was chosen on a value a repetition judgement produced
-    /// says so, and the root entry the same search stored says the same thing.
+    /// says so.
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_repetition_behind_the_played_move_marks_the_reply() {
@@ -229,19 +205,12 @@ mod value_marks {
             &format!("position sfen {PERPETUAL_CHECK} moves {PERPETUAL_CYCLE}"),
             2,
         );
-        h.send(&format!("tt probe sfen {PERPETUAL_ROOT}"));
         let out = h.quit_join();
 
         assert_eq!(
             reply_marks(&out),
             [true, false, false],
             "the played move's value came through a repetition, in:\n{out}"
-        );
-        let probed = probed_marks(&out).expect("the root's entry survived the search");
-        assert_eq!(
-            probed,
-            reply_marks(&out),
-            "the root's entry must say what the reply said, in:\n{out}"
         );
     }
 

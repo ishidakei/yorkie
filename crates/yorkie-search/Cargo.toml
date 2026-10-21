@@ -36,9 +36,9 @@ yorkie-eval = { path = "../yorkie-eval", features = ["source-network"] }
 #     configuration and line assembly, the root moves' fail-bound flags, the book
 #     hit's per-candidate lines, and the transposition table's `hashfull`
 #     occupancy the Storage layer supplies.
-#   - `verbose3` — the per-entry path-dependence mark a `tt probe` reports: the
-#     bit the search carries on its return path, and the propagation that
-#     maintains it.
+#   - `verbose3` — the value marks the per-reply statistics line reports: the
+#     bits the search carries on its return path, and the propagation that
+#     maintains them.
 #
 # Each implies the one before it, as on the Protocol layer. All are off by
 # default.

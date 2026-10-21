@@ -370,21 +370,6 @@ struct ActiveSearch {
     /// Raised by the worker while it is thinking ahead, so the command that
     /// ends that search knows to join the worker rather than leave it running.
     pondering: Arc<AtomicBool>,
-    /// Set by the coordinator *inside* the critical section that writes the
-    /// reply, so this search counts as finished from the moment that reply is
-    /// on the wire.
-    ///
-    /// [`JoinHandle::is_finished`] is not that moment: the coordinator emits its
-    /// reply and only then unwinds, so a host that reads the reply and
-    /// immediately sends the next command can land in the window where the
-    /// thread has not yet returned. A flag stamped under the output lock closes
-    /// it — any reader that has seen the reply took the same lock afterwards, so
-    /// it cannot see this as unset.
-    ///
-    /// The `tt` commands' idle check is its only reader, and they are
-    /// `verbose3`, so a build without that feature neither carries nor raises it.
-    #[cfg(feature = "verbose3")]
-    reply_sent: Arc<AtomicBool>,
     /// The root game ply this search ran at (`rootPos.game_ply()`), carried so
     /// a completed real search updates the engine's `last_game_ply`.
     game_ply: i32,
@@ -431,10 +416,6 @@ struct SearchHandles {
     ponder_stop: Arc<AtomicBool>,
     /// Raised while a worker is thinking ahead — see [`ActiveSearch::pondering`].
     pondering: Arc<AtomicBool>,
-    /// Raised when a search's reply reaches the output sink. Its only reader is
-    /// the `verbose3` table-inspection commands' idle check.
-    #[cfg(feature = "verbose3")]
-    reply_sent: Arc<AtomicBool>,
     /// Per-worker node counters (index 0 = main, `1..` = helpers), read by the
     /// aggregate node ceiling and the final aggregated `info ... nodes` — both
     /// `verbose2`, like the counters themselves.
@@ -452,8 +433,6 @@ impl SearchHandles {
             stop: Arc::new(AtomicBool::new(false)),
             ponder_stop: Arc::new(AtomicBool::new(false)),
             pondering: Arc::new(AtomicBool::new(false)),
-            #[cfg(feature = "verbose3")]
-            reply_sent: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "verbose2")]
             node_slots: new_tally(n_threads),
             bmc_slots: new_tally(n_threads),
@@ -475,8 +454,6 @@ impl SearchHandles {
         self.stop.store(false, Ordering::Relaxed);
         self.ponder_stop.store(false, Ordering::Relaxed);
         self.pondering.store(false, Ordering::Relaxed);
-        #[cfg(feature = "verbose3")]
-        self.reply_sent.store(false, Ordering::Relaxed);
         #[cfg(feature = "verbose2")]
         for slot in self.node_slots.iter() {
             slot.store(0, Ordering::Relaxed);
@@ -687,17 +664,7 @@ pub trait EngineSink: Clone + Send + 'static {
     /// played move's value was derived through — for the statistics line to
     /// report, so a caller reading the stream learns them without a second probe
     /// of a root entry that may since have been replaced.
-    ///
-    /// `sent` is raised before the output lock is released, so the reply
-    /// becoming visible and the search counting as finished are one indivisible
-    /// step downstream; its only reader is the `verbose3` table-inspection
-    /// commands' idle check.
-    fn reply(
-        &self,
-        reply: Reply,
-        #[cfg(feature = "verbose3")] marks: ValueMarks,
-        #[cfg(feature = "verbose3")] sent: &AtomicBool,
-    );
+    fn reply(&self, reply: Reply, #[cfg(feature = "verbose3")] marks: ValueMarks);
 
     /// A book hit's surviving candidates, reported as the probe answers and
     /// before any hold.
@@ -705,14 +672,12 @@ pub trait EngineSink: Clone + Send + 'static {
     fn book_candidates(&self, hit: &BookHit, hashfull: u32, time_ms: u64);
 
     /// A book hit's terminal output: the summary of the chosen line, then the
-    /// reply itself, in one indivisible step for the same reason
-    /// [`Self::reply`]'s `sent` is.
+    /// reply itself.
     fn book_reply(
         &self,
         hit: &BookHit,
         #[cfg(feature = "verbose2")] hashfull: u32,
         #[cfg(feature = "verbose2")] time_ms: u64,
-        #[cfg(feature = "verbose3")] sent: &AtomicBool,
     );
 
     /// The final PV block a completed search emits before its reply.
@@ -954,27 +919,6 @@ impl<P: EngineSink> Engine<P> {
     /// process while the test process itself stays where it is.
     pub fn set_startup_affinity(&mut self, cpus: BTreeSet<usize>) {
         self.startup_affinity = cpus;
-    }
-
-    /// Whether a search is still in flight.
-    pub fn search_is_running(&self) -> bool {
-        self.search.is_some()
-    }
-
-    /// Reclaim a search that has already replied but not yet been joined, so the
-    /// natural `go … → reply → inspect` sequence finds the session idle.
-    ///
-    /// "Already replied" is [`ActiveSearch::reply_sent`], not
-    /// [`JoinHandle::is_finished`]: the coordinator writes its reply and *then*
-    /// unwinds. `is_finished` still stands beside it for the searches that end
-    /// without a reply.
-    #[cfg(feature = "verbose3")]
-    pub fn reclaim_replied_search(&mut self) {
-        if self.search.as_ref().is_some_and(|active| {
-            active.reply_sent.load(Ordering::Relaxed) || active.handle.is_finished()
-        }) {
-            self.finish_search_join();
-        }
     }
 
     /// Install `pos` as the search root directly, for the measurement command
@@ -1557,8 +1501,6 @@ impl<P: EngineSink> Engine<P> {
         let stop_for_active = Arc::clone(&job.stop);
         let ponder_stop_for_active = Arc::clone(&job.ponder.stop);
         let pondering_for_active = Arc::clone(&job.ponder.pondering);
-        #[cfg(feature = "verbose3")]
-        let sent_for_active = Arc::clone(&job.reply_sent);
         // The coordinator's own system node, resolved before the thread starts
         // so the network type it searches with is selected once per `go`.
         let node = self.worker_plan.system_nodes[0];
@@ -1576,8 +1518,6 @@ impl<P: EngineSink> Engine<P> {
             stop: stop_for_active,
             ponder_stop: ponder_stop_for_active,
             pondering: pondering_for_active,
-            #[cfg(feature = "verbose3")]
-            reply_sent: sent_for_active,
             game_ply,
         });
         GoOutcome::Started
@@ -1869,11 +1809,6 @@ impl<P: EngineSink> Engine<P> {
         // request that holds one and arrives with `verbose2`.
         #[cfg(feature = "verbose2")]
         let infinite = limits.infinite;
-        // The flag saying this `go`'s reply reached the output sink; the
-        // table-inspection commands' idle check is its only reader, so only
-        // their feature has it. Cleared for this search by `arm` above.
-        #[cfg(feature = "verbose3")]
-        let reply_sent = Arc::clone(&self.handles.reply_sent);
 
         // What the coordinator keeps searching on once its reply is out. The
         // handles are the session's own, cleared by `arm` above like the rest.
@@ -1927,8 +1862,6 @@ impl<P: EngineSink> Engine<P> {
             ponder,
             #[cfg(feature = "verbose2")]
             infinite,
-            #[cfg(feature = "verbose3")]
-            reply_sent,
             entering_king,
             #[cfg(feature = "verbose2")]
             mate_mode,
@@ -2143,7 +2076,6 @@ fn emit_book_hit<P: EngineSink>(
     #[cfg(feature = "verbose2")] time_ms: u64,
     #[cfg(feature = "verbose2")] infinite: bool,
     #[cfg(feature = "verbose2")] stop: &AtomicBool,
-    #[cfg(feature = "verbose3")] sent: &AtomicBool,
 ) {
     // Reported immediately, like the reference's in-probe isRoot block.
     #[cfg(feature = "verbose2")]
@@ -2158,8 +2090,6 @@ fn emit_book_hit<P: EngineSink>(
         hashfull,
         #[cfg(feature = "verbose2")]
         time_ms,
-        #[cfg(feature = "verbose3")]
-        sent,
     );
 }
 
@@ -2922,12 +2852,6 @@ struct CoordinatorJob<P: EngineSink> {
     /// clause that sets it.
     #[cfg(feature = "verbose2")]
     infinite: bool,
-    /// Stamped `true` in the same output-lock critical section that writes this
-    /// search's reply, so the engine can tell "reply is out" from "thread
-    /// has exited" (see [`ActiveSearch::reply_sent`]). `verbose3`, like the
-    /// reader.
-    #[cfg(feature = "verbose3")]
-    reply_sent: Arc<AtomicBool>,
     /// The entering-king declaration thresholds snapshot for this `go`.
     entering_king: EnteringKingConfig,
     /// `go mate` mode — disables the early mate break and enables the mate-found
@@ -3009,8 +2933,6 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
         ponder,
         #[cfg(feature = "verbose2")]
         infinite,
-        #[cfg(feature = "verbose3")]
-        reply_sent,
         entering_king,
         #[cfg(feature = "verbose2")]
         mate_mode,
@@ -3052,8 +2974,6 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
             // simply has no move.
             #[cfg(feature = "verbose3")]
             ValueMarks::NONE,
-            #[cfg(feature = "verbose3")]
-            &reply_sent,
         );
         return CoordinatedOutcome {
             histories,
@@ -3084,8 +3004,6 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
                 decl_rule: true,
                 ..ValueMarks::NONE
             },
-            #[cfg(feature = "verbose3")]
-            &reply_sent,
         );
         return CoordinatedOutcome {
             histories,
@@ -3137,8 +3055,6 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
                 infinite,
                 #[cfg(feature = "verbose2")]
                 &stop,
-                #[cfg(feature = "verbose3")]
-                &reply_sent,
             );
             // A book move is thought past like any other: the opponent's reply
             // may leave the book, and a warm table costs nothing.
@@ -3318,8 +3234,6 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
         // resign by value included, since that decision reads the same score.
         #[cfg(feature = "verbose3")]
         best.marks,
-        #[cfg(feature = "verbose3")]
-        &reply_sent,
     );
 
     // Consume the search (ending the `&tt` / `&net` borrows) and reclaim the main
@@ -3816,8 +3730,6 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             ponder_stop: Arc::new(AtomicBool::new(false)),
             pondering: Arc::new(AtomicBool::new(false)),
-            #[cfg(feature = "verbose3")]
-            reply_sent: Arc::new(AtomicBool::new(true)),
             game_ply: 20,
         });
         engine.finish_search_join();
@@ -3852,8 +3764,6 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             ponder_stop: Arc::new(AtomicBool::new(false)),
             pondering: Arc::new(AtomicBool::new(false)),
-            #[cfg(feature = "verbose3")]
-            reply_sent: Arc::new(AtomicBool::new(true)),
             game_ply: 3,
         });
         engine.finish_search_join();

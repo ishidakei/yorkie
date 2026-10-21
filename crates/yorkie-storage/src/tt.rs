@@ -100,7 +100,8 @@
 //! entering-king declaration rule, or the move limit past which a game is a
 //! draw. At `verbose3` each entry carries a `ValueMarks`, one bit per such
 //! source, recording which of them its value and best move were derived
-//! through, so an outside inspector can tell those entries apart. Nothing in
+//! through, so a search that reuses the entry can carry them on to the value
+//! it returns. Nothing in
 //! the table reads the bits: they are not part of an entry's identity, they do
 //! not enter the replacement priority, and a probe hits or misses regardless of
 //! them.
@@ -172,13 +173,6 @@ type AtomicTteKey = AtomicU16;
 fn tte_key(key: u64) -> TteKey {
     key as TteKey
 }
-/// A stored key widened back to 64 bits, for [`TranspositionTable::checksum`],
-/// and compiled only where that is.
-#[cfg(all(not(feature = "tt-entry16"), feature = "verbose3"))]
-#[inline]
-fn key_bits(k: TteKey) -> u64 {
-    k as u64
-}
 /// Number of entries per cluster (`TT_CLUSTER_SIZE == 3`).
 #[cfg(not(feature = "tt-entry16"))]
 const CLUSTER_SIZE: usize = 3;
@@ -207,13 +201,6 @@ fn tte_key(key: u64) -> TteKey {
     {
         key
     }
-}
-/// A stored key widened back to 64 bits — already that wide here. Compiled only
-/// where [`TranspositionTable::checksum`] is.
-#[cfg(all(feature = "tt-entry16", feature = "verbose3"))]
-#[inline]
-fn key_bits(k: TteKey) -> u64 {
-    k
 }
 /// Entries per cluster: a 16-byte entry fits twice in the 32-byte cluster.
 #[cfg(feature = "tt-entry16")]
@@ -1057,38 +1044,6 @@ impl TranspositionTable {
             #[cfg(feature = "verbose3")]
             marks,
         );
-    }
-
-    /// A stable checksum over the whole table's raw bytes.
-    ///
-    /// Nothing a game plays reads it: it exists to pin the table's contents
-    /// while the table is being inspected from the outside, which is what the
-    /// `verbose3` feature is for, so it is compiled only there.
-    ///
-    /// The value marks are part of what the table stores and so are mixed in:
-    /// in the default layout as the cluster's mark word, and under `tt-entry16`
-    /// inside the key each entry already contributes.
-    #[cfg(feature = "verbose3")]
-    pub fn checksum(&self) -> u64 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        let mut mix = |x: u64| {
-            h ^= x;
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        };
-        for cluster in self.clusters.iter() {
-            for e in &cluster.entry {
-                mix(key_bits(e.key.load(REL)));
-                mix(e.depth8.load(REL) as u64);
-                mix(e.gen_bound8.load(REL) as u64);
-                mix(e.move16.load(REL) as u64);
-                mix(e.value16.load(REL).cast_unsigned() as u64);
-                mix(e.eval16.load(REL).cast_unsigned() as u64);
-            }
-            #[cfg(not(feature = "tt-entry16"))]
-            mix(cluster.marks.load(REL) as u64);
-        }
-        mix(GENERATION8.load(REL) as u64);
-        h
     }
 }
 

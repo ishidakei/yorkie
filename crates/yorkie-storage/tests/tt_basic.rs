@@ -511,22 +511,25 @@ fn new_search_wraps_within_five_bits() {
     assert_eq!(tt.generation(), 0, "generation wraps at 2^5");
 }
 
-/// Compares whole tables byte for byte through `checksum`, so it exists only in
-/// a build that has one.
-#[cfg(feature = "verbose3")]
 #[cfg_attr(miri, ignore)]
 #[test]
 fn determinism_identical_sequences_yield_identical_tables() {
-    fn run(tt: &TranspositionTable) -> u64 {
+    fn run(tt: &TranspositionTable) -> (Vec<(bool, TTData)>, u8) {
         tt.clear();
+        let entry = |f: u16| {
+            (
+                key((f as u64) * 3, f.wrapping_mul(37).wrapping_add(1)),
+                (f & 1) as u8,
+            )
+        };
         for round in 0..4 {
             tt.new_search();
             for f in 1..=6u16 {
-                let k = key((f as u64) * 3, f.wrapping_mul(37).wrapping_add(1));
+                let (k, side) = entry(f);
                 store(
                     tt,
                     k,
-                    (f & 1) as u8,
+                    side,
                     (round * 100 + f as i32) - 250,
                     f % 2 == 0,
                     Bound::Lower,
@@ -536,7 +539,14 @@ fn determinism_identical_sequences_yield_identical_tables() {
                 );
             }
         }
-        tt.checksum()
+        let read = (1..=6u16)
+            .map(|f| {
+                let (k, side) = entry(f);
+                let (found, data, _) = tt.probe(k, side);
+                (found, data)
+            })
+            .collect();
+        (read, tt.generation())
     }
 
     // The same sequence twice on the one table, each from the emptied state.
@@ -808,8 +818,8 @@ mod narrow_key_identity {
 /// The per-entry value marks, which exist only at `verbose3`. The search's
 /// rule for *when* an entry is marked is the Search layer's; what is pinned
 /// here is that marks written for one entry come back for that entry and no
-/// other, follow the payload through the replacement policy, and are part of
-/// what [`TranspositionTable::checksum`] summarises.
+/// other, follow the payload through the replacement policy, and go when the
+/// table is cleared.
 #[cfg(feature = "verbose3")]
 mod value_marks {
     use super::*;
@@ -1041,49 +1051,43 @@ mod value_marks {
         assert_eq!(data.marks, ALL, "and with it the marks");
     }
 
+    /// A miss reports no marks whatever the slot holds, so the slots are read
+    /// through the all-zero key instead: in both layouts it matches the first
+    /// empty entry of cluster 0, and the probe returns that entry's contents
+    /// marks included. Occupying each slot in turn moves the match to the next.
     #[cfg_attr(miri, ignore)]
     #[test]
     fn clear_drops_the_marks_with_the_entries() {
         let tt = fresh_tt();
         let side = 0;
-        let empty = tt.checksum();
+        let family = cluster_family(0);
 
-        for &k in &cluster_family(112) {
+        for &k in &family {
             store_marked(&tt, k, side, 1, false, Bound::Exact, 8, 0x11, 0, ALL);
         }
         tt.clear();
-        assert_eq!(
-            tt.checksum(),
-            empty,
-            "a cleared table must be indistinguishable from a fresh one"
-        );
-    }
+        for &k in &family {
+            let (found, data, _) = tt.probe(k, side);
+            assert!(!found, "clear empties every entry");
+            assert_eq!(data, miss_sentinel());
+        }
 
-    /// The checksum summarises everything the table stores, the marks included,
-    /// so two runs that differ in nothing else still differ in it.
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn the_checksum_covers_every_mark() {
-        let checksum_with = |marks: ValueMarks| {
-            let tt = fresh_tt();
+        for (i, &k) in family.iter().enumerate() {
+            let (found, data, _) = tt.probe(0, side);
+            assert!(!found);
+            assert_eq!(data.marks, ValueMarks::NONE, "entry {i} kept its marks");
             store_marked(
                 &tt,
-                key(128, 0x0404),
-                0,
-                7,
+                k,
+                side,
+                1,
                 false,
                 Bound::Exact,
                 8,
                 0x11,
                 0,
-                marks,
+                ValueMarks::NONE,
             );
-            tt.checksum()
-        };
-        let empty = checksum_with(ValueMarks::NONE);
-        assert_eq!(empty, checksum_with(ValueMarks::NONE));
-        for marks in [PATH_DEP, DECL_RULE, MOVE_LIMIT] {
-            assert_ne!(empty, checksum_with(marks), "{marks:?} must reach the sum");
         }
     }
 

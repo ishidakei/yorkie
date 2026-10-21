@@ -45,18 +45,19 @@ serde_json = "~1.0"
 #   - `verbose2` — adds the search `info` lines, and the non-match `go` clauses
 #     (`depth` / `nodes` / `mate` / `movetime` / `infinite` / `rtime`) an
 #     analysis mode needs.
-#   - `verbose3` — adds `tt store` / `tt probe` / `tt children` and `bench`.
+#   - `verbose3` — adds `bench`, and the value marks on the per-reply
+#     statistics line.
 #
-# `tt` and `bench` disappear as command tokens without `verbose3`. The gated `go`
+# `bench` disappears as a command token without `verbose3`. The gated `go`
 # clauses cannot disappear the same way, since `go` itself is a match command, so
 # without `verbose2` a `go` line carrying one is *rejected* and starts no search
 # — silently ignoring the clause would turn `go depth 4` into an unbounded,
 # clock-less search mid-game. The refusal happens in every build; `verbose1` is
 # where it is also reported.
 #
-# The `tt` command family and the `bench` summary line are not diagnostics but
-# the response payload of a `verbose3` command, so they ride on that feature
-# alone and no `info` line is involved in gating them.
+# The `bench` summary line is not a diagnostic but the response payload of a
+# `verbose3` command, so it rides on that feature alone and no `info` line is
+# involved in gating it.
 #
 # Each feature also turns on the feature of the same name in every lower layer
 # that has one, because the output it brings is not all produced here: what a
@@ -72,13 +73,12 @@ serde_json = "~1.0"
 #     bounds, the book hit's per-candidate lines, and the transposition table's
 #     `hashfull` occupancy.
 #   - `verbose3` → `yorkie-search/verbose3` and `yorkie-storage/verbose3` — the
-#     per-entry path-dependence mark the `tt` commands read and write, and
-#     `TranspositionTable::checksum`, which serves the table-inspection commands
-#     and has no in-game reader.
+#     value marks the statistics line reports, which the search carries on its
+#     return path and the transposition table keeps per entry.
 #
-# `tt-entry16` is the Storage-layer entry-widening feature, re-exported so this
-# crate's session tests can `cfg` on it. Off by default, and orthogonal to the
-# verbosity axis.
+# `tt-entry16` is the Storage-layer entry-widening feature, re-exported so the
+# binary crate can reach it. Off by default, and orthogonal to the verbosity
+# axis.
 #
 # `random` is the Search-layer evaluation-noise feature, likewise orthogonal.
 # This crate owns the `random` setting the amplitude comes from and the per-game

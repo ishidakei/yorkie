@@ -27,15 +27,15 @@ use yorkie_state::TextWriter;
 // build writes, composes its text in a stack buffer instead.
 #[cfg(feature = "verbose2")]
 use yorkie_state::{Move, write_usi_move};
-// A whole SFEN is parsed only by the `verbose3` commands that carry one as an
-// argument; the `position` command's own is read field by field, into the
-// position the engine already holds.
+// A whole SFEN is parsed only by `bench`, whose position list carries them;
+// the `position` command's own is read field by field, into the position the
+// engine already holds.
 #[cfg(feature = "verbose3")]
-use yorkie_state::{Position, SfenBuf, parse_sfen, parse_sfen_fields_into, parse_usi_move};
+use yorkie_state::{SfenBuf, parse_sfen};
 #[cfg(feature = "verbose2")]
 use yorkie_storage::Value;
 #[cfg(feature = "verbose3")]
-use yorkie_storage::{TTData, TranspositionTable, VALUE_NONE, ValueMarks};
+use yorkie_storage::ValueMarks;
 // The per-reply allocation tally: raised by the counting global allocator this
 // feature installs, and read by the statistics line that reports it.
 #[cfg(feature = "verbose1")]
@@ -56,10 +56,6 @@ use crate::formatter::Formatter;
 use crate::parser::{Command, MAX_LINE_BYTES, parse_line};
 #[cfg(feature = "verbose1")]
 use crate::stats::StatsBuf;
-#[cfg(feature = "verbose3")]
-use crate::tt_command::{
-    TtCommand, TtPosition, TtStoreArgs, bound_name, parse_tt, value_from_tt, value_to_tt,
-};
 
 /// The public values used in the `id name` / `id author` lines.
 ///
@@ -96,24 +92,22 @@ const KEEP_ALIVE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// network's — a copy of a few hundred mebibytes per node, where the machine
 /// calls for copies — run between `isready` and `readyok`.
 const KEEP_ALIVE_TICKS_PER_NEWLINE: u32 = 50;
-// Reference USI score conversion. These are `pub(crate)` so the `verbose3` `tt`
-// commands, which speak the same score surface, do not grow a second copy of
-// the scale.
+// Reference USI score conversion.
 //
 // The mate scale is only needed to *render* a score, and both surfaces that
 // render one are optional, so the default build compiles neither the two
-// constants nor `push_score` / `format_score`. `PAWN_VALUE` is unconditional:
-// `to_cp` and the draw-contempt scaling read it in every build.
+// constants nor `write_score`. `PAWN_VALUE` is unconditional: `to_cp` and the
+// draw-contempt scaling read it in every build.
 /// `VALUE_MATE`.
 #[cfg(feature = "verbose2")]
-pub(crate) const VALUE_MATE: Value = 32000;
+const VALUE_MATE: Value = 32000;
 /// `VALUE_TB_WIN_IN_MAX_PLY`: the `is_decisive` threshold.
 #[cfg(feature = "verbose2")]
-pub(crate) const VALUE_TB_WIN_IN_MAX_PLY: Value = VALUE_MATE - 246;
+const VALUE_TB_WIN_IN_MAX_PLY: Value = VALUE_MATE - 246;
 /// Append a search value to `out` the way the reference USI layer formats it: a
 /// mate distance for decisive scores, else centipawns.
 #[cfg(feature = "verbose2")]
-pub(crate) fn write_score(out: &mut TextWriter<'_>, v: Value) {
+fn write_score(out: &mut TextWriter<'_>, v: Value) {
     if v.abs() >= VALUE_TB_WIN_IN_MAX_PLY {
         let distance = VALUE_MATE - v.abs();
         let mate = if v > 0 { distance } else { -distance };
@@ -257,12 +251,7 @@ impl<W: Write + Send + 'static> EngineSink for UsiSink<W> {
         let _ = self.info_string(msg);
     }
 
-    fn reply(
-        &self,
-        reply: Reply,
-        #[cfg(feature = "verbose3")] marks: ValueMarks,
-        #[cfg(feature = "verbose3")] sent: &AtomicBool,
-    ) {
+    fn reply(&self, reply: Reply, #[cfg(feature = "verbose3")] marks: ValueMarks) {
         // Composed before the lock is taken, so the composing's own allocations
         // stay inside the interval the statistics line reports.
         let mut payload = BestmoveBuf::new();
@@ -275,8 +264,6 @@ impl<W: Write + Send + 'static> EngineSink for UsiSink<W> {
             marks,
         );
         let _ = Formatter::new(&mut *guard).bestmove(text);
-        #[cfg(feature = "verbose3")]
-        sent.store(true, Ordering::Relaxed);
     }
 
     #[cfg(feature = "verbose2")]
@@ -302,7 +289,6 @@ impl<W: Write + Send + 'static> EngineSink for UsiSink<W> {
         hit: &BookHit,
         #[cfg(feature = "verbose2")] hashfull: u32,
         #[cfg(feature = "verbose2")] time_ms: u64,
-        #[cfg(feature = "verbose3")] sent: &AtomicBool,
     ) {
         #[cfg(feature = "verbose2")]
         let mut bytes = [0u8; INFO_BYTES];
@@ -337,8 +323,6 @@ impl<W: Write + Send + 'static> EngineSink for UsiSink<W> {
             ValueMarks::NONE,
         );
         let _ = Formatter::new(&mut *guard).bestmove(text);
-        #[cfg(feature = "verbose3")]
-        sent.store(true, Ordering::Relaxed);
     }
 
     #[cfg(feature = "verbose2")]
@@ -482,8 +466,6 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
                 Command::PonderHit => self.handle_ponderhit(),
                 #[cfg(feature = "verbose3")]
                 Command::Bench(tokens) => self.handle_bench(&tokens)?,
-                #[cfg(feature = "verbose3")]
-                Command::Tt(tokens) => self.handle_tt(&tokens)?,
                 Command::Quit => {
                     self.engine.finish_search_join();
                     return Ok(());
@@ -789,237 +771,6 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
         self.out.info_string(out.as_bytes())
     }
 
-    // The `tt` command family exists only under the `verbose3` cargo feature.
-    // Its `info string` lines are the commands' response — a `tt probe` that
-    // printed nothing would be a command with no output — so they go through the
-    // unconditional [`Self::info_string`] rather than the `verbose1` sink.
-
-    /// Dispatch one `tt …` line.
-    ///
-    /// Refuses while a search is in flight — one `info string tt error: …` line,
-    /// never a panic. A worker that has already replied but not yet been joined
-    /// is reclaimed first rather than refused, so the natural
-    /// `go … → bestmove → tt probe` sequence works. The table itself is always
-    /// there to read: it is a `static`, empty rather than absent before a game.
-    ///
-    /// What counts as "already replied" is [`Engine::reclaim_replied_search`]'s
-    /// question, not this one's.
-    #[cfg(feature = "verbose3")]
-    fn handle_tt(&mut self, tokens: &[&[u8]]) -> io::Result<()> {
-        self.engine.reclaim_replied_search();
-        if self.engine.search_is_running() {
-            return self.tt_error(&[b"a search is running; `stop` it first"]);
-        }
-
-        let command = match parse_tt(tokens) {
-            Ok(command) => command,
-            Err(e) => {
-                let mut bytes = [0u8; DIAG_BYTES];
-                let mut out = TextWriter::new(&mut bytes);
-                e.write_message(&mut out);
-                return self.tt_error(&[out.as_bytes()]);
-            }
-        };
-
-        match command {
-            TtCommand::Store(args) => self.tt_store(&args),
-            TtCommand::Probe(position) => self.tt_probe(&position),
-            TtCommand::Children(position) => self.tt_children(&position),
-        }
-    }
-
-    /// The single error channel for the `tt` commands.
-    #[cfg(feature = "verbose3")]
-    fn tt_error(&self, parts: &[&[u8]]) -> io::Result<()> {
-        let mut all: Vec<&[u8]> = Vec::with_capacity(parts.len() + 1);
-        all.push(b"tt error: ");
-        all.extend_from_slice(parts);
-        self.out.info_string_parts(&all)
-    }
-
-    /// Build the [`Position`] a `tt` command names.
-    ///
-    /// The extra king check is this surface's own: the SFEN parser accepts a
-    /// kingless board, but the move generators these commands then run assume
-    /// both kings are present.
-    ///
-    /// A refusal is written into `reason`, which the caller owns, and the
-    /// returned `Err` says only that there is one.
-    #[cfg(feature = "verbose3")]
-    fn tt_position(
-        &self,
-        position: &TtPosition<'_>,
-        reason: &mut TextWriter<'_>,
-    ) -> Result<Position, ()> {
-        use yorkie_state::Color;
-
-        let pos = match position {
-            TtPosition::StartPos => Position::startpos(),
-            TtPosition::Sfen(fields) => {
-                let mut pos = Position::empty();
-                match parse_sfen_fields_into(&mut pos, *fields) {
-                    Ok(()) => pos,
-                    Err(e) => {
-                        e.write_message(reason);
-                        return Err(());
-                    }
-                }
-            }
-        };
-        if pos.king_square(Color::Black).is_none() || pos.king_square(Color::White).is_none() {
-            reason.bytes(b"position has no king for one or both sides");
-            return Err(());
-        }
-        Ok(pos)
-    }
-
-    /// `tt store …` — write one entry for the named position.
-    ///
-    /// The write goes through the ordinary probe-then-write path at the table's
-    /// current generation, exactly as a search storing that value at that depth
-    /// would. That includes the replacement policy, which may decline the write,
-    /// so the command re-probes afterwards and reports which happened.
-    #[cfg(feature = "verbose3")]
-    fn tt_store(&self, args: &TtStoreArgs<'_>) -> io::Result<()> {
-        let mut reason_bytes = [0u8; DIAG_BYTES];
-        let mut reason = TextWriter::new(&mut reason_bytes);
-        let pos = match self.tt_position(&args.position, &mut reason) {
-            Ok(pos) => pos,
-            Err(()) => return self.tt_error(&[reason.as_bytes()]),
-        };
-        let mut legal: Vec<Move> = Vec::new();
-        pos.generate_legal_all(&mut legal);
-
-        // `none` stores the `MOVE_NONE` fragment, which `TTEntry::save` reads as
-        // "keep whatever move this entry already holds for this position".
-        let move16 = if args.mv == b"none" {
-            None
-        } else {
-            match parse_usi_move(args.mv, &pos) {
-                Ok(mv) if legal.contains(&mv) => mv.move16_stored(),
-                Ok(_) => {
-                    return self.tt_error(&[b"move `", args.mv, b"` is not legal here"]);
-                }
-                Err(e) => {
-                    reason.clear();
-                    e.write_message(&mut reason);
-                    return self.tt_error(&[
-                        b"move `",
-                        args.mv,
-                        b"` is not a USI move: ",
-                        reason.as_bytes(),
-                    ]);
-                }
-            }
-        };
-
-        let key = pos.key();
-        let side = pos.side_to_move().index() as u8;
-        let stored_value = value_to_tt(args.value, 0);
-        let generation = TranspositionTable::shared().generation();
-
-        let (_, _, writer) = TranspositionTable::shared().probe(key, side);
-        writer.write(
-            key,
-            stored_value,
-            args.pv,
-            args.bound,
-            args.depth,
-            move16,
-            args.eval,
-            generation,
-            args.marks,
-        );
-
-        // Verify rather than assume. A `move none` write is excluded from the
-        // comparison on purpose: `save` deliberately preserves the pre-existing
-        // move for it, so a mismatch there is the documented behaviour, not a
-        // declined write.
-        let (found, data, _) = TranspositionTable::shared().probe(key, side);
-        let stored = found
-            && data.value == stored_value
-            && data.eval == args.eval
-            && data.depth == args.depth
-            && data.bound == args.bound
-            && data.is_pv == args.pv
-            && data.marks == args.marks
-            && (move16.is_none() || data.move16 == move16);
-        if stored {
-            self.out.info_string(b"tt store ok")
-        } else {
-            self.out
-                .info_string(b"tt store skipped (replacement policy kept the existing entry)")
-        }
-    }
-
-    /// `tt probe …` — read the entry for the named position (`ply == 0`, so the
-    /// reported value is exactly the stored one).
-    #[cfg(feature = "verbose3")]
-    fn tt_probe(&self, position: &TtPosition<'_>) -> io::Result<()> {
-        let mut bytes = [0u8; DIAG_BYTES];
-        let mut out = TextWriter::new(&mut bytes);
-        let pos = match self.tt_position(position, &mut out) {
-            Ok(pos) => pos,
-            Err(()) => return self.tt_error(&[out.as_bytes()]),
-        };
-        let (found, data, _) =
-            TranspositionTable::shared().probe(pos.key(), pos.side_to_move().index() as u8);
-        if !found {
-            return self.out.info_string(b"tt probe miss");
-        }
-        let mut legal: Vec<Move> = Vec::new();
-        pos.generate_legal_all(&mut legal);
-        out.clear();
-        out.bytes(b"tt probe hit ");
-        write_tt_entry_fields(&mut out, &data, &legal, 0);
-        self.out.info_string(out.as_bytes())
-    }
-
-    /// `tt children …` — probe every legal child of the named position, one ply
-    /// deep.
-    ///
-    /// Children are reported at `ply == 1`, so their values are expressed
-    /// relative to the *named* position: a child holding "mate in 5 from the
-    /// child" prints as `mate 6`, one ply further out than a `tt probe` of that
-    /// child's own SFEN would. A child with no entry produces no line, and the
-    /// closing `tt children end <n>` line marks the list complete.
-    #[cfg(feature = "verbose3")]
-    fn tt_children(&self, position: &TtPosition<'_>) -> io::Result<()> {
-        let mut bytes = [0u8; DIAG_BYTES];
-        let mut out = TextWriter::new(&mut bytes);
-        let mut pos = match self.tt_position(position, &mut out) {
-            Ok(pos) => pos,
-            Err(()) => return self.tt_error(&[out.as_bytes()]),
-        };
-        let mut legal: Vec<Move> = Vec::new();
-        pos.generate_legal_all(&mut legal);
-
-        let mut child_legal: Vec<Move> = Vec::new();
-        let mut hits = 0usize;
-        for mv in &legal {
-            let undo = pos.do_move(*mv);
-            let (found, data, _) =
-                TranspositionTable::shared().probe(pos.key(), pos.side_to_move().index() as u8);
-            if found {
-                child_legal.clear();
-                pos.generate_legal_all(&mut child_legal);
-                out.clear();
-                out.bytes(b"tt child ");
-                write_usi_move(*mv, &mut out);
-                out.byte(b' ');
-                write_tt_entry_fields(&mut out, &data, &child_legal, 1);
-            }
-            pos.undo_move(*mv, undo);
-            if found {
-                hits += 1;
-                self.out.info_string(out.as_bytes())?;
-            }
-        }
-        out.clear();
-        out.bytes(b"tt children end ").u64(hits as u64);
-        self.out.info_string(out.as_bytes())
-    }
-
     #[cfg(feature = "verbose1")]
     fn handle_unknown(&mut self, line: &[u8]) -> io::Result<()> {
         self.out.info_string_parts(&[b"unknown command: ", line])
@@ -1034,67 +785,6 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
     #[cfg(not(feature = "verbose1"))]
     fn handle_too_long(&mut self) -> io::Result<()> {
         Ok(())
-    }
-}
-
-/// The labelled body shared by `tt probe hit` and `tt child` lines:
-/// `move <usi|none> value <score> depth <d> bound <b> eval <score> pv <bool>
-/// pathdep <0|1> declrule <0|1> movelimit <0|1>`.
-///
-/// `legal` is the legal-move list of the position the entry belongs to, used to
-/// widen the stored 16-bit fragment exactly as the search does: a fragment with
-/// no matching legal move prints as `none` rather than being decoded into a
-/// nonsense square. That is also what a **key16 false positive** looks like from
-/// here — the table matches entries on the low 16 bits of the key, so a hit may
-/// belong to a different position sharing those bits.
-///
-/// `ply` is the entry's distance from the position the command named, so the
-/// value is reported in that position's frame.
-#[cfg(feature = "verbose3")]
-fn write_tt_entry_fields(out: &mut TextWriter<'_>, data: &TTData, legal: &[Move], ply: i32) {
-    out.bytes(b"move ");
-    match legal
-        .iter()
-        .copied()
-        .find(|m| m.move16_stored() == data.move16)
-    {
-        Some(mv) => write_usi_move(mv, out),
-        None => {
-            out.bytes(b"none");
-        }
-    }
-    out.bytes(b" value ");
-    write_tt_score_field(out, value_from_tt(data.value, ply));
-    out.bytes(b" depth ")
-        .i64(i64::from(data.depth))
-        .bytes(b" bound ")
-        .bytes(bound_name(data.bound))
-        .bytes(b" eval ");
-    write_tt_score_field(out, data.eval);
-    out.bytes(b" pv ")
-        .bytes(if data.is_pv {
-            &b"true"[..]
-        } else {
-            &b"false"[..]
-        })
-        .bytes(b" pathdep ")
-        .u64(u64::from(data.marks.path_dep))
-        .bytes(b" declrule ")
-        .u64(u64::from(data.marks.decl_rule))
-        .bytes(b" movelimit ")
-        .u64(u64::from(data.marks.move_limit));
-}
-
-/// One score field of a `tt` output line: `cp <n>` / `mate <n>` in the same USI
-/// scale [`write_score`] gives an `info … score` line, or the literal `none`
-/// for the `VALUE_NONE` sentinel (which the search writes into `eval16`
-/// whenever a node has no static eval — `tt store` cannot produce it).
-#[cfg(feature = "verbose3")]
-fn write_tt_score_field(out: &mut TextWriter<'_>, v: Value) {
-    if v == VALUE_NONE {
-        out.bytes(b"none");
-    } else {
-        write_score(out, v);
     }
 }
 

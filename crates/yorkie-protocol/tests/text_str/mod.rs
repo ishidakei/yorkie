@@ -8,7 +8,7 @@
 
 #![allow(dead_code)]
 
-use yorkie_state::{Move, Position, SfenBuf, SfenError, UsiMoveBuf};
+use yorkie_state::{Move, Position, SfenError, UsiMoveBuf};
 
 /// [`yorkie_state::parse_sfen`] for an SFEN written as text — or, so one helper
 /// covers both, already as bytes.
@@ -22,12 +22,6 @@ pub fn parse_usi_move(
     pos: &Position,
 ) -> Result<Move, yorkie_state::UsiMoveParseError> {
     yorkie_state::parse_usi_move(usi.as_ref(), pos)
-}
-
-/// A position's SFEN as an owned string.
-pub fn format_sfen(pos: &Position) -> String {
-    let mut buf = SfenBuf::new();
-    String::from_utf8(yorkie_state::format_sfen(pos, &mut buf).to_vec()).expect("an SFEN is ASCII")
 }
 
 /// A move's USI text as an owned string.

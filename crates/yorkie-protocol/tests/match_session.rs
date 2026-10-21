@@ -104,8 +104,29 @@ fn go_ponder_and_ponderhit_are_match_commands() {
     );
 }
 
+/// `tt` is not a command token in any build: a line starting with it takes the
+/// ordinary unknown-command path — reported from `verbose1` up, and skipped
+/// without a byte of output in the tournament build.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn tt_is_an_unknown_command_in_every_build() {
+    let _tt = common::serial_tt();
+    for line in [
+        "tt probe sfen lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
+        "tt probe startpos",
+        "tt store startpos move 7g7f value 0 depth 1 bound exact eval 0",
+        "tt children startpos",
+        "tt",
+    ] {
+        assert_eq!(
+            drive(&format!("{line}\nquit\n")),
+            diag_line(&format!("unknown command: {line}")),
+        );
+    }
+}
+
 /// Below `verbose3`: `bench` is not a command token at all — it lands in the
-/// ordinary unknown-command path, exactly as `tt` does.
+/// ordinary unknown-command path.
 #[cfg(not(feature = "verbose3"))]
 mod below_verbose3 {
     use super::{diag_line, drive};
