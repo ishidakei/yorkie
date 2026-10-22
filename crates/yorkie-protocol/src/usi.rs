@@ -7,10 +7,11 @@
 //! [`UsiSink`], the [`EngineSink`] this build compiles.
 
 use std::collections::BTreeSet;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, StdoutLock, Write};
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 #[cfg(feature = "verbose3")]
@@ -117,33 +118,84 @@ fn write_score(out: &mut TextWriter<'_>, v: Value) {
     }
 }
 
-/// The USI renderer: every line this engine writes is composed here.
+/// Where a session's lines are written: one output the main thread and the
+/// search threads share, each line written whole while the guard [`Self::lock`]
+/// returns is held, so no two threads' lines interleave.
 ///
-/// A handle to the one output sink, shared with the search worker (which emits
-/// its own `info` / `bestmove`). A `Mutex` serialises the worker's lines against
-/// any the main thread emits concurrently; a clone is another handle to the same
-/// sink, not a second one.
-pub struct UsiSink<W: Write + Send + 'static> {
-    writer: Arc<Mutex<W>>,
+/// A clone is a handle to the same output, not a second one.
+pub trait UsiOutput: Clone + Send + 'static {
+    /// What a line is written to.
+    type Writer: Write;
+    /// Exclusive use of the writer, for as long as it lives.
+    type Guard<'a>: DerefMut<Target = Self::Writer>
+    where
+        Self: 'a;
+
+    /// Take exclusive use of the output.
+    fn lock(&self) -> Self::Guard<'_>;
 }
 
-impl<W: Write + Send + 'static> Clone for UsiSink<W> {
+/// The process's standard output, which is what a session played over USI
+/// writes to.
+///
+/// Zero-sized: the stream is the process's own, its buffer is shared, and the
+/// standard library serialises every access to it, so there is no handle to
+/// hold and a clone of this is nothing at all.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stdout;
+
+/// Exclusive use of the process's standard output — what [`Stdout::lock`]
+/// returns.
+pub struct StdoutGuard(StdoutLock<'static>);
+
+impl Deref for StdoutGuard {
+    type Target = StdoutLock<'static>;
+
+    fn deref(&self) -> &StdoutLock<'static> {
+        &self.0
+    }
+}
+
+impl DerefMut for StdoutGuard {
+    fn deref_mut(&mut self) -> &mut StdoutLock<'static> {
+        &mut self.0
+    }
+}
+
+impl UsiOutput for Stdout {
+    type Writer = StdoutLock<'static>;
+    type Guard<'a> = StdoutGuard;
+
+    fn lock(&self) -> StdoutGuard {
+        StdoutGuard(io::stdout().lock())
+    }
+}
+
+/// The USI renderer: every line this engine writes is composed here.
+///
+/// It writes to the session's [`UsiOutput`], which the search worker (emitting
+/// its own `info` / `bestmove`) writes to as well; a clone renders to the same
+/// output, not a second one.
+pub struct UsiSink<O: UsiOutput> {
+    out: O,
+}
+
+impl<O: UsiOutput> Clone for UsiSink<O> {
     fn clone(&self) -> Self {
         Self {
-            writer: Arc::clone(&self.writer),
+            out: self.out.clone(),
         }
     }
 }
 
-impl<W: Write + Send + 'static> UsiSink<W> {
-    pub fn new(writer: Arc<Mutex<W>>) -> Self {
-        Self { writer }
+impl<O: UsiOutput> UsiSink<O> {
+    pub fn new(out: O) -> Self {
+        Self { out }
     }
 
-    /// Lock the shared output sink, recovering from a poisoned mutex (a worker
-    /// panic must not wedge the main loop's own output).
-    fn lock(&self) -> MutexGuard<'_, W> {
-        self.writer.lock().unwrap_or_else(|e| e.into_inner())
+    /// Exclusive use of the output, for the lines written while it is held.
+    fn lock(&self) -> O::Guard<'_> {
+        self.out.lock()
     }
 
     /// Emit one `info string <msg>` line.
@@ -236,7 +288,7 @@ fn render_reply(payload: &mut BestmoveBuf, reply: Reply) -> &[u8] {
     }
 }
 
-impl<W: Write + Send + 'static> EngineSink for UsiSink<W> {
+impl<O: UsiOutput> EngineSink for UsiSink<O> {
     // A clone of this sink is what renders the PV lines, so the renderer is this
     // very type.
     #[cfg(feature = "verbose2")]
@@ -346,7 +398,7 @@ impl<W: Write + Send + 'static> EngineSink for UsiSink<W> {
 /// which is what keeps the tournament build's search free of PV work: the
 /// search's emission sites are all behind `pv_sink.is_some()`.
 #[cfg(feature = "verbose2")]
-impl<W: Write + Send + 'static> PvSink for UsiSink<W> {
+impl<O: UsiOutput> PvSink for UsiSink<O> {
     fn emit(&mut self, info: &PvInfo) {
         let mut guard = self.lock();
         let _ = write_pv_info(&mut *guard, info);
@@ -355,31 +407,34 @@ impl<W: Write + Send + 'static> PvSink for UsiSink<W> {
 
 /// The USI event loop: a line reader, the renderer and the engine those lines
 /// drive.
-pub struct UsiEngine<R: BufRead, W: Write + Send + 'static> {
+pub struct UsiEngine<R: BufRead, O: UsiOutput> {
     reader: R,
     /// The renderer, and a second handle to the engine's own output.
-    out: UsiSink<W>,
+    out: UsiSink<O>,
     /// The engine the commands drive.
-    engine: Engine<UsiSink<W>>,
+    engine: Engine<UsiSink<O>>,
     /// Poll interval of the `isready` keep-alive helper thread ([`KeepAlive`]),
     /// overridable via [`Self::with_keep_alive_poll`] so a test can drive the
     /// mechanism with a short interval.
     keep_alive_poll: Duration,
 }
 
-impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
+impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
     /// A session whose book / `rtime` PRNG stream is seeded from process entropy,
     /// so every process run differs. Tests wanting reproducible book selection
     /// or `rtime` budgets construct via [`Self::with_book_seed`].
-    pub fn new(reader: R, writer: Arc<Mutex<W>>) -> Self {
-        Self::from_engine(reader, UsiSink::new(writer), Engine::new)
+    ///
+    /// A process runs one session at a time: the flags, counters and helper
+    /// slots a search runs on, like the transposition table, are the process's.
+    pub fn new(reader: R, out: O) -> Self {
+        Self::from_engine(reader, UsiSink::new(out), Engine::new)
     }
 
     /// A session with an explicit book-PRNG seed. The entropy default
     /// ([`Self::new`]) draws one instead; tests inject a fixed seed for
     /// deterministic book / `rtime` behaviour.
-    pub fn with_book_seed(reader: R, writer: Arc<Mutex<W>>, book_seed: u64) -> Self {
-        Self::from_engine(reader, UsiSink::new(writer), |sink| {
+    pub fn with_book_seed(reader: R, out: O, book_seed: u64) -> Self {
+        Self::from_engine(reader, UsiSink::new(out), |sink| {
             Engine::with_book_seed(sink, book_seed)
         })
     }
@@ -388,8 +443,8 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
     /// session keeps a handle of its own beside the engine's.
     fn from_engine(
         reader: R,
-        out: UsiSink<W>,
-        build: impl FnOnce(UsiSink<W>) -> Engine<UsiSink<W>>,
+        out: UsiSink<O>,
+        build: impl FnOnce(UsiSink<O>) -> Engine<UsiSink<O>>,
     ) -> Self {
         let engine = build(out.clone());
         Self {
@@ -700,7 +755,23 @@ impl<R: BufRead, W: Write + Send + 'static> UsiEngine<R, W> {
         // `setoption` line that still means something here — the table's size
         // is the build's, not the command's. The pool rebuild reports itself
         // exactly as the reference `Threads` on_change callback does.
-        self.engine.resize_pool(config.threads.max(1) as usize);
+        //
+        // The flags, counters and helper slots a pool runs on are `static`s of
+        // a fixed size, so a count past that is refused rather than run on
+        // fewer workers than it names.
+        let threads = config.threads.max(1) as usize;
+        let capacity = Engine::<UsiSink<O>>::pool_capacity();
+        if threads > capacity {
+            let mut bytes = [0u8; DIAG_BYTES];
+            let mut out = TextWriter::new(&mut bytes);
+            out.bytes(b"bench: threads ")
+                .u64(threads as u64)
+                .bytes(b" is more than this build runs (")
+                .u64(capacity as u64)
+                .bytes(b"); nothing run");
+            return self.out.info_string(out.as_bytes());
+        }
+        self.engine.resize_pool(threads);
         {
             let mut bytes = [0u8; DIAG_BYTES];
             let mut out = TextWriter::new(&mut bytes);
@@ -932,7 +1003,7 @@ impl KeepAlive {
     /// The tick holds the shared output lock for the whole newline, so a
     /// keep-alive tick can never interleave mid-line with an `info string …` the
     /// heavy work emits concurrently.
-    fn spawn<W: Write + Send + 'static>(out: UsiSink<W>, poll: Duration) -> Self {
+    fn spawn<O: UsiOutput>(out: UsiSink<O>, poll: Duration) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let started = Arc::new(AtomicBool::new(false));
         let handle = thread::spawn({
@@ -1001,19 +1072,18 @@ mod tests {
     use yorkie_state::{Position, parse_usi_move};
 
     use crate::engine::MAX_POSITION_MOVES;
-    use crate::{king_shuffle, serial_tt};
+    use crate::{Buffer, king_shuffle, serial_session};
 
     /// Drive a full canned session in-process and return everything written.
     ///
-    /// The output sink is an `Arc<Mutex<Vec<u8>>>` shared with the session (and,
+    /// The output sink is a [`Buffer`] shared with the session (and,
     /// during a `go`, its search worker); after `run` returns — which joins any
     /// worker — the buffer holds the complete transcript.
     fn run_with(input: &str) -> String {
-        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let session = UsiEngine::new(input.as_bytes(), Arc::clone(&output));
+        let output = Buffer::default();
+        let session = UsiEngine::new(input.as_bytes(), output.clone());
         session.run().expect("session run");
-        let bytes = output.lock().expect("output lock").clone();
-        String::from_utf8(bytes).expect("utf-8")
+        String::from_utf8(output.bytes()).expect("utf-8")
     }
 
     /// The initial position's SFEN as text, for the command lines below.
@@ -1128,21 +1198,21 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn quit_returns_immediately() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         assert_eq!(run_with("quit\n"), "");
     }
 
     #[cfg_attr(miri, ignore)]
     #[test]
     fn eof_returns_ok() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         assert_eq!(run_with(""), "");
     }
 
     #[cfg_attr(miri, ignore)]
     #[test]
     fn isready_without_network_reports_load_failure() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         // Nothing staged an evaluation file where this session looks — beside
         // the running executable — so the load fails: the contract is an
         // `info string eval load failed:` notice and NO `readyok`. The process
@@ -1182,9 +1252,8 @@ mod tests {
     }
 
     /// Everything written to a shared test writer so far.
-    fn writer_snapshot(writer: &Arc<Mutex<Vec<u8>>>) -> String {
-        let bytes = writer.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        String::from_utf8(bytes).expect("utf-8")
+    fn writer_snapshot(writer: &Buffer) -> String {
+        String::from_utf8(writer.bytes()).expect("utf-8")
     }
 
     /// Block until the shared writer holds at least `want` bare keep-alive
@@ -1197,7 +1266,7 @@ mod tests {
     /// cadence therefore expires before the newline lands whenever the machine
     /// is busy; this loop only bounds how long the helper may take to write
     /// anything at all.
-    fn wait_for_bare_newlines(writer: &Arc<Mutex<Vec<u8>>>, want: usize) {
+    fn wait_for_bare_newlines(writer: &Buffer, want: usize) {
         // Generous versus the ~50 ms nominal cadence of a 1 ms poll: this is a
         // liveness backstop for a helper that never writes, not a cadence check.
         const DEADLINE: Duration = Duration::from_secs(5);
@@ -1223,11 +1292,11 @@ mod tests {
         // shared writer, between two ticks, so this asserts both that bare
         // newlines are emitted while the job runs and that none of them
         // interleaves mid-line with that output.
-        let writer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = Buffer::default();
         {
             // 1 ms poll → a bare newline every 50 polls (KEEP_ALIVE_TICKS_PER_NEWLINE).
             let keep_alive =
-                KeepAlive::spawn(UsiSink::new(Arc::clone(&writer)), Duration::from_millis(1));
+                KeepAlive::spawn(UsiSink::new(writer.clone()), Duration::from_millis(1));
             // Heavy job, part one: run until the helper has ticked at least once.
             wait_for_bare_newlines(&writer, 1);
             // Then emit a real line partway through, to probe for interleaving.
@@ -1236,7 +1305,7 @@ mod tests {
             // every build. Count under the same lock, so the count cannot miss a
             // tick that lands between the write and the read.
             let seen = {
-                let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
+                let mut guard = writer.lock();
                 Formatter::new(&mut *guard)
                     .info_string(b"busy")
                     .expect("write to Vec cannot fail");
@@ -1277,11 +1346,11 @@ mod tests {
         // enough that this near-instant scope itself took that long, the count is
         // allowed to rise exactly as far as the stolen time justifies. On an idle
         // machine the scope takes a millisecond or two and the bound is zero.
-        let writer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = Buffer::default();
         let poll = Duration::from_millis(1);
         let start = Instant::now();
         {
-            let _keep_alive = KeepAlive::spawn(UsiSink::new(Arc::clone(&writer)), poll);
+            let _keep_alive = KeepAlive::spawn(UsiSink::new(writer.clone()), poll);
             // No wait: the "job" finishes before the first newline tick.
         }
         // Returning from the scope at all is the stop-and-join property: a Drop
@@ -1300,14 +1369,14 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn usinewgame_is_no_op() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         assert_eq!(run_with("usinewgame\nquit\n"), "");
     }
 
     #[cfg_attr(miri, ignore)]
     #[test]
     fn unknown_command_echoes_back() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         assert_eq!(
             run_with("frobnicate\nquit\n"),
             diag("unknown command: frobnicate")
@@ -1321,7 +1390,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn setoption_is_consumed_silently() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         for line in [
             "setoption name USI_Hash value 256",
             "setoption name Nonexistent value foo",
@@ -1354,7 +1423,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_consumed_setoption_changes_nothing() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         let with_setoption = run_with(
             "setoption name Threads value 1\n\
              setoption name USI_Hash value 1\n\
@@ -1369,14 +1438,14 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn position_startpos_silent() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         assert_eq!(run_with("position startpos\nquit\n"), "");
     }
 
     #[cfg_attr(miri, ignore)]
     #[test]
     fn position_sfen_startpos_silent() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         let sfen = startpos_sfen();
         assert_eq!(run_with(&format!("position sfen {sfen}\nquit\n")), "");
     }
@@ -1384,14 +1453,14 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn position_startpos_moves_silent() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         assert_eq!(run_with("position startpos moves 7g7f\nquit\n"), "");
     }
 
     #[cfg_attr(miri, ignore)]
     #[test]
     fn position_sfen_malformed_emits_info_string() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         let out = run_with("position sfen not-a-board b - 1\nquit\n");
         if cfg!(feature = "verbose1") {
             assert!(
@@ -1409,7 +1478,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn position_with_illegal_move_emits_info_string() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         // 1a1b would move a non-existent piece (square 1a empty at startpos).
         let out = run_with("position startpos moves 1a1b\nquit\n");
         if cfg!(feature = "verbose1") {
@@ -1425,7 +1494,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn position_with_pseudo_legal_but_illegal_move_emits_info_string() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         // 1a1b' shape — pick a syntactically valid move that is not a legal
         // generated move from startpos. Pawn on 7g cannot jump to 5g.
         let out = run_with("position startpos moves 7g5g\nquit\n");
@@ -1442,7 +1511,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn position_parse_error_leaves_prior_state_intact() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         // Apply a legal move; then send a malformed sfen; then `go`. The reply
         // must be a legal move from the *post-7g7f* position, not from startpos
         // — proving the malformed line did not clobber the engine's state.
@@ -1472,7 +1541,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_move_list_past_the_bound_is_refused() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         let session = format!(
             "position startpos moves 7g7f\n\
              position startpos moves {}\n\
@@ -1502,7 +1571,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_position_sfen_is_accepted_however_its_fields_were_spaced() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         let sfen = startpos_sfen();
         assert_eq!(
             run_with(&format!("position   sfen  {sfen}   moves   7g7f\nquit\n")),
@@ -1513,7 +1582,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn go_without_network_resigns_with_notice() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         // No successful `isready`, so no network is loaded. `go` must not crash;
         // it emits the notice and `bestmove resign`. (The positive path — a
         // legal, search-chosen move — is covered in tests/eval_session.rs with a
@@ -1534,7 +1603,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn go_with_limit_subtokens_still_emits_one_bestmove() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         // Whatever subset of the `go` clauses the host provides, the session parses and
         // accepts them and still emits exactly one bestmove line (resign here,
         // as no network is loaded).
@@ -1552,7 +1621,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn go_with_gated_limit_subtokens_is_refused_and_starts_no_search() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         let session = "go depth 8 wtime 60000 btime 60000 byoyomi 5000\nquit\n";
         // The refusal is what matters — no `bestmove`, so no search started. The
         // line that names it is `verbose1`.
@@ -1569,7 +1638,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn go_with_match_subtokens_still_emits_one_bestmove() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         let session = "go wtime 60000 btime 60000 byoyomi 5000\nquit\n";
         let out = run_with(session);
         let bestmoves: Vec<&str> = out.lines().filter(|l| l.starts_with("bestmove ")).collect();
@@ -1582,7 +1651,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn bench_is_an_unknown_command_below_verbose3() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         assert_eq!(
             run_with("bench 16 1 6 default depth\nquit\n"),
             diag("unknown command: bench 16 1 6 default depth")
@@ -1592,7 +1661,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn stop_is_silent() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         assert_eq!(run_with("stop\nquit\n"), "");
         // `stop` with no network resolves the same as `go` alone: the no-network
         // notice plus a single `bestmove resign`, and nothing more.
@@ -1611,7 +1680,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_bench_thread_count_emits_the_allocation_line() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         let out = run_with(
             "bench 1 1 1 current movetime\n\
              bench 1 4 1 current movetime\n\
@@ -1627,6 +1696,29 @@ mod tests {
         assert!(
             out.contains("info string Using 2 threads on CPUs "),
             "{out}"
+        );
+    }
+
+    /// A pool runs on `static` flags, counters and helper slots of a fixed size,
+    /// so a `bench` asking for more workers than they hold is refused by name
+    /// and runs nothing, rather than running on fewer workers than it named.
+    #[cfg(feature = "verbose3")]
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_bench_past_the_pool_capacity_is_refused() {
+        let _session = serial_session();
+        let capacity = Engine::<UsiSink<Buffer>>::pool_capacity();
+        let out = run_with(&format!(
+            "bench 1 {} 1 current movetime\nquit\n",
+            capacity + 1
+        ));
+        assert_eq!(
+            out,
+            format!(
+                "info string bench: threads {} is more than this build runs ({capacity}); \
+                 nothing run\n",
+                capacity + 1
+            )
         );
     }
 }

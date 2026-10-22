@@ -20,7 +20,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use yorkie_eval::network_file;
-use yorkie_protocol::UsiEngine;
+use yorkie_protocol::{UsiEngine, UsiOutput};
 use yorkie_state::{Move, Position, SfenError, UsiMoveParseError, sfen_pack};
 
 /// The engine speaks bytes; the fixtures here are written as text. These two
@@ -69,28 +69,59 @@ pub fn evaluation_is_noise_free() -> bool {
     }
 }
 
-/// Serialises the tests that reach the transposition table.
+/// Serialises the tests that drive a session.
 ///
-/// The table is one `static` per process, and `usinewgame` — which every `go`
-/// session and every `bench` runs — empties the whole of it. Two tests driving
-/// sessions as threads of one binary would therefore clear and overwrite each
-/// other's entries, and what a search visits, and so how many nodes it reports,
-/// would depend on which other test was running beside it.
+/// A session's state is the process's. The transposition table is one `static`,
+/// and `usinewgame` — which every `go` session and every `bench` runs — empties
+/// the whole of it; the flags a search stops on, the per-worker counters and
+/// the helper slots are `static`s too, which every `go` arms and every pool
+/// parks its helpers on. Two tests driving sessions as threads of one binary
+/// would therefore clear and overwrite each other's state, and what a search
+/// visits, and so how many nodes it reports, would depend on which other test
+/// was running beside it.
 ///
 /// Under `cargo nextest` each test is its own process and the lock is never
 /// contended; under a plain `cargo test`, where one binary's tests are threads
 /// of one process, it is what makes a driven search reproducible.
-static TT_LOCK: Mutex<()> = Mutex::new(());
+static SESSION_LOCK: Mutex<()> = Mutex::new(());
 
-/// Exclusive use of the process's transposition table, held until the returned
-/// guard goes out of scope. A test that drives a session takes it as the first
-/// thing in its body, so the guard covers every search that body runs.
+/// Exclusive use of the process's session state, held until the returned guard
+/// goes out of scope. A test that drives a session takes it as the first thing
+/// in its body, so the guard covers every session that body builds.
 ///
-/// A panicking test leaves the lock poisoned; the next test wants the table,
-/// not the panic, and the session it drives empties the table before searching
-/// anything.
-pub fn serial_tt() -> MutexGuard<'static, ()> {
-    TT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+/// A panicking test leaves the lock poisoned; the next test wants the state,
+/// not the panic, and the session it drives empties the table and arms its
+/// flags before searching anything.
+pub fn serial_session() -> MutexGuard<'static, ()> {
+    SESSION_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A session's output kept in memory: what a driven session writes, shared
+/// with its search threads, for the test to read back.
+#[derive(Clone, Default)]
+pub struct Transcript(Arc<Mutex<Vec<u8>>>);
+
+impl Transcript {
+    /// Everything written so far.
+    pub fn bytes(&self) -> Vec<u8> {
+        self.lock().clone()
+    }
+
+    /// Everything written so far, as text.
+    pub fn text(&self) -> String {
+        String::from_utf8(self.bytes()).expect("utf-8")
+    }
+}
+
+impl UsiOutput for Transcript {
+    type Writer = Vec<u8>;
+    type Guard<'a> = MutexGuard<'a, Vec<u8>>;
+
+    /// A search thread that panicked mid-line leaves the lock poisoned; the
+    /// test reading the transcript back still wants it.
+    fn lock(&self) -> MutexGuard<'_, Vec<u8>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// The message [`evaluation_is_noise_free`]'s callers skip with.
@@ -201,11 +232,11 @@ pub fn write_synthetic_evaluation_file_in(dir: &Path) -> PathBuf {
 /// whose output does not depend on book-move randomisation; book sessions use
 /// [`drive_with_seed`].
 pub fn drive(input: &str) -> String {
-    let output = Arc::new(Mutex::new(Vec::<u8>::new()));
-    driver(input.as_bytes(), Arc::clone(&output), None)
+    let output = Transcript::default();
+    driver(input.as_bytes(), output.clone(), None)
         .run()
         .expect("driver run");
-    let bytes = output.lock().expect("output lock").clone();
+    let bytes = output.bytes();
     String::from_utf8(bytes).expect("utf-8")
 }
 
@@ -213,11 +244,11 @@ pub fn drive(input: &str) -> String {
 /// they are and the transcript comes back as bytes, so a line carrying a value
 /// spelled in some host's code page can be driven and read.
 pub fn drive_bytes(input: &[u8]) -> Vec<u8> {
-    let output = Arc::new(Mutex::new(Vec::<u8>::new()));
-    driver(input, Arc::clone(&output), None)
+    let output = Transcript::default();
+    driver(input, output.clone(), None)
         .run()
         .expect("driver run");
-    output.lock().expect("output lock").clone()
+    output.bytes()
 }
 
 /// A fixed seed for reproducible book / `rtime` sessions: injecting it makes
@@ -227,11 +258,11 @@ pub const TEST_BOOK_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 /// Like [`drive`] but with an explicit book-PRNG session seed, so book-move
 /// selection (and `rtime`) is reproducible.
 pub fn drive_with_seed(input: &str, book_seed: u64) -> String {
-    let output = Arc::new(Mutex::new(Vec::<u8>::new()));
-    driver(input.as_bytes(), Arc::clone(&output), Some(book_seed))
+    let output = Transcript::default();
+    driver(input.as_bytes(), output.clone(), Some(book_seed))
         .run()
         .expect("driver run");
-    let bytes = output.lock().expect("output lock").clone();
+    let bytes = output.bytes();
     String::from_utf8(bytes).expect("utf-8")
 }
 
@@ -307,9 +338,9 @@ pub fn engine_eval_root() -> PathBuf {
 /// Build a driver over `reader`, pointed at whatever network this test staged.
 fn driver<R: BufRead>(
     reader: R,
-    output: Arc<Mutex<Vec<u8>>>,
+    output: Transcript,
     book_seed: Option<u64>,
-) -> UsiEngine<R, Vec<u8>> {
+) -> UsiEngine<R, Transcript> {
     let driver = match book_seed {
         Some(seed) => UsiEngine::with_book_seed(reader, output, seed),
         None => UsiEngine::new(reader, output),
@@ -490,7 +521,7 @@ impl Read for BlockingReader {
 /// A running driver on its own thread, fed incrementally.
 pub struct StreamHarness {
     tx: Sender<Option<Vec<u8>>>,
-    output: Arc<Mutex<Vec<u8>>>,
+    output: Transcript,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -504,8 +535,8 @@ impl StreamHarness {
     /// reproducible book / `rtime` sessions. `None` uses process entropy.
     pub fn start_with_seed(book_seed: Option<u64>) -> Self {
         let (tx, rx) = channel();
-        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let out2 = Arc::clone(&output);
+        let output = Transcript::default();
+        let out2 = output.clone();
         let handle = std::thread::spawn(move || {
             let reader = BufReader::new(BlockingReader {
                 rx,
@@ -531,7 +562,7 @@ impl StreamHarness {
 
     /// Current transcript.
     pub fn output(&self) -> String {
-        String::from_utf8(self.output.lock().expect("lock").clone()).expect("utf-8")
+        String::from_utf8(self.output.bytes()).expect("utf-8")
     }
 
     /// Poll until `pred(output)` holds or `timeout` elapses; returns whether it

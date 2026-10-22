@@ -88,7 +88,7 @@ fn bestmove_lines(out: &str) -> Vec<&str> {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn synthetic_network_session_matches_direct_search_choice() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     // The direct `run_root` below installs no game seed, so it is the plain
     // evaluation's choice; only a build whose sessions make the same one can be
     // compared against it.
@@ -157,7 +157,7 @@ fn synthetic_network_session_matches_direct_search_choice() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn isready_keep_alive_emits_bare_newline_during_heavy_load() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     // With a very short injected poll interval, the real heavy work here — the
     // evaluation file's opening and the book load — spans many keep-alive ticks
     // and reliably
@@ -170,12 +170,12 @@ fn isready_keep_alive_emits_bare_newline_during_heavy_load() {
         .to_path_buf();
 
     let input = "usi\nisready\nquit\n".to_string();
-    let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let driver = UsiEngine::new(input.as_bytes(), std::sync::Arc::clone(&output))
+    let output = common::Transcript::default();
+    let driver = UsiEngine::new(input.as_bytes(), output.clone())
         .with_eval_root(eval_root)
         .with_keep_alive_poll(std::time::Duration::from_micros(100));
     driver.run().expect("driver run");
-    let out = String::from_utf8(output.lock().expect("output lock").clone()).expect("utf-8");
+    let out = output.text();
 
     // The load succeeded: exactly one readyok, no failure notice.
     assert!(
@@ -207,7 +207,7 @@ fn isready_keep_alive_emits_bare_newline_during_heavy_load() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn synthetic_network_reuse_reset_and_mate_resign() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     // Same reason as above, doubled: the session's second `go` is a new game,
     // which is exactly where the noise changes.
     if !evaluation_is_noise_free() {
@@ -292,7 +292,7 @@ const DECLARABLE_SFEN: &str = "+R+R+B+B5/3GKG3/2SGGGS2/9/9/9/9/9/4k4 b R 1";
 #[cfg_attr(miri, ignore)]
 #[test]
 fn entering_king_configured_rule_declares_win_without_searching() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     // A 27-point-declarable position under the configured rule yields
     // `bestmove win` and emits no search `info` line (the pre-search
     // declaration shortcut fires before any worker runs).

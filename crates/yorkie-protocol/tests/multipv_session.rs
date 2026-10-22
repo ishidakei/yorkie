@@ -132,7 +132,7 @@ fn last_multipv_block(out: &str) -> Vec<&str> {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn the_configured_multipv_emits_that_many_ranked_lines_per_iteration() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     let want = config::MULTI_PV as usize;
     if want < 2 {
         eprintln!("skipped: this build compiled in MultiPV 1, which emits no multipv index");
@@ -189,7 +189,7 @@ fn the_configured_multipv_emits_that_many_ranked_lines_per_iteration() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn multipv_clamps_to_the_legal_move_count() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     if config::MULTI_PV < 2 {
         eprintln!("skipped: this build compiled in MultiPV 1, which cannot exceed a move count");
         return;
@@ -217,7 +217,7 @@ fn multipv_clamps_to_the_legal_move_count() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn an_unthrottled_pv_interval_prints_every_iteration() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     if config::PV_INTERVAL != 0 {
         eprintln!("skipped: this build throttles the PV, so which iterations print is timing");
         return;
@@ -235,7 +235,7 @@ fn an_unthrottled_pv_interval_prints_every_iteration() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_final_pv_always_precedes_bestmove() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     // Which line carries the final PV depends on the compiled-in `MultiPV`: a
     // single-PV build emits one line per iteration, so the last one before
     // `bestmove` is it, but a `MultiPV N` iteration ends on its `multipv N`
@@ -272,7 +272,7 @@ fn a_final_pv_always_precedes_bestmove() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_consideration_mode_pv_replays_as_a_legal_sequence() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     if !config::CONSIDERATION_MODE {
         eprintln!("skipped: this build did not compile ConsiderationMode in");
         return;

@@ -9,21 +9,23 @@
 //! unknown-command and too-long lines are diagnostics and go through
 //! [`diag_line`].
 
-use std::sync::{Arc, Mutex};
+mod common;
 
+use common::{Transcript, serial_session};
 use yorkie_protocol::UsiEngine;
 
 fn drive(input: &str) -> String {
-    let output = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let driver = UsiEngine::new(input.as_bytes(), Arc::clone(&output));
+    let _session = serial_session();
+    let output = Transcript::default();
+    let driver = UsiEngine::new(input.as_bytes(), output.clone());
     driver.run().expect("driver run");
-    let bytes = output.lock().expect("output lock").clone();
-    String::from_utf8(bytes).expect("utf-8")
+    output.text()
 }
 
 /// The transcript a diagnostic `info string <body>` contributes in this build —
-/// nothing without `verbose1`. (This file predates `tests/common`, and keeps
-/// its own two-line harness so the handshake golden depends on nothing else.)
+/// nothing without `verbose1`. (This file keeps its own two-line harness, taking
+/// only the output buffer and the session lock from `tests/common`, so the
+/// handshake golden depends on nothing else.)
 fn diag_line(body: &str) -> String {
     if cfg!(feature = "verbose1") {
         format!("info string {body}\n")
@@ -84,11 +86,12 @@ fn isready_refuses_a_machine_that_is_not_the_one_the_binary_was_built_for() {
     std::fs::write(node.join("node0/cpulist"), "900\n").expect("write node0");
     std::fs::write(node.join("node1/cpulist"), "901\n").expect("write node1");
 
-    let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let _session = serial_session();
+    let output = Transcript::default();
     let driver =
-        UsiEngine::new(&b"isready\nquit\n"[..], Arc::clone(&output)).with_sysfs_root(root.clone());
+        UsiEngine::new(&b"isready\nquit\n"[..], output.clone()).with_sysfs_root(root.clone());
     driver.run().expect("driver run");
-    let out = String::from_utf8(output.lock().expect("output lock").clone()).expect("utf-8");
+    let out = output.text();
 
     let _ = std::fs::remove_dir_all(&root);
 

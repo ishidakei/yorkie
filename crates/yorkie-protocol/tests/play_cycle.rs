@@ -13,16 +13,17 @@
 
 #![cfg(feature = "verbose2")]
 
-use std::sync::{Arc, Mutex};
+mod common;
 
+use common::{Transcript, serial_session};
 use yorkie_protocol::UsiEngine;
 
 fn drive(input: &str) -> String {
-    let output = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let driver = UsiEngine::new(input.as_bytes(), Arc::clone(&output));
+    let _session = serial_session();
+    let output = Transcript::default();
+    let driver = UsiEngine::new(input.as_bytes(), output.clone());
     driver.run().expect("driver run");
-    let bytes = output.lock().expect("output lock").clone();
-    String::from_utf8(bytes).expect("utf-8")
+    output.text()
 }
 
 fn is_well_formed_usi_move(s: &str) -> bool {

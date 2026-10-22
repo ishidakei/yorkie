@@ -349,27 +349,25 @@ struct LoadedEval {
 /// Only the coordinator probes, once per `go` before helpers start: the
 /// on-the-fly read path is not thread-safe by design, and this single-prober
 /// discipline is what preserves that.
+///
+/// A loaded book is read-only for the rest of the process and every `go`'s
+/// coordinator reads it, so it is held as a `&'static` borrow made when it is
+/// loaded, and a `go` hands its coordinator that reference. The borrow is never
+/// given back: a book is loaded once per process unless the files the book
+/// setting names change between two readiness handshakes, and a reload keeps
+/// the books it replaces in memory.
 struct LoadedBook {
     books: Vec<Book>,
     ignore_book_ply: bool,
 }
 
 /// A search worker running on its own thread. The main thread
-/// keeps reading commands while this runs; a stop request sets [`Self::stop`],
-/// which the search polls at the reference `check_time` granularity. The worker
+/// keeps reading commands while this runs; a stop request sets [`STOP`], which
+/// the search polls at the reference `check_time` granularity. The worker
 /// emits its own progress and its reply, then returns the session-owned
 /// [`SearchState`] so the engine can reclaim it for the next `go`.
 struct ActiveSearch {
     handle: JoinHandle<SearchState>,
-    stop: Arc<AtomicBool>,
-    /// The stop flag of the thinking-ahead search this worker runs once it has
-    /// replied, which is a different search and so takes a flag of its own: the
-    /// one above is already set by the time the reply is out, both by the
-    /// coordinator ending its helpers and by a search that stopped itself.
-    ponder_stop: Arc<AtomicBool>,
-    /// Raised by the worker while it is thinking ahead, so the command that
-    /// ends that search knows to join the worker rather than leave it running.
-    pondering: Arc<AtomicBool>,
     /// The root game ply this search ran at (`rootPos.game_ply()`), carried so
     /// a completed real search updates the engine's `last_game_ply`.
     game_ply: i32,
@@ -379,8 +377,8 @@ struct ActiveSearch {
 /// the worker finishes: the game-scoped worker history tables, which persist
 /// across `go`s within one game and are reset by [`Engine::new_game`].
 ///
-/// The transposition table is not part of this handover — it lives behind an
-/// [`Arc`], so the worker gets a clone and never hands it back.
+/// The transposition table is not part of this handover — it is a `static`,
+/// which the worker reaches directly and never hands back.
 struct SearchState {
     histories: WorkerHistories,
     /// The chosen worker's reported score / average score and the main worker's
@@ -399,75 +397,85 @@ struct SearchState {
     vote_buffers: VoteBuffers,
 }
 
-/// The handles a `go` hands its coordinator that carry no value from one search
-/// to the next: the flags the main loop signals on and the per-worker counters
-/// the workers tally into.
+/// The workers a pool can hold: the `threads` setting, which is the size of
+/// every pool a game runs.
 ///
-/// They belong to the session rather than to one search, and each `go` clears
-/// them ([`Self::arm`]) instead of building new ones, so starting a search
-/// reaches the allocator for none of them. Nothing races that reset: every `go`
-/// joins the previous coordinator first, and a joined coordinator has already
-/// collected every helper it dispatched.
-struct SearchHandles {
-    /// The one shared stop flag every worker polls.
-    stop: Arc<AtomicBool>,
-    /// The stop flag of the thinking-ahead search that follows a reply — see
-    /// [`ActiveSearch::ponder_stop`].
-    ponder_stop: Arc<AtomicBool>,
-    /// Raised while a worker is thinking ahead — see [`ActiveSearch::pondering`].
-    pondering: Arc<AtomicBool>,
-    /// Per-worker node counters (index 0 = main, `1..` = helpers), read by the
-    /// aggregate node ceiling and the final aggregated `info ... nodes` — both
-    /// `verbose2`, like the counters themselves.
+/// The measurement command carries a worker count of its own, so a build that
+/// has it (`verbose3`) holds room for `BENCH_POOL_CAPACITY` workers as well,
+/// and refuses a count beyond that. The unit tests build pools of their own
+/// sizes and get the same room.
+#[cfg(not(any(test, feature = "verbose3")))]
+const POOL_CAPACITY: usize = config::THREADS as usize;
+#[cfg(any(test, feature = "verbose3"))]
+const POOL_CAPACITY: usize = if (config::THREADS as usize) > BENCH_POOL_CAPACITY {
+    config::THREADS as usize
+} else {
+    BENCH_POOL_CAPACITY
+};
+
+/// The most workers a measurement run may ask for in a build whose own
+/// `threads` setting is smaller.
+#[cfg(any(test, feature = "verbose3"))]
+const BENCH_POOL_CAPACITY: usize = 256;
+
+const _: () = assert!(POOL_CAPACITY >= 1);
+
+// The flags the main loop signals a search on and the per-worker counters the
+// workers tally into. They carry no value from one search to the next, so they
+// belong to the session rather than to a search, and like the transposition
+// table there is one session per process: each is a `static`, which a worker
+// reaches at a constant address rather than through a handle it was given.
+// Every `go` clears them ([`arm_search`]) before its search starts, and nothing
+// races that reset: every `go` joins the previous coordinator first, and a
+// joined coordinator has already collected every helper it dispatched.
+
+/// The one stop flag every worker of a search polls.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+/// The stop flag of the thinking-ahead search a coordinator runs once it has
+/// replied, which is a different search and so takes a flag of its own:
+/// [`STOP`] is already set by the time the reply is out, both by the
+/// coordinator ending its helpers and by a search that stopped itself.
+static PONDER_STOP: AtomicBool = AtomicBool::new(false);
+
+/// Raised by the coordinator while it is thinking ahead, so the command that
+/// ends that search knows to join the coordinator rather than leave it running.
+static PONDERING: AtomicBool = AtomicBool::new(false);
+
+/// Per-worker node counters (index 0 = main, `1..` = helpers), read by the
+/// aggregate node ceiling and the final aggregated `info ... nodes` — both
+/// `verbose2`, like the counters themselves.
+#[cfg(feature = "verbose2")]
+static NODE_SLOTS: [TallySlot; POOL_CAPACITY] = [const { TallySlot::new() }; POOL_CAPACITY];
+
+/// Per-worker best-move-change counters: each worker bumps its own slot at the
+/// root and the main worker folds them all each iteration.
+static BMC_SLOTS: [TallySlot; POOL_CAPACITY] = [const { TallySlot::new() }; POOL_CAPACITY];
+
+/// The node counters of a pool of `workers`, one slot per worker.
+#[cfg(feature = "verbose2")]
+fn node_tally(workers: usize) -> &'static [TallySlot] {
+    &NODE_SLOTS[..workers]
+}
+
+/// The best-move-change counters of a pool of `workers`, one slot per worker.
+fn bmc_tally(workers: usize) -> &'static [TallySlot] {
+    &BMC_SLOTS[..workers]
+}
+
+/// Clear every flag, and zero the counters of a pool of `workers`, for a search
+/// about to start.
+fn arm_search(workers: usize) {
+    STOP.store(false, Ordering::Relaxed);
+    PONDER_STOP.store(false, Ordering::Relaxed);
+    PONDERING.store(false, Ordering::Relaxed);
     #[cfg(feature = "verbose2")]
-    node_slots: Arc<Vec<TallySlot>>,
-    /// Per-worker best-move-change counters: each worker bumps its own slot at
-    /// the root and the main worker folds them all each iteration.
-    bmc_slots: Arc<Vec<TallySlot>>,
-}
-
-impl SearchHandles {
-    /// The handles for a pool of `n_threads` workers.
-    fn new(n_threads: usize) -> Self {
-        SearchHandles {
-            stop: Arc::new(AtomicBool::new(false)),
-            ponder_stop: Arc::new(AtomicBool::new(false)),
-            pondering: Arc::new(AtomicBool::new(false)),
-            #[cfg(feature = "verbose2")]
-            node_slots: new_tally(n_threads),
-            bmc_slots: new_tally(n_threads),
-        }
+    for slot in node_tally(workers) {
+        slot.store(0, Ordering::Relaxed);
     }
-
-    /// Give the counters one slot per worker of a freshly (re)built pool. Only a
-    /// pool rebuild changes the worker count, and no search runs across one.
-    fn fit_to_pool(&mut self, n_threads: usize) {
-        #[cfg(feature = "verbose2")]
-        {
-            self.node_slots = new_tally(n_threads);
-        }
-        self.bmc_slots = new_tally(n_threads);
+    for slot in bmc_tally(workers) {
+        slot.store(0, Ordering::Relaxed);
     }
-
-    /// Clear every flag and zero every counter for a search about to start.
-    fn arm(&mut self) {
-        self.stop.store(false, Ordering::Relaxed);
-        self.ponder_stop.store(false, Ordering::Relaxed);
-        self.pondering.store(false, Ordering::Relaxed);
-        #[cfg(feature = "verbose2")]
-        for slot in self.node_slots.iter() {
-            slot.store(0, Ordering::Relaxed);
-        }
-        for slot in self.bmc_slots.iter() {
-            slot.store(0, Ordering::Relaxed);
-        }
-    }
-}
-
-/// One zeroed counter per worker, each on a cache line of its own so a worker
-/// publishing to its slot leaves every other worker's slot alone.
-fn new_tally(n_threads: usize) -> Arc<Vec<TallySlot>> {
-    Arc::new((0..n_threads).map(|_| TallySlot::new()).collect())
 }
 
 /// The buffers a coordinator collects its workers into: one [`WorkerResult`] per
@@ -641,7 +649,9 @@ fn write_cpu_list<'c>(cpus: impl IntoIterator<Item = &'c CpuIndex>, out: &mut Te
 ///
 /// The search runs on a thread of its own and emits from there, so a sink is
 /// cloned into each `go`'s coordinator — hence `Clone + Send + 'static`. A clone
-/// is a handle to the same output, not a second one.
+/// is a handle to the same output, not a second one; the sink the engine plays
+/// with writes to the process's standard output and is zero-sized, so the clone
+/// is nothing at all.
 pub trait EngineSink: Clone + Send + 'static {
     /// The per-iteration PV renderer this protocol layer installs on the main
     /// worker — a concrete type, like the sink itself.
@@ -713,9 +723,9 @@ pub struct Engine<P: EngineSink> {
     histories: Option<WorkerHistories>,
     /// The loaded opening books, present only after a [`Self::ready`] opened at least
     /// one readable `.ybb`. `None` means bookless (default `BookFile=no_book`, or
-    /// every listed book failed / was unsupported). Behind an [`Arc`] so a `go`
-    /// hands its coordinator a cheap clone.
-    book: Option<Arc<LoadedBook>>,
+    /// every listed book failed / was unsupported). A `'static` borrow — see
+    /// [`LoadedBook`] — so a `go` hands its coordinator the reference itself.
+    book: Option<&'static LoadedBook>,
     /// The `(resolved-name-list, on-the-fly, ignore-book-ply)` signature of the
     /// last book load — the Multiple Book priority list, not a single name.
     /// [`Self::ready`] reloads only when this changes — the reference's reload-skip.
@@ -783,18 +793,12 @@ pub struct Engine<P: EngineSink> {
     /// Which CPU each worker pins itself to and which system node its memory
     /// belongs on, for the current pool size. Rebuilt with the pool. Slot 0 is
     /// the per-`go` coordinator; `1..` are the helper threads.
-    worker_plan: Arc<WorkerPlan>,
+    worker_plan: WorkerPlan,
     /// Per-worker handles to the node-shared correction / pawn tables, rebuilt
     /// at every pool (re)build from [`Self::worker_plan`]. Length equals the pool
-    /// size, so `[0]` is the coordinator's and `[1..]` the helpers'.
+    /// size, so `[0]` is the coordinator's and `[1..]` the helpers', each of
+    /// which is handed its own when the pool spawns it.
     worker_shared: Vec<Arc<SharedHistories>>,
-    /// [`Self::worker_shared`] without the coordinator's slot-0 handle — worker
-    /// `h + 1`'s set at index `h` — behind an [`Arc`] so a `go` hands its
-    /// coordinator the list rather than a fresh copy of it. Rebuilt with the
-    /// pool, alongside its source.
-    helper_shared: Arc<Vec<Arc<SharedHistories>>>,
-    /// The flags and counters every `go` reuses.
-    handles: SearchHandles,
     /// The coordinator's collection buffers. `None` only while a search holds
     /// them, exactly like [`Self::histories`].
     vote_buffers: Option<VoteBuffers>,
@@ -835,25 +839,25 @@ impl<P: EngineSink> Engine<P> {
         // question, asked once, before a game.
         let numa_layout =
             NumaLayout::from_const(settings.numa_node_cpus(), settings.numa_system_nodes());
-        let worker_plan = Arc::new(WorkerPlan::of(
+        let worker_plan = WorkerPlan::of(
             settings.worker_cpus(),
             settings.worker_system_nodes(),
             threads,
-        ));
-        let pool = ThreadPool::with_binding(threads, Arc::clone(&worker_plan));
-        // The pool decides the worker count — it refuses a size below one — so
-        // what the counters and buffers are sized by is the pool, not the
-        // setting it was asked for.
-        let workers = pool.size();
-        // Build the per-node shared correction / pawn tables and give the
-        // coordinator (worker 0) its node's set.
+        );
+        // Build the per-node shared correction / pawn tables: the helpers are
+        // handed theirs as the pool spawns them, and the coordinator (worker 0)
+        // gets its node's set here.
         let worker_shared = build_worker_shared(&worker_plan);
-        let helper_shared = helper_slice(&worker_shared);
+        let pool = ThreadPool::with_binding(threads, worker_plan, &worker_shared);
+        // The pool decides the worker count — it refuses a size below one — so
+        // what the buffers are sized by is the pool, not the setting it was
+        // asked for.
+        let workers = pool.size();
         let histories = Some(WorkerHistories::with_shared(Arc::clone(&worker_shared[0])));
         // The coordinator's bundle is built (and filled) right here, on the
         // command thread — so place it explicitly; see
         // `place_coordinator_histories`.
-        place_coordinator_histories(histories.as_ref(), worker_plan.system_nodes[0]);
+        place_coordinator_histories(histories.as_ref(), worker_plan.system_node(0));
         Self {
             sink,
             settings,
@@ -881,8 +885,6 @@ impl<P: EngineSink> Engine<P> {
             numa_layout,
             worker_plan,
             worker_shared,
-            helper_shared,
-            handles: SearchHandles::new(workers),
             vote_buffers: Some(VoteBuffers::for_pool(workers)),
             eval_root: network_file::executable_directory(),
             sysfs_root: PathBuf::from(SYSFS_ROOT),
@@ -936,11 +938,19 @@ impl<P: EngineSink> Engine<P> {
     }
 
     /// Rebuild the worker pool at `threads` workers — the one value a
-    /// measurement command carries that still means something here.
+    /// measurement command carries that still means something here. At most
+    /// [`Self::pool_capacity`].
     #[cfg(feature = "verbose3")]
     pub fn resize_pool(&mut self, threads: usize) {
         self.pool_threads = threads;
         self.rebuild_pool();
+    }
+
+    /// The most workers [`Self::resize_pool`] can be asked for: the room this
+    /// build holds for a pool's flags, counters and helper slots.
+    #[cfg(feature = "verbose3")]
+    pub fn pool_capacity() -> usize {
+        POOL_CAPACITY
     }
 
     /// Append `"Using N thread[s] on CPUs <list>"` for the live pool to `out`.
@@ -959,8 +969,8 @@ impl<P: EngineSink> Engine<P> {
             // Both flags: the worker may be searching for its reply, or thinking
             // ahead past one it has already given, and the join below waits for
             // whichever it is.
-            active.stop.store(true, Ordering::Relaxed);
-            active.ponder_stop.store(true, Ordering::Relaxed);
+            STOP.store(true, Ordering::Relaxed);
+            PONDER_STOP.store(true, Ordering::Relaxed);
             let state = active
                 .handle
                 .join()
@@ -1053,17 +1063,16 @@ impl<P: EngineSink> Engine<P> {
     /// destroys and recreates the helper threads.
     fn rebuild_pool(&mut self) {
         let requested = self.pool_threads;
-        self.worker_plan = Arc::new(WorkerPlan::of(
+        self.worker_plan = WorkerPlan::of(
             self.settings.worker_cpus(),
             self.settings.worker_system_nodes(),
             requested,
-        ));
+        );
         // Rebuild the per-node shared correction / pawn tables from the fresh
         // assignment, so every pool rebuild resets them. The coordinator's own
         // game-scoped per-worker tables persist, so only its shared handle is
         // swapped.
         self.worker_shared = build_worker_shared(&self.worker_plan);
-        self.helper_shared = helper_slice(&self.worker_shared);
         if let Some(h) = self.histories.as_mut() {
             h.set_shared(Arc::clone(&self.worker_shared[0]));
         }
@@ -1071,15 +1080,13 @@ impl<P: EngineSink> Engine<P> {
         // faulted on the command thread, so re-assert their placement for the fresh
         // assignment. Helpers need nothing here: they are respawned and each
         // allocates its own bundle on-thread after pinning.
-        place_coordinator_histories(self.histories.as_ref(), self.worker_plan.system_nodes[0]);
+        place_coordinator_histories(self.histories.as_ref(), self.worker_plan.system_node(0));
         self.pool
-            .set_with_binding(requested, Arc::clone(&self.worker_plan));
-        // The per-worker counters and the coordinator's collection buffers are
-        // sized by the worker count, so the rebuilt pool is where they are
-        // resized — nowhere else changes it, and no search runs across a
-        // rebuild.
+            .set_with_binding(requested, self.worker_plan, &self.worker_shared);
+        // The coordinator's collection buffers are sized by the worker count,
+        // so the rebuilt pool is where they are resized — nowhere else changes
+        // it, and no search runs across a rebuild.
         let size = self.pool.size();
-        self.handles.fit_to_pool(size);
         if let Some(buffers) = self.vote_buffers.as_mut() {
             buffers.fit_to_pool(size);
         }
@@ -1195,10 +1202,10 @@ impl<P: EngineSink> Engine<P> {
         }
 
         if !books.is_empty() {
-            self.book = Some(Arc::new(LoadedBook {
+            self.book = Some(Box::leak(Box::new(LoadedBook {
                 books,
                 ignore_book_ply,
-            }));
+            })));
         }
         Ok(())
     }
@@ -1501,14 +1508,9 @@ impl<P: EngineSink> Engine<P> {
             return GoOutcome::NoNetwork;
         };
 
-        // The handles the main loop signals on; cloned out of the job before it
-        // moves into the worker thread.
-        let stop_for_active = Arc::clone(&job.stop);
-        let ponder_stop_for_active = Arc::clone(&job.ponder.stop);
-        let pondering_for_active = Arc::clone(&job.ponder.pondering);
         // The coordinator's own system node, resolved before the thread starts
         // so the network type it searches with is selected once per `go`.
-        let node = self.worker_plan.system_nodes[0];
+        let node = self.worker_plan.system_node(0);
         let handle = std::thread::spawn(move || {
             let outcome = with_eval_network!(node, |net| run_coordinated(net, job));
             SearchState {
@@ -1518,13 +1520,7 @@ impl<P: EngineSink> Engine<P> {
             }
         });
 
-        self.search = Some(ActiveSearch {
-            handle,
-            stop: stop_for_active,
-            ponder_stop: ponder_stop_for_active,
-            pondering: pondering_for_active,
-            game_ply,
-        });
+        self.search = Some(ActiveSearch { handle, game_ply });
         GoOutcome::Started
     }
 
@@ -1537,9 +1533,9 @@ impl<P: EngineSink> Engine<P> {
     /// that raises the flag just after this looked stops on the flag anyway and
     /// is reclaimed by the next command that needs its state.
     pub fn stop_pondering(&mut self) {
-        if let Some(active) = &self.search {
-            active.ponder_stop.store(true, Ordering::Relaxed);
-            if active.pondering.load(Ordering::Relaxed) {
+        if self.search.is_some() {
+            PONDER_STOP.store(true, Ordering::Relaxed);
+            if PONDERING.load(Ordering::Relaxed) {
                 self.finish_search_join();
             }
         }
@@ -1699,9 +1695,10 @@ impl<P: EngineSink> Engine<P> {
             })
         };
         // Clear the session's flags and counters for this search.
-        self.handles.arm();
+        let workers = self.pool.size();
+        arm_search(workers);
         let control = SearchControl {
-            stop: Some(Arc::clone(&self.handles.stop)),
+            stop: Some(&STOP),
             // A ceiling of zero nodes and a ceiling of one end the same
             // search: the first completed iteration precedes the first
             // consultation of the ceiling either way.
@@ -1772,14 +1769,9 @@ impl<P: EngineSink> Engine<P> {
 
         // The persistent helper slots to dispatch to. The pool is never resized
         // while a coordinator runs (every resize path calls
-        // `finish_search_join` first), so these stay valid for this whole `go`.
+        // `finish_search_join` first), so these are the live helpers' for this
+        // whole `go`.
         let helper_slots = self.pool.helper_slots();
-        // Each helper's node-shared tables: worker `h + 1` gets
-        // `worker_shared[h + 1]`, which is why the list is held without the
-        // coordinator's slot-0 handle. It is rebuilt only with the pool, which
-        // never happens mid-`go`, so it stays aligned with these helpers for the
-        // whole search.
-        let helper_shared = Arc::clone(&self.helper_shared);
 
         // The shared table is a `static`, so nothing is handed over for it; the
         // main histories are still lent take-and-return and reclaimed on join.
@@ -1793,16 +1785,12 @@ impl<P: EngineSink> Engine<P> {
             .take()
             .expect("session collection buffers present when idle");
         let sink = self.sink.clone();
-        let stop = control
-            .stop
-            .clone()
-            .expect("stop flag installed just above");
         let pos = self.pos.clone();
 
-        // Book state for this `go`: the loaded book (cheap `Arc` clone), the
-        // `USI_OwnBook` gate and a fresh seed. The selection settings are
-        // [`BOOK_CONFIG`] and travel with no job.
-        let book = self.book.as_ref().map(Arc::clone);
+        // Book state for this `go`: the loaded book, the `USI_OwnBook` gate and
+        // a fresh seed. The selection settings are [`BOOK_CONFIG`] and travel
+        // with no job.
+        let book = self.book;
         let own_book = self.settings.usi_own_book();
         self.book_seed = self
             .book_seed
@@ -1815,17 +1803,19 @@ impl<P: EngineSink> Engine<P> {
         #[cfg(feature = "verbose2")]
         let infinite = limits.infinite;
 
-        // What the coordinator keeps searching on once its reply is out. The
-        // handles are the session's own, cleared by `arm` above like the rest.
+        // The per-worker counters of this pool, cleared by `arm_search` above.
+        #[cfg(feature = "verbose2")]
+        let node_slots = node_tally(workers);
+        let bmc_slots = bmc_tally(workers);
+
+        // What the coordinator keeps searching on once its reply is out. Its
+        // flags are the session's own, cleared by `arm_search` like the rest.
         let ponder = PonderJob {
             enabled: ponder_after_reply,
-            stop: Arc::clone(&self.handles.ponder_stop),
-            pondering: Arc::clone(&self.handles.pondering),
-            helper_slots: Arc::clone(&helper_slots),
-            helper_shared: Arc::clone(&helper_shared),
+            helper_slots,
             #[cfg(feature = "verbose2")]
-            node_slots: Arc::clone(&self.handles.node_slots),
-            bmc_slots: Arc::clone(&self.handles.bmc_slots),
+            node_slots,
+            bmc_slots,
             #[cfg(feature = "random")]
             random_seed: self.random_seed,
             #[cfg(feature = "verbose2")]
@@ -1843,7 +1833,7 @@ impl<P: EngineSink> Engine<P> {
         // CPU — and points its allocations at that CPU's node — at the start of
         // every `go`. It is spawned per `go`, so it re-pins each time: same
         // target CPU, idempotent.
-        let worker_plan = Arc::clone(&self.worker_plan);
+        let worker_plan = self.worker_plan;
 
         Some(CoordinatorJob {
             pos,
@@ -1852,14 +1842,12 @@ impl<P: EngineSink> Engine<P> {
             #[cfg(feature = "verbose2")]
             use_voting,
             control,
-            stop,
             histories,
             vote_buffers,
             #[cfg(feature = "verbose2")]
-            node_slots: Arc::clone(&self.handles.node_slots),
-            bmc_slots: Arc::clone(&self.handles.bmc_slots),
+            node_slots,
+            bmc_slots,
             helper_slots,
-            helper_shared,
             worker_plan,
             book,
             own_book,
@@ -1892,7 +1880,7 @@ impl<P: EngineSink> Engine<P> {
         // always exists. A measurement position is answered and left: a search
         // that outlived it would be measured into the next one.
         let job = self.prepare_coordinator_job(params, Instant::now(), false, true)?;
-        let node = self.worker_plan.system_nodes[0];
+        let node = self.worker_plan.system_node(0);
         let outcome = with_eval_network!(node, |net| run_coordinated(net, job));
         // Return the session state the job borrowed (the async path reclaims
         // this on join; here we hand it straight back). Bench uses fixed
@@ -1909,10 +1897,20 @@ impl<P: EngineSink> Engine<P> {
     /// stops with nothing to say and is joined here, so `stop` leaves the
     /// session idle. With no search running this is a silent no-op.
     pub fn stop(&mut self) {
-        if let Some(active) = &self.search {
-            active.stop.store(true, Ordering::Relaxed);
+        if self.search.is_some() {
+            STOP.store(true, Ordering::Relaxed);
         }
         self.stop_pondering();
+    }
+}
+
+impl<P: EngineSink> Drop for Engine<P> {
+    /// The flags, counters and helper slots a search runs on are the process's
+    /// rather than this engine's, so an engine going away takes its search with
+    /// it: a coordinator left running would still be reading them when the next
+    /// engine arms them for a search of its own.
+    fn drop(&mut self) {
+        self.finish_search_join();
     }
 }
 
@@ -2099,9 +2097,11 @@ fn emit_book_hit<P: EngineSink>(
 }
 
 /// Everything one helper needs to run its own iterative deepening for a single
-/// `go`. The heavy state is shared: the stop flag and the per-worker node
-/// counters behind [`Arc`], the transposition table as the one `static` every
-/// worker reads. The network is not here at all — which one this helper reads
+/// `go`. The heavy state is shared: the stop flag and the per-worker counters
+/// are the session's `static`s, of which the job carries the references, and
+/// the transposition table is the one `static` every worker reads. The
+/// node-shared history tables were handed to the helper when the pool spawned
+/// it. The network is not here at all — which one this helper reads
 /// was decided when its thread was spawned, and is the type its search was
 /// compiled for. The position and the root-move list are cheap per-helper
 /// copies (the reference `start_thinking` copies the root-move list to every
@@ -2116,17 +2116,18 @@ struct HelperJob {
     /// [`CoordinatorJob::depth`], which this copies.
     #[cfg(feature = "verbose2")]
     limit_depth: i32,
-    /// The one shared stop flag every worker polls (the engine installs it).
-    stop: Arc<AtomicBool>,
+    /// The stop flag every worker of this search polls: [`STOP`] for a `go`,
+    /// [`PONDER_STOP`] for the search that thinks past its reply.
+    stop: &'static AtomicBool,
     /// Per-worker node counters; the helper publishes `nodes` to
     /// `node_slots[index]`. The aggregate they form is read by the node ceiling
     /// and by the search `info` lines, both `verbose2`.
     #[cfg(feature = "verbose2")]
-    node_slots: Arc<Vec<TallySlot>>,
+    node_slots: &'static [TallySlot],
     /// Per-worker best-move-change counters; the helper `fetch_add`s its own
     /// `bmc_slots[index]` at the root, and the main worker folds every slot
     /// each iteration.
-    bmc_slots: Arc<Vec<TallySlot>>,
+    bmc_slots: &'static [TallySlot],
     /// This helper's index into `node_slots` / `bmc_slots` (`>= 1`; index 0 is the
     /// main worker).
     index: usize,
@@ -2146,12 +2147,6 @@ struct HelperJob {
     /// line, so only that one searches for any.
     #[cfg(feature = "verbose2")]
     multi_pv: usize,
-    /// This helper's node-shared correction / pawn tables — a cheap
-    /// [`Arc`] clone of `worker_shared[index]`. Stable across `go`s within a pool
-    /// lifetime (the engine rebuilds it only on a pool rebuild, which recreates
-    /// the helper threads), so the helper attaches it once to its persistent
-    /// per-worker tables.
-    shared: Arc<SharedHistories>,
 }
 
 /// The state of one helper's coordination slot. The coordinator drives
@@ -2176,13 +2171,22 @@ enum SlotState {
 
 /// One persistent helper's coordination slot: a [`SlotState`] behind a mutex and
 /// a condvar both the coordinator and the helper wait on.
+///
+/// The slots are the session's, like its flags: [`HELPER_SLOTS`] holds one per
+/// helper a pool can have, and a pool of `n` workers runs its helpers on the
+/// first `n − 1`.
 struct HelperSlot {
     state: Mutex<SlotState>,
     cv: Condvar,
 }
 
+/// The helper slots of every pool this process builds, worker `h + 1` parked on
+/// slot `h`.
+static HELPER_SLOTS: [HelperSlot; POOL_CAPACITY - 1] =
+    [const { HelperSlot::new() }; POOL_CAPACITY - 1];
+
 impl HelperSlot {
-    fn new() -> Self {
+    const fn new() -> Self {
         HelperSlot {
             state: Mutex::new(SlotState::Parked),
             cv: Condvar::new(),
@@ -2220,12 +2224,18 @@ impl HelperSlot {
 /// job (or exit) arrives, run one iterative deepening with the helper's own
 /// game-scoped histories, publish the result, and re-park. The histories persist
 /// across jobs within a game — the pool is recreated to reset them.
-fn helper_loop<N: NetworkParams>(net: N, slot: Arc<HelperSlot>) {
-    // The per-worker tables persist across `go`s (game-scoped); the shared
-    // correction / pawn tables are attached from the first job's `shared`
-    // handle. Built lazily so the helper never allocates a throwaway
-    // single-thread shared set before its node's real one arrives. The handle is
-    // stable within a pool lifetime, so it is set once.
+///
+/// `shared` is this helper's node's shared correction / pawn tables, which the
+/// pool hands over when it spawns the helper. A pool built by a unit test that
+/// never dispatches a job hands over none.
+fn helper_loop<N: NetworkParams>(
+    net: N,
+    slot: &'static HelperSlot,
+    mut shared: Option<Arc<SharedHistories>>,
+) {
+    // The per-worker tables persist across `go`s (game-scoped) and are built on
+    // the first job, attached to the node's shared tables, so a pool that is
+    // rebuilt before it searches allocates none.
     let mut histories: Option<WorkerHistories> = None;
     loop {
         // Park until the coordinator assigns a job or the pool asks us to exit.
@@ -2244,24 +2254,28 @@ fn helper_loop<N: NetworkParams>(net: N, slot: Arc<HelperSlot>) {
             }
         };
 
-        // Attach this helper's node-shared tables on the first job (they are
-        // stable within a pool lifetime), then run with the persistent
-        // histories. A helper's control is stop-only (no deadlines, no node
-        // ceiling): the reference runs `check_time` on the main worker alone;
-        // helpers merely poll the shared stop flag.
-        let histories_in =
-            histories.unwrap_or_else(|| WorkerHistories::with_shared(Arc::clone(&job.shared)));
+        // Run with the persistent histories, built on the first job. A helper's
+        // control is stop-only (no deadlines, no node ceiling): the reference
+        // runs `check_time` on the main worker alone; helpers merely poll the
+        // shared stop flag.
+        let histories_in = histories.unwrap_or_else(|| {
+            WorkerHistories::with_shared(
+                shared
+                    .take()
+                    .expect("the pool hands every helper it dispatches to its node's tables"),
+            )
+        });
         let (result, reclaimed) = {
             let mut qs = QSearch::with_histories(net, histories_in);
             qs.set_control(SearchControl {
-                stop: Some(Arc::clone(&job.stop)),
+                stop: Some(job.stop),
                 #[cfg(feature = "verbose2")]
                 node_limit: None,
                 time: None,
             });
             #[cfg(feature = "verbose2")]
-            qs.set_node_tally(Arc::clone(&job.node_slots), job.index);
-            qs.set_best_move_tally(Arc::clone(&job.bmc_slots), job.index);
+            qs.set_node_tally(job.node_slots, job.index);
+            qs.set_best_move_tally(job.bmc_slots, job.index);
             qs.set_entering_king(job.entering_king);
             #[cfg(feature = "verbose2")]
             qs.set_mate_mode(job.mate_mode);
@@ -2281,16 +2295,6 @@ fn helper_loop<N: NetworkParams>(net: N, slot: Arc<HelperSlot>) {
         };
         histories = Some(reclaimed);
 
-        // Release every shared-`Arc` clone this helper holds BEFORE publishing
-        // `Finished`, so a reclaim that follows the coordinator's `collect()`
-        // finds nothing still held by a helper that has been descheduled
-        // mid-teardown. Dropping here, before the `Finished` store that
-        // `collect()` synchronizes on, makes the release happen-before the
-        // reclaim.
-        drop(job.stop);
-        #[cfg(feature = "verbose2")]
-        drop(job.node_slots);
-
         *slot.lock() = SlotState::Finished(result);
         slot.cv.notify_all();
     }
@@ -2302,12 +2306,13 @@ fn helper_loop<N: NetworkParams>(net: N, slot: Arc<HelperSlot>) {
 ///
 /// Each helper owns game-scoped histories that persist across `go`s, so the
 /// pool is recreated to reset them.
+///
+/// The helpers park on the session's [`HELPER_SLOTS`], one process holding one
+/// pool at a time, so what the pool owns is its threads and how many there are.
 struct ThreadPool {
-    /// One coordination slot per helper (`size − 1` of them). Behind an [`Arc`]
-    /// so the coordinator that dispatches to and collects from them is handed
-    /// the list itself rather than a copy of it per `go`; the list is replaced
-    /// only by a rebuild.
-    slots: Arc<Vec<Arc<HelperSlot>>>,
+    /// The live helpers (`size − 1`), parked on the first that many slots of
+    /// [`HELPER_SLOTS`].
+    helpers: usize,
     /// The helper threads, joined on resize / teardown.
     handles: Vec<JoinHandle<()>>,
 }
@@ -2316,21 +2321,22 @@ impl ThreadPool {
     /// Build a pool of `size` slots (one main + `size − 1` helpers), spawning the
     /// helper threads parked and idle, each pinned to the CPU a plan built for
     /// this process's own affinity gives it — the pool unit tests use this, so
-    /// they never pin a test thread to a CPU the test runner may not use.
+    /// they never pin a test thread to a CPU the test runner may not use. No job
+    /// is dispatched to such a pool, so its helpers are handed no shared tables.
     #[cfg(test)]
     fn new(size: usize) -> Self {
-        Self::with_binding(size, Arc::new(WorkerPlan::of_allowed_cpus(size)))
+        Self::with_binding(size, WorkerPlan::of_allowed_cpus(size), &[])
     }
 
     /// Build a pool of `size` slots with a worker plan. Each helper thread
     /// (worker `1..`) pins itself to its assigned CPU once at spawn, before it
-    /// parks.
-    fn with_binding(size: usize, plan: Arc<WorkerPlan>) -> Self {
+    /// parks, and takes worker `w`'s node-shared tables `shared[w]` with it.
+    fn with_binding(size: usize, plan: WorkerPlan, shared: &[Arc<SharedHistories>]) -> Self {
         let mut pool = ThreadPool {
-            slots: Arc::new(Vec::new()),
+            helpers: 0,
             handles: Vec::new(),
         };
-        pool.set_with_binding(size, plan);
+        pool.set_with_binding(size, plan, shared);
         pool
     }
 
@@ -2338,7 +2344,7 @@ impl ThreadPool {
     /// pool unit tests.
     #[cfg(test)]
     fn set(&mut self, size: usize) {
-        self.set_with_binding(size, Arc::new(WorkerPlan::of_allowed_cpus(size)));
+        self.set_with_binding(size, WorkerPlan::of_allowed_cpus(size), &[]);
     }
 
     /// Resize to `size` slots, mirroring the reference `ThreadPool::set`: it
@@ -2354,27 +2360,29 @@ impl ThreadPool {
     /// tables across every node. Setting the preference at spawn is what makes
     /// [`helper_loop`]'s lazy allocation land node-locally, and it is per-thread,
     /// so the shared transposition table's interleave is untouched.
-    fn set_with_binding(&mut self, size: usize, plan: Arc<WorkerPlan>) {
+    ///
+    /// `size` is at most [`POOL_CAPACITY`]: the measurement command, the one
+    /// caller with a size of its own, refuses a larger one before it gets here.
+    fn set_with_binding(&mut self, size: usize, plan: WorkerPlan, shared: &[Arc<SharedHistories>]) {
         self.shutdown();
         let size = size.max(1);
-        let mut slots = Vec::with_capacity(size - 1);
-        for worker_id in 1..size {
-            let slot = Arc::new(HelperSlot::new());
-            let slot_for_thread = Arc::clone(&slot);
-            let plan_for_thread = Arc::clone(&plan);
+        assert!(
+            size <= POOL_CAPACITY,
+            "a pool of {size} workers is past this build's {POOL_CAPACITY}"
+        );
+        for (worker_id, slot) in (1..size).zip(&HELPER_SLOTS) {
+            // The slot is left `Exit` by the pool that used it last.
+            *slot.lock() = SlotState::Parked;
+            let shared = shared.get(worker_id).map(Arc::clone);
             self.handles.push(std::thread::spawn(move || {
-                let node = plan_for_thread.system_nodes[worker_id];
-                yorkie_numa::pin_current_thread_to_cpu_with_local_memory(
-                    plan_for_thread.cpus[worker_id],
-                    node,
-                );
+                let node = plan.system_node(worker_id);
+                yorkie_numa::pin_current_thread_to_cpu_with_local_memory(plan.cpu(worker_id), node);
                 // The one place this helper's node becomes the network type its
                 // search is compiled for. Once per thread, before it parks.
-                with_eval_network!(node, |net| helper_loop(net, slot_for_thread));
+                with_eval_network!(node, |net| helper_loop(net, slot, shared));
             }));
-            slots.push(slot);
         }
-        self.slots = Arc::new(slots);
+        self.helpers = size - 1;
     }
 
     /// Ask every helper to exit and join it, leaving only the main slot.
@@ -2382,25 +2390,25 @@ impl ThreadPool {
     /// `finish_search_join` every caller runs before a resize / teardown), so the
     /// `Exit` is never overwritten by a late `Finished` write.
     fn shutdown(&mut self) {
-        for slot in self.slots.iter() {
+        for slot in self.helper_slots() {
             *slot.lock() = SlotState::Exit;
             slot.cv.notify_all();
         }
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
-        self.slots = Arc::new(Vec::new());
+        self.helpers = 0;
     }
 
     /// The configured pool size: the main-worker slot plus the live helpers.
     fn size(&self) -> usize {
-        self.slots.len() + 1
+        self.helpers + 1
     }
 
-    /// The helper slot list a coordinator dispatches to and collects from for one
-    /// `go`.
-    fn helper_slots(&self) -> Arc<Vec<Arc<HelperSlot>>> {
-        Arc::clone(&self.slots)
+    /// The slots of the live helpers, which a coordinator dispatches to and
+    /// collects from for one `go`.
+    fn helper_slots(&self) -> &'static [HelperSlot] {
+        &HELPER_SLOTS[..self.helpers]
     }
 }
 
@@ -2413,34 +2421,35 @@ impl Drop for ThreadPool {
 }
 
 /// Which CPU each worker runs on, and which system NUMA node its private memory
-/// belongs to. Held behind an [`Arc`] so a pool rebuild can cheaply hand each
-/// helper thread a clone.
+/// belongs to, worker 0 being the per-`go` search coordinator.
 ///
-/// Both vectors are one entry per worker and are indexed by worker id, worker 0
-/// being the per-`go` search coordinator.
+/// The assignment itself is the compiled one, so the plan borrows it and adds
+/// only how many workers it covers: a small value, copied wherever a thread
+/// needs it.
+#[derive(Clone, Copy)]
 struct WorkerPlan {
-    cpus: Vec<usize>,
-    system_nodes: Vec<NumaIndex>,
+    /// One CPU per worker of the assignment, indexed by worker id.
+    cpus: &'static [usize],
+    /// The system node of each of [`Self::cpus`].
+    system_nodes: &'static [NumaIndex],
+    /// The workers the plan covers, at least one.
+    workers: usize,
 }
 
 impl WorkerPlan {
-    /// The plan for `requested` workers over the compiled assignment.
+    /// The plan for `requested` workers over the assignment `cpus` /
+    /// `system_nodes`.
     ///
     /// The assignment holds one CPU per configured worker. Asking for more than
     /// that is only reachable through the measurement command that carries its
     /// own worker count, and the extra workers wrap around onto the same CPUs —
     /// oversubscribing the CPUs this binary owns rather than spilling onto ones
     /// another binary was given.
-    fn of(cpus: &[usize], system_nodes: &[NumaIndex], requested: usize) -> Self {
-        let n = cpus.len().max(1);
-        let pick = |worker: usize| worker % n;
+    fn of(cpus: &'static [usize], system_nodes: &'static [NumaIndex], requested: usize) -> Self {
         WorkerPlan {
-            cpus: (0..requested.max(1))
-                .map(|w| cpus.get(pick(w)).copied().unwrap_or(0))
-                .collect(),
-            system_nodes: (0..requested.max(1))
-                .map(|w| system_nodes.get(pick(w)).copied().unwrap_or(0))
-                .collect(),
+            cpus,
+            system_nodes,
+            workers: requested.max(1),
         }
     }
 
@@ -2449,22 +2458,55 @@ impl WorkerPlan {
     /// pin themselves somewhere the test runner permits.
     #[cfg(test)]
     fn of_allowed_cpus(requested: usize) -> Self {
-        let cpus: Vec<usize> = yorkie_numa::startup_affinity().iter().copied().collect();
-        // The node has to be one this binary declares a region for, since a
-        // spawned helper selects its network from it.
-        let nodes = vec![config::EVAL_REGION_NODES[0]; cpus.len().max(1)];
-        Self::of(&cpus, &nodes, requested)
+        static ALLOWED: std::sync::OnceLock<(Vec<usize>, Vec<NumaIndex>)> =
+            std::sync::OnceLock::new();
+        let (cpus, nodes) = ALLOWED.get_or_init(|| {
+            let cpus: Vec<usize> = yorkie_numa::startup_affinity().iter().copied().collect();
+            // The node has to be one this binary declares a region for, since a
+            // spawned helper selects its network from it.
+            let nodes = vec![config::EVAL_REGION_NODES[0]; cpus.len().max(1)];
+            (cpus, nodes)
+        });
+        Self::of(cpus, nodes, requested)
+    }
+
+    /// Worker `worker`'s slot in the assignment, wrapping past its end.
+    fn pick(&self, worker: usize) -> usize {
+        worker % self.cpus.len().max(1)
+    }
+
+    /// The CPU worker `worker` pins itself to.
+    fn cpu(&self, worker: usize) -> usize {
+        self.cpus.get(self.pick(worker)).copied().unwrap_or(0)
+    }
+
+    /// The system node worker `worker`'s memory belongs on.
+    fn system_node(&self, worker: usize) -> NumaIndex {
+        self.system_nodes
+            .get(self.pick(worker))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Every worker's CPU, in worker order.
+    fn cpus(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.workers).map(|w| self.cpu(w))
+    }
+
+    /// Every worker's system node, in worker order.
+    fn system_nodes(&self) -> impl Iterator<Item = NumaIndex> + '_ {
+        (0..self.workers).map(|w| self.system_node(w))
     }
 
     /// The CPUs the plan uses, ascending and without repeats.
     fn distinct_cpus(&self) -> BTreeSet<usize> {
-        self.cpus.iter().copied().collect()
+        self.cpus().collect()
     }
 
     /// The system NUMA nodes the plan's workers sit on, ascending and without
     /// repeats.
     fn distinct_system_nodes(&self) -> Vec<NumaIndex> {
-        let set: BTreeSet<NumaIndex> = self.system_nodes.iter().copied().collect();
+        let set: BTreeSet<NumaIndex> = self.system_nodes().collect();
         set.into_iter().collect()
     }
 }
@@ -2514,7 +2556,7 @@ fn machine_refusal(
     if !missing.is_empty() {
         return Some(LayoutRefusal::DeniedCpus(missing));
     }
-    for (worker, (&cpu, &node)) in plan.cpus.iter().zip(&plan.system_nodes).enumerate() {
+    for (worker, (cpu, node)) in plan.cpus().zip(plan.system_nodes()).enumerate() {
         let live_node = live.system_node_of_cpu(cpu);
         if live_node != Some(node) {
             return Some(LayoutRefusal::CpuNode {
@@ -2586,7 +2628,7 @@ fn place_coordinator_histories(histories: Option<&WorkerHistories>, node: NumaIn
 ///
 /// Returns one [`Arc`] per worker, each pointing at its node's table set.
 fn build_worker_shared(plan: &WorkerPlan) -> Vec<Arc<SharedHistories>> {
-    let counts = shared_node_counts(&plan.system_nodes);
+    let counts = shared_node_counts(plan.system_nodes());
 
     let mut node_shared: std::collections::BTreeMap<NumaIndex, Arc<SharedHistories>> =
         std::collections::BTreeMap::new();
@@ -2594,10 +2636,9 @@ fn build_worker_shared(plan: &WorkerPlan) -> Vec<Arc<SharedHistories>> {
         let thread_count = count.next_power_of_two();
         // A CPU of that node: the first worker the plan puts there.
         let cpu = plan
-            .system_nodes
-            .iter()
-            .position(|&n| n == node)
-            .map(|worker| plan.cpus[worker])
+            .system_nodes()
+            .position(|n| n == node)
+            .map(|worker| plan.cpu(worker))
             .expect("every counted node holds at least one worker");
         let mut built: Option<Arc<SharedHistories>> = None;
         yorkie_numa::execute_on_cpu(cpu, || {
@@ -2606,27 +2647,19 @@ fn build_worker_shared(plan: &WorkerPlan) -> Vec<Arc<SharedHistories>> {
         node_shared.insert(node, built.expect("execute_on_cpu ran the closure"));
     }
 
-    plan.system_nodes
-        .iter()
-        .map(|node| Arc::clone(&node_shared[node]))
+    plan.system_nodes()
+        .map(|node| Arc::clone(&node_shared[&node]))
         .collect()
-}
-
-/// The helpers' share of a per-worker handle list: everything past worker 0,
-/// the coordinator, and nothing at all for a list that holds no worker.
-///
-/// The result is what a `go` hands its coordinator, so it is built where its
-/// source is and shared from there.
-fn helper_slice<T: Clone>(all: &[T]) -> Arc<Vec<T>> {
-    Arc::new(all.get(1..).unwrap_or_default().to_vec())
 }
 
 /// The node → worker-count map the shared-history construction sizes each set
 /// from. Pure — no allocation and no pinning.
-fn shared_node_counts(worker_nodes: &[NumaIndex]) -> std::collections::BTreeMap<NumaIndex, usize> {
+fn shared_node_counts(
+    worker_nodes: impl IntoIterator<Item = NumaIndex>,
+) -> std::collections::BTreeMap<NumaIndex, usize> {
     let mut counts: std::collections::BTreeMap<NumaIndex, usize> =
         std::collections::BTreeMap::new();
-    for &node in worker_nodes {
+    for node in worker_nodes {
         *counts.entry(node).or_insert(0) += 1;
     }
     counts
@@ -2656,31 +2689,27 @@ fn write_thread_allocation_information(
 }
 
 /// Thinking ahead: what the coordinator searches once it has answered, and the
-/// handles that search runs under.
+/// workers that search runs on.
 ///
 /// The engine plays a move and the opponent's clock starts; the position that
 /// move reaches is the one position certain to matter next, so the same workers
 /// keep searching it — with no limit — until the next command arrives. Nothing
 /// comes out of that search: what it leaves behind is a warm transposition
 /// table and warm history tables, which is what the next `go` starts from.
+///
+/// It runs under [`PONDER_STOP`] and raises [`PONDERING`] while it does.
 struct PonderJob {
     /// Whether this `go` is thought past at all: the `ponder` setting, and a
     /// request that was a move in a game ([`is_a_game_move`]).
     enabled: bool,
-    /// The stop flag this search runs under — see [`ActiveSearch::ponder_stop`].
-    stop: Arc<AtomicBool>,
-    /// Raised while this search runs — see [`ActiveSearch::pondering`].
-    pondering: Arc<AtomicBool>,
     /// The helper slots, dispatched to again for this search.
-    helper_slots: Arc<Vec<Arc<HelperSlot>>>,
-    /// Each helper's node-shared tables, aligned with `helper_slots`.
-    helper_shared: Arc<Vec<Arc<SharedHistories>>>,
+    helper_slots: &'static [HelperSlot],
     /// The per-worker node counters, published to as in any other search. What
     /// they hold has already been read by the reply this search follows.
     #[cfg(feature = "verbose2")]
-    node_slots: Arc<Vec<TallySlot>>,
+    node_slots: &'static [TallySlot],
     /// The per-worker best-move-change counters.
-    bmc_slots: Arc<Vec<TallySlot>>,
+    bmc_slots: &'static [TallySlot],
     /// The game's evaluation-noise seed, the same one the reply was searched
     /// under.
     #[cfg(feature = "random")]
@@ -2715,7 +2744,7 @@ impl PonderJob {
         }
         // The command that ends this search may have arrived while the reply
         // was being written, in which case there is nothing to start.
-        if self.stop.load(Ordering::Relaxed) {
+        if PONDER_STOP.load(Ordering::Relaxed) {
             return histories;
         }
         let mut root = pos.clone();
@@ -2730,7 +2759,7 @@ impl PonderJob {
             return histories;
         }
 
-        self.pondering.store(true, Ordering::Relaxed);
+        PONDERING.store(true, Ordering::Relaxed);
         #[cfg(feature = "verbose1")]
         sink.diagnostic(b"ponder start");
         // The generation is advanced exactly as it is for a `go`: this is a
@@ -2744,10 +2773,10 @@ impl PonderJob {
                 root_moves: root_moves.clone(),
                 #[cfg(feature = "verbose2")]
                 limit_depth: SEARCH_MAX_DEPTH,
-                stop: Arc::clone(&self.stop),
+                stop: &PONDER_STOP,
                 #[cfg(feature = "verbose2")]
-                node_slots: Arc::clone(&self.node_slots),
-                bmc_slots: Arc::clone(&self.bmc_slots),
+                node_slots: self.node_slots,
+                bmc_slots: self.bmc_slots,
                 index: h + 1,
                 entering_king,
                 #[cfg(feature = "verbose2")]
@@ -2756,7 +2785,6 @@ impl PonderJob {
                 random_seed: self.random_seed,
                 #[cfg(feature = "verbose2")]
                 multi_pv: self.multi_pv,
-                shared: Arc::clone(&self.helper_shared[h]),
             });
         }
 
@@ -2764,14 +2792,14 @@ impl PonderJob {
         // No clock and no ceiling: the stop flag is the whole of this search's
         // control, exactly as `go infinite` is.
         qs.set_control(SearchControl {
-            stop: Some(Arc::clone(&self.stop)),
+            stop: Some(&PONDER_STOP),
             #[cfg(feature = "verbose2")]
             node_limit: None,
             time: None,
         });
         #[cfg(feature = "verbose2")]
-        qs.set_node_tally(Arc::clone(&self.node_slots), 0);
-        qs.set_best_move_tally(Arc::clone(&self.bmc_slots), 0);
+        qs.set_node_tally(self.node_slots, 0);
+        qs.set_best_move_tally(self.bmc_slots, 0);
         qs.set_entering_king(entering_king);
         #[cfg(feature = "verbose2")]
         qs.set_mate_mode(false);
@@ -2790,8 +2818,8 @@ impl PonderJob {
         // Whatever ended this search ends the helpers with it, and each is
         // collected before the thread returns — a slot left holding a result
         // belongs to no search.
-        self.stop.store(true, Ordering::Relaxed);
-        for slot in self.helper_slots.iter() {
+        PONDER_STOP.store(true, Ordering::Relaxed);
+        for slot in self.helper_slots {
             #[cfg(feature = "verbose1")]
             crate::stats::add_search([&slot.collect()]);
             #[cfg(not(feature = "verbose1"))]
@@ -2801,7 +2829,7 @@ impl PonderJob {
         // reads "no longer thinking ahead" has already been told it stopped.
         #[cfg(feature = "verbose1")]
         sink.diagnostic(b"ponder stop");
-        self.pondering.store(false, Ordering::Relaxed);
+        PONDERING.store(false, Ordering::Relaxed);
         qs.into_histories()
     }
 }
@@ -2822,10 +2850,8 @@ struct CoordinatorJob<P: EngineSink> {
     /// coordinator has no choice to carry and always votes.
     #[cfg(feature = "verbose2")]
     use_voting: bool,
-    /// The main worker's full control (stop + node ceiling + deadlines).
+    /// The main worker's full control ([`STOP`] + node ceiling + deadlines).
     control: SearchControl,
-    /// The one shared stop flag.
-    stop: Arc<AtomicBool>,
     /// The main worker's game-scoped histories, returned to the engine on join.
     histories: WorkerHistories,
     /// The session's collection buffers, returned to the engine on join beside
@@ -2837,23 +2863,18 @@ struct CoordinatorJob<P: EngineSink> {
     /// this `go` by the engine. The aggregate node ceiling and the final
     /// aggregated `info ... nodes` are the readers, both `verbose2`.
     #[cfg(feature = "verbose2")]
-    node_slots: Arc<Vec<TallySlot>>,
+    node_slots: &'static [TallySlot],
     /// Per-worker best-move-change counters, same slot-per-worker shape and
     /// zeroed on the same terms: each worker bumps its own slot at the root and
     /// the main worker folds them all each iteration.
-    bmc_slots: Arc<Vec<TallySlot>>,
+    bmc_slots: &'static [TallySlot],
     /// The persistent helper slots to dispatch to, one per helper.
-    helper_slots: Arc<Vec<Arc<HelperSlot>>>,
-    /// Each helper's node-shared correction / pawn tables, aligned
-    /// with `helper_slots`: `helper_shared[h]` is worker `h + 1`'s
-    /// [`SharedHistories`]. Handed to the helper in its [`HelperJob`]. The main
-    /// worker's own shared handle already lives inside `histories`.
-    helper_shared: Arc<Vec<Arc<SharedHistories>>>,
+    helper_slots: &'static [HelperSlot],
     /// The active worker plan: the coordinator pins itself to worker 0's CPU and
     /// prefers that CPU's node for memory at the start of this `go`.
-    worker_plan: Arc<WorkerPlan>,
+    worker_plan: WorkerPlan,
     /// The loaded opening book to probe once, if any.
-    book: Option<Arc<LoadedBook>>,
+    book: Option<&'static LoadedBook>,
     /// `USI_OwnBook` — the master gate; when off the book is never probed.
     own_book: bool,
     /// The seed for this `go`'s book PRNG (deterministic within a session).
@@ -2931,14 +2952,12 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
         #[cfg(feature = "verbose2")]
         use_voting,
         control,
-        stop,
         histories,
         vote_buffers,
         #[cfg(feature = "verbose2")]
         node_slots,
         bmc_slots,
         helper_slots,
-        helper_shared,
         worker_plan,
         book,
         own_book,
@@ -2967,8 +2986,8 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     // coordinator respawns. The bundle in `histories` is placed separately, at
     // pool (re)build time, because it was already faulted on the command thread.
     yorkie_numa::pin_current_thread_to_cpu_with_local_memory(
-        worker_plan.cpus[0],
-        worker_plan.system_nodes[0],
+        worker_plan.cpu(0),
+        worker_plan.system_node(0),
     );
 
     // One TT generation bump per `go`, on the main worker, BEFORE any helper
@@ -3031,7 +3050,7 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     // (the on-the-fly read path is not thread-safe by design). The
     // `USI_OwnBook` gate and a loaded book are both required. On a hit we emit
     // and return without searching, holding the reply for `go infinite`.
-    if own_book && let Some(loaded) = &book {
+    if own_book && let Some(loaded) = book {
         let mut prng = Prng::new(book_seed);
         let probed = probe_book(
             &loaded.books,
@@ -3067,7 +3086,7 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
                 #[cfg(feature = "verbose2")]
                 infinite,
                 #[cfg(feature = "verbose2")]
-                &stop,
+                &STOP,
             );
             // A book move is thought past like any other: the opponent's reply
             // may leave the book, and a warm table costs nothing.
@@ -3089,10 +3108,10 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
             root_moves: root_moves.clone(),
             #[cfg(feature = "verbose2")]
             limit_depth: depth,
-            stop: Arc::clone(&stop),
+            stop: &STOP,
             #[cfg(feature = "verbose2")]
-            node_slots: Arc::clone(&node_slots),
-            bmc_slots: Arc::clone(&bmc_slots),
+            node_slots,
+            bmc_slots,
             index: h + 1,
             entering_king,
             #[cfg(feature = "verbose2")]
@@ -3101,7 +3120,6 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
             random_seed,
             #[cfg(feature = "verbose2")]
             multi_pv,
-            shared: Arc::clone(&helper_shared[h]),
         });
     }
 
@@ -3114,8 +3132,8 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     let mut qs = QSearch::with_histories(net, histories);
     qs.set_control(control);
     #[cfg(feature = "verbose2")]
-    qs.set_node_tally(Arc::clone(&node_slots), 0);
-    qs.set_best_move_tally(Arc::clone(&bmc_slots), 0);
+    qs.set_node_tally(node_slots, 0);
+    qs.set_best_move_tally(bmc_slots, 0);
     qs.set_entering_king(entering_king);
     #[cfg(feature = "verbose2")]
     qs.set_mate_mode(mate_mode);
@@ -3135,11 +3153,11 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     // `stop`, which catches the search that ended by itself — a mate found, the
     // depth ceiling reached — before one arrived.
     #[cfg(feature = "verbose2")]
-    hold_reply(&stop, infinite);
+    hold_reply(&STOP, infinite);
 
     // Signal the helpers the search is over, then wait for and collect each one.
     // They observe the shared stop at their next checkpoint and finish promptly.
-    stop.store(true, Ordering::Relaxed);
+    STOP.store(true, Ordering::Relaxed);
     let VoteBuffers {
         mut results,
         mut votes,
@@ -3148,7 +3166,7 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     // is about to be filled again.
     results.clear();
     results.push(main_result);
-    for slot in helper_slots.iter() {
+    for slot in helper_slots {
         results.push(slot.collect());
     }
     // Every worker's counts go to the interval the reply below ends.
@@ -3282,12 +3300,13 @@ mod tests {
     use super::*;
 
     use crate::usi::UsiSink;
-    use crate::{king_shuffle, serial_tt};
+    use crate::{Buffer, king_shuffle, serial_session};
 
     /// An engine writing into a buffer nothing reads back — for the state a test
-    /// drives directly rather than through a session.
-    fn idle_engine() -> Engine<UsiSink<Vec<u8>>> {
-        Engine::new(UsiSink::new(Arc::new(Mutex::new(Vec::new()))))
+    /// drives directly rather than through a session. The caller holds
+    /// [`serial_session`], since the engine's pool and flags are the process's.
+    fn idle_engine() -> Engine<UsiSink<Buffer>> {
+        Engine::new(UsiSink::new(Buffer::default()))
     }
 
     /// What a refused command must leave behind, read off the engine itself: the
@@ -3296,7 +3315,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_refused_position_leaves_the_accepted_one_in_place() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         let mut engine = idle_engine();
         engine
             .set_position(PositionSfen::StartPos, b"7g7f 3c3d")
@@ -3325,7 +3344,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_games_position_commands_reuse_the_buffers() {
-        let _tt = serial_tt();
+        let _session = serial_session();
         let mut engine = idle_engine();
         let sfen: [&[u8]; 4] = [
             b"lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL",
@@ -3370,20 +3389,23 @@ mod tests {
         String::from_utf8(out.as_bytes().to_vec()).expect("a message is ASCII")
     }
 
-    /// A plan pinning one worker to each of `cpus`, on the node `built` puts it
-    /// on.
-    fn plan_over(cpus: &[usize], built: &NumaLayout) -> WorkerPlan {
-        let nodes: Vec<NumaIndex> = cpus
-            .iter()
-            .map(|&c| built.system_node_of_cpu(c).expect("a CPU of the layout"))
-            .collect();
-        WorkerPlan::of(cpus, &nodes, cpus.len())
+    /// A plan pinning one worker to each of `cpus`, on `nodes`, which must be
+    /// the nodes `built` puts those CPUs on.
+    fn plan_over(
+        cpus: &'static [usize],
+        nodes: &'static [NumaIndex],
+        built: &NumaLayout,
+    ) -> WorkerPlan {
+        for (&cpu, &node) in cpus.iter().zip(nodes) {
+            assert_eq!(built.system_node_of_cpu(cpu), Some(node), "CPU {cpu}");
+        }
+        WorkerPlan::of(cpus, nodes, cpus.len())
     }
 
     #[test]
     fn a_machine_matching_the_compiled_layout_is_no_difference() {
         let built = layout(&[&[0, 1], &[2, 3]]);
-        let plan = plan_over(&[0, 2], &built);
+        let plan = plan_over(&[0, 2], &[0, 1], &built);
         assert_eq!(
             machine_refusal(&built, &affinity(&[0, 1, 2, 3]), &plan, &built),
             None
@@ -3393,7 +3415,7 @@ mod tests {
     #[test]
     fn a_machine_with_another_node_count_is_reported_with_both_counts() {
         let built = layout(&[&[0, 1], &[2, 3]]);
-        let plan = plan_over(&[0, 2], &built);
+        let plan = plan_over(&[0, 2], &[0, 1], &built);
         let live = layout(&[&[0, 1, 2, 3]]);
         let msg = machine_refusal(&live, &affinity(&[0, 1, 2, 3]), &plan, &built)
             .expect("one node is not two");
@@ -3405,7 +3427,7 @@ mod tests {
     #[test]
     fn a_node_holding_other_cpus_is_reported_with_both_cpu_lists() {
         let built = layout(&[&[0, 1], &[2, 3]]);
-        let plan = plan_over(&[0, 2], &built);
+        let plan = plan_over(&[0, 2], &[0, 1], &built);
         let live = layout(&[&[0, 1], &[2, 3, 4]]);
         let msg = machine_refusal(&live, &affinity(&[0, 1, 2, 3, 4]), &plan, &built)
             .expect("node 1 grew a CPU");
@@ -3422,7 +3444,7 @@ mod tests {
         // engine, whose workers would then pin themselves to CPUs they may not
         // run on. Only the CPUs it is missing are named.
         let built = layout(&[&[0, 1], &[2, 3]]);
-        let plan = plan_over(&[0, 2, 3], &built);
+        let plan = plan_over(&[0, 2, 3], &[0, 1, 1], &built);
         let msg = machine_refusal(&built, &affinity(&[0, 1]), &plan, &built)
             .expect("two of the plan's CPUs are hidden");
         let msg = refusal_message(&msg);
@@ -3446,7 +3468,7 @@ mod tests {
         // to its own CPU. An affinity holding exactly those CPUs is equally
         // fine.
         let built = layout(&[&[0, 1], &[2, 3]]);
-        let plan = plan_over(&[0, 1], &built);
+        let plan = plan_over(&[0, 1], &[0, 0], &built);
         assert_eq!(
             machine_refusal(&built, &affinity(&[0, 1, 2, 3]), &plan, &built),
             None
@@ -3463,7 +3485,7 @@ mod tests {
         // CPUs — every worker's memory would be placed on a node its CPU is not
         // on, so the machine is not the one this binary was built for.
         let built = layout(&[&[0, 1], &[2, 3]]);
-        let plan = plan_over(&[0, 2], &built);
+        let plan = plan_over(&[0, 2], &[0, 1], &built);
         let live = NumaLayout::from_const(&[&[0, 1], &[2, 3]], &[1, 0]);
         let msg = machine_refusal(&live, &affinity(&[0, 1, 2, 3]), &plan, &built)
             .expect("CPU 0 is on the other node now");
@@ -3491,8 +3513,10 @@ mod tests {
 
     #[test]
     fn thread_pool_new_sizes_to_main_plus_helpers() {
+        let _session = serial_session();
         let pool = ThreadPool::new(4);
         assert_eq!(pool.size(), 4, "4 slots = 1 main + 3 helpers");
+        drop(pool);
         let single = ThreadPool::new(1);
         assert_eq!(single.size(), 1, "1 slot = main only, no helpers");
     }
@@ -3503,6 +3527,7 @@ mod tests {
         // the next, so cycling sizes never leaks OS threads. We can only assert
         // the resulting slot count here; the no-leak property is what the join
         // in `shutdown` guarantees.
+        let _session = serial_session();
         let mut pool = ThreadPool::new(2);
         assert_eq!(pool.size(), 2);
         pool.set(1);
@@ -3515,58 +3540,57 @@ mod tests {
     }
 
     #[test]
-    fn a_go_is_handed_the_pools_own_helper_list() {
-        // Nothing about dispatching to the helpers copies the list: every `go`
-        // gets the pool's, which only a rebuild replaces.
+    fn a_go_is_handed_the_static_helper_slots() {
+        // Nothing about dispatching to the helpers builds a list: every `go`
+        // gets the session's own slots, as many as the pool has helpers.
+        let _session = serial_session();
         let mut pool = ThreadPool::new(3);
         let first = pool.helper_slots();
-        assert!(Arc::ptr_eq(&first, &pool.helper_slots()));
+        assert_eq!(first.len(), 2);
+        assert!(std::ptr::eq(first.as_ptr(), HELPER_SLOTS.as_ptr()));
         pool.set(2);
-        assert!(
-            !Arc::ptr_eq(&first, &pool.helper_slots()),
-            "a rebuilt pool hands out its new slots"
-        );
-        assert_eq!(pool.helper_slots().len(), 1);
+        assert_eq!(pool.helper_slots().len(), 1, "a rebuilt pool's helpers");
+        assert!(std::ptr::eq(
+            pool.helper_slots().as_ptr(),
+            HELPER_SLOTS.as_ptr()
+        ));
     }
 
-    // --- the handles and buffers a `go` reuses ----------------------------
+    // --- the flags, counters and buffers a `go` reuses --------------------
 
     #[test]
     fn arming_a_search_clears_what_the_last_one_left() {
-        let mut handles = SearchHandles::new(3);
-        let stop = Arc::clone(&handles.stop);
-        let bmc = Arc::clone(&handles.bmc_slots);
-        handles.stop.store(true, Ordering::Relaxed);
-        handles.ponder_stop.store(true, Ordering::Relaxed);
-        handles.pondering.store(true, Ordering::Relaxed);
-        handles.bmc_slots[2].store(9, Ordering::Relaxed);
+        let _session = serial_session();
+        STOP.store(true, Ordering::Relaxed);
+        PONDER_STOP.store(true, Ordering::Relaxed);
+        PONDERING.store(true, Ordering::Relaxed);
+        bmc_tally(3)[2].store(9, Ordering::Relaxed);
         #[cfg(feature = "verbose2")]
-        handles.node_slots[1].store(9, Ordering::Relaxed);
+        node_tally(3)[1].store(9, Ordering::Relaxed);
 
-        handles.arm();
+        arm_search(3);
 
-        assert!(!handles.stop.load(Ordering::Relaxed));
-        assert!(!handles.ponder_stop.load(Ordering::Relaxed));
-        assert!(!handles.pondering.load(Ordering::Relaxed));
+        assert!(!STOP.load(Ordering::Relaxed));
+        assert!(!PONDER_STOP.load(Ordering::Relaxed));
+        assert!(!PONDERING.load(Ordering::Relaxed));
         assert!(
-            handles
-                .bmc_slots
-                .iter()
-                .all(|s| s.load(Ordering::Relaxed) == 0),
+            bmc_tally(3).iter().all(|s| s.load(Ordering::Relaxed) == 0),
             "every best-move-change counter starts at zero"
         );
         #[cfg(feature = "verbose2")]
         assert!(
-            handles
-                .node_slots
-                .iter()
-                .all(|s| s.load(Ordering::Relaxed) == 0),
+            node_tally(3).iter().all(|s| s.load(Ordering::Relaxed) == 0),
             "every node counter starts at zero"
         );
-        assert!(
-            Arc::ptr_eq(&stop, &handles.stop) && Arc::ptr_eq(&bmc, &handles.bmc_slots),
-            "the flags and counters are cleared in place, not rebuilt"
-        );
+    }
+
+    #[test]
+    fn a_pool_hands_its_workers_one_counter_each() {
+        assert_eq!(bmc_tally(1).len(), 1);
+        assert_eq!(bmc_tally(POOL_CAPACITY).len(), POOL_CAPACITY);
+        #[cfg(feature = "verbose2")]
+        assert_eq!(node_tally(4).len(), 4);
+        assert_eq!(HELPER_SLOTS.len(), POOL_CAPACITY - 1);
     }
 
     #[test]
@@ -3584,6 +3608,7 @@ mod tests {
     fn thread_pool_zero_is_clamped_to_one() {
         // The engine never passes 0 (the option min is 1), but the pool clamps
         // defensively so `size − 1` never underflows.
+        let _session = serial_session();
         let pool = ThreadPool::new(0);
         assert_eq!(pool.size(), 1);
     }
@@ -3592,12 +3617,12 @@ mod tests {
 
     #[test]
     fn shared_node_counts_are_the_workers_per_node() {
-        let c = shared_node_counts(&[0, 1, 0, 1, 0]);
+        let c = shared_node_counts([0, 1, 0, 1, 0]);
         assert_eq!(c[&0], 3);
         assert_eq!(c[&1], 2);
 
         // Every worker on one node: one set, sized for all of them.
-        let c = shared_node_counts(&[2, 2, 2]);
+        let c = shared_node_counts([2, 2, 2]);
         assert_eq!(c.len(), 1);
         assert_eq!(c[&2], 3);
     }
@@ -3645,8 +3670,8 @@ mod tests {
         // command asking for more wraps around rather than spilling onto CPUs
         // this binary was not given.
         let plan = WorkerPlan::of(&[4, 9], &[0, 1], 5);
-        assert_eq!(plan.cpus, vec![4, 9, 4, 9, 4]);
-        assert_eq!(plan.system_nodes, vec![0, 1, 0, 1, 0]);
+        assert_eq!(plan.cpus().collect::<Vec<_>>(), vec![4, 9, 4, 9, 4]);
+        assert_eq!(plan.system_nodes().collect::<Vec<_>>(), vec![0, 1, 0, 1, 0]);
         assert_eq!(plan.distinct_cpus(), BTreeSet::from([4, 9]));
         assert_eq!(plan.distinct_system_nodes(), vec![0, 1]);
     }
@@ -3682,10 +3707,11 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_pool_rebuild_places_the_coordinator_histories_on_worker_zero_node() {
+        let _session = serial_session();
         let mut engine = idle_engine();
         engine.rebuild_pool();
 
-        let node = engine.worker_plan.system_nodes[0];
+        let node = engine.worker_plan.system_node(0);
         let regions = engine
             .histories
             .as_ref()
@@ -3727,6 +3753,7 @@ mod tests {
             "the short-circuit carry is the -VALUE_INFINITE sentinel with no tr"
         );
 
+        let _session = serial_session();
         let mut engine = idle_engine();
         // Seed distinctive "previous real search" state.
         engine.best_previous_score = 123;
@@ -3743,9 +3770,6 @@ mod tests {
         });
         engine.search = Some(ActiveSearch {
             handle,
-            stop: Arc::new(AtomicBool::new(false)),
-            ponder_stop: Arc::new(AtomicBool::new(false)),
-            pondering: Arc::new(AtomicBool::new(false)),
             game_ply: 20,
         });
         engine.finish_search_join();
@@ -3767,6 +3791,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn real_search_carry_overwrites_time_reduction() {
+        let _session = serial_session();
         let mut engine = idle_engine();
         engine.previous_time_reduction = 0.42;
 
@@ -3777,9 +3802,6 @@ mod tests {
         });
         engine.search = Some(ActiveSearch {
             handle,
-            stop: Arc::new(AtomicBool::new(false)),
-            ponder_stop: Arc::new(AtomicBool::new(false)),
-            pondering: Arc::new(AtomicBool::new(false)),
             game_ply: 3,
         });
         engine.finish_search_join();
@@ -3832,7 +3854,7 @@ mod tests {
             config::WORKER_SYSTEM_NODES,
             config::WORKER_CPUS.len() * 3 + 1,
         );
-        for node in plan.system_nodes {
+        for node in plan.system_nodes() {
             assert!(config::EVAL_REGION_NODES.contains(&node));
         }
     }

@@ -22,7 +22,6 @@ use std::num::{NonZeroI32, NonZeroU16, NonZeroU32};
 // without that feature names neither type.
 #[cfg(feature = "verbose2")]
 use std::num::NonZeroU64;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(feature = "verbose2")]
 use std::time::Duration;
@@ -371,8 +370,9 @@ impl std::ops::Deref for TallySlot {
 pub struct SearchControl {
     /// Shared abort flag, set asynchronously by the driver on `stop` / `quit`
     /// and polled at the `CHECK_INTERVAL` granularity. `None` (the default)
-    /// means no external stop is possible.
-    pub stop: Option<Arc<AtomicBool>>,
+    /// means no external stop is possible. A flag outlives every search that
+    /// polls it, so the driver keeps it in a `static`.
+    pub stop: Option<&'static AtomicBool>,
     /// Hard node ceiling (`go nodes N`): abort once the node counter reaches it.
     /// `go nodes` and the `NodesLimit` config key, its only two sources, are
     /// both `verbose2`; without that feature a search is bounded by its clock,
@@ -581,22 +581,27 @@ pub struct QSearch<N: NetworkParams> {
     /// on the single-worker path; under Lazy-SMP the shared per-worker slot
     /// takes its place, so the main worker can sum every worker's count.
     best_move_changes: f64,
-    /// Lazy-SMP shared node counters: one slot per worker plus this worker's
-    /// index. Each checkpoint publishes to its own slot, and the main worker's
-    /// node ceiling sums them, reproducing `threads.nodes_searched()`. `None`
-    /// on the single-worker path, where `self.nodes` is authoritative.
+    /// Lazy-SMP shared node counters, one slot per worker, from this worker's
+    /// own slot (always the first here) to the pool's last — the whole pool for
+    /// the main worker. Each checkpoint publishes to its own slot, and the main
+    /// worker's node ceiling sums them, reproducing `threads.nodes_searched()`.
+    /// `None` on the single-worker path, where `self.nodes` is authoritative.
     ///
     /// The aggregate has two readers, the node ceiling and the `nodes` field of
     /// a search `info` line, and both are `verbose2`; the search itself decides
     /// on this worker's own [`Self::nodes`], never on the sum.
+    ///
+    /// A slice and nothing else, so the field is as wide as the handle it
+    /// stands for and every field laid out after it keeps its offset; which
+    /// worker this is lives in [`Self::main_tally`].
     #[cfg(feature = "verbose2")]
-    node_tally: Option<(Arc<Vec<TallySlot>>, usize)>,
-    /// Lazy-SMP shared best-move-change counters, in the same slot-per-worker
-    /// shape as `node_tally`. Every worker adds to its own slot; only
-    /// the main worker folds *every* slot into `totBestMoveChanges` and zeroes
-    /// them, at each iteration end. Relaxed atomics, because the reference's
-    /// cross-thread reads here are benign races.
-    best_move_tally: Option<(Arc<Vec<TallySlot>>, usize)>,
+    node_tally: Option<&'static [TallySlot]>,
+    /// Lazy-SMP shared best-move-change counters, in the same shape as
+    /// `node_tally`. Every worker adds to its own slot; only the main worker
+    /// folds *every* slot into `totBestMoveChanges` and zeroes them, at each
+    /// iteration end. Relaxed atomics, because the reference's cross-thread
+    /// reads here are benign races.
+    best_move_tally: Option<&'static [TallySlot]>,
 
     /// `pvIdx` — the current MultiPV line index. Read at the root by the
     /// interior-search hooks; `0` on the first line, so those hooks are no-ops
@@ -655,6 +660,10 @@ pub struct QSearch<N: NetworkParams> {
     /// offset and no search ever redraws one mid-game.
     #[cfg(feature = "random")]
     random_seed: u64,
+    /// Whether this worker's tallies start at the pool's first slot — the main
+    /// worker, which alone reads every slot. Declared last, so it takes a byte
+    /// of the struct's tail rather than moving a field before it.
+    main_tally: bool,
 }
 
 /// The result one worker's iterative deepening produces, consumed by
@@ -919,6 +928,7 @@ impl<N: NetworkParams> QSearch<N> {
             #[cfg(feature = "verbose2")]
             node_tally: None,
             best_move_tally: None,
+            main_tally: false,
             #[cfg(feature = "verbose2")]
             pv_idx: 0,
             #[cfg(feature = "verbose2")]
@@ -1015,14 +1025,17 @@ impl<N: NetworkParams> QSearch<N> {
     /// `go nodes N` ceiling can sum every worker's count (the reference
     /// `threads.nodes_searched()`). Leave unset for the single-worker path.
     #[cfg(feature = "verbose2")]
-    pub fn set_node_tally(&mut self, slots: Arc<Vec<TallySlot>>, index: usize) {
-        self.node_tally = Some((slots, index));
+    pub fn set_node_tally(&mut self, slots: &'static [TallySlot], index: usize) {
+        self.node_tally = Some(&slots[index..]);
+        self.main_tally = index == 0;
     }
 
-    /// Install the Lazy-SMP shared best-move-change counters. Leave unset for
-    /// the single-worker path, where `best_move_changes` carries the count.
-    pub fn set_best_move_tally(&mut self, slots: Arc<Vec<TallySlot>>, index: usize) {
-        self.best_move_tally = Some((slots, index));
+    /// Install the Lazy-SMP shared best-move-change counters, in the same
+    /// shape as the node counters (`verbose2`). Leave unset for the single-worker
+    /// path, where `best_move_changes` carries the count.
+    pub fn set_best_move_tally(&mut self, slots: &'static [TallySlot], index: usize) {
+        self.best_move_tally = Some(&slots[index..]);
+        self.main_tally = index == 0;
     }
 
     /// Install the raw `MultiPV` option value for this `go`. Every worker gets
@@ -1073,10 +1086,12 @@ impl<N: NetworkParams> QSearch<N> {
     /// (`worker.threads.nodes_searched()`). With a tally installed, sum every
     /// worker's published slot; without one (single worker), this worker's own
     /// `nodes` is the whole search, so the two forms agree bit-for-bit.
+    ///
+    /// Only the main worker is given a ceiling, and its tally is the whole pool.
     #[cfg(feature = "verbose2")]
     fn counted_nodes(&self) -> u64 {
-        match &self.node_tally {
-            Some((slots, _)) => slots.iter().map(|s| s.load(Ordering::Relaxed)).sum(),
+        match self.node_tally {
+            Some(slots) => slots.iter().map(|s| s.load(Ordering::Relaxed)).sum(),
             None => self.nodes,
         }
     }
@@ -1086,9 +1101,9 @@ impl<N: NetworkParams> QSearch<N> {
     /// helper reaches this too, but takes the no-op arm and leaves its slot for
     /// the main worker to read and clear.
     fn fold_best_move_changes(&mut self, tot: &mut f64) {
-        match &self.best_move_tally {
-            Some((slots, 0)) => {
-                for s in slots.iter() {
+        match self.best_move_tally {
+            Some(slots) if self.main_tally => {
+                for s in slots {
                     *tot += s.swap(0, Ordering::Relaxed) as f64;
                 }
             }
@@ -1121,8 +1136,8 @@ impl<N: NetworkParams> QSearch<N> {
         // rather than per node. Inert (no slot) on the single-worker path, and
         // absent entirely where neither reader of the sum exists.
         #[cfg(feature = "verbose2")]
-        if let Some((slots, idx)) = &self.node_tally {
-            slots[*idx].store(self.nodes, Ordering::Relaxed);
+        if let Some(slots) = self.node_tally {
+            slots[0].store(self.nodes, Ordering::Relaxed);
         }
 
         // The external stop flag (GUI `stop` / `gameover`, the coordinator's
@@ -2381,16 +2396,16 @@ impl<N: NetworkParams> QSearch<N> {
     /// `self.nodes`.
     ///
     /// Only the PV-output path reads it — the `go nodes N` ceiling has its own
-    /// [`Self::counted_nodes`] — so it is compiled only where a PV is printed.
+    /// [`Self::counted_nodes`] — so it is compiled only where a PV is printed,
+    /// and only the main worker prints one: its tally is the whole pool, its
+    /// own slot first.
     #[cfg(feature = "verbose2")]
     fn aggregate_nodes(&self) -> u64 {
-        match &self.node_tally {
-            Some((slots, idx)) => {
+        match self.node_tally {
+            Some(slots) => {
                 let mut total = self.nodes;
-                for (i, s) in slots.iter().enumerate() {
-                    if i != *idx {
-                        total += s.load(Ordering::Relaxed);
-                    }
+                for s in slots.iter().skip(1) {
+                    total += s.load(Ordering::Relaxed);
                 }
                 total
             }
@@ -3759,9 +3774,9 @@ impl<N: NetworkParams> QSearch<N> {
                     #[cfg(not(feature = "verbose2"))]
                     let counts = move_count > 1;
                     if counts {
-                        match &self.best_move_tally {
-                            Some((slots, idx)) => {
-                                slots[*idx].fetch_add(1, Ordering::Relaxed);
+                        match self.best_move_tally {
+                            Some(slots) => {
+                                slots[0].fetch_add(1, Ordering::Relaxed);
                             }
                             None => self.best_move_changes += 1.0,
                         }
@@ -5019,14 +5034,15 @@ mod tests {
         let _tt = fresh_tt();
 
         // Four workers; the main worker (slot 0) folds them all.
-        let slots: Arc<Vec<TallySlot>> = Arc::new((0..4).map(|_| TallySlot::new()).collect());
+        static SLOTS: [TallySlot; 4] = [const { TallySlot::new() }; 4];
+        let slots: &'static [TallySlot] = &SLOTS;
         slots[0].store(2, Ordering::Relaxed);
         slots[1].store(3, Ordering::Relaxed);
         slots[2].store(0, Ordering::Relaxed);
         slots[3].store(5, Ordering::Relaxed);
 
         let mut main = QSearch::new(net.network());
-        main.set_best_move_tally(Arc::clone(&slots), 0);
+        main.set_best_move_tally(slots, 0);
         let mut tot = 1.0; // a pre-existing aged statistic is added to, not replaced
         main.fold_best_move_changes(&mut tot);
         assert_eq!(tot, 1.0 + 10.0, "main folds every worker's count (2+3+0+5)");
@@ -5037,7 +5053,7 @@ mod tests {
         // A helper (slot != 0) neither folds nor resets — the main worker owns that.
         slots[1].store(7, Ordering::Relaxed);
         let mut helper = QSearch::new(net.network());
-        helper.set_best_move_tally(Arc::clone(&slots), 1);
+        helper.set_best_move_tally(slots, 1);
         let mut htot = 4.0;
         helper.fold_best_move_changes(&mut htot);
         assert_eq!(htot, 4.0, "a helper folds nothing");

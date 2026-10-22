@@ -35,7 +35,7 @@ fn info_lines(out: &str) -> Vec<&str> {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn search_output_is_bestmove_only_below_verbose2() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     // --- Part 1: the initialisation phase, which no feature gates. ---
     //
     // No network at the package-root working directory, so `isready` fails the

@@ -78,7 +78,7 @@ fn bestmove_indices(out: &str) -> Vec<usize> {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn every_reply_reports_the_allocations_of_its_own_interval() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     stage_configured_eval_dir();
     let out = drive(
         "usi\n\
@@ -124,7 +124,7 @@ fn every_reply_reports_the_allocations_of_its_own_interval() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_searched_reply_reports_its_nodes_and_table_updates() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     stage_configured_eval_dir();
     let out = drive(
         "usi\n\
@@ -175,7 +175,7 @@ fn a_single_threaded_replys_nodes_are_its_last_info_lines() {
     use yorkie_protocol::config;
 
     assert_eq!(config::THREADS, 1, "this pins a single-threaded search");
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     stage_configured_eval_dir();
     let h = StreamHarness::start();
     h.send("usi");
@@ -213,7 +213,7 @@ fn a_single_threaded_replys_nodes_are_its_last_info_lines() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_reply_that_starts_no_search_still_reports_its_interval() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     // No network staged for this session — the working directory is wherever the
     // previous test left it, so this asserts only the shape a `bestmove` line
     // comes in, not which move it is.
@@ -317,7 +317,7 @@ mod value_marks {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_repetition_behind_the_played_move_marks_the_reply() {
-        let _tt = common::serial_tt();
+        let _session = common::serial_session();
         let h = ready_harness();
         search(
             &h,
@@ -338,7 +338,7 @@ mod value_marks {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_declaration_marks_the_reply_it_is() {
-        let _tt = common::serial_tt();
+        let _session = common::serial_session();
         let h = ready_harness();
         search(
             &h,
@@ -364,7 +364,7 @@ mod value_marks {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_reply_past_the_move_limit_marks_it() {
-        let _tt = common::serial_tt();
+        let _session = common::serial_session();
         let horizon = config::MAX_MOVES_TO_DRAW;
         let h = ready_harness();
         search(&h, &format!("position sfen {TWO_KINGS_AT_PLY_60}"), 2);
@@ -384,7 +384,7 @@ mod value_marks {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn a_reply_that_met_no_rule_prints_the_line_unchanged() {
-        let _tt = common::serial_tt();
+        let _session = common::serial_session();
         let h = ready_harness();
         search(&h, "position startpos", 2);
         let out = h.quit_join();

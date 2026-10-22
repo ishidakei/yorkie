@@ -112,7 +112,7 @@ fn assert_no_search_after_the_reply(h: &StreamHarness, why: &str) {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_clocked_go_is_followed_by_a_search_the_next_command_ends() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     let h = start_ready();
     h.send("position startpos");
     h.send(GAME_CLOCK);
@@ -162,7 +162,7 @@ fn a_clocked_go_is_followed_by_a_search_the_next_command_ends() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_fixed_depth_or_node_go_is_not_followed_by_a_search() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     let h = start_ready();
     h.send("position startpos");
     h.send("go depth 2");
@@ -185,7 +185,7 @@ fn a_fixed_depth_or_node_go_is_not_followed_by_a_search() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_search_that_proves_a_mate_ends_by_itself_and_says_nothing() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     let h = start_ready();
     h.send(&format!("position sfen {MATED_IN_2_BLACK}"));
     h.send(GAME_CLOCK);
@@ -221,7 +221,7 @@ fn a_search_that_proves_a_mate_ends_by_itself_and_says_nothing() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn stop_ends_the_search_after_a_reply_and_emits_nothing() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     let h = start_ready();
     h.send("position startpos");
     h.send(GAME_CLOCK);
@@ -248,7 +248,7 @@ fn stop_ends_the_search_after_a_reply_and_emits_nothing() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn gameover_ends_the_search_after_a_reply() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     let h = start_ready();
     h.send("position startpos");
     h.send(GAME_CLOCK);
@@ -271,7 +271,7 @@ fn gameover_ends_the_search_after_a_reply() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn quit_ends_the_search_after_a_reply() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     let h = start_ready();
     h.send("position startpos");
     h.send(GAME_CLOCK);
@@ -285,7 +285,7 @@ fn quit_ends_the_search_after_a_reply() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn isready_answers_after_the_search_has_ended() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     let h = start_ready();
     h.send("position startpos");
     h.send(GAME_CLOCK);
@@ -316,7 +316,7 @@ fn isready_answers_after_the_search_has_ended() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_resigned_position_is_not_searched_past() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     let h = start_ready();
     h.send(&format!("position sfen {MATED_BLACK}"));
     h.send(GAME_CLOCK);
@@ -329,7 +329,7 @@ fn a_resigned_position_is_not_searched_past() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_declared_win_is_not_searched_past() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     assert_eq!(
         config::ENTERING_KING_RULE,
         "CSARule27",
@@ -348,7 +348,7 @@ fn a_declared_win_is_not_searched_past() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_mating_move_is_not_searched_past() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     let h = start_ready();
     h.send(&format!("position sfen {MATE_IN_1_BLACK}"));
     h.send(GAME_CLOCK);
@@ -372,7 +372,7 @@ fn a_mating_move_is_not_searched_past() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_go_ponder_is_answered_like_a_plain_go_and_ponderhit_changes_nothing() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     let h = start_ready();
     h.send("position startpos");
     h.send("go ponder btime 1000 wtime 1000");

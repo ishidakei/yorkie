@@ -16,9 +16,8 @@ mod common;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 
-use common::stage_configured_eval_dir;
+use common::{Transcript, stage_configured_eval_dir};
 use yorkie_protocol::{UsiEngine, config};
 
 /// The CPUs this build's workers are pinned to.
@@ -37,12 +36,12 @@ fn compiled_cpus() -> BTreeSet<usize> {
 /// Drive a session as a process allowed on `cpus` alone, against the network
 /// `eval_root` holds.
 fn drive_confined(input: &str, cpus: BTreeSet<usize>, eval_root: PathBuf) -> String {
-    let output = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let driver = UsiEngine::new(input.as_bytes(), Arc::clone(&output))
+    let output = Transcript::default();
+    let driver = UsiEngine::new(input.as_bytes(), output.clone())
         .with_startup_affinity(cpus)
         .with_eval_root(eval_root);
     driver.run().expect("driver run");
-    String::from_utf8(output.lock().expect("output lock").clone()).expect("utf-8")
+    output.text()
 }
 
 /// The directory the staged network sits under, which the driver reads
@@ -58,7 +57,7 @@ fn staged_eval_root() -> PathBuf {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_start_denied_a_workers_cpu_is_refused() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     let workers = worker_cpus();
     let allowed: BTreeSet<usize> = compiled_cpus().difference(&workers).copied().collect();
     if allowed.is_empty() {
@@ -86,7 +85,7 @@ fn a_start_denied_a_workers_cpu_is_refused() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_start_confined_to_exactly_the_workers_cpus_readies() {
-    let _tt = common::serial_tt();
+    let _session = common::serial_session();
     // The narrowest confinement that still leaves every worker its seat: nothing
     // beyond the assignment is needed, since each worker narrows itself to one
     // CPU anyway.

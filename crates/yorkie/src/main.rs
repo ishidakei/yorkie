@@ -2,10 +2,9 @@ use std::ffi::OsString;
 use std::io::{BufReader, Write as _, stdin, stdout};
 use std::os::unix::ffi::OsStrExt as _;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
 
 use yorkie::perft;
-use yorkie_protocol::UsiEngine;
+use yorkie_protocol::{Stdout, UsiEngine};
 use yorkie_state::text::{TextWriter, atoi_u32};
 use yorkie_state::{Position, parse_sfen, parse_usi_move};
 
@@ -45,11 +44,9 @@ fn main() -> ExitCode {
 /// Run what `args` asks for, or write why it cannot into `message`.
 fn dispatch(args: &[&[u8]], message: &mut TextWriter<'_>) -> Result<(), ()> {
     let Some((&cmd, rest)) = args.split_first() else {
-        // The reader stays on the main thread; the writer is shared with the
-        // search worker, so it must be `Send + 'static` — use the owned `Stdout`
-        // handle (a `StdoutLock` is not `Send`) behind an `Arc<Mutex<_>>`.
-        let writer = Arc::new(Mutex::new(stdout()));
-        return UsiEngine::new(BufReader::new(stdin()), writer)
+        // The reader stays on the main thread; the search worker writes its own
+        // lines, through the process's standard output like the main thread.
+        return UsiEngine::new(BufReader::new(stdin()), Stdout)
             .run()
             .map_err(|e| {
                 message.bytes(b"usi session i/o error: errno ");
