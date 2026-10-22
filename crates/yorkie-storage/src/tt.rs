@@ -411,7 +411,7 @@ impl TTEntry {
     /// expression and `Default::default` is not one. Every other build states
     /// the table's zeros to the assembler and needs no initialiser at all; the
     /// unit tests build clusters of their own from it.
-    #[cfg(any(miri, all(test, feature = "verbose1")))]
+    #[cfg(any(miri, test))]
     const fn empty() -> TTEntry {
         TTEntry {
             key: AtomicTteKey::new(0),
@@ -495,7 +495,7 @@ impl Cluster {
     /// An empty cluster: the all-zero bit pattern the table starts as. Needed
     /// only where the table is a Rust `static` — see [`TTEntry::empty`] — and
     /// by the unit tests that store into a cluster of their own.
-    #[cfg(any(miri, all(test, feature = "verbose1")))]
+    #[cfg(any(miri, test))]
     const fn empty() -> Cluster {
         Cluster {
             entry: [const { TTEntry::empty() }; CLUSTER_SIZE],
@@ -542,10 +542,22 @@ impl Cluster {
     /// are written exactly when the payload is, and left alone when the
     /// replacement condition declines the store.
     ///
-    /// `updates` is the storing thread's own count of stores that wrote the
-    /// payload, raised by one when this one does. A store that only rewrites
-    /// the move leaves it alone. The table is shared, so the count lives with
-    /// the caller rather than in here.
+    /// A store that would leave the entry as it is skips its writes: the move
+    /// is written only when it differs from the one there, and the payload
+    /// only when at least one of its fields does. A write of an equal value
+    /// changes nothing a reader can see, but it still takes the cache line for
+    /// writing and invalidates every other core's copy of it. The payload is
+    /// skipped whole or written whole, never field by field, so a skip cannot
+    /// leave the key of one store beside another store's fields: the entry
+    /// either keeps what a concurrent writer put there since the loads above,
+    /// which is what an unskipped store landing before that writer's would
+    /// also have left, or receives this store's fields as before.
+    ///
+    /// `updates` is the storing thread's own count of stores whose replacement
+    /// condition held, raised by one when this one's does, whether or not any
+    /// field then differed. A store that only rewrites the move leaves it
+    /// alone. The table is shared, so the count lives with the caller rather
+    /// than in here.
     #[inline]
     #[expect(clippy::too_many_arguments)]
     fn save(
@@ -571,10 +583,16 @@ impl Cluster {
         let old_key = entry.key.load(REL);
         let old_depth8 = entry.depth8.load(REL);
         let old_gen_bound8 = entry.gen_bound8.load(REL);
+        let old_move16 = entry.move16.load(REL);
+        let old_value16 = entry.value16.load(REL);
+        let old_eval16 = entry.eval16.load(REL);
+        #[cfg(all(feature = "verbose3", not(feature = "tt-entry16")))]
+        let old_marks = self.marks(slot);
 
         // Preserve the old move if we don't have a new one for this position.
-        if m.is_some() || !key_matches(old_key, k) {
-            entry.move16.store(m.map_or(0, NonZeroU16::get), REL);
+        let new_move16 = m.map_or(0, NonZeroU16::get);
+        if (m.is_some() || !key_matches(old_key, k)) && new_move16 != old_move16 {
+            entry.move16.store(new_move16, REL);
         }
 
         // The depth comparison is in `i32` to match the reference's `int`
@@ -588,16 +606,24 @@ impl Cluster {
             debug_assert!(d - DEPTH_NONE < 256);
             debug_assert!(curr_generation <= GENERATION_MASK);
 
-            entry.key.store(k, REL);
-            entry.depth8.store((d - DEPTH_NONE) as u8, REL);
-            entry.gen_bound8.store(
-                curr_generation | (b as u8) << BOUND_SHIFT | (pv as u8) << PV_SHIFT,
-                REL,
-            );
-            entry.value16.store(v as i16, REL);
-            entry.eval16.store(ev as i16, REL);
+            let depth8 = (d - DEPTH_NONE) as u8;
+            let gen_bound8 = curr_generation | (b as u8) << BOUND_SHIFT | (pv as u8) << PV_SHIFT;
+            let payload_unchanged = old_key == k
+                && old_depth8 == depth8
+                && old_gen_bound8 == gen_bound8
+                && old_value16 == v as i16
+                && old_eval16 == ev as i16;
             #[cfg(all(feature = "verbose3", not(feature = "tt-entry16")))]
-            self.set_marks(slot, marks);
+            let payload_unchanged = payload_unchanged && old_marks == marks;
+            if !payload_unchanged {
+                entry.key.store(k, REL);
+                entry.depth8.store(depth8, REL);
+                entry.gen_bound8.store(gen_bound8, REL);
+                entry.value16.store(v as i16, REL);
+                entry.eval16.store(ev as i16, REL);
+                #[cfg(all(feature = "verbose3", not(feature = "tt-entry16")))]
+                self.set_marks(slot, marks);
+            }
             #[cfg(feature = "verbose1")]
             {
                 *updates += 1;
@@ -1230,6 +1256,262 @@ mod static_table_tests {
     }
 }
 
+#[cfg(test)]
+mod save_tests {
+    //! What an entry holds after a store. A store skips the writes that would
+    //! leave the entry as it is, and the entry must end up exactly as a store
+    //! that writes unconditionally leaves it. Each test stores into clusters of
+    //! its own, so nothing here touches the shared table.
+
+    use super::*;
+
+    /// One store's arguments, all into slot 0.
+    #[derive(Clone, Copy)]
+    struct Store {
+        k: TteKey,
+        v: Value,
+        pv: bool,
+        b: Bound,
+        d: Depth,
+        m: u16,
+        ev: Value,
+        generation: u8,
+        #[cfg(feature = "verbose3")]
+        marks: ValueMarks,
+    }
+
+    /// Two positions' stored keys, both non-zero so neither matches an empty
+    /// entry.
+    fn this() -> TteKey {
+        tte_key(0x0123_4567_89ab_cdef)
+    }
+    fn other() -> TteKey {
+        tte_key(0x0fed_cba9_8765_4321)
+    }
+
+    /// `this()` at depth 10 in generation 0, with move 7.
+    fn base() -> Store {
+        Store {
+            k: this(),
+            v: 100,
+            pv: false,
+            b: Bound::Lower,
+            d: 10,
+            m: 7,
+            ev: 50,
+            generation: 0,
+            #[cfg(feature = "verbose3")]
+            marks: ValueMarks::NONE,
+        }
+    }
+
+    fn save(cluster: &Cluster, s: Store) {
+        #[cfg(feature = "verbose1")]
+        let mut updates = 0;
+        cluster.save(
+            0,
+            s.k,
+            s.v,
+            s.pv,
+            s.b,
+            s.d,
+            NonZeroU16::new(s.m),
+            s.ev,
+            s.generation,
+            #[cfg(feature = "verbose3")]
+            s.marks,
+            #[cfg(feature = "verbose1")]
+            &mut updates,
+        );
+    }
+
+    /// The store with no comparison against the entry's contents: the move is
+    /// written whenever the store carries one or the entry holds another
+    /// position, and every payload field whenever the replacement condition
+    /// holds.
+    fn save_unconditionally(cluster: &Cluster, s: Store) {
+        #[cfg(all(feature = "verbose3", feature = "tt-entry16"))]
+        let k = s.k | (s.marks.bits() as TteKey) << MARK_SHIFT;
+        #[cfg(not(all(feature = "verbose3", feature = "tt-entry16")))]
+        let k = s.k;
+        let entry = &cluster.entry[0];
+        let old_key = entry.key.load(REL);
+        let old_depth8 = entry.depth8.load(REL);
+        let old_gen_bound8 = entry.gen_bound8.load(REL);
+        if s.m != 0 || !key_matches(old_key, k) {
+            entry.move16.store(s.m, REL);
+        }
+        if s.b == Bound::Exact
+            || !key_matches(old_key, k)
+            || s.d - DEPTH_NONE + 2 * s.pv as Depth > old_depth8 as Depth - 4
+            || relative_age(old_gen_bound8, s.generation) != 0
+        {
+            entry.key.store(k, REL);
+            entry.depth8.store((s.d - DEPTH_NONE) as u8, REL);
+            entry.gen_bound8.store(
+                s.generation | (s.b as u8) << BOUND_SHIFT | (s.pv as u8) << PV_SHIFT,
+                REL,
+            );
+            entry.value16.store(s.v as i16, REL);
+            entry.eval16.store(s.ev as i16, REL);
+            #[cfg(all(feature = "verbose3", not(feature = "tt-entry16")))]
+            cluster.set_marks(0, s.marks);
+        }
+    }
+
+    /// Every stored bit of a cluster: each entry's six fields, then the marks
+    /// word where the layout has one (0 where it does not).
+    type Contents = (Vec<(TteKey, u8, u8, u16, i16, i16)>, u16);
+
+    fn contents(cluster: &Cluster) -> Contents {
+        let entries = cluster
+            .entry
+            .iter()
+            .map(|e| {
+                (
+                    e.key.load(REL),
+                    e.depth8.load(REL),
+                    e.gen_bound8.load(REL),
+                    e.move16.load(REL),
+                    e.value16.load(REL),
+                    e.eval16.load(REL),
+                )
+            })
+            .collect();
+        #[cfg(all(feature = "verbose3", not(feature = "tt-entry16")))]
+        let marks = cluster.marks.load(REL);
+        #[cfg(not(all(feature = "verbose3", not(feature = "tt-entry16"))))]
+        let marks = 0;
+        (entries, marks)
+    }
+
+    /// Store `first` and then `second` into two empty clusters, one through
+    /// [`Cluster::save`] and one through [`save_unconditionally`], checking
+    /// after each store that the two hold the same. Returns the first cluster
+    /// and its contents from before `second`.
+    fn check(first: Store, second: Store) -> (Cluster, Contents) {
+        let skipping = Cluster::empty();
+        let unconditional = Cluster::empty();
+        save(&skipping, first);
+        save_unconditionally(&unconditional, first);
+        assert_eq!(contents(&skipping), contents(&unconditional));
+        let before = contents(&skipping);
+        save(&skipping, second);
+        save_unconditionally(&unconditional, second);
+        assert_eq!(contents(&skipping), contents(&unconditional));
+        (skipping, before)
+    }
+
+    /// Depth 1 is stored as 4, which does not beat 13 − 4 in the same
+    /// generation, so these stores rewrite the move at most.
+    #[test]
+    fn an_unchanged_move_with_a_declined_payload_leaves_the_entry_alone() {
+        let (cluster, before) = check(base(), Store { d: 1, ..base() });
+        assert_eq!(contents(&cluster), before);
+    }
+
+    #[test]
+    fn a_changed_move_with_a_declined_payload_writes_the_move_alone() {
+        let (cluster, _) = check(
+            base(),
+            Store {
+                d: 1,
+                m: 9,
+                ..base()
+            },
+        );
+        let data = cluster.read(0);
+        assert_eq!(data.move16, NonZeroU16::new(9));
+        assert_eq!(data.depth, 10);
+    }
+
+    #[test]
+    fn a_store_without_a_move_keeps_the_positions_move() {
+        let (cluster, _) = check(
+            base(),
+            Store {
+                m: 0,
+                d: 11,
+                ..base()
+            },
+        );
+        let data = cluster.read(0);
+        assert_eq!(data.move16, NonZeroU16::new(7));
+        assert_eq!(data.depth, 11);
+    }
+
+    #[test]
+    fn an_unchanged_payload_leaves_the_entry_alone() {
+        let (cluster, before) = check(base(), base());
+        assert_eq!(contents(&cluster), before);
+    }
+
+    #[test]
+    fn a_payload_that_differs_in_one_field_is_written() {
+        let variants = [
+            Store { v: 101, ..base() },
+            Store { pv: true, ..base() },
+            Store {
+                b: Bound::Upper,
+                ..base()
+            },
+            Store {
+                b: Bound::Exact,
+                ..base()
+            },
+            Store { d: 11, ..base() },
+            Store { ev: 51, ..base() },
+            Store {
+                generation: 1,
+                ..base()
+            },
+            #[cfg(feature = "verbose3")]
+            Store {
+                marks: ValueMarks::from_bits(0b101),
+                ..base()
+            },
+        ];
+        for (i, second) in variants.into_iter().enumerate() {
+            let (cluster, before) = check(base(), second);
+            assert_ne!(contents(&cluster), before, "variant {i}");
+            let data = cluster.read(0);
+            assert_eq!(data.value, second.v, "variant {i}");
+            assert_eq!(data.eval, second.ev, "variant {i}");
+            assert_eq!(data.depth, second.d, "variant {i}");
+            assert_eq!(data.bound, second.b, "variant {i}");
+            assert_eq!(data.is_pv, second.pv, "variant {i}");
+            #[cfg(feature = "verbose3")]
+            assert_eq!(data.marks, second.marks, "variant {i}");
+        }
+    }
+
+    #[test]
+    fn a_store_into_another_positions_entry_replaces_it() {
+        for (first_move, second_move) in [(7, 9), (7, 7), (7, 0), (0, 0)] {
+            let (cluster, _) = check(
+                Store {
+                    m: first_move,
+                    ..base()
+                },
+                Store {
+                    k: other(),
+                    d: 1,
+                    m: second_move,
+                    ..base()
+                },
+            );
+            assert!(key_matches(cluster.entry[0].key.load(REL), other()));
+            let data = cluster.read(0);
+            assert_eq!(
+                data.move16,
+                NonZeroU16::new(second_move),
+                "moves {first_move}, {second_move}"
+            );
+            assert_eq!(data.depth, 1, "moves {first_move}, {second_move}");
+        }
+    }
+}
+
 #[cfg(all(test, feature = "verbose1"))]
 mod store_count_tests {
     //! The two counts a `verbose1` build takes at a store: whether the store
@@ -1336,6 +1618,17 @@ mod store_count_tests {
     fn a_store_over_an_older_generation_counts() {
         let cluster = holding_depth_10();
         assert_eq!(store(&cluster, this(), false, Bound::Lower, 0, 0, 0, 1), 1);
+    }
+
+    /// A store whose replacement condition holds counts even when every field
+    /// it would write already holds that value and nothing is written.
+    #[test]
+    fn a_store_of_an_unchanged_payload_counts() {
+        let cluster = holding_depth_10();
+        assert_eq!(
+            store(&cluster, this(), false, Bound::Lower, 10, 7, 50, 0),
+            1
+        );
     }
 
     #[test]
