@@ -657,13 +657,16 @@ impl Position {
             board_key: self.board_key,
             plies_from_null: prev.plies_from_null + 1,
             continuous_check,
-            // Filled in by `store_current_repetition` below.
+            // Filled in by `store_current_repetition` below; left at zero under
+            // `quick_draw`, whose check reads no stored verdict.
             repetition: 0,
             repetition_times: 0,
             repetition_type: RepetitionState::None,
         });
 
-        self.store_current_repetition();
+        if !crate::config::QUICK_DRAW {
+            self.store_current_repetition();
+        }
 
         undo
     }
@@ -937,11 +940,64 @@ impl Position {
     /// earlier occurrence lies after the search root, while a forced fourfold —
     /// carrying a negative `repetition` — always passes, so it is seen even when
     /// it sits entirely in the game history before the root.
+    ///
+    /// Under `quick_draw` the verdict is `quick_repetition`'s instead, which
+    /// counts the second occurrence within 16 plies, and `ply` is not read.
     pub fn is_repetition(&self, ply: u16) -> RepetitionState {
+        if crate::config::QUICK_DRAW {
+            return self.quick_repetition();
+        }
         match self.history.last() {
             Some(s) if s.repetition != 0 && s.repetition < ply as i32 => s.repetition_type,
             _ => RepetitionState::None,
         }
+    }
+
+    /// The repetition verdict that counts a position's second occurrence: walk
+    /// back `min(16, plies_from_null)` plies in steps of two and classify the
+    /// nearest earlier occurrence, wherever it lies relative to the search root.
+    ///
+    /// Nothing is read from the stored repetition fields, so the verdict does
+    /// not depend on how often the position occurred before, and a cycle that
+    /// is perpetual check from one occurrence to the next is a perpetual-check
+    /// verdict even if an earlier cycle was not.
+    pub(crate) fn quick_repetition(&self) -> RepetitionState {
+        let end = MAX_REPETITION_PLY.min(self.current_plies_from_null());
+        if end < 4 {
+            return RepetitionState::None;
+        }
+
+        let stm = self.side_to_move;
+        let cc_stm = self.current_continuous_check(stm);
+        let cc_opp = self.current_continuous_check(stm.flip());
+
+        let mut i = 4i32;
+        while i <= end {
+            if let Some(prev) = self.state_back(i as usize)
+                && prev.board_key == self.board_key
+            {
+                if prev.hands == self.hands {
+                    return if i <= cc_stm {
+                        RepetitionState::Lose
+                    } else if i <= cc_opp {
+                        RepetitionState::Win
+                    } else {
+                        RepetitionState::Draw
+                    };
+                }
+                let cur_hand = &self.hands[stm.index()];
+                let prev_hand = &prev.hands[stm.index()];
+                if hand_is_equal_or_superior(cur_hand, prev_hand) {
+                    return RepetitionState::Superior;
+                }
+                if hand_is_equal_or_superior(prev_hand, cur_hand) {
+                    return RepetitionState::Inferior;
+                }
+            }
+            i += 2;
+        }
+
+        RepetitionState::None
     }
 }
 
@@ -1794,10 +1850,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn is_repetition_lose_when_side_to_move_is_perpetual_checker() {
-        // A Black rook oscillates giving check to a shuffling White king, and
-        // the position returns to the root after four plies with Black to move.
+    /// A Black rook oscillates giving check to a shuffling White king, and the
+    /// position returns to the root after four plies with Black to move.
+    fn perpetual_check_by_side_to_move() -> Position {
         let mut p = Position::empty();
         let bk = Piece::new(PieceKind::King, Color::Black);
         let wk = Piece::new(PieceKind::King, Color::White);
@@ -1816,18 +1871,13 @@ mod tests {
         p.do_move(Move::make(k0, k1, wk)); // White: king escapes to K1
         p.do_move(Move::make(b, a, br)); // Black: rook B→A, checks WK@K1
         p.do_move(Move::make(k1, k0, wk)); // White: king back to K0 (== root)
-
-        assert_eq!(
-            p.is_repetition(16),
-            RepetitionState::Lose,
-            "the perpetually-checking side to move must be classified LOSE",
-        );
+        p
     }
 
-    #[test]
-    fn is_repetition_win_when_opponent_is_perpetual_checker() {
-        // The mirror of the LOSE case: a White rook perpetually checks a
-        // shuffling Black king, and the position recurs with Black to move.
+    /// The mirror of [`perpetual_check_by_side_to_move`]: a White rook
+    /// perpetually checks a shuffling Black king, and the position recurs with
+    /// Black to move.
+    fn perpetual_check_by_opponent() -> Position {
         let mut p = Position::empty();
         let bk = Piece::new(PieceKind::King, Color::Black);
         let wk = Piece::new(PieceKind::King, Color::White);
@@ -1846,9 +1896,22 @@ mod tests {
         p.do_move(Move::make(b, a, wr)); // White: rook B→A, checks BK@K1
         p.do_move(Move::make(k1, k0, bk)); // Black: king back to K0
         p.do_move(Move::make(a, b, wr)); // White: rook A→B, checks BK@K0 (== root)
+        p
+    }
 
+    #[test]
+    fn is_repetition_lose_when_side_to_move_is_perpetual_checker() {
         assert_eq!(
-            p.is_repetition(16),
+            perpetual_check_by_side_to_move().is_repetition(16),
+            RepetitionState::Lose,
+            "the perpetually-checking side to move must be classified LOSE",
+        );
+    }
+
+    #[test]
+    fn is_repetition_win_when_opponent_is_perpetual_checker() {
+        assert_eq!(
+            perpetual_check_by_opponent().is_repetition(16),
             RepetitionState::Win,
             "the checked side to move must be classified WIN",
         );
@@ -2065,6 +2128,86 @@ mod tests {
             RepetitionState::Draw,
             "four real plies past the null restore detection",
         );
+    }
+
+    #[test]
+    fn quick_repetition_reports_the_second_occurrence_without_a_ply_gate() {
+        let mut p = setup_king_shuffle_pos();
+        for m in shuffle_cycle() {
+            p.do_move(m);
+        }
+        // The default check gates this twofold on the search ply; the quick one
+        // takes no ply, so an occurrence at or before the root counts too.
+        assert_eq!(p.is_repetition(4), RepetitionState::None);
+        assert_eq!(p.quick_repetition(), RepetitionState::Draw);
+
+        // A further occurrence is classified the same way, from the nearest
+        // earlier one alone.
+        for m in shuffle_cycle() {
+            p.do_move(m);
+        }
+        assert_eq!(p.quick_repetition(), RepetitionState::Draw);
+    }
+
+    #[test]
+    fn quick_repetition_classifies_perpetual_check_on_the_second_occurrence() {
+        assert_eq!(
+            perpetual_check_by_side_to_move().quick_repetition(),
+            RepetitionState::Lose,
+        );
+        assert_eq!(
+            perpetual_check_by_opponent().quick_repetition(),
+            RepetitionState::Win,
+        );
+    }
+
+    #[test]
+    fn quick_repetition_classifies_superior_and_inferior_hands() {
+        let filler = superiority_state(9, 9);
+        let superior = assemble(
+            superiority_board(),
+            &[
+                filler.clone(),
+                filler.clone(),
+                filler.clone(),
+                superiority_state(1, 0),
+            ],
+            superiority_state(0, 1),
+        );
+        assert_eq!(superior.quick_repetition(), RepetitionState::Superior);
+
+        let inferior = assemble(
+            superiority_board(),
+            &[
+                filler.clone(),
+                filler.clone(),
+                filler,
+                superiority_state(0, 1),
+            ],
+            superiority_state(1, 0),
+        );
+        assert_eq!(inferior.quick_repetition(), RepetitionState::Inferior);
+    }
+
+    #[test]
+    fn quick_repetition_looks_back_at_most_sixteen_plies() {
+        // The fillers stand on a different board, so the only earlier
+        // occurrence is the root, `len` plies back.
+        let mut other = superiority_board();
+        other.set(Square::new(0, 8).unwrap(), None);
+        other.set(
+            Square::new(1, 8).unwrap(),
+            Some(Piece::new(PieceKind::King, Color::Black)),
+        );
+        let filler = make_state(other, [Hand::empty(), Hand::empty()], Color::Black, false);
+        let with_root_back = |plies: usize| {
+            let mut states = vec![filler.clone(); plies - 1];
+            states.push(superiority_state(0, 0));
+            assemble(superiority_board(), &states, superiority_state(0, 0))
+        };
+
+        assert_eq!(with_root_back(16).quick_repetition(), RepetitionState::Draw);
+        assert_eq!(with_root_back(18).quick_repetition(), RepetitionState::None);
     }
 
     #[cfg_attr(miri, ignore)]

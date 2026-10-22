@@ -74,6 +74,8 @@ max_moves_to_draw = 50
 
 flatten_winning_mate = false
 
+quick_draw = false
+
 pv_interval = 0
 
 # DIFFERENCE: false in test.toml. Each PV is collected from the transposition

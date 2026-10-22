@@ -64,6 +64,11 @@ max_moves_to_draw = 0
 # search spends its time on nothing else.
 flatten_winning_mate = true
 
+# DIFFERENCE: false in default.toml. A line that returns to a recent position
+# is cut there, which spends the search on lines that make progress; the game
+# rule is unchanged.
+quick_draw = true
+
 pv_interval = 300
 consideration_mode = false
 output_fail_lh_pv = true
