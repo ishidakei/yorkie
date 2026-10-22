@@ -1,0 +1,111 @@
+# The config of the engines a self-play measurement plays: many games at once
+# on one machine, each engine process confined to a logical CPU of its own by
+# whatever starts it. Select it with the `YORKIE_CONFIG` environment variable:
+#
+#     YORKIE_CONFIG=configs/tune.toml cargo build --release
+#
+# Every value is `configs/tournament.toml`'s, so what is measured is how the
+# engine plays a rated game, except the ones marked DIFFERENCE, which say why at
+# their own key.
+#
+# The schema and its rules are identical to `configs/default.toml`, which carries
+# the per-key commentary.
+
+# ---------------------------------------------------------------------------
+# Engine core
+# ---------------------------------------------------------------------------
+
+# DIFFERENCE: 1024 in tournament.toml. Many engines share the machine's memory,
+# two per game being played, and a fast game fills a small table anyway.
+usi_hash = 64
+
+threads = 1
+multi_pv = 1
+original_eval_dir = "eval"
+eval_dir = "eval"
+fv_scale = 16
+
+# DIFFERENCE: "auto" in tournament.toml. Every process of one binary would pin
+# its worker to the same CPU, so two games of it could not run side by side.
+# Nothing is pinned here; the process that starts each engine confines it to a
+# CPU of its own.
+cpu_assignment = "none"
+
+# DIFFERENCE: ".yorkie-cpu-ledger" in tournament.toml. A build that pins nothing
+# takes nothing from a ledger.
+cpu_ledger = ""
+numa_nodes = "auto"
+
+# DIFFERENCE: true in tournament.toml. A search that runs on the opponent's time
+# would take the CPU from the opponent's engine whenever the two share one, and
+# makes no two runs alike.
+ponder = false
+
+# ---------------------------------------------------------------------------
+# Opening book
+# ---------------------------------------------------------------------------
+
+book_options_v2 = false
+usi_own_book = true
+narrow_book = false
+book_moves = 16
+book_ignore_rate = 0
+book_file = "no_book"
+book_dir = "book"
+yorkie_book_files = []
+book_eval_diff = 30
+book_eval_black_diff = 0
+book_eval_white_diff = 0
+book_eval_black_limit = 0
+book_eval_white_limit = -140
+book_depth_limit = 16
+book_depth_black_limit = 0
+book_depth_white_limit = 5
+book_on_the_fly = false
+consider_book_move_count = false
+book_pv_moves = 8
+ignore_book_ply = false
+flipped_book = true
+
+# ---------------------------------------------------------------------------
+# Search behaviour
+# ---------------------------------------------------------------------------
+
+entering_king_rule = "CSARule27"
+depth_limit = 0
+nodes_limit = 0
+max_moves_to_draw = 0
+flatten_winning_mate = true
+quick_draw = true
+
+# DIFFERENCE: 300 in tournament.toml. A match build prints no search `info`
+# line, so this changes nothing in a game. A build of this config carrying the
+# feature that prints them reports every iteration, which is what lets two such
+# builds' fixed-node output be compared line for line: a throttle makes which
+# iterations print depend on how fast the machine ran them.
+pv_interval = 0
+consideration_mode = false
+output_fail_lh_pv = true
+draw_value_black = -2
+draw_value_white = -2
+resign_value = 99999
+generate_all_legal_moves = false
+random = 0
+
+# ---------------------------------------------------------------------------
+# Time management
+# ---------------------------------------------------------------------------
+
+# DIFFERENCE: 120 / 1120 / 2000 in tournament.toml. The engines talk to a
+# process on the same machine, not to a server across a network, and the time
+# controls a measurement plays are a second or two a game: margins sized for a
+# network would leave no time to think at all.
+network_delay = 20
+network_delay2 = 100
+minimum_thinking_time = 100
+
+slow_mover = 100
+
+# DIFFERENCE: true in tournament.toml. With it on, every move thinks at least a
+# whole second, which the clock of a game a second or two long cannot pay for.
+round_up_to_full_second = false

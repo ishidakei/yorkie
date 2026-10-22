@@ -24,7 +24,9 @@ multi_pv = 3
 original_eval_dir = "eval"
 eval_dir = "eval"
 fv_scale = 16
-cpu_assignment = "0"
+# DIFFERENCE: "0" in test.toml. No worker is pinned, so the readiness check asks
+# nothing of the process's affinity and nothing is placed on a NUMA node.
+cpu_assignment = "none"
 cpu_ledger = ""
 numa_nodes = "auto"
 ponder = false

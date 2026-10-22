@@ -349,6 +349,105 @@ fn auto_without_a_ledger_is_a_build_error() {
     assert!(err.contains("`cpu_ledger` is empty"), "message: {err}");
 }
 
+// --- No pinning ------------------------------------------------------------
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn none_takes_no_cpu_and_leaves_the_ledger_alone() {
+    let m = two_node_machine();
+    let path = ledger_path("none");
+
+    // Every CPU of the machine is already another build's: `"none"` still
+    // builds, since it takes none of them, and adds no line.
+    take_cpus(&request("auto", "", 8), &m, &path, &identity("/build/a")).expect("takes them all");
+    let before = std::fs::read_to_string(&path).expect("the ledger was written");
+    assert_eq!(
+        take_cpus(&request("none", "", 4), &m, &path, &identity("/build/b")).expect("pins none"),
+        Vec::<usize>::new()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the ledger is still there"),
+        before,
+        "`none` adds no line"
+    );
+
+    let absent = ledger_path("none-no-ledger");
+    take_cpus(&request("none", "", 1), &m, &absent, &identity("/build/c")).expect("pins none");
+    assert!(!absent.exists(), "no ledger was created");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn none_still_refuses_more_workers_than_the_machine_has() {
+    let m = two_node_machine();
+    let err = take_cpus(
+        &request("none", "", 9),
+        &m,
+        &ledger_path("none-too-many"),
+        &identity("/build/a"),
+    )
+    .expect_err("nine workers on eight CPUs");
+    assert!(err.contains("`threads` = 9 exceeds"), "{err}");
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn none_generates_no_cpu_and_one_node_per_worker() {
+    // Resolved against the machine running the test, whose first node is the
+    // one every worker of an unpinned build names.
+    let resolved = resolve_cpu_assignment(
+        &request("none", "", 2),
+        &identity("/build/a"),
+        Path::new("/repo"),
+    )
+    .expect("an unpinned build needs no ledger");
+    let items = &resolved.items;
+    assert!(
+        items.contains("pub const WORKERS_PINNED: bool = false;"),
+        "{items}"
+    );
+    assert!(
+        items.contains("pub const WORKER_CPUS: &[usize] = &[];"),
+        "{items}"
+    );
+    let nodes_line = items
+        .lines()
+        .find(|l| l.starts_with("pub const WORKER_SYSTEM_NODES"))
+        .expect("the node table is generated");
+    let (_, values) = nodes_line.split_once("= &[").expect("an array");
+    let first = values
+        .split([',', ']'])
+        .next()
+        .expect("a first entry")
+        .trim();
+    assert_eq!(
+        nodes_line,
+        format!("pub const WORKER_SYSTEM_NODES: &[usize] = &[{first}, {first}];"),
+        "every worker names the same node"
+    );
+    assert!(
+        items.contains(&format!(
+            "pub const EVAL_REGION_NODES: &[usize] = &[{first}];"
+        )),
+        "one evaluation region: {items}"
+    );
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_pinned_assignment_says_it_is_pinned() {
+    let items = render_cpu_assignment(&[3, 1], &[0, 0]);
+    assert!(
+        items.contains("pub const WORKERS_PINNED: bool = true;"),
+        "{items}"
+    );
+    assert!(
+        items.contains("pub const WORKER_CPUS: &[usize] = &[3, 1];"),
+        "{items}"
+    );
+}
+
 #[cfg_attr(miri, ignore)]
 #[test]
 fn an_explicit_list_the_machine_refuses_is_a_build_error() {

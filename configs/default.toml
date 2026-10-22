@@ -72,6 +72,13 @@ fv_scale = 16
 # ledger and appears in none: it says which CPUs this binary runs on, and keeping
 # it clear of the other builds on the machine is the business of whoever wrote
 # it.
+#
+# `"none"` pins no worker at all, for measurement builds only: it consults and
+# writes no ledger, places no memory on a NUMA node of its own accord, and
+# `isready` asks nothing of the process's CPU affinity. Every process of such a
+# binary runs wherever whatever started it allows — which is what lets many
+# processes of one binary share a machine, each confined to its own CPU with
+# `taskset`. Pinning never changes what the search computes, only where it runs.
 cpu_assignment = "auto"
 
 # The file recording which CPUs each build on the same machine took: one build per

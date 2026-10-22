@@ -77,9 +77,10 @@ enum Kind {
     /// built on another by accident.
     NodeCount,
     /// Which logical CPU each worker is pinned to: the string `"auto"` for a
-    /// pick made from the CPUs no earlier build on the same machine has taken, or an
-    /// explicit CPU list. Either way the chosen CPUs are generated as constants
-    /// and recorded in the ledger.
+    /// pick made from the CPUs no earlier build on the same machine has taken
+    /// and recorded in the ledger, an explicit CPU list, or `"none"` for no
+    /// pinning at all. The chosen CPUs, none for `"none"`, are generated as
+    /// constants.
     CpuAssignment,
     /// A list of files, each with a selection weight: an array of
     /// `{ file = "<name>", weight = <n> }` tables, generated as
@@ -146,7 +147,7 @@ enum Layout<'a> {
 /// taken against, and how many workers want a CPU.
 #[allow(dead_code)]
 struct AssignmentRequest<'a> {
-    /// The `cpu_assignment` value: `"auto"` or an explicit CPU list.
+    /// The `cpu_assignment` value: `"auto"`, `"none"` or an explicit CPU list.
     spec: &'a str,
     /// The `cpu_ledger` value, as the config wrote it.
     ledger: &'a str,
@@ -942,7 +943,8 @@ fn generate(
                         label,
                         entry.line,
                         &format!(
-                            "`{}` must be \"auto\" or a CPU list such as \"0,2,4-7\", got {}",
+                            "`{}` must be \"auto\", \"none\" or a CPU list such as \"0,2,4-7\", \
+                             got {}",
                             spec.key,
                             value.type_name()
                         ),
@@ -1028,7 +1030,7 @@ fn expected(kind: &Kind) -> &'static str {
         Kind::Bool => "a boolean",
         Kind::Text | Kind::Choice(_) => "a string",
         Kind::NodeCount => "an integer or \"auto\"",
-        Kind::CpuAssignment => "\"auto\" or a CPU list",
+        Kind::CpuAssignment => "\"auto\", \"none\" or a CPU list",
         Kind::WeightedFiles => "an array of `{ file = \"<name>\", weight = <n> }` tables",
     }
 }

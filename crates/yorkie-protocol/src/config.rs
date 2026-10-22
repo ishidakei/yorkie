@@ -49,10 +49,11 @@ const _: () = assert!(
     "both layout tables are indexed by node, so both are NUMA_NODES long"
 );
 const _: () = assert!(
-    WORKER_CPUS.len() == THREADS as usize,
-    "one worker, one CPU: the assignment covers exactly the configured workers"
+    WORKER_CPUS.len() == if WORKERS_PINNED { THREADS as usize } else { 0 },
+    "one worker, one CPU: the assignment covers exactly the configured workers, \
+     and an unpinned build names none"
 );
 const _: () = assert!(
-    WORKER_SYSTEM_NODES.len() == WORKER_CPUS.len(),
-    "both worker tables are indexed by worker id"
+    WORKER_SYSTEM_NODES.len() == THREADS as usize,
+    "the worker node table is indexed by worker id"
 );

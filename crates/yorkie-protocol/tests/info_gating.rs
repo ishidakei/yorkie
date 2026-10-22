@@ -88,6 +88,7 @@ fn search_output_is_bestmove_only_below_verbose2() {
             .iter()
             .filter(|l| {
                 l.starts_with("info string workers on CPUs ")
+                    || **l == "info string workers unpinned"
                     || l.starts_with("info string transposition table: ")
                     || l.starts_with("info string evaluation network: ")
             })
@@ -102,10 +103,13 @@ fn search_output_is_bestmove_only_below_verbose2() {
         // binary's workers sit on, as one node the table prefers or the several
         // it is interleaved over. Which of the two this build gets depends on
         // its CPU assignment and the layout it was built for, so the assertion
-        // accepts either and insists that one is named.
+        // accepts either and insists that one is named. A build that pins no
+        // worker has no node to name and says so instead.
         assert!(
             placement[1].contains("; preferred on node ")
-                || placement[1].contains("; interleave on nodes "),
+                || placement[1].contains("; interleave on nodes ")
+                || (!yorkie_protocol::config::WORKERS_PINNED
+                    && placement[1].contains("; no node policy;")),
             "the placement line says what the pages were given, got {:?} in:\n{out}",
             placement[1]
         );
@@ -114,7 +118,9 @@ fn search_output_is_bestmove_only_below_verbose2() {
         // node the workers read it from.
         assert!(
             placement[2].contains("; one shared mapping;")
-                || placement[2].contains("; one copy on "),
+                || placement[2].contains("; one copy on ")
+                || (!yorkie_protocol::config::WORKERS_PINNED
+                    && placement[2].contains("; one copy, no node policy,")),
             "the network line says where the parameters went, got {:?} in:\n{out}",
             placement[2]
         );

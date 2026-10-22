@@ -1757,16 +1757,19 @@ mod tests {
              bench 1 2 1 current movetime\n\
              quit\n",
         );
-        // Prefix matches: the CPU list the line ends with is the host's.
-        assert!(out.contains("info string Using 1 thread on CPUs "), "{out}");
-        assert!(
-            out.contains("info string Using 4 threads on CPUs "),
-            "{out}"
-        );
-        assert!(
-            out.contains("info string Using 2 threads on CPUs "),
-            "{out}"
-        );
+        // Prefix matches: the CPU list the line ends with is the host's. A
+        // build that pins no worker names no CPU.
+        let place = if crate::config::WORKERS_PINNED {
+            "on CPUs "
+        } else {
+            "unpinned"
+        };
+        for pool in ["1 thread ", "4 threads ", "2 threads "] {
+            assert!(
+                out.contains(&format!("info string Using {pool}{place}")),
+                "{out}"
+            );
+        }
     }
 
     /// A pool runs on `static` flags, counters and helper slots of a fixed size,

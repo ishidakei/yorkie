@@ -9,6 +9,10 @@
 //! usual: that is what a set of engines pinned to individual CPUs of one
 //! many-core machine relies on.
 //!
+//! A build with `cpu_assignment = "none"` pins no worker, so no confinement takes
+//! anything from it: it readies under any `taskset` at all, which is what lets
+//! many processes of that one binary share a machine.
+//!
 //! The confinement is presented to the driver rather than imposed on the test
 //! process, which shares its CPUs with the rest of the suite.
 
@@ -58,6 +62,10 @@ fn staged_eval_root() -> PathBuf {
 #[test]
 fn a_start_denied_a_workers_cpu_is_refused() {
     let _session = common::serial_session();
+    if !config::WORKERS_PINNED {
+        eprintln!("skipped: this build pins no worker, so no confinement denies one a CPU");
+        return;
+    }
     let workers = worker_cpus();
     let allowed: BTreeSet<usize> = compiled_cpus().difference(&workers).copied().collect();
     if allowed.is_empty() {
@@ -86,6 +94,10 @@ fn a_start_denied_a_workers_cpu_is_refused() {
 #[test]
 fn a_start_confined_to_exactly_the_workers_cpus_readies() {
     let _session = common::serial_session();
+    if !config::WORKERS_PINNED {
+        eprintln!("skipped: this build pins no worker, so it has no CPUs to be confined to");
+        return;
+    }
     // The narrowest confinement that still leaves every worker its seat: nothing
     // beyond the assignment is needed, since each worker narrows itself to one
     // CPU anyway.
@@ -105,6 +117,47 @@ fn a_start_confined_to_exactly_the_workers_cpus_readies() {
         )),
         "the session names the CPUs it plays on, got: {out:?}"
     );
+}
+
+/// Confined to a single CPU — each of the machine's lowest and highest in turn,
+/// so every CPU but one is hidden and a worker's CPU is among the hidden ones
+/// whenever a worker has one — a session readies exactly when no worker is
+/// pinned to a hidden CPU: always, in a build that pins none.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_single_cpu_confinement_readies_unless_it_hides_a_workers_cpu() {
+    let _session = common::serial_session();
+    let compiled = compiled_cpus();
+    if compiled.len() < 2 {
+        eprintln!("skipped: a one-CPU machine has no confinement that hides a CPU");
+        return;
+    }
+    let ends = [
+        *compiled.first().expect("non-empty"),
+        *compiled.last().expect("non-empty"),
+    ];
+    for cpu in ends {
+        let allowed = BTreeSet::from([cpu]);
+        let out = drive_confined("isready\nquit\n", allowed.clone(), staged_eval_root());
+        let readies = !config::WORKERS_PINNED || worker_cpus().is_subset(&allowed);
+        assert_eq!(
+            out.contains("readyok"),
+            readies,
+            "confined to CPU {cpu}, pinned = {}: {out:?}",
+            config::WORKERS_PINNED
+        );
+        assert_eq!(
+            out.contains("info string NUMA layout mismatch:"),
+            !readies,
+            "a session that does not ready says why: {out:?}"
+        );
+        if !config::WORKERS_PINNED {
+            assert!(
+                out.contains("info string workers unpinned"),
+                "an unpinned build says so: {out:?}"
+            );
+        }
+    }
 }
 
 /// A CPU list in the shortened sysfs form, as the notice above writes it.

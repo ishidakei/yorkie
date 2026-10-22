@@ -7,7 +7,9 @@
 // took; an explicit CPU list names them outright and touches no ledger, so
 // whoever writes such a list is the one keeping it clear of the other builds on
 // the machine. Either way the choice is made once, when the binary is built, and
-// nothing at run time revisits it.
+// nothing at run time revisits it. `"none"` is the third form: no worker is
+// pinned and no ledger is touched, so any number of processes of the one binary
+// can share a machine, each placed by whatever runs it.
 //
 // Split from `build_config.rs` because this is the part that consults the
 // machine and the ledger rather than the config file, and split from
@@ -30,6 +32,9 @@ struct Machine {
     domains: Vec<L3Domain>,
     layout: yorkie_numa::NumaLayout,
 }
+
+/// The `cpu_assignment` value that pins no worker.
+const UNPINNED: &str = "none";
 
 /// Which build a ledger line belongs to.
 ///
@@ -240,6 +245,7 @@ fn explicit_cpus(
 ///
 /// An explicit list is the other case, and it neither opens nor writes the
 /// ledger: the CPUs are the ones written down, held against the machine only.
+/// `"none"` takes no CPU at all and leaves the ledger alone too.
 fn take_cpus(
     request: &AssignmentRequest,
     machine: &Machine,
@@ -256,6 +262,9 @@ fn take_cpus(
         ));
     }
 
+    if request.spec == UNPINNED {
+        return Ok(Vec::new());
+    }
     if request.spec != "auto" {
         return explicit_cpus(request.spec, machine, threads);
     }
@@ -339,6 +348,9 @@ impl Drop for LedgerLock {
 }
 
 /// The generated items naming the assigned CPUs and the node each one sits on.
+///
+/// An unpinned build has no CPUs to name, so `cpus` is empty while
+/// `system_nodes` still holds one node per worker.
 fn render_cpu_assignment(cpus: &[CpuIndex], system_nodes: &[NumaIndex]) -> String {
     let list = |v: &[usize]| {
         v.iter()
@@ -348,6 +360,12 @@ fn render_cpu_assignment(cpus: &[CpuIndex], system_nodes: &[NumaIndex]) -> Strin
     };
     format!(
         "
+/// Whether every worker thread pins itself to a CPU of its own. `false` only
+/// under `cpu_assignment = \"none\"`, where [`WORKER_CPUS`] is empty: no
+/// worker is pinned, nothing places memory on a node, and `isready` asks
+/// nothing of the process's affinity.
+pub const WORKERS_PINNED: bool = {pinned};
+
 /// The logical CPU every worker thread pins itself to, indexed by worker id:
 /// `{shape}`.
 ///
@@ -355,17 +373,24 @@ fn render_cpu_assignment(cpus: &[CpuIndex], system_nodes: &[NumaIndex]) -> Strin
 /// worker runs. Worker 0 is the search coordinator.
 pub const WORKER_CPUS: &[usize] = &[{cpus}];
 
-/// The system NUMA node of each worker's CPU, aligned with [`WORKER_CPUS`].
+/// The system NUMA node of each worker's CPU, one per worker, indexed like
+/// [`WORKER_CPUS`].
 ///
 /// This is what the per-worker memory placement and the shared tables are keyed
-/// by, and `isready` holds it against the running machine before a game.
+/// by, and `isready` holds it against the running machine before a game. An
+/// unpinned build names the machine's first node for every worker: the node
+/// whose evaluation region and shared tables they all use, with nothing placing
+/// memory there.
 pub const WORKER_SYSTEM_NODES: &[usize] = &[{nodes}];
 {regions}",
-        shape = format_cpu_list({
+        pinned = !cpus.is_empty(),
+        shape = if cpus.is_empty() {
+            "none".to_string()
+        } else {
             let mut sorted = cpus.to_vec();
             sorted.sort_unstable();
-            sorted
-        }),
+            format_cpu_list(sorted)
+        },
         cpus = list(cpus),
         nodes = list(system_nodes),
         regions = render_eval_regions(system_nodes),
@@ -463,10 +488,14 @@ fn resolve_cpu_assignment(
     };
 
     let cpus = take_cpus(request, &machine, &ledger, identity)?;
-    let system_nodes: Vec<NumaIndex> = cpus
-        .iter()
-        .map(|&cpu| machine.layout.system_node_of_cpu(cpu).unwrap_or(0))
-        .collect();
+    let system_nodes: Vec<NumaIndex> = if request.spec == UNPINNED {
+        let first = machine.layout.system_nodes.first().copied().unwrap_or(0);
+        vec![first; usize::try_from(request.threads).unwrap_or(1).max(1)]
+    } else {
+        cpus.iter()
+            .map(|&cpu| machine.layout.system_node_of_cpu(cpu).unwrap_or(0))
+            .collect()
+    };
     Ok(ResolvedAssignment {
         items: render_cpu_assignment(&cpus, &system_nodes),
     })

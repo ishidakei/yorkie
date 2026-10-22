@@ -910,7 +910,7 @@ impl<P: EngineSink> Engine<P> {
         // The coordinator's bundle is built (and filled) right here, on the
         // command thread — so place it explicitly; see
         // `place_coordinator_histories`.
-        place_coordinator_histories(histories.as_ref(), worker_plan.system_node(0));
+        place_coordinator_histories(histories.as_ref(), &worker_plan);
         let yorkie_choices = settings
             .yorkie_book_files()
             .iter()
@@ -1130,6 +1130,9 @@ impl<P: EngineSink> Engine<P> {
                     addr, span, &nodes,
                 )));
             }
+            TablePlacement::ProcessPolicy => {
+                out.bytes(b"no node policy");
+            }
         }
         let huge = yorkie_storage::advise_huge_pages(addr, span);
         out.bytes(b"; huge pages ").bytes(outcome(huge));
@@ -1163,7 +1166,7 @@ impl<P: EngineSink> Engine<P> {
         // faulted on the command thread, so re-assert their placement for the fresh
         // assignment. Helpers need nothing here: they are respawned and each
         // allocates its own bundle on-thread after pinning.
-        place_coordinator_histories(self.histories.as_ref(), self.worker_plan.system_node(0));
+        place_coordinator_histories(self.histories.as_ref(), &self.worker_plan);
         self.pool
             .set_with_binding(requested, self.worker_plan, &self.worker_shared);
         // The coordinator's collection buffers are sized by the worker count,
@@ -1395,12 +1398,17 @@ impl<P: EngineSink> Engine<P> {
         // Which CPUs this binary plays on. An operator running several engines
         // on one machine has to be able to see, from the engine itself, that
         // each got the CPUs meant for it — so the line is an
-        // initialisation-phase notice, present in every build.
+        // initialisation-phase notice, present in every build. A build that
+        // pins nothing says so, since its CPUs are whatever runs it allows.
         {
             let mut bytes = [0u8; NOTICE_BYTES];
             let mut out = TextWriter::new(&mut bytes);
-            out.bytes(b"workers on CPUs ");
-            write_cpu_list(&self.worker_plan.distinct_cpus(), &mut out);
+            if self.worker_plan.pinned() {
+                out.bytes(b"workers on CPUs ");
+                write_cpu_list(&self.worker_plan.distinct_cpus(), &mut out);
+            } else {
+                out.bytes(b"workers unpinned");
+            }
             self.sink.notice(out.as_bytes())?;
         }
         // The machine is the one the binary was built for, so the workers'
@@ -1494,14 +1502,23 @@ impl<P: EngineSink> Engine<P> {
                 .bytes(b"one shared mapping; huge pages ")
                 .bytes(outcome(huge));
         } else {
-            notice.bytes(b"one copy on ");
+            let pinned = self.worker_plan.pinned();
+            notice.bytes(if pinned {
+                &b"one copy on "[..]
+            } else {
+                &b"one copy, "[..]
+            });
             for (slot, node) in config::EVAL_REGION_NODES.iter().copied().enumerate() {
                 if slot != 0 {
                     notice.bytes(b"; ");
                 }
                 let (addr, span) = network_file::region_backing(slot);
-                notice.bytes(b"node ").u64(node as u64).byte(b' ');
-                notice.bytes(outcome(mempolicy::migrate_region_to_node(addr, span, node)));
+                if pinned {
+                    notice.bytes(b"node ").u64(node as u64).byte(b' ');
+                    notice.bytes(outcome(mempolicy::migrate_region_to_node(addr, span, node)));
+                } else {
+                    notice.bytes(b"no node policy");
+                }
                 let huge = yorkie_storage::advise_huge_pages(addr, span);
                 // SAFETY: as the shared mapping above.
                 let w = unsafe { network_file::load_into_region(slot, path)? };
@@ -2606,7 +2623,7 @@ impl ThreadPool {
             let shared = shared.get(worker_id).map(Arc::clone);
             self.handles.push(std::thread::spawn(move || {
                 let node = plan.system_node(worker_id);
-                yorkie_numa::pin_current_thread_to_cpu_with_local_memory(plan.cpu(worker_id), node);
+                pin_worker(&plan, worker_id);
                 // The one place this helper's node becomes the network type its
                 // search is compiled for. Once per thread, before it parks.
                 with_eval_network!(node, |net| helper_loop(net, slot, shared));
@@ -2656,9 +2673,14 @@ impl Drop for ThreadPool {
 /// The assignment itself is the compiled one, so the plan borrows it and adds
 /// only how many workers it covers: a small value, copied wherever a thread
 /// needs it.
+///
+/// A plan with no CPUs is an unpinned build's: no worker is pinned and nothing
+/// is placed on a node, so every worker runs wherever the process may and its
+/// memory follows the process's own policy.
 #[derive(Clone, Copy)]
 struct WorkerPlan {
-    /// One CPU per worker of the assignment, indexed by worker id.
+    /// One CPU per worker of the assignment, indexed by worker id; empty when
+    /// the build pins nothing.
     cpus: &'static [usize],
     /// The system node of each of [`Self::cpus`].
     system_nodes: &'static [NumaIndex],
@@ -2700,14 +2722,20 @@ impl WorkerPlan {
         Self::of(cpus, nodes, requested)
     }
 
-    /// Worker `worker`'s slot in the assignment, wrapping past its end.
-    fn pick(&self, worker: usize) -> usize {
-        worker % self.cpus.len().max(1)
+    /// Whether the workers pin themselves to CPUs at all.
+    fn pinned(&self) -> bool {
+        !self.cpus.is_empty()
     }
 
-    /// The CPU worker `worker` pins itself to.
-    fn cpu(&self, worker: usize) -> usize {
-        self.cpus.get(self.pick(worker)).copied().unwrap_or(0)
+    /// Worker `worker`'s slot in the assignment, wrapping past its end.
+    fn pick(&self, worker: usize) -> usize {
+        worker % self.system_nodes.len().max(1)
+    }
+
+    /// The CPU worker `worker` pins itself to, or `None` in a build that pins
+    /// nothing.
+    fn cpu(&self, worker: usize) -> Option<usize> {
+        self.cpus.get(self.pick(worker)).copied()
     }
 
     /// The system node worker `worker`'s memory belongs on.
@@ -2718,9 +2746,9 @@ impl WorkerPlan {
             .unwrap_or(0)
     }
 
-    /// Every worker's CPU, in worker order.
+    /// Every worker's CPU, in worker order; none in a build that pins nothing.
     fn cpus(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..self.workers).map(|w| self.cpu(w))
+        (0..self.workers).filter_map(|w| self.cpu(w))
     }
 
     /// Every worker's system node, in worker order.
@@ -2810,6 +2838,9 @@ enum TablePlacement {
     /// those: no node's memory controller carries the whole engine's probe
     /// traffic, and no page lands where no worker probes from.
     AcrossNodes(Vec<NumaIndex>),
+    /// The workers are pinned nowhere, so no node is theirs and the table
+    /// keeps the process's own policy.
+    ProcessPolicy,
 }
 
 /// The placement a worker plan implies.
@@ -2822,6 +2853,9 @@ enum TablePlacement {
 /// Reading the answer off the compiled constants keeps the readiness handshake
 /// from asking the machine a second time.
 fn table_placement(plan: &WorkerPlan) -> TablePlacement {
+    if !plan.pinned() {
+        return TablePlacement::ProcessPolicy;
+    }
     let nodes = plan.distinct_system_nodes();
     match nodes.as_slice() {
         [node] => TablePlacement::OnNode(*node),
@@ -2840,13 +2874,26 @@ fn table_placement(plan: &WorkerPlan) -> TablePlacement {
 /// has pinned itself.
 ///
 /// Best-effort throughout, and run at pool-(re)build time only, outside any
-/// clock.
-fn place_coordinator_histories(histories: Option<&WorkerHistories>, node: NumaIndex) {
+/// clock. A build that pins no worker places nothing here either.
+fn place_coordinator_histories(histories: Option<&WorkerHistories>, plan: &WorkerPlan) {
     let Some(histories) = histories else {
         return;
     };
+    if !plan.pinned() {
+        return;
+    }
+    let node = plan.system_node(0);
     for (addr, len) in histories.backing_regions() {
         mempolicy::migrate_region_to_node(addr, len, node);
+    }
+}
+
+/// Pin the calling thread to worker `worker`'s CPU and make that CPU's node its
+/// allocation preference — or, in a build that pins no worker, leave the thread
+/// and its memory policy as they are.
+fn pin_worker(plan: &WorkerPlan, worker: usize) {
+    if let Some(cpu) = plan.cpu(worker) {
+        yorkie_numa::pin_current_thread_to_cpu_with_local_memory(cpu, plan.system_node(worker));
     }
 }
 
@@ -2854,7 +2901,8 @@ fn place_coordinator_histories(histories: Option<&WorkerHistories>, node: NumaIn
 /// set per system NUMA node the plan's workers sit on.
 ///
 /// Each node's set is allocated and filled *inside* a thread pinned to one of
-/// that node's worker CPUs, so the pages first-touch there.
+/// that node's worker CPUs, so the pages first-touch there. A build that pins
+/// no worker allocates its one set on the calling thread.
 ///
 /// Returns one [`Arc`] per worker, each pointing at its node's table set.
 fn build_worker_shared(plan: &WorkerPlan) -> Vec<Arc<SharedHistories>> {
@@ -2865,16 +2913,21 @@ fn build_worker_shared(plan: &WorkerPlan) -> Vec<Arc<SharedHistories>> {
     for (&node, &count) in &counts {
         let thread_count = count.next_power_of_two();
         // A CPU of that node: the first worker the plan puts there.
-        let cpu = plan
+        let worker = plan
             .system_nodes()
             .position(|n| n == node)
-            .map(|worker| plan.cpu(worker))
             .expect("every counted node holds at least one worker");
-        let mut built: Option<Arc<SharedHistories>> = None;
-        yorkie_numa::execute_on_cpu(cpu, || {
-            built = Some(Arc::new(SharedHistories::new(thread_count)));
-        });
-        node_shared.insert(node, built.expect("execute_on_cpu ran the closure"));
+        let built = match plan.cpu(worker) {
+            Some(cpu) => {
+                let mut built: Option<Arc<SharedHistories>> = None;
+                yorkie_numa::execute_on_cpu(cpu, || {
+                    built = Some(Arc::new(SharedHistories::new(thread_count)));
+                });
+                built.expect("execute_on_cpu ran the closure")
+            }
+            None => Arc::new(SharedHistories::new(thread_count)),
+        };
+        node_shared.insert(node, built);
     }
 
     plan.system_nodes()
@@ -2899,7 +2952,8 @@ fn shared_node_counts(
 // command and nowhere else, since that is the only command that can change the
 // worker count; everything else about the assignment is a compile-time constant.
 /// `"Using N thread[s] on CPUs <list>"` — the pool size, and the CPUs its
-/// workers are pinned to.
+/// workers are pinned to; `"Using N thread[s] unpinned"` in a build that pins
+/// none.
 #[cfg(feature = "verbose3")]
 fn write_thread_allocation_information(
     threads_size: usize,
@@ -2914,8 +2968,13 @@ fn write_thread_allocation_information(
         } else {
             &b"thread"[..]
         })
-        .bytes(b" on CPUs ");
-    write_cpu_list(&plan.distinct_cpus(), out);
+        .byte(b' ');
+    if plan.pinned() {
+        out.bytes(b"on CPUs ");
+        write_cpu_list(&plan.distinct_cpus(), out);
+    } else {
+        out.bytes(b"unpinned");
+    }
 }
 
 /// Thinking ahead: what the coordinator searches once it has answered, and the
@@ -3223,10 +3282,7 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     // launcher's process-wide interleave. Idempotent across the per-`go`
     // coordinator respawns. The bundle in `histories` is placed separately, at
     // pool (re)build time, because it was already faulted on the command thread.
-    yorkie_numa::pin_current_thread_to_cpu_with_local_memory(
-        worker_plan.cpu(0),
-        worker_plan.system_node(0),
-    );
+    pin_worker(&worker_plan, 0);
 
     // One TT generation bump per `go`, on the main worker, BEFORE any helper
     // starts, so the observable single-thread sequence is the reference's:

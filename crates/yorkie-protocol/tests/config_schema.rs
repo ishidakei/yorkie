@@ -30,6 +30,7 @@ const CHECKED_IN_CONFIGS: &[&str] = &[
     "configs/test.toml",
     "configs/test-limits.toml",
     "configs/tournament.toml",
+    "configs/tune.toml",
 ];
 
 /// Compile a config body as the build with every gating feature on sees it —
@@ -474,6 +475,7 @@ fn a_build_without_a_layout_or_an_assignment_generates_neither() {
         "NUMA_NODE_CPUS",
         "NUMA_SYSTEM_NODES",
         "CPU_ASSIGNMENT",
+        "WORKERS_PINNED",
         "WORKER_CPUS",
         "WORKER_SYSTEM_NODES",
     ] {
@@ -514,7 +516,9 @@ fn a_cpu_assignment_that_is_not_a_string_or_not_resolvable_is_an_error() {
     let err = compile(&default_with("cpu_assignment", Some("cpu_assignment = 3")))
         .expect_err("must fail");
     assert!(
-        err.contains("`cpu_assignment` must be \"auto\" or a CPU list such as \"0,2,4-7\""),
+        err.contains(
+            "`cpu_assignment` must be \"auto\", \"none\" or a CPU list such as \"0,2,4-7\""
+        ),
         "message: {err}"
     );
 
