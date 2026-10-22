@@ -35,7 +35,7 @@ use std::time::Instant;
 use yorkie_eval::{NetworkParams, NnueError, network_file};
 use yorkie_numa::{CpuIndex, NumaIndex, NumaLayout, SysfsError, mempolicy};
 use yorkie_search::{
-    BookConfig, BookHit, EnteringKingConfig, Prng, QSearch, RootMove, SearchControl,
+    BookConfig, BookHit, EnteringKingConfig, Prng, QSearch, RootMove, RootWidth, SearchControl,
     SharedHistories, TallySlot, TimeControl, TimeInput, TimeManagement, VALUE_INFINITE,
     WorkerHistories, WorkerResult, WorkerVote, YorkieProbe, declaration_win, generate_root_moves,
     probe_book, select_best_worker,
@@ -61,6 +61,7 @@ use yorkie_storage::{Book, TranspositionTable, Value, YorkieBook, YorkieBookErro
 use yorkie_storage::clear_alloc_count;
 
 use crate::config::{self, with_eval_network};
+use crate::settings::PONDER_ROOT_WIDTH;
 #[cfg(feature = "random")]
 use crate::settings::RANDOM_AMPLITUDE;
 use crate::settings::Settings;
@@ -2393,6 +2394,9 @@ struct HelperJob {
     /// line, so only that one searches for any.
     #[cfg(feature = "verbose2")]
     multi_pv: usize,
+    /// How wide the helper reads its root: single-line for a `go`, the
+    /// configured width for the search that thinks past the reply.
+    root_width: RootWidth,
 }
 
 /// The state of one helper's coordination slot. The coordinator drives
@@ -2531,6 +2535,7 @@ fn helper_loop<N: NetworkParams>(
             // Helpers run the MultiPV loop too, but with no sink they never emit.
             #[cfg(feature = "verbose2")]
             qs.set_multi_pv(job.multi_pv);
+            qs.set_root_width(job.root_width);
             // A ceiling below the search's own maximum has two sources, `go
             // depth N` and the `DepthLimit` key, and both need `verbose2`.
             #[cfg(feature = "verbose2")]
@@ -3003,8 +3008,9 @@ struct PonderJob {
     /// under.
     #[cfg(feature = "random")]
     random_seed: u64,
-    /// The `MultiPV` value the engine's own searches run at: this is the same
-    /// search a `go` gets, aimed at a position one ply further on.
+    /// The `MultiPV` value the engine's own searches run at: apart from the
+    /// width of its root, this is the search a `go` gets, aimed at a position
+    /// one ply further on.
     #[cfg(feature = "verbose2")]
     multi_pv: usize,
 }
@@ -3075,6 +3081,7 @@ impl PonderJob {
                 random_seed: self.random_seed,
                 #[cfg(feature = "verbose2")]
                 multi_pv: self.multi_pv,
+                root_width: PONDER_ROOT_WIDTH,
             });
         }
 
@@ -3100,6 +3107,10 @@ impl PonderJob {
         qs.set_random(RANDOM_AMPLITUDE, self.random_seed);
         #[cfg(feature = "verbose2")]
         qs.set_multi_pv(self.multi_pv);
+        // The one thing this search does differently from a `go`'s: the
+        // opponent picks the move at its root, so it reads several of them to
+        // full depth rather than one.
+        qs.set_root_width(PONDER_ROOT_WIDTH);
         // No PV sink: the main worker of this search prints nothing either.
         // The reply this search follows is already out, so what each of its
         // workers did counts towards the next one.
@@ -3423,6 +3434,7 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
             random_seed,
             #[cfg(feature = "verbose2")]
             multi_pv,
+            root_width: RootWidth::SINGLE_LINE,
         });
     }
 

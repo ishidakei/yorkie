@@ -477,6 +477,44 @@ impl std::ops::Deref for TallySlot {
     }
 }
 
+/// How wide a search reads its root: how many root moves skip the late-move
+/// reduction, and how far below the best one a move may score and still do so.
+///
+/// A search that thinks past the engine's own reply does not know which of the
+/// opponent's moves will be played, and only the subtree of the one that is
+/// will be of use afterwards. Widening its root searches each plausible reply
+/// to full depth instead of one predicted reply deep and the rest reduced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootWidth {
+    /// Root moves, in the root's move order, searched without late-move
+    /// reduction; `0` is every one. `1` is the single-line search, where only
+    /// the first move is never reduced.
+    pub unreduced: usize,
+    /// A root move found more than this many value units below the best one is
+    /// reduced as usual for the rest of the search, whatever `unreduced` says.
+    /// Read only when `unreduced` is not `1`.
+    pub margin: Value,
+}
+
+impl RootWidth {
+    /// The single-line search every `go` runs.
+    pub const SINGLE_LINE: Self = Self {
+        unreduced: 1,
+        margin: 1,
+    };
+
+    /// Whether this is anything but [`Self::SINGLE_LINE`]'s shape.
+    fn widens(self) -> bool {
+        self.unreduced != 1
+    }
+}
+
+impl Default for RootWidth {
+    fn default() -> Self {
+        Self::SINGLE_LINE
+    }
+}
+
 /// Time, node and stop controls for one search, mapped by the driver from the
 /// `go` limits. With every field absent there is no early termination, and the
 /// search runs to its depth limit exactly as a build without this machinery
@@ -645,6 +683,10 @@ pub struct QSearch<N: NetworkParams> {
     /// not the test build neither carries the flag nor compiles the check.
     #[cfg(test)]
     verify_accumulator: bool,
+    /// Test-only: the root-move list as the last [`Self::run_worker`] left it,
+    /// for the tests that read what a search did per root move.
+    #[cfg(test)]
+    last_root_moves: Vec<RootMove>,
 
     /// The single set of live worker history tables, read **everywhere** in the
     /// search tree, so that an interior update is visible to a later leaf
@@ -804,6 +846,42 @@ pub struct QSearch<N: NetworkParams> {
     /// Whether the root is the position after the engine's own move — the
     /// opponent to move — rather than one the engine is to move in.
     thinking_ahead: [bool; FLATTEN as usize],
+    /// How wide this search reads its root. Set per search by
+    /// [`Self::set_root_width`]; [`RootWidth::SINGLE_LINE`] otherwise.
+    root_width: HeldWidth,
+}
+
+/// A [`RootWidth`] as the search holds it: three bytes of alignment one with no
+/// niche, which the compiler lays out after every other field, in the struct's
+/// tail. Any wider field, or one it sorts in among the four-byte ones, moves the
+/// node path's flags to other offsets, and that alone costs measurable speed.
+#[derive(Clone, Copy)]
+struct HeldWidth {
+    unreduced: u8,
+    margin: [u8; 2],
+}
+
+const _: () = assert!(size_of::<HeldWidth>() == 3 && align_of::<HeldWidth>() == 1);
+
+impl HeldWidth {
+    /// `width` with its count and margin saturated to what the bytes hold: a
+    /// count above 255 reads as 255, and a margin wider than the whole value
+    /// range as the widest one there is.
+    fn new(width: RootWidth) -> Self {
+        let unreduced = u8::try_from(width.unreduced).unwrap_or(u8::MAX);
+        let margin = u16::try_from(width.margin.max(1)).unwrap_or(u16::MAX);
+        Self {
+            unreduced,
+            margin: margin.to_ne_bytes(),
+        }
+    }
+
+    fn get(self) -> RootWidth {
+        RootWidth {
+            unreduced: self.unreduced as usize,
+            margin: u16::from_ne_bytes(self.margin) as Value,
+        }
+    }
 }
 
 /// The result one worker's iterative deepening produces, consumed by
@@ -1063,6 +1141,8 @@ impl<N: NetworkParams> QSearch<N> {
             ),
             #[cfg(test)]
             verify_accumulator: false,
+            #[cfg(test)]
+            last_root_moves: Vec::new(),
             histories,
             root_delta: ROOT_DELTA_FULL,
             root_depth: 1,
@@ -1099,6 +1179,7 @@ impl<N: NetworkParams> QSearch<N> {
             random_seed: 0,
             engine_us: [Color::Black; FLATTEN as usize],
             thinking_ahead: [false; FLATTEN as usize],
+            root_width: HeldWidth::new(RootWidth::SINGLE_LINE),
         }
     }
 
@@ -1257,6 +1338,14 @@ impl<N: NetworkParams> QSearch<N> {
     #[cfg(feature = "verbose2")]
     pub fn set_multi_pv(&mut self, multi_pv: usize) {
         self.multi_pv = multi_pv.max(1);
+    }
+
+    /// Install how wide this search reads its root. Every worker of a search
+    /// gets the same width. A `go` leaves it unset, which is
+    /// [`RootWidth::SINGLE_LINE`]; the search that thinks past the engine's
+    /// reply installs the configured one.
+    pub fn set_root_width(&mut self, width: RootWidth) {
+        self.root_width = HeldWidth::new(width);
     }
 
     /// Install the PV-output configuration and sink on the **main** worker (the
@@ -2518,6 +2607,10 @@ impl<N: NetworkParams> QSearch<N> {
         // then `root_moves[0]` — the best-so-far after the partial iteration's
         // sort — is still a legal move. Nothing reads the list afterwards, so it
         // is taken out of it rather than copied.
+        #[cfg(test)]
+        {
+            self.last_root_moves = root_moves.clone();
+        }
         let best = completed_best.unwrap_or_else(|| root_moves.swap_remove(0));
         #[cfg(feature = "verbose2")]
         if completed_lines.is_empty() {
@@ -3886,6 +3979,30 @@ impl<N: NetworkParams> QSearch<N> {
                 r += r * 273 / (256 * depth + 260);
             }
 
+            // A widened root reads each candidate move unreduced, with the
+            // window `(floor, alpha)` in place of the null window: a value inside
+            // it is the move's score, one at or below `floor` puts the move more
+            // than the margin below the best and marks it far, and one at or
+            // above `alpha` is re-searched with the full window. Taking the
+            // window needs a PV child; `floor` is below `alpha` whenever `wide`
+            // holds.
+            let mut wide = false;
+            let mut floor = alpha;
+            if root_node && move_count > 1 {
+                let width = self.root_width.get();
+                if width.widens()
+                    && (width.unreduced == 0 || move_count as usize <= width.unreduced)
+                    && alpha > -VALUE_INFINITE
+                    && let Some(rm) = root_moves
+                        .as_deref()
+                        .and_then(|rms| rms.iter().find(|rm| rm.mv == mv))
+                    && !rm.far
+                {
+                    wide = true;
+                    floor = (alpha - width.margin).max(-VALUE_INFINITE);
+                }
+            }
+
             // Step 17. Late-move reduction / extension.
             //
             // Several searches of this one move can run below; each overwrites
@@ -3894,7 +4011,7 @@ impl<N: NetworkParams> QSearch<N> {
             #[cfg(feature = "verbose3")]
             let node_marks = self.marks;
             let mut value: Value = best_value;
-            if depth >= 2 && move_count > 1 {
+            if depth >= 2 && move_count > 1 && !wide {
                 let d = ((new_depth - r / 1024).min(new_depth + 2)).max(1) + pv_node as i32;
                 self.stack[s].reduction = new_depth - d;
                 self.pv_node = false;
@@ -3941,7 +4058,23 @@ impl<N: NetworkParams> QSearch<N> {
                 }
             }
             // Step 18. Full-depth search when LMR is skipped.
-            else if !pv_node || move_count > 1 {
+            else if wide {
+                self.stack[s + 1].pv.clear();
+                self.pv_node = true;
+                self.set_read_tt(true);
+                value = -self.search(
+                    pos,
+                    ply + 1,
+                    -alpha,
+                    -floor,
+                    new_depth,
+                    false,
+                    true,
+                    undo.captured(),
+                    None,
+                    scratch,
+                );
+            } else if !pv_node || move_count > 1 {
                 if tt_move.is_none() {
                     r += 1057;
                 }
@@ -3962,7 +4095,7 @@ impl<N: NetworkParams> QSearch<N> {
                 );
             }
 
-            if pv_node && (move_count == 1 || value > alpha) {
+            if pv_node && (move_count == 1 || value > alpha || (wide && value >= alpha)) {
                 self.stack[s + 1].pv.clear();
                 if Some(mv) == tt_move
                     && ((is_valid(tt_value) && is_decisive(tt_value) && tt_data.depth > 0)
@@ -4010,6 +4143,9 @@ impl<N: NetworkParams> QSearch<N> {
             {
                 let ms_init: i64 = -(VALUE_INFINITE as i64 * VALUE_INFINITE as i64);
                 rm.effort += self.nodes - node_count;
+                if wide && value <= floor {
+                    rm.far = true;
+                }
                 rm.average_score = if rm.average_score != -VALUE_INFINITE {
                     (value + rm.average_score) / 2
                 } else {
@@ -6478,6 +6614,191 @@ mod tests {
                 run(90, 0x8765_4321),
                 "a new seed is what makes the next game differ"
             );
+        }
+    }
+
+    /// The widened root of the search that thinks past the engine's reply,
+    /// against the real network: a zero network scores every root move alike,
+    /// so no move could ever be told apart as far below the rest. Skipped when
+    /// `nn.bin` is absent.
+    mod root_width {
+        use super::*;
+        use crate::text_str::{format_usi_move, parse_usi_move};
+
+        const STARTPOS: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
+
+        /// The opening after 7g7f 3c3d: the two bishops face each other, and
+        /// Black's on 8h is guarded by the silver on 7i alone. Moving that
+        /// silver away hangs the bishop to 2b8h+; the other moves keep it.
+        const HANGING_BISHOP: &str =
+            "lnsgkgsnl/1r5b1/pppppp1pp/6p2/9/2P6/PP1PPPPPP/1B5R1/LNSGKGSNL b - 3";
+        const HANGING_MOVES: [&str; 2] = ["7i6h", "7i7h"];
+        /// Moves that keep the bishop guarded.
+        const SAFE_MOVES: [&str; 2] = ["2g2f", "6i7h"];
+
+        /// Deep enough that a root move's subtree is more than a handful of
+        /// nodes, so a full-depth one stands apart from a reduced one.
+        const DEPTH: i32 = 10;
+
+        /// No margin a position can open: nothing is ever far.
+        const NO_MARGIN: Value = 30_000;
+        /// Five pawns: less than the bishop a hanging move loses, more than
+        /// what the other moves of the opening differ by.
+        const BISHOP_MARGIN: Value = 450;
+
+        struct Searched {
+            best: Move,
+            nodes: u64,
+            root_moves: Vec<RootMove>,
+        }
+
+        impl Searched {
+            fn far(&self) -> Vec<String> {
+                let mut far: Vec<String> = self
+                    .root_moves
+                    .iter()
+                    .filter(|rm| rm.far)
+                    .map(|rm| format_usi_move(rm.mv))
+                    .collect();
+                far.sort();
+                far
+            }
+
+            fn effort(&self, usi: &str) -> u64 {
+                self.root_moves
+                    .iter()
+                    .find(|rm| format_usi_move(rm.mv) == usi)
+                    .map(|rm| rm.effort)
+                    .expect("a root move")
+            }
+
+            /// The median node count of a root move's subtree: what the moves
+            /// behind the best one are given.
+            fn median_effort(&self) -> u64 {
+                let mut efforts: Vec<u64> = self.root_moves.iter().map(|rm| rm.effort).collect();
+                efforts.sort_unstable();
+                efforts[efforts.len() / 2]
+            }
+        }
+
+        fn search<N: NetworkParams>(net: N, sfen: &str, width: Option<RootWidth>) -> Searched {
+            let _tt = fresh_tt();
+            let mut q = QSearch::new(net);
+            if let Some(width) = width {
+                q.set_root_width(width);
+            }
+            let out = q.run_root(&pos(sfen), DEPTH);
+            assert_eq!(out.depth, DEPTH, "{sfen}: every iteration completes");
+            Searched {
+                best: out.best_move,
+                nodes: out.nodes,
+                root_moves: std::mem::take(&mut q.last_root_moves),
+            }
+        }
+
+        fn width(unreduced: usize, margin: Value) -> RootWidth {
+            RootWidth { unreduced, margin }
+        }
+
+        fn real_net() -> Option<OwnedNetwork> {
+            let path = real_nn_bin();
+            if !path.exists() {
+                eprintln!("skipping: {} not present", path.display());
+                return None;
+            }
+            Some(yorkie_eval::load_network(&path).expect("real nn.bin loads"))
+        }
+
+        #[test]
+        fn the_named_moves_are_legal() {
+            let p = pos(HANGING_BISHOP);
+            for usi in HANGING_MOVES.iter().chain(&SAFE_MOVES) {
+                parse_usi_move(usi, &p).expect("a legal move");
+            }
+            assert_eq!(RootWidth::default(), RootWidth::SINGLE_LINE);
+            assert_eq!(RootWidth::SINGLE_LINE.unreduced, 1);
+        }
+
+        /// One unreduced root move is the search a `go` runs, whatever the
+        /// margin: the same nodes, the same move, nothing marked.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn a_width_of_one_is_the_single_line_search() {
+            let Some(net) = real_net() else { return };
+            for sfen in [HANGING_BISHOP, STARTPOS] {
+                let go = search(net.network(), sfen, None);
+                for margin in [BISHOP_MARGIN, NO_MARGIN] {
+                    let one = search(net.network(), sfen, Some(width(1, margin)));
+                    assert_eq!((one.best, one.nodes), (go.best, go.nodes), "{sfen}");
+                    assert!(one.far().is_empty(), "{sfen}");
+                }
+            }
+        }
+
+        /// Reading every root move to full depth costs more nodes and gives the
+        /// moves behind the best one many times the subtree the reduced search
+        /// gives them, for the same best move. Two unreduced moves are a search
+        /// of their own, wider than the single line.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn unreduced_root_moves_are_searched_wider_for_the_same_best_move() {
+            let Some(net) = real_net() else { return };
+            let one = search(net.network(), STARTPOS, None);
+            let two = search(net.network(), STARTPOS, Some(width(2, NO_MARGIN)));
+            let every = search(net.network(), STARTPOS, Some(width(0, NO_MARGIN)));
+
+            assert!(
+                one.nodes < every.nodes && one.nodes < two.nodes,
+                "nodes: one {}, two {}, every {}",
+                one.nodes,
+                two.nodes,
+                every.nodes
+            );
+            assert_eq!(every.best, one.best);
+            assert!(
+                every.median_effort() >= 3 * one.median_effort(),
+                "median subtree: one {}, every {}",
+                one.median_effort(),
+                every.median_effort()
+            );
+            assert!(every.far().is_empty() && two.far().is_empty());
+        }
+
+        /// A move that hangs the bishop scores more than five pawns below the
+        /// best move, so a search with that margin marks it far and spends on
+        /// it no more than about what the single-line search does, while it
+        /// goes on reading the moves that lose nothing. A margin wider than any
+        /// gap marks nothing and reads the hanging moves to full depth too.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn a_move_far_below_the_best_is_reduced_unless_the_margin_covers_it() {
+            let Some(net) = real_net() else { return };
+            let one = search(net.network(), HANGING_BISHOP, None);
+            let narrow = search(net.network(), HANGING_BISHOP, Some(width(0, BISHOP_MARGIN)));
+            let wide = search(net.network(), HANGING_BISHOP, Some(width(0, NO_MARGIN)));
+
+            let far = narrow.far();
+            for usi in HANGING_MOVES {
+                assert!(far.iter().any(|m| m == usi), "{usi} not in {far:?}");
+            }
+            for usi in SAFE_MOVES {
+                assert!(!far.iter().any(|m| m == usi), "{usi} in {far:?}");
+            }
+            assert!(wide.far().is_empty(), "{:?}", wide.far());
+            assert!(
+                narrow.nodes < wide.nodes,
+                "nodes: narrow {}, wide {}",
+                narrow.nodes,
+                wide.nodes
+            );
+
+            for usi in HANGING_MOVES {
+                let (one, narrow, wide) = (one.effort(usi), narrow.effort(usi), wide.effort(usi));
+                assert!(
+                    narrow < wide && narrow <= 2 * one.max(1),
+                    "{usi}: subtree single-line {one}, narrow {narrow}, wide {wide}"
+                );
+            }
         }
     }
 }

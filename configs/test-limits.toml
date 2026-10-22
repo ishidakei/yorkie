@@ -103,6 +103,9 @@ generate_all_legal_moves = false
 # the setting has no effect.
 random = 100
 
+ponder_root_moves = 1
+ponder_root_margin = 500
+
 # ---------------------------------------------------------------------------
 # Time management
 # ---------------------------------------------------------------------------

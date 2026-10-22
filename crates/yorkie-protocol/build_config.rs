@@ -461,6 +461,18 @@ const SCHEMA: &[Spec] = &[
         "random",
         0,
     ),
+    int(
+        "ponder_root_moves",
+        "(none: root moves the search after the engine's own move reads unreduced)",
+        0,
+        255,
+    ),
+    int(
+        "ponder_root_margin",
+        "(none: score margin, in centipawns, past which that search reduces a root move)",
+        1,
+        30_000,
+    ),
     // --- Time management.
     int("network_delay", "NetworkDelay", 0, 10_000),
     int("network_delay2", "NetworkDelay2", 0, 10_000),

@@ -397,3 +397,46 @@ fn a_go_ponder_is_answered_like_a_plain_go_and_ponderhit_changes_nothing() {
     }
     assert_eq!(bestmove_lines(&h.quit_join()).len(), 1);
 }
+
+// 8. How wide the search after a reply reads its root is that search's own
+//    setting: once `usinewgame` has ended it and cleared what it left behind, a
+//    node-limited `go` answers exactly as one in a session that never searched
+//    past a reply, which is the single-line search every `go` runs.
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_go_after_a_search_past_the_reply_answers_as_a_go_in_a_fresh_session() {
+    const POSITION: &str = "position startpos moves 7g7f";
+    const NODES: &str = "go nodes 3000";
+    if !common::evaluation_is_noise_free() {
+        eprintln!("skipped: this build's evaluation noise differs between the two sessions");
+        return;
+    }
+    let _session = common::serial_session();
+
+    let fresh = start_ready();
+    fresh.send("usinewgame");
+    fresh.send(POSITION);
+    fresh.send(NODES);
+    wait_for_replies(&fresh, 1);
+    let expected = bestmove(&fresh, 0);
+    fresh.quit_join();
+
+    let h = start_ready();
+    h.send("usinewgame");
+    h.send("position startpos");
+    h.send(GAME_CLOCK);
+    wait_for_replies(&h, 1);
+    assert_thinking_ahead(&h);
+    h.send("usinewgame");
+    h.send(POSITION);
+    h.send(NODES);
+    wait_for_replies(&h, 2);
+    assert_eq!(
+        bestmove(&h, 1),
+        expected,
+        "the `go` answers as it does in a fresh session:\n{}",
+        h.output()
+    );
+    h.quit_join();
+}

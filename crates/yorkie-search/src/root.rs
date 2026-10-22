@@ -85,16 +85,17 @@ pub struct RootMove {
     pub score_upperbound: bool,
     /// Nodes spent searching this root move's subtree.
     pub effort: u64,
+    /// A widened root found this move more than its margin below the best one,
+    /// so it is reduced as usual for the rest of the search (see
+    /// [`crate::RootWidth`]). Always `false` in a single-line search.
+    pub far: bool,
 }
 
-// The move, its PV handle and its per-iteration statistics, with nothing
-// between them. The two fail-bound flags a PV-printing build adds are a ninth
-// eight-byte slot, which is what the second figure records; the three value
-// marks of a `verbose3` build are three more bytes of that same slot, so the
-// figure covers them too.
-#[cfg(not(feature = "verbose2"))]
-const _: () = assert!(size_of::<RootMove>() == 64);
-#[cfg(feature = "verbose2")]
+// The move, its PV handle and its per-iteration statistics fill eight
+// eight-byte slots with nothing between them; the `far` flag opens a ninth. The
+// two fail-bound flags a PV-printing build adds and the three value marks of a
+// `verbose3` build are more bytes of that same ninth slot, so every build has
+// the one figure.
 const _: () = assert!(size_of::<RootMove>() == 72);
 
 /// `Vec::clone` allocates exactly the length it copies, so a derived clone would
@@ -129,6 +130,7 @@ impl Clone for RootMove {
             self.score_upperbound = source.score_upperbound;
         }
         self.effort = source.effort;
+        self.far = source.far;
     }
 }
 
@@ -154,6 +156,7 @@ impl RootMove {
             #[cfg(feature = "verbose2")]
             score_upperbound: false,
             effort: 0,
+            far: false,
         }
     }
 }

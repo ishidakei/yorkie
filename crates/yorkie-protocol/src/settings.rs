@@ -29,6 +29,16 @@
 pub(crate) const RANDOM_AMPLITUDE: yorkie_storage::Value =
     (crate::config::RANDOM * crate::engine::PAWN_VALUE as i64 / 100) as yorkie_storage::Value;
 
+/// The root width of the search that thinks past the engine's own reply.
+///
+/// `ponder_root_margin` is in centipawns and converts to the search's unit the
+/// way `random` does. A `go` never reads this: its root is single-line.
+pub(crate) const PONDER_ROOT_WIDTH: yorkie_search::RootWidth = yorkie_search::RootWidth {
+    unreduced: crate::config::PONDER_ROOT_MOVES as usize,
+    margin: (crate::config::PONDER_ROOT_MARGIN * crate::engine::PAWN_VALUE as i64 / 100)
+        as yorkie_storage::Value,
+};
+
 /// The engine's settings: the generated constants, addressed by name.
 ///
 /// A zero-sized type — there is no settings state to hold. It exists so the

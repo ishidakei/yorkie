@@ -99,6 +99,12 @@ resign_value = 99999
 generate_all_legal_moves = false
 random = 0
 
+# TEST VALUE: the play value is 0. `ponder` is off above, so no search reads it
+# either way; 1 is the single-line root a `go` searches, which keeps every
+# fixed-node fixture what it is in a build of the play config.
+ponder_root_moves = 1
+ponder_root_margin = 500
+
 # ---------------------------------------------------------------------------
 # Time management
 # ---------------------------------------------------------------------------

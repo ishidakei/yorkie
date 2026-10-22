@@ -46,7 +46,7 @@ pub use history::{
 };
 pub use movepick::{MovePicker, PickerScratch};
 pub use qsearch::{
-    QSearch, QSearchOutcome, SearchControl, TallySlot, TimeControl, VALUE_INFINITE,
+    QSearch, QSearchOutcome, RootWidth, SearchControl, TallySlot, TimeControl, VALUE_INFINITE,
     VALUE_MATE_FLAT, WorkerResult,
 };
 // The per-game evaluation noise: only a build that carries it.

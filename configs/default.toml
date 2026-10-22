@@ -297,6 +297,20 @@ generate_all_legal_moves = false
 # a build warning when it is not 0.
 random = 0
 
+# How many root moves the search after the engine's own move (`ponder` above)
+# reads without late-move reduction, in the root's move order. That search does
+# not know which reply the opponent will play, so it searches each plausible
+# one to full depth instead of one predicted reply deep. `1` is the single-line
+# search a `go` gets (only the first move is never reduced), `0` is every root
+# move, and the largest count is 255. Has no effect on a `go` search, and no
+# effect at all when `ponder` is false.
+ponder_root_moves = 0
+
+# A root move of that search whose score is more than this many centipawns
+# below the best root move's is reduced as usual, whatever `ponder_root_moves`
+# says. Read only by that search.
+ponder_root_margin = 500
+
 # ---------------------------------------------------------------------------
 # Time management
 # ---------------------------------------------------------------------------
