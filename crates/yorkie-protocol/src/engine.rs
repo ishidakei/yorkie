@@ -24,7 +24,7 @@ use std::num::NonZeroU64;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 // The only wait this engine ever does is the one that holds a `go infinite`
 // reply, and that clause arrives with `verbose2`.
@@ -37,7 +37,8 @@ use yorkie_numa::{CpuIndex, NumaIndex, NumaLayout, SysfsError, mempolicy};
 use yorkie_search::{
     BookConfig, BookHit, EnteringKingConfig, Prng, QSearch, RootMove, SearchControl,
     SharedHistories, TallySlot, TimeControl, TimeInput, TimeManagement, WorkerHistories,
-    WorkerResult, WorkerVote, declaration_win, generate_root_moves, probe_book, select_best_worker,
+    WorkerResult, WorkerVote, YorkieProbe, declaration_win, generate_root_moves, probe_book,
+    select_best_worker,
 };
 // The PV-line surface: only a `verbose2` build renders one, so only it needs
 // the line's data type, the sink trait the search emits through and the output
@@ -48,11 +49,12 @@ use yorkie_search::{PvInfo, PvOutputConfig, PvSink};
 #[cfg(feature = "random")]
 use yorkie_search::new_game_seed;
 use yorkie_state::{
-    ExtMove, Move, Position, SfenError, TextWriter, parse_sfen_into, parse_usi_move,
+    ExtMove, Move, PackedSfen, Position, SfenError, TextWriter, parse_sfen_into, parse_usi_move,
+    sfen_pack,
 };
 #[cfg(feature = "verbose3")]
 use yorkie_storage::ValueMarks;
-use yorkie_storage::{Book, TranspositionTable, Value};
+use yorkie_storage::{Book, TranspositionTable, Value, YorkieBook, YorkieBookError};
 // The per-reply allocation tally: raised by the counting global allocator this
 // feature installs, and cleared where an interval starts.
 #[cfg(feature = "verbose1")]
@@ -87,6 +89,11 @@ const SYSFS_ROOT: &str = "/sys";
 /// so the bound is out of a game's reach, and a command that exceeds it is
 /// refused rather than allowed to grow the buffer that holds it.
 pub(crate) const MAX_POSITION_MOVES: usize = 1024;
+
+/// Positions one game path holds: the starting position and one after each of
+/// at most [`MAX_POSITION_MOVES`] moves. A command longer than that is refused,
+/// so a path never needs more room than this.
+const GAME_PATH_CAPACITY: usize = MAX_POSITION_MOVES + 1;
 
 /// Room the retained SFEN buffer starts with: enough for the longest SFEN a
 /// board can spell — every square occupied by a promoted piece, both hands
@@ -142,6 +149,10 @@ struct RetainedPosition {
     sfen: Vec<u8>,
     /// The moves in the order they were applied.
     moves: Vec<Move>,
+    /// Every position the replay passed through, packed: the starting position,
+    /// then the one after each move. Recorded only while a yorkie book is read,
+    /// and empty otherwise; its room is reserved when that book is loaded.
+    path: Vec<PackedSfen>,
 }
 
 impl RetainedPosition {
@@ -151,6 +162,7 @@ impl RetainedPosition {
             startpos: true,
             sfen: Vec::with_capacity(SFEN_CAPACITY),
             moves: Vec::with_capacity(MAX_POSITION_MOVES),
+            path: Vec::new(),
         }
     }
 
@@ -159,6 +171,7 @@ impl RetainedPosition {
         self.startpos = true;
         self.sfen.clear();
         self.moves.clear();
+        self.path.clear();
     }
 
     /// Take the starting position of a freshly parsed command, joining an
@@ -361,6 +374,19 @@ struct LoadedBook {
     ignore_book_ply: bool,
 }
 
+/// The yorkie book one `go` probes: none when no yorkie book is loaded or
+/// `USI_OwnBook` is off, and `fill` writing the game path into [`GAME_PATH`]
+/// only for a book that will read it.
+fn yorkie_for_go(
+    own_book: bool,
+    loaded: Option<&YorkieBook>,
+    fill: impl FnOnce(&mut Vec<PackedSfen>),
+) -> Option<&YorkieBook> {
+    let book = loaded.filter(|_| own_book)?;
+    fill(&mut GAME_PATH.lock().unwrap_or_else(PoisonError::into_inner));
+    Some(book)
+}
+
 /// A search worker running on its own thread. The main thread
 /// keeps reading commands while this runs; a stop request sets [`STOP`], which
 /// the search polls at the reference `check_time` granularity. The worker
@@ -452,6 +478,16 @@ static NODE_SLOTS: [TallySlot; POOL_CAPACITY] = [const { TallySlot::new() }; POO
 /// root and the main worker folds them all each iteration.
 static BMC_SLOTS: [TallySlot; POOL_CAPACITY] = [const { TallySlot::new() }; POOL_CAPACITY];
 
+/// Every position of the game so far, which a `go`'s yorkie-book probe reads
+/// ([`Engine::fill_game_path`]).
+///
+/// It is the session's rather than handed over so that a `go` neither
+/// allocates nor waits for it to come back: it is written only between
+/// searches, after the previous coordinator has been joined, and read only by
+/// the coordinator's book probe. Its room is reserved when a yorkie book is
+/// loaded.
+static GAME_PATH: Mutex<Vec<PackedSfen>> = Mutex::new(Vec::new());
+
 /// The node counters of a pool of `workers`, one slot per worker.
 #[cfg(feature = "verbose2")]
 fn node_tally(workers: usize) -> &'static [TallySlot] {
@@ -537,8 +573,9 @@ pub enum GoOutcome {
 
 /// The result of the heavy [`Engine::ready`] initialisation, produced inside
 /// whatever keep-alive scope the protocol layer wraps it in and consumed once
-/// that helper has stopped: the network is ready, the load failed, or the
-/// machine is not the one this binary plans its threads for.
+/// that helper has stopped: the network is ready, the load failed, the machine
+/// is not the one this binary plans its threads for, or the configured yorkie
+/// book could not be loaded.
 ///
 /// Each failure carries its reason for the caller to render, and no build
 /// answers a failed one with a readiness reply.
@@ -546,6 +583,8 @@ pub enum ReadyOutcome {
     Ready,
     LoadFailed(NnueError),
     LayoutMismatch(LayoutRefusal),
+    /// The yorkie book file named in the config, and why it was refused.
+    YorkieBookFailed(PathBuf, YorkieBookError),
 }
 
 /// Why the machine this process runs on is not the one the binary was built
@@ -730,6 +769,23 @@ pub struct Engine<P: EngineSink> {
     /// last book load — the Multiple Book priority list, not a single name.
     /// [`Self::ready`] reloads only when this changes — the reference's reload-skip.
     book_signature: Option<(Vec<PathBuf>, bool, bool)>,
+    /// The yorkie books this session reads, in the config's order; empty when
+    /// the yorkie book is disabled. Resolved once, at construction, the way
+    /// [`book_path`] resolves the `.ybb` name.
+    yorkie_choices: Vec<YorkieBookChoice>,
+    /// The yorkie books [`Self::ready`] loaded, aligned with
+    /// [`Self::yorkie_choices`], and the files they came from, so a repeat
+    /// readiness handshake reuses them. `None` until a load succeeds. A
+    /// `'static` borrow on the terms of [`LoadedBook`], so choosing a book is
+    /// an index and a `go` hands its coordinator the reference itself.
+    yorkie_books: Option<(Vec<PathBuf>, &'static [YorkieBook])>,
+    /// The index into [`Self::yorkie_choices`] of the book the game in
+    /// progress plays from: drawn at every [`Self::new_game`], and the first
+    /// entry until the first one.
+    yorkie_choice: usize,
+    /// The generator [`Self::new_game`] draws the yorkie book from, seeded from
+    /// the session seed so [`Engine::with_book_seed`] pins it too.
+    yorkie_prng: Prng,
     /// A session-scoped seed advanced per `go`, driving both the book-selection
     /// PRNG and the `rtime` PRNG. Seeded from process entropy by default; tests
     /// pin it via [`Engine::with_book_seed`].
@@ -858,9 +914,22 @@ impl<P: EngineSink> Engine<P> {
         // command thread — so place it explicitly; see
         // `place_coordinator_histories`.
         place_coordinator_histories(histories.as_ref(), worker_plan.system_node(0));
+        let yorkie_choices = settings
+            .yorkie_book_files()
+            .iter()
+            .map(|&(file, weight)| YorkieBookChoice {
+                name: PathBuf::from(file),
+                path: book_path(settings.book_dir(), file),
+                weight,
+            })
+            .collect();
         Self {
             sink,
             settings,
+            yorkie_choices,
+            yorkie_books: None,
+            yorkie_choice: 0,
+            yorkie_prng: Prng::new(book_seed ^ YORKIE_DRAW_SEED_MIX),
             pos: Position::startpos(),
             eval: None,
             tt_placed: false,
@@ -907,6 +976,23 @@ impl<P: EngineSink> Engine<P> {
     /// [`Self::set_sysfs_root`].
     pub fn set_eval_root(&mut self, root: PathBuf) {
         self.eval_root = root;
+    }
+
+    /// Override the yorkie book list with `(file, weight)` pairs, an empty list
+    /// disabling it. The `info string` that reports a game's book names the
+    /// file as it is given here.
+    ///
+    /// `yorkie_book_files` is compiled in like every other setting, so a test
+    /// that drives a session against books of its own names the files here.
+    pub fn set_yorkie_books(&mut self, books: Vec<(PathBuf, u32)>) {
+        self.yorkie_choices = books
+            .into_iter()
+            .map(|(path, weight)| YorkieBookChoice {
+                name: path.clone(),
+                path,
+                weight,
+            })
+            .collect();
     }
 
     /// Override the sysfs root the [`Self::ready`] layout check reads, so a test
@@ -1092,21 +1178,6 @@ impl<P: EngineSink> Engine<P> {
         }
     }
 
-    /// The absolute path a `<BookDir>/<BookFile>` pair resolves to.
-    ///
-    /// Mirrors the reference `get_book_name`: join `BookDir` onto the binary's
-    /// folder, then `BookFile`. An absolute `BookDir` (as tests use) wins over
-    /// the binary folder — `Path::join` semantics match `Path::Combine`.
-    /// `BookDir` / `BookFile` are data paths opened as-is via `std::fs`, with
-    /// no shell or metacharacter interpretation.
-    fn book_path(&self, book_dir: &str, book_file: &str) -> PathBuf {
-        let base = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| PathBuf::from("."));
-        base.join(book_dir).join(book_file)
-    }
-
     /// (Re)load the opening books from the current options — the reference's
     /// `BookMoveSelector::read_book`. Reloads only when the `(name list,
     /// on-the-fly, IgnoreBookPly)` capture changed.
@@ -1119,7 +1190,7 @@ impl<P: EngineSink> Engine<P> {
         let book_dir = self.settings.book_dir();
         let on_the_fly = self.settings.book_on_the_fly();
         let ignore_book_ply = self.settings.ignore_book_ply();
-        let base = self.book_path(book_dir, book_file);
+        let base = book_path(book_dir, book_file);
 
         // Enumerate the priority series now: the resolved name list is half of
         // the reload-skip capture, so a numbered file appearing (or vanishing)
@@ -1135,7 +1206,7 @@ impl<P: EngineSink> Engine<P> {
 
         // `no_book` → bookless, silently. (`book_name_without_extension` yields
         // an empty stem for it, so `names` is just the base name anyway.)
-        if book_file == "no_book" {
+        if book_file == NO_BOOK {
             return Ok(());
         }
 
@@ -1210,6 +1281,103 @@ impl<P: EngineSink> Engine<P> {
         Ok(())
     }
 
+    /// Load every configured yorkie book, unless the ones already loaded are
+    /// they.
+    ///
+    /// Unlike a `.ybb` that fails to open, a yorkie book that fails is not
+    /// passed over: it is named in the config to be played from, so the first
+    /// failure comes back for the readiness handshake to refuse on, and none of
+    /// the list is loaded. An empty list loads nothing.
+    fn load_yorkie_books(&mut self) -> io::Result<Option<(PathBuf, YorkieBookError)>> {
+        if self.yorkie_choices.is_empty() {
+            self.yorkie_books = None;
+            return Ok(None);
+        }
+        if self.yorkie_books.as_ref().is_some_and(|(loaded, _)| {
+            loaded
+                .iter()
+                .eq(self.yorkie_choices.iter().map(|choice| &choice.path))
+        }) {
+            return Ok(None);
+        }
+        self.yorkie_books = None;
+        let mut books = Vec::with_capacity(self.yorkie_choices.len());
+        for choice in &self.yorkie_choices {
+            let book = match YorkieBook::open(&choice.path) {
+                Ok(book) => book,
+                Err(e) => return Ok(Some((choice.path.clone(), e))),
+            };
+            let mut bytes = [0u8; NOTICE_BYTES];
+            let mut out = TextWriter::new(&mut bytes);
+            out.bytes(b"yorkie book loaded : ")
+                .u64(book.shared_count() as u64)
+                .bytes(b" shared + ")
+                .u64(book.path_dependent_count() as u64)
+                .bytes(b" path-dependent entries");
+            self.sink.notice(out.as_bytes())?;
+            books.push(book);
+        }
+        let paths = self
+            .yorkie_choices
+            .iter()
+            .map(|choice| choice.path.clone())
+            .collect();
+        self.yorkie_books = Some((paths, Vec::leak(books)));
+        self.reserve_game_path();
+        Ok(None)
+    }
+
+    /// Draw the book this game plays from and say which it is, at the start of
+    /// a game. Nothing is drawn or said when there is no yorkie book.
+    fn draw_yorkie_book(&mut self) -> io::Result<()> {
+        if self.yorkie_choices.is_empty() {
+            return Ok(());
+        }
+        self.yorkie_choice = draw_weighted(&self.yorkie_choices, &mut self.yorkie_prng);
+        let mut bytes = [0u8; NOTICE_BYTES];
+        let mut out = TextWriter::new(&mut bytes);
+        out.bytes(b"yorkie book: ")
+            .path(&self.yorkie_choices[self.yorkie_choice].name);
+        self.sink.notice(out.as_bytes())
+    }
+
+    /// The yorkie book the game in progress plays from, if one is loaded.
+    fn chosen_yorkie_book(&self) -> Option<&'static YorkieBook> {
+        let (_, books) = self.yorkie_books.as_ref()?;
+        let books: &'static [YorkieBook] = books;
+        books.get(self.yorkie_choice)
+    }
+
+    /// Give every game-path buffer room for the longest game a `position`
+    /// command may name, so that recording and handing over a path allocates
+    /// nothing once the game has started.
+    fn reserve_game_path(&mut self) {
+        let shared = &mut *GAME_PATH.lock().unwrap_or_else(PoisonError::into_inner);
+        for path in [
+            &mut self.last_position.path,
+            &mut self.pending_position.path,
+            shared,
+        ] {
+            path.reserve_exact(GAME_PATH_CAPACITY - path.len());
+        }
+    }
+
+    /// Write into `out` every position of the game the last `position` command
+    /// named: its starting position, then the position after each of its
+    /// moves, the current one last. What a path-dependent yorkie-book entry is
+    /// matched against.
+    ///
+    /// A command read before the book was loaded recorded no path, and the
+    /// current position then stands alone.
+    fn fill_game_path(&self, out: &mut Vec<PackedSfen>) {
+        out.clear();
+        if self.last_position.path.is_empty() {
+            out.push(sfen_pack(&self.pos));
+        } else {
+            out.extend_from_slice(&self.last_position.path);
+        }
+    }
+
     /// Make the engine ready to play: hold the machine against the layout this
     /// binary was built for, place the transposition table, load the opening
     /// book and read the evaluation network into the memory the machine calls
@@ -1245,6 +1413,9 @@ impl<P: EngineSink> Engine<P> {
         self.place_transposition_table()?;
         // Load / reload the opening book (the reference does this in `isready`).
         self.reload_book()?;
+        if let Some((path, reason)) = self.load_yorkie_books()? {
+            return Ok(ReadyOutcome::YorkieBookFailed(path, reason));
+        }
         let path = self.evaluation_file_path();
 
         // Idempotent: a repeat reuses what is already in memory — no
@@ -1390,6 +1561,7 @@ impl<P: EngineSink> Engine<P> {
         moves: &'a [u8],
     ) -> Result<(), PositionRefusal<'a>> {
         self.stop_pondering();
+        let record_path = self.yorkie_books.is_some() && self.settings.usi_own_book();
         let Self {
             pending_position: pending,
             scratch_pos: scratch,
@@ -1399,6 +1571,9 @@ impl<P: EngineSink> Engine<P> {
         } = self;
         pending.set_start(sfen);
         pending.start_into(scratch).map_err(PositionRefusal::Sfen)?;
+        if record_path {
+            pending.path.push(sfen_pack(scratch));
+        }
         for mv in yorkie_state::text::tokens(moves) {
             if pending.moves.len() == MAX_POSITION_MOVES {
                 return Err(PositionRefusal::TooManyMoves);
@@ -1412,6 +1587,9 @@ impl<P: EngineSink> Engine<P> {
             }
             scratch.do_move(parsed);
             pending.moves.push(parsed);
+            if record_path {
+                pending.path.push(sfen_pack(scratch));
+            }
         }
         // Both installs are a swap: what they displace becomes the next
         // command's scratch, buffers and all, so a game's `position` commands
@@ -1423,8 +1601,8 @@ impl<P: EngineSink> Engine<P> {
 
     /// Start a new game: reclaim any search, empty the table, rebuild the
     /// history tables and the pool, and reset every per-game carry-forward (the
-    /// reference `search_clear`).
-    pub fn new_game(&mut self) {
+    /// reference `search_clear`); then draw the yorkie book the game plays from.
+    pub fn new_game(&mut self) -> io::Result<()> {
         // Reclaim any running search, then reset the game state: startpos, an
         // emptied table, and fresh history tables (the reference
         // `search_clear`). Clearing the table also resets its generation; the next
@@ -1462,6 +1640,7 @@ impl<P: EngineSink> Engine<P> {
         // Routing through `rebuild_pool` keeps the NUMA binding assignment
         // consistent with the recreated helpers.
         self.rebuild_pool();
+        self.draw_yorkie_book()?;
         // The pool and the history tables just rebuilt are a new game's setup,
         // not the first move's work, so they are not counted against it. The
         // join above ended any search of the last game, whose counts go the
@@ -1471,6 +1650,7 @@ impl<P: EngineSink> Engine<P> {
             clear_alloc_count();
             crate::stats::clear_search_counts();
         }
+        Ok(())
     }
 
     /// Start a search under `params`.
@@ -1792,6 +1972,9 @@ impl<P: EngineSink> Engine<P> {
         // with no job.
         let book = self.book;
         let own_book = self.settings.usi_own_book();
+        let yorkie = yorkie_for_go(own_book, self.chosen_yorkie_book(), |out| {
+            self.fill_game_path(out)
+        });
         self.book_seed = self
             .book_seed
             .wrapping_mul(6_364_136_223_846_793_005)
@@ -1850,6 +2033,7 @@ impl<P: EngineSink> Engine<P> {
             helper_slots,
             worker_plan,
             book,
+            yorkie,
             own_book,
             book_seed,
             ponder,
@@ -1936,6 +2120,51 @@ fn is_a_game_move(params: &GoParams) -> bool {
         && params.movetime.is_none()
         && !params.infinite;
     clocked
+}
+
+/// The `book_file` name that means no book.
+const NO_BOOK: &str = "no_book";
+
+/// One entry of the yorkie-book list: the file as the config names it, the
+/// path it resolves to, and its selection weight.
+struct YorkieBookChoice {
+    name: PathBuf,
+    path: PathBuf,
+    weight: u32,
+}
+
+/// Mixed into the session seed for the yorkie-book draw, so the draw does not
+/// replay the stream the book-move selection takes from the same seed.
+const YORKIE_DRAW_SEED_MIX: u64 = 0x5DEE_CE66_D1CE_B00C;
+
+/// The index of one of `choices`, each drawn with probability its weight over
+/// the sum of all weights. `choices` is not empty.
+fn draw_weighted(choices: &[YorkieBookChoice], prng: &mut Prng) -> usize {
+    let total: u64 = choices.iter().map(|choice| u64::from(choice.weight)).sum();
+    let mut ticket = prng.rand(total);
+    for (i, choice) in choices.iter().enumerate() {
+        let weight = u64::from(choice.weight);
+        if ticket < weight {
+            return i;
+        }
+        ticket -= weight;
+    }
+    choices.len() - 1
+}
+
+/// The absolute path a `<BookDir>/<BookFile>` pair resolves to.
+///
+/// Mirrors the reference `get_book_name`: join `BookDir` onto the binary's
+/// folder, then `BookFile`. An absolute `BookDir` (as tests use) wins over
+/// the binary folder — `Path::join` semantics match `Path::Combine`.
+/// `BookDir` / `BookFile` are data paths opened as-is via `std::fs`, with
+/// no shell or metacharacter interpretation.
+fn book_path(book_dir: &str, book_file: &str) -> PathBuf {
+    let base = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join(book_dir).join(book_file)
 }
 
 /// The two book extensions the reference's name resolution knows about.
@@ -2875,6 +3104,9 @@ struct CoordinatorJob<P: EngineSink> {
     worker_plan: WorkerPlan,
     /// The loaded opening book to probe once, if any.
     book: Option<&'static LoadedBook>,
+    /// The loaded yorkie book, present only when one is loaded and
+    /// `USI_OwnBook` is on. The game it is probed for is in [`GAME_PATH`].
+    yorkie: Option<&'static YorkieBook>,
     /// `USI_OwnBook` — the master gate; when off the book is never probed.
     own_book: bool,
     /// The seed for this `go`'s book PRNG (deterministic within a session).
@@ -2960,6 +3192,7 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
         helper_slots,
         worker_plan,
         book,
+        yorkie,
         own_book,
         book_seed,
         ponder,
@@ -3048,17 +3281,25 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
 
     // Opening-book probe — once, on the coordinator, BEFORE any helper starts
     // (the on-the-fly read path is not thread-safe by design). The
-    // `USI_OwnBook` gate and a loaded book are both required. On a hit we emit
-    // and return without searching, holding the reply for `go infinite`.
-    if own_book && let Some(loaded) = book {
+    // `USI_OwnBook` gate and a loaded book — yorkie or `.ybb` — are both
+    // required. On a hit we emit and return without searching, holding the
+    // reply for `go infinite`.
+    if own_book && (book.is_some() || yorkie.is_some()) {
         let mut prng = Prng::new(book_seed);
+        let path = yorkie.map(|_| GAME_PATH.lock().unwrap_or_else(PoisonError::into_inner));
+        let probe = yorkie
+            .zip(path.as_deref())
+            .map(|(book, path)| YorkieProbe { book, path });
         let probed = probe_book(
-            &loaded.books,
-            loaded.ignore_book_ply,
+            probe.as_ref(),
+            book.map_or(&[], |loaded| &loaded.books[..]),
+            book.is_some_and(|loaded| loaded.ignore_book_ply),
             &pos,
             &BOOK_CONFIG,
             &mut prng,
         );
+        // The path is not held through the thinking-ahead search a hit starts.
+        drop(path);
         #[cfg(feature = "verbose1")]
         {
             let mut bytes = [0u8; BOOK_DIAGNOSTIC_BYTES];
@@ -3307,6 +3548,147 @@ mod tests {
     /// [`serial_session`], since the engine's pool and flags are the process's.
     fn idle_engine() -> Engine<UsiSink<Buffer>> {
         Engine::new(UsiSink::new(Buffer::default()))
+    }
+
+    /// An empty yorkie book: a header pointing the path-dependent offset table
+    /// at the end of the header, then the trailer.
+    fn empty_yorkie_book() -> YorkieBook {
+        let mut image = vec![0u8; 40];
+        image[..8].copy_from_slice(b"YKBOOK01");
+        image[8] = 2;
+        image[32] = 40;
+        let digest = yorkie_storage::yorkie_book::sha256(&image);
+        image.extend_from_slice(&digest);
+        image.extend_from_slice(b"YKBOOKED");
+        YorkieBook::from_bytes(image).expect("valid empty book")
+    }
+
+    #[test]
+    fn usi_own_book_off_leaves_the_yorkie_book_unprobed() {
+        let book = empty_yorkie_book();
+        let probed = yorkie_for_go(true, Some(&book), |_| {});
+        assert!(probed.is_some(), "on with a book loaded → probed");
+        let probed = yorkie_for_go(false, Some(&book), |_| {
+            panic!("no game path is built for a book that is not read")
+        });
+        assert!(probed.is_none(), "USI_OwnBook off → not probed");
+        assert!(yorkie_for_go(true, None, |_| {}).is_none());
+    }
+
+    /// A yorkie-book list of `weights`, the files named by their index.
+    fn weighted(weights: &[u32]) -> Vec<YorkieBookChoice> {
+        weights
+            .iter()
+            .enumerate()
+            .map(|(i, &weight)| YorkieBookChoice {
+                name: PathBuf::from(i.to_string()),
+                path: PathBuf::from(i.to_string()),
+                weight,
+            })
+            .collect()
+    }
+
+    /// With the seed pinned, the draws are one fixed sequence.
+    #[test]
+    fn a_pinned_seed_draws_a_fixed_sequence() {
+        let choices = weighted(&[70, 30]);
+        let mut prng = Prng::new(TEST_DRAW_SEED ^ YORKIE_DRAW_SEED_MIX);
+        let drawn: Vec<usize> = (0..16)
+            .map(|_| draw_weighted(&choices, &mut prng))
+            .collect();
+        assert_eq!(
+            drawn,
+            [0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0],
+            "the sequence a pinned seed draws"
+        );
+    }
+
+    /// The seed `a_pinned_seed_draws_a_fixed_sequence` pins.
+    const TEST_DRAW_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    /// Over many draws each entry comes up in proportion to its weight, and a
+    /// one-entry list always draws that entry, whatever its weight.
+    #[test]
+    fn draws_follow_the_weights() {
+        const DRAWS: usize = 10_000;
+        let choices = weighted(&[70, 30]);
+        let mut prng = Prng::new(TEST_DRAW_SEED);
+        let mut counts = [0usize; 2];
+        for _ in 0..DRAWS {
+            counts[draw_weighted(&choices, &mut prng)] += 1;
+        }
+        assert_eq!(counts[0] + counts[1], DRAWS);
+        // Three standard deviations of a 70/30 split over 10,000 draws is
+        // about 137.
+        assert!(
+            counts[0].abs_diff(7_000) <= 150,
+            "70/30 drew {counts:?} over {DRAWS}"
+        );
+
+        let choices = weighted(&[3]);
+        let mut prng = Prng::new(TEST_DRAW_SEED);
+        assert!((0..100).all(|_| draw_weighted(&choices, &mut prng) == 0));
+    }
+
+    /// The game path a `go` reads.
+    fn game_path(engine: &Engine<UsiSink<Buffer>>) -> Vec<PackedSfen> {
+        let mut path = Vec::new();
+        engine.fill_game_path(&mut path);
+        path
+    }
+
+    /// The game path is every position the last `position` command passed
+    /// through, the current one last; a session with no `position` has the
+    /// initial position alone. The commands of a whole game are recorded in
+    /// the room reserved when the book was loaded.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn the_game_path_follows_the_position_command() {
+        let _session = serial_session();
+        let mut engine = idle_engine();
+        engine.yorkie_books = Some((
+            vec![PathBuf::from("book.ykb")],
+            Vec::leak(vec![empty_yorkie_book()]),
+        ));
+        engine.reserve_game_path();
+        assert_eq!(game_path(&engine), vec![sfen_pack(&Position::startpos())]);
+
+        engine
+            .set_position(PositionSfen::StartPos, b"7g7f 3c3d")
+            .expect("both moves are legal");
+        let path = game_path(&engine);
+        assert_eq!(path.len(), 3);
+        assert_eq!(path[0], sfen_pack(&Position::startpos()));
+        assert_eq!(path[2], sfen_pack(&engine.pos));
+
+        assert_eq!(
+            engine
+                .set_position(PositionSfen::StartPos, b"7g7f 9z9z")
+                .err(),
+            Some(PositionRefusal::IllegalMove(b"9z9z")),
+        );
+        assert_eq!(
+            game_path(&engine),
+            path,
+            "a refused command records nothing"
+        );
+
+        for retained in [&engine.last_position, &engine.pending_position] {
+            assert_eq!(retained.path.capacity(), GAME_PATH_CAPACITY);
+        }
+    }
+
+    /// Without a yorkie book nothing is recorded, and no room is taken for it.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn no_game_path_is_recorded_without_a_yorkie_book() {
+        let _session = serial_session();
+        let mut engine = idle_engine();
+        engine
+            .set_position(PositionSfen::StartPos, b"7g7f 3c3d")
+            .expect("both moves are legal");
+        assert!(engine.last_position.path.is_empty());
+        assert_eq!(engine.last_position.path.capacity(), 0);
     }
 
     /// What a refused command must leave behind, read off the engine itself: the

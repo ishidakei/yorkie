@@ -5,6 +5,16 @@
 //! move, porting `BookMoveSelector::probe_impl` /
 //! `BookMoveSelector::find_in_books` / `MemoryBook::find`.
 //!
+//! A yorkie book ([`yorkie_storage::YorkieBook`]), when one is loaded, is
+//! probed ahead of every `.ybb`. Its path-dependent entries apply only when
+//! certain earlier positions have occurred in the game, so its probe takes the
+//! game's positions as well as the current one ([`YorkieProbe`]). A hit there
+//! answers the position; a miss falls through to the `.ybb` probe unchanged.
+//! Of the book settings, only `USI_OwnBook` (the caller's gate),
+//! `BookIgnoreRate` and `BookPvMoves` apply to it: it has no mirrored probe and
+//! no ply in its key, so it is consulted at any ply and no `.ybb` filter
+//! touches it.
+//!
 //! The raw reader speaks only packed keys and move fragments; everything that
 //! needs [`Position`] or movegen knowledge — packing, flipping, widening a
 //! `move16` into a validated [`Move`], the eval / depth / narrow filters, and
@@ -19,7 +29,19 @@ use yorkie_state::TextWriter;
 use yorkie_state::{
     Color, Move, PackedSfen, Piece, PieceKind, Position, Square, flip_move16, sfen_pack,
 };
-use yorkie_storage::{Book, BookMove};
+use yorkie_storage::yorkie_book::WEIGHT_TOTAL;
+use yorkie_storage::{Book, BookMove, YorkieBook};
+
+/// A yorkie book and the game it is probed for: every position the game has
+/// reached, as packed keys, the current one included.
+#[derive(Clone, Copy)]
+pub struct YorkieProbe<'a> {
+    /// The loaded book.
+    pub book: &'a YorkieBook,
+    /// The positions seen so far, in game order; the last is the position
+    /// being probed.
+    pub path: &'a [PackedSfen],
+}
 
 /// The name of the option a filter consulted, carried alongside its value so a
 /// diagnostic can quote it. The name has no other reader, so below `verbose1` —
@@ -342,17 +364,21 @@ struct Candidate {
     count: u16,
 }
 
-/// Probe `books` for `pos` and select a move under `config` — the reference's
+/// Probe the yorkie book, then `books`, for `pos` and select a move under
+/// `config` — for the `.ybb` leg, the reference's
 /// `BookMoveSelector::probe_impl` for the root case.
 ///
-/// `books` is the Multiple Book priority list; every lookup goes through
-/// `find_in_books`, which returns the first non-empty hit and never merges
-/// across books.
+/// `yorkie`, when given, is consulted first and at any ply; a hit there is the
+/// answer. `books` is the Multiple Book priority list; every lookup goes
+/// through `find_in_books`, which returns the first non-empty hit and never
+/// merges across books.
 ///
 /// The `USI_OwnBook` gate is the caller's responsibility. Returns a miss for
-/// every early-out the reference takes: ignore-rate skip, past `BookMoves`,
-/// key/ply miss, or an empty surviving candidate set.
+/// every early-out the reference takes: ignore-rate skip (which skips the
+/// yorkie book too), past `BookMoves`, key/ply miss, or an empty surviving
+/// candidate set.
 pub fn probe_book(
+    yorkie: Option<&YorkieProbe<'_>>,
     books: &[Book],
     ignore_book_ply: bool,
     pos: &Position,
@@ -363,6 +389,28 @@ pub fn probe_book(
 
     // Random skip (`BookIgnoreRate`). Rate 0 never skips; rate 100 always does.
     if config.ignore_rate > 0 && (prng.rand(100) as i64) < config.ignore_rate {
+        return result;
+    }
+
+    // A miss draws nothing from `prng`, so a build without a yorkie book, or a
+    // position it lacks, selects among the `.ybb` moves exactly as it would
+    // with no yorkie book at all.
+    if let Some(yorkie) = yorkie
+        && let Some(hit) = probe_yorkie(
+            yorkie,
+            #[cfg(feature = "verbose2")]
+            books,
+            #[cfg(feature = "verbose2")]
+            ignore_book_ply,
+            pos,
+            #[cfg(feature = "verbose2")]
+            config,
+            prng,
+            #[cfg(feature = "verbose1")]
+            &mut result,
+        )
+    {
+        result.hit = Some(hit);
         return result;
     }
 
@@ -510,6 +558,134 @@ pub fn probe_book(
         info_lines,
     });
     result
+}
+
+/// The yorkie-book leg of [`probe_book`]: the applying entry for `pos`, and one
+/// of its moves drawn with probability `weight / 10,000`.
+///
+/// `None` when no entry applies, or when the drawn move is not legal here — a
+/// book that is not a subset of what the position allows is reported and
+/// passed over rather than trusted.
+///
+/// The `.ybb` books and the config only shape the hit's PV, and the result only
+/// collects diagnostics, so each is passed only to a build that prints those.
+fn probe_yorkie(
+    yorkie: &YorkieProbe<'_>,
+    #[cfg(feature = "verbose2")] books: &[Book],
+    #[cfg(feature = "verbose2")] ignore_book_ply: bool,
+    pos: &Position,
+    #[cfg(feature = "verbose2")] config: &BookConfig,
+    prng: &mut Prng,
+    #[cfg(feature = "verbose1")] result: &mut BookProbeResult,
+) -> Option<BookHit> {
+    let key = sfen_pack(pos);
+    let entry = yorkie.book.probe(&key, |k| yorkie.path.contains(k))?;
+
+    let draw = prng.rand(u64::from(WEIGHT_TOTAL));
+    let mut acc = 0u64;
+    let drawn = entry.moves().find(|m| {
+        acc += u64::from(m.weight);
+        draw < acc
+    })?;
+
+    let mut legal: Vec<Move> = Vec::new();
+    pos.generate_legal_all(&mut legal);
+    let Some(best) = widen(&legal, drawn.move16) else {
+        #[cfg(feature = "verbose1")]
+        result.diagnostics.push(BookDiagnostic::IllegalMoveInDb {
+            move16: drawn.move16,
+        });
+        return None;
+    };
+    // A yorkie-book entry records no score and no depth, so a hit reports
+    // `score cp 0` at depth 0.
+    let value = 0;
+
+    #[cfg(feature = "verbose2")]
+    let pv_moves = config.pv_moves.max(1) as usize;
+    #[cfg(feature = "verbose2")]
+    let info_lines = entry
+        .moves()
+        .filter_map(|m| widen(&legal, m.move16))
+        .enumerate()
+        .map(|(i, mv)| BookInfoLine {
+            multipv: i + 1,
+            score: value,
+            depth: 0,
+            pv: build_yorkie_pv(
+                yorkie,
+                books,
+                ignore_book_ply,
+                pos,
+                config.flipped_book,
+                mv,
+                pv_moves,
+            ),
+        })
+        .collect();
+    #[cfg(feature = "verbose2")]
+    let ponder = build_yorkie_pv(
+        yorkie,
+        books,
+        ignore_book_ply,
+        pos,
+        config.flipped_book,
+        best,
+        2,
+    )
+    .get(1)
+    .copied();
+
+    Some(BookHit {
+        best,
+        #[cfg(feature = "verbose2")]
+        ponder,
+        value,
+        #[cfg(feature = "verbose2")]
+        info_lines,
+    })
+}
+
+/// A book PV from a yorkie-book hit, starting with `first`: each following
+/// position is probed with the game path extended by the moves walked so far,
+/// taking the yorkie book's first (heaviest) move, or on a miss there the first
+/// sorted `.ybb` move — the same two-stage order the root probe uses. Its
+/// second move is the hit's ponder move.
+#[cfg(feature = "verbose2")]
+fn build_yorkie_pv(
+    yorkie: &YorkieProbe<'_>,
+    books: &[Book],
+    ignore_book_ply: bool,
+    pos: &Position,
+    flipped: bool,
+    first: Move,
+    pv_moves: usize,
+) -> Vec<Move> {
+    let mut path = yorkie.path.to_vec();
+    let mut pv = vec![first];
+    let mut work = pos.clone();
+    work.do_move(first);
+    path.push(sfen_pack(&work));
+    while pv.len() < pv_moves {
+        let key = sfen_pack(&work);
+        let next = match yorkie.book.probe(&key, |k| path.contains(k)) {
+            Some(entry) => entry.moves().next().map(|m| m.move16),
+            None => find_in_books(books, ignore_book_ply, &work, flipped)
+                .and_then(|moves| moves.first().map(|m| m.move16)),
+        };
+        let Some(m16) = next else {
+            break;
+        };
+        let mut legal: Vec<Move> = Vec::new();
+        work.generate_legal_all(&mut legal);
+        let Some(mv) = widen(&legal, m16) else {
+            break;
+        };
+        pv.push(mv);
+        work.do_move(mv);
+        path.push(sfen_pack(&work));
+    }
+    pv
 }
 
 /// The ponder move for `best`: probe the post-`best` position, take its first
@@ -859,7 +1035,7 @@ mod tests {
         // Any seed picks the sole survivor.
         for seed in [1u64, 2, 12345, 0xDEAD_BEEF] {
             let mut prng = Prng::new(seed);
-            let r = probe_book(one(&book), false, &pos(STARTPOS_B), &c, &mut prng);
+            let r = probe_book(None, one(&book), false, &pos(STARTPOS_B), &c, &mut prng);
             let hit = r.hit.expect("hit");
             assert_eq!(usi(hit.best), "7g7f", "seed {seed}");
             assert_eq!(hit.value, 100);
@@ -874,7 +1050,7 @@ mod tests {
         let allowed = ["7g7f", "2g2f", "6i7h"];
         for seed in [1u64, 7, 99, 4321] {
             let mut prng = Prng::new(seed);
-            let hit = probe_book(one(&book), false, &pos(STARTPOS_B), &c, &mut prng)
+            let hit = probe_book(None, one(&book), false, &pos(STARTPOS_B), &c, &mut prng)
                 .hit
                 .expect("hit");
             assert!(allowed.contains(&usi(hit.best).as_str()), "seed {seed}");
@@ -884,7 +1060,7 @@ mod tests {
         #[cfg(feature = "verbose2")]
         {
             let mut prng = Prng::new(1);
-            let hit = probe_book(one(&book), false, &pos(STARTPOS_B), &c, &mut prng)
+            let hit = probe_book(None, one(&book), false, &pos(STARTPOS_B), &c, &mut prng)
                 .hit
                 .expect("hit");
             assert_eq!(hit.info_lines.len(), 3);
@@ -902,7 +1078,7 @@ mod tests {
         // Black to move; a floor above every stored value drops all moves.
         c.eval_black_limit = 200;
         let mut prng = Prng::new(1);
-        let r = probe_book(one(&book), false, &pos(STARTPOS_B), &c, &mut prng);
+        let r = probe_book(None, one(&book), false, &pos(STARTPOS_B), &c, &mut prng);
         assert!(r.hit.is_none(), "all moves below the per-side floor → miss");
     }
 
@@ -914,7 +1090,7 @@ mod tests {
         c.depth_limit = 25;
         let mut prng = Prng::new(1);
         assert!(
-            probe_book(one(&book), false, &pos(STARTPOS_B), &c, &mut prng)
+            probe_book(None, one(&book), false, &pos(STARTPOS_B), &c, &mut prng)
                 .hit
                 .is_none()
         );
@@ -922,7 +1098,7 @@ mod tests {
         c.depth_limit = 20;
         let mut prng = Prng::new(1);
         assert!(
-            probe_book(one(&book), false, &pos(STARTPOS_B), &c, &mut prng)
+            probe_book(None, one(&book), false, &pos(STARTPOS_B), &c, &mut prng)
                 .hit
                 .is_some()
         );
@@ -985,7 +1161,7 @@ mod tests {
         c.eval_black_diff = 0;
         c.eval_white_diff = 99999;
         let mut prng = Prng::new(1);
-        let r = probe_book(one(&book), false, &pos(STARTPOS_B), &c, &mut prng);
+        let r = probe_book(None, one(&book), false, &pos(STARTPOS_B), &c, &mut prng);
         let hit = r.hit.expect("hit");
         assert_eq!(usi(hit.best), "7g7f");
         #[cfg(feature = "verbose1")]
@@ -1004,7 +1180,7 @@ mod tests {
         let allowed = ["7g7f", "2g2f", "6i7h"];
         for seed in [1u64, 7, 99, 4321] {
             let mut prng = Prng::new(seed);
-            let hit = probe_book(one(&book), false, &pos(STARTPOS_B), &c, &mut prng)
+            let hit = probe_book(None, one(&book), false, &pos(STARTPOS_B), &c, &mut prng)
                 .hit
                 .expect("hit");
             assert!(allowed.contains(&usi(hit.best).as_str()), "seed {seed}");
@@ -1019,7 +1195,7 @@ mod tests {
         c.eval_black_diff = 99999;
         c.eval_white_diff = 0;
         let mut prng = Prng::new(1);
-        let r = probe_book(one(&book), false, &pos(STARTPOS_W), &c, &mut prng);
+        let r = probe_book(None, one(&book), false, &pos(STARTPOS_W), &c, &mut prng);
         let hit = r.hit.expect("hit");
         assert_eq!(usi(hit.best), "3c3d");
         #[cfg(feature = "verbose1")]
@@ -1038,7 +1214,7 @@ mod tests {
         let allowed = ["3c3d", "8c8d", "4a3b"];
         for seed in [1u64, 7, 99, 4321] {
             let mut prng = Prng::new(seed);
-            let hit = probe_book(one(&book), false, &pos(STARTPOS_W), &c, &mut prng)
+            let hit = probe_book(None, one(&book), false, &pos(STARTPOS_W), &c, &mut prng)
                 .hit
                 .expect("hit");
             assert!(allowed.contains(&usi(hit.best).as_str()), "seed {seed}");
@@ -1057,7 +1233,14 @@ mod tests {
         c.depth_black_limit = 25;
         c.depth_white_limit = 0;
         let mut prng = Prng::new(1);
-        let r = probe_book(one(&black_book), false, &pos(STARTPOS_B), &c, &mut prng);
+        let r = probe_book(
+            None,
+            one(&black_book),
+            false,
+            &pos(STARTPOS_B),
+            &c,
+            &mut prng,
+        );
         assert!(r.hit.is_none(), "Black depth floor above 20 → miss");
         #[cfg(feature = "verbose1")]
         assert!(
@@ -1073,15 +1256,29 @@ mod tests {
         c.depth_white_limit = 25;
         let mut prng = Prng::new(1);
         assert!(
-            probe_book(one(&black_book), false, &pos(STARTPOS_B), &c, &mut prng)
-                .hit
-                .is_some(),
+            probe_book(
+                None,
+                one(&black_book),
+                false,
+                &pos(STARTPOS_B),
+                &c,
+                &mut prng
+            )
+            .hit
+            .is_some(),
             "the White depth floor is inert at a Black root"
         );
 
         // White root: the mirror image.
         let mut prng = Prng::new(1);
-        let r = probe_book(one(&white_book), false, &pos(STARTPOS_W), &c, &mut prng);
+        let r = probe_book(
+            None,
+            one(&white_book),
+            false,
+            &pos(STARTPOS_W),
+            &c,
+            &mut prng,
+        );
         assert!(r.hit.is_none(), "White depth floor above 20 → miss");
         #[cfg(feature = "verbose1")]
         assert!(
@@ -1097,9 +1294,16 @@ mod tests {
         c.depth_white_limit = 0;
         let mut prng = Prng::new(1);
         assert!(
-            probe_book(one(&white_book), false, &pos(STARTPOS_W), &c, &mut prng)
-                .hit
-                .is_some(),
+            probe_book(
+                None,
+                one(&white_book),
+                false,
+                &pos(STARTPOS_W),
+                &c,
+                &mut prng
+            )
+            .hit
+            .is_some(),
             "the Black depth floor is inert at a White root"
         );
     }
@@ -1116,7 +1320,7 @@ mod tests {
         let allowed = ["7g7f", "2g2f", "6i7h"];
         for seed in [1u64, 2, 3, 4] {
             let mut prng = Prng::new(seed);
-            let hit = probe_book(one(&book), false, &pos(STARTPOS_B), &c, &mut prng)
+            let hit = probe_book(None, one(&book), false, &pos(STARTPOS_B), &c, &mut prng)
                 .hit
                 .expect("V1 fields are inert under V2");
             assert!(allowed.contains(&usi(hit.best).as_str()), "seed {seed}");
@@ -1163,7 +1367,7 @@ mod tests {
         // for every seed (no fall-through, no merged candidate set).
         for seed in [1u64, 2, 99, 4321] {
             let mut prng = Prng::new(seed);
-            let hit = probe_book(&books, false, &pos(STARTPOS_B), &c, &mut prng)
+            let hit = probe_book(None, &books, false, &pos(STARTPOS_B), &c, &mut prng)
                 .hit
                 .expect("hit");
             assert_eq!(usi(hit.best), "7g7f", "seed {seed}");
@@ -1183,7 +1387,7 @@ mod tests {
         // what decides, not the file contents.
         let reversed = vec![priority_book_1(), priority_book_0()];
         let mut prng = Prng::new(1);
-        let hit = probe_book(&reversed, false, &pos(STARTPOS_B), &c, &mut prng)
+        let hit = probe_book(None, &reversed, false, &pos(STARTPOS_B), &c, &mut prng)
             .hit
             .expect("hit");
         assert_eq!(usi(hit.best), "2g2f");
@@ -1194,7 +1398,7 @@ mod tests {
         let books = vec![priority_book_0(), priority_book_1()];
         let c = cfg(); // flipped_book off, so the White root cannot hit book 0.
         let mut prng = Prng::new(1);
-        let hit = probe_book(&books, false, &pos(STARTPOS_W), &c, &mut prng)
+        let hit = probe_book(None, &books, false, &pos(STARTPOS_W), &c, &mut prng)
             .hit
             .expect("book 1 answers what book 0 lacks");
         assert_eq!(usi(hit.best), "3c3d");
@@ -1211,7 +1415,7 @@ mod tests {
         };
         let mut prng = Prng::new(1);
         assert!(
-            probe_book(&books, false, &after, &cfg(), &mut prng)
+            probe_book(None, &books, false, &after, &cfg(), &mut prng)
                 .hit
                 .is_none()
         );
@@ -1219,7 +1423,7 @@ mod tests {
         // An empty priority list is a miss too (the bookless engine).
         let mut prng = Prng::new(1);
         assert!(
-            probe_book(&[], false, &pos(STARTPOS_B), &cfg(), &mut prng)
+            probe_book(None, &[], false, &pos(STARTPOS_B), &cfg(), &mut prng)
                 .hit
                 .is_none()
         );
@@ -1245,7 +1449,7 @@ mod tests {
             Book::from_memory(build_ybb(&child)).expect("valid ybb"),
         ];
         let mut prng = Prng::new(1);
-        let hit = probe_book(&books, false, &pos(STARTPOS_B), &cfg(), &mut prng)
+        let hit = probe_book(None, &books, false, &pos(STARTPOS_B), &cfg(), &mut prng)
             .hit
             .expect("hit");
         assert_eq!(usi(hit.best), "7g7f");
@@ -1279,7 +1483,7 @@ mod tests {
         let mut c = cfg();
         c.eval_diff = 0; // only the best legal value survives.
         let mut prng = Prng::new(1);
-        let r = probe_book(one(&book), false, &pos(STARTPOS_B), &c, &mut prng);
+        let r = probe_book(None, one(&book), false, &pos(STARTPOS_B), &c, &mut prng);
         let hit = r.hit.expect("legal move still selectable");
         assert_eq!(usi(hit.best), "7g7f");
         #[cfg(feature = "verbose1")]
@@ -1303,7 +1507,7 @@ mod tests {
         let allowed = ["7g7f", "2g2f", "6i7h"];
         for seed in [1u64, 2, 3, 4, 5] {
             let mut prng = Prng::new(seed);
-            let hit = probe_book(one(&book), false, &pos(STARTPOS_B), &c, &mut prng)
+            let hit = probe_book(None, one(&book), false, &pos(STARTPOS_B), &c, &mut prng)
                 .hit
                 .expect("hit");
             assert!(allowed.contains(&usi(hit.best).as_str()), "seed {seed}");
@@ -1317,7 +1521,7 @@ mod tests {
         c.book_moves = 0; // ply 1 > 0 → miss.
         let mut prng = Prng::new(1);
         assert!(
-            probe_book(one(&book), false, &pos(STARTPOS_B), &c, &mut prng)
+            probe_book(None, one(&book), false, &pos(STARTPOS_B), &c, &mut prng)
                 .hit
                 .is_none()
         );
@@ -1331,7 +1535,7 @@ mod tests {
         for seed in [1u64, 2, 3] {
             let mut prng = Prng::new(seed);
             assert!(
-                probe_book(one(&book), false, &pos(STARTPOS_B), &c, &mut prng)
+                probe_book(None, one(&book), false, &pos(STARTPOS_B), &c, &mut prng)
                     .hit
                     .is_none()
             );
@@ -1346,14 +1550,14 @@ mod tests {
         let c = cfg();
         let mut prng = Prng::new(1);
         assert!(
-            probe_book(one(&book), false, &at_ply_2, &c, &mut prng)
+            probe_book(None, one(&book), false, &at_ply_2, &c, &mut prng)
                 .hit
                 .is_none(),
             "ply mismatch → miss when enforced"
         );
         let mut prng = Prng::new(1);
         assert!(
-            probe_book(one(&book), true, &at_ply_2, &c, &mut prng)
+            probe_book(None, one(&book), true, &at_ply_2, &c, &mut prng)
                 .hit
                 .is_some(),
             "ply ignored → hit"
@@ -1370,7 +1574,7 @@ mod tests {
         c.eval_diff = 0; // isolate the flipped best move (7g7f → 3c3d).
         c.flipped_book = true;
         let mut prng = Prng::new(1);
-        let hit = probe_book(one(&book), false, &pos(STARTPOS_W), &c, &mut prng)
+        let hit = probe_book(None, one(&book), false, &pos(STARTPOS_W), &c, &mut prng)
             .hit
             .expect("flipped hit");
         assert_eq!(usi(hit.best), "3c3d", "7g7f mirrored 180° is 3c3d");
@@ -1379,7 +1583,7 @@ mod tests {
         c.flipped_book = false;
         let mut prng = Prng::new(1);
         assert!(
-            probe_book(one(&book), false, &pos(STARTPOS_W), &c, &mut prng)
+            probe_book(None, one(&book), false, &pos(STARTPOS_W), &c, &mut prng)
                 .hit
                 .is_none()
         );
@@ -1413,7 +1617,7 @@ mod tests {
         ];
         let book = Book::from_memory(build_ybb(&recs)).expect("valid ybb");
         let mut prng = Prng::new(1);
-        let hit = probe_book(one(&book), false, &pos(STARTPOS_B), &cfg(), &mut prng)
+        let hit = probe_book(None, one(&book), false, &pos(STARTPOS_B), &cfg(), &mut prng)
             .hit
             .expect("hit");
         assert_eq!(usi(hit.best), "7g7f");
@@ -1431,9 +1635,400 @@ mod tests {
         )];
         let leaf_book = Book::from_memory(build_ybb(&solo)).expect("valid ybb");
         let mut prng = Prng::new(1);
-        let hit = probe_book(one(&leaf_book), false, &pos(STARTPOS_B), &cfg(), &mut prng)
+        let hit = probe_book(
+            None,
+            one(&leaf_book),
+            false,
+            &pos(STARTPOS_B),
+            &cfg(),
+            &mut prng,
+        )
+        .hit
+        .expect("hit");
+        assert_eq!(hit.ponder, None, "no child entry → no ponder");
+    }
+
+    // --- Yorkie book: probed ahead of the `.ybb` books. ---
+
+    /// One yorkie-book entry: `(key, moves as (usi, weight), support)`, the
+    /// moves written in the order given (descending weight, as the format
+    /// requires of a real book).
+    type YkEntry = (PackedSfen, Vec<(u16, u16)>, Vec<PackedSfen>);
+
+    /// Build a well-formed yorkie-book image from shared and path-dependent
+    /// entries. Each section is sorted by key; the sort is stable, so
+    /// path-dependent entries sharing a key keep the order given.
+    fn build_ykb(shared: &[YkEntry], pathdep: &[YkEntry]) -> YorkieBook {
+        let mut out = vec![0u8; 40];
+        out[..8].copy_from_slice(b"YKBOOK01");
+        out[8..10].copy_from_slice(&2u16.to_le_bytes());
+        out[16..24].copy_from_slice(&(shared.len() as u64).to_le_bytes());
+        out[24..32].copy_from_slice(&(pathdep.len() as u64).to_le_bytes());
+        for (is_pathdep, entries) in [(false, shared), (true, pathdep)] {
+            let mut sorted = entries.to_vec();
+            sorted.sort_by_key(|e| e.0);
+            let table = out.len();
+            if is_pathdep {
+                out[32..40].copy_from_slice(&(table as u64).to_le_bytes());
+            }
+            out.resize(table + sorted.len() * 8, 0);
+            for (i, (key, moves, support)) in sorted.iter().enumerate() {
+                let off = out.len() as u64;
+                out[table + i * 8..table + i * 8 + 8].copy_from_slice(&off.to_le_bytes());
+                out.extend_from_slice(key);
+                out.extend_from_slice(&(moves.len() as u16).to_le_bytes());
+                out.extend_from_slice(&(support.len() as u16).to_le_bytes());
+                for (m, w) in moves {
+                    out.extend_from_slice(&m.to_le_bytes());
+                    out.extend_from_slice(&w.to_le_bytes());
+                }
+                for s in support {
+                    out.extend_from_slice(s);
+                }
+            }
+        }
+        let digest = yorkie_storage::yorkie_book::sha256(&out);
+        out.extend_from_slice(&digest);
+        out.extend_from_slice(b"YKBOOKED");
+        YorkieBook::from_bytes(out).expect("valid yorkie book")
+    }
+
+    /// `sfen` with `moves` played, and every position along the way packed —
+    /// the game path the driver hands the probe.
+    fn walk(sfen: &str, moves: &[&str]) -> (Position, Vec<PackedSfen>) {
+        let mut p = pos(sfen);
+        let mut path = vec![sfen_pack(&p)];
+        for usi in moves {
+            let mv = parse_usi_move(usi, &p).expect("legal move");
+            p.do_move(mv);
+            path.push(sfen_pack(&p));
+        }
+        (p, path)
+    }
+
+    fn yprobe<'a>(book: &'a YorkieBook, path: &'a [PackedSfen]) -> YorkieProbe<'a> {
+        YorkieProbe { book, path }
+    }
+
+    #[test]
+    fn a_shared_yorkie_entry_answers_the_position() {
+        let (root, path) = walk(STARTPOS_B, &[]);
+        let book = build_ykb(
+            &[(path[0], vec![(m16(STARTPOS_B, "2g2f"), 10_000)], vec![])],
+            &[],
+        );
+        let mut prng = Prng::new(1);
+        let r = probe_book(
+            Some(&yprobe(&book, &path)),
+            &[],
+            false,
+            &root,
+            &cfg(),
+            &mut prng,
+        );
+        let hit = r.hit.expect("yorkie hit");
+        assert_eq!(usi(hit.best), "2g2f");
+        // The entry records no score.
+        assert_eq!(hit.value, 0);
+        #[cfg(feature = "verbose1")]
+        assert!(r.diagnostics.is_empty());
+    }
+
+    /// A position reached by two move orders: 7g7f 3c3d 2g2f and 2g2f 3c3d
+    /// 7g7f. Its path-dependent entries can tell them apart.
+    const TRANSPOSED: [&str; 3] = ["7g7f", "3c3d", "2g2f"];
+
+    #[test]
+    fn a_path_dependent_entry_applies_only_when_its_support_was_seen() {
+        let (here, path) = walk(STARTPOS_B, &TRANSPOSED);
+        let (_, other_path) = walk(STARTPOS_B, &["2g2f", "3c3d", "7g7f"]);
+        let key = sfen_pack(&here);
+        assert_eq!(key, *other_path.last().unwrap(), "both orders transpose");
+        let after_7g7f = path[1];
+
+        let book = build_ykb(
+            &[],
+            &[(
+                key,
+                vec![(parse_usi_move("8c8d", &here).unwrap().move16(), 10_000)],
+                vec![path[0], after_7g7f],
+            )],
+        );
+        let mut prng = Prng::new(1);
+        let hit = probe_book(
+            Some(&yprobe(&book, &path)),
+            &[],
+            false,
+            &here,
+            &cfg(),
+            &mut prng,
+        )
+        .hit
+        .expect("every support seen → hit");
+        assert_eq!(usi(hit.best), "8c8d");
+
+        // The other order never passed through the post-7g7f position.
+        let mut prng = Prng::new(1);
+        assert!(
+            probe_book(
+                Some(&yprobe(&book, &other_path)),
+                &[],
+                false,
+                &here,
+                &cfg(),
+                &mut prng
+            )
+            .hit
+            .is_none(),
+            "one support missing → miss"
+        );
+    }
+
+    #[test]
+    fn the_first_applying_path_dependent_entry_wins() {
+        let (here, path) = walk(STARTPOS_B, &TRANSPOSED);
+        let key = sfen_pack(&here);
+        let mv = |usi| parse_usi_move(usi, &here).unwrap().move16();
+        let never_seen = sfen_pack(&pos(STARTPOS_W));
+        let book = build_ykb(
+            &[],
+            &[
+                (key, vec![(mv("8c8d"), 10_000)], vec![never_seen]),
+                (key, vec![(mv("4a3b"), 10_000)], vec![path[1]]),
+                (key, vec![(mv("2b8h+"), 10_000)], vec![path[0]]),
+            ],
+        );
+        for seed in [1u64, 2, 99] {
+            let mut prng = Prng::new(seed);
+            let hit = probe_book(
+                Some(&yprobe(&book, &path)),
+                &[],
+                false,
+                &here,
+                &cfg(),
+                &mut prng,
+            )
             .hit
             .expect("hit");
-        assert_eq!(hit.ponder, None, "no child entry → no ponder");
+            assert_eq!(usi(hit.best), "4a3b", "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn a_yorkie_miss_falls_through_and_a_hit_shadows_the_ybb() {
+        let ybb = three_move_book();
+        let mut c = cfg();
+        c.eval_diff = 0; // the `.ybb` answer is 7g7f alone.
+        let (root, path) = walk(STARTPOS_B, &[]);
+
+        // A book that lacks the position: the `.ybb` answers.
+        let elsewhere = sfen_pack(&pos(STARTPOS_W));
+        let missing = build_ykb(
+            &[(elsewhere, vec![(m16(STARTPOS_W, "3c3d"), 10_000)], vec![])],
+            &[],
+        );
+        let mut prng = Prng::new(1);
+        let hit = probe_book(
+            Some(&yprobe(&missing, &path)),
+            one(&ybb),
+            false,
+            &root,
+            &c,
+            &mut prng,
+        )
+        .hit
+        .expect("ybb hit");
+        assert_eq!(usi(hit.best), "7g7f");
+
+        // A book that has it: the yorkie book answers, whatever the `.ybb` says.
+        let present = build_ykb(
+            &[(path[0], vec![(m16(STARTPOS_B, "5g5f"), 10_000)], vec![])],
+            &[],
+        );
+        let mut prng = Prng::new(1);
+        let hit = probe_book(
+            Some(&yprobe(&present, &path)),
+            one(&ybb),
+            false,
+            &root,
+            &c,
+            &mut prng,
+        )
+        .hit
+        .expect("yorkie hit");
+        assert_eq!(usi(hit.best), "5g5f");
+        #[cfg(feature = "verbose2")]
+        assert_eq!(hit.info_lines.len(), 1, "the .ybb moves are not merged in");
+    }
+
+    /// Startpos with three weighted moves.
+    fn weighted_book(path: &[PackedSfen]) -> YorkieBook {
+        build_ykb(
+            &[(
+                path[0],
+                vec![
+                    (m16(STARTPOS_B, "7g7f"), 6_000),
+                    (m16(STARTPOS_B, "2g2f"), 3_000),
+                    (m16(STARTPOS_B, "5g5f"), 1_000),
+                ],
+                vec![],
+            )],
+            &[],
+        )
+    }
+
+    #[test]
+    fn a_seeded_draw_is_reproducible() {
+        let (root, path) = walk(STARTPOS_B, &[]);
+        let book = weighted_book(&path);
+        let draws = |seed| {
+            let mut prng = Prng::new(seed);
+            (0..8)
+                .map(|_| {
+                    usi(probe_book(
+                        Some(&yprobe(&book, &path)),
+                        &[],
+                        false,
+                        &root,
+                        &cfg(),
+                        &mut prng,
+                    )
+                    .hit
+                    .expect("hit")
+                    .best)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(draws(12345), draws(12345));
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn draws_follow_the_weights() {
+        let (root, path) = walk(STARTPOS_B, &[]);
+        let book = weighted_book(&path);
+        let mut prng = Prng::new(7);
+        let n = 4000;
+        let mut counts = std::collections::HashMap::<String, u32>::new();
+        for _ in 0..n {
+            let hit = probe_book(
+                Some(&yprobe(&book, &path)),
+                &[],
+                false,
+                &root,
+                &cfg(),
+                &mut prng,
+            )
+            .hit
+            .expect("hit");
+            *counts.entry(usi(hit.best)).or_default() += 1;
+        }
+        for (mv, weight) in [("7g7f", 0.6), ("2g2f", 0.3), ("5g5f", 0.1)] {
+            let share = f64::from(counts[mv]) / f64::from(n);
+            assert!(
+                (share - weight).abs() < 0.03,
+                "{mv}: drawn {share:.3}, weight {weight}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_yorkie_book_has_no_ply_limit() {
+        let (here, path) = walk(STARTPOS_B, &TRANSPOSED);
+        let book = build_ykb(
+            &[(
+                sfen_pack(&here),
+                vec![(parse_usi_move("8c8d", &here).unwrap().move16(), 10_000)],
+                vec![],
+            )],
+            &[],
+        );
+        let mut c = cfg();
+        c.book_moves = 0; // the `.ybb` would not be consulted at ply 4.
+        let mut prng = Prng::new(1);
+        let hit = probe_book(
+            Some(&yprobe(&book, &path)),
+            &[],
+            false,
+            &here,
+            &c,
+            &mut prng,
+        )
+        .hit
+        .expect("a yorkie hit past BookMoves still plays");
+        assert_eq!(usi(hit.best), "8c8d");
+    }
+
+    #[test]
+    fn ignore_rate_100_skips_the_yorkie_book_too() {
+        let (root, path) = walk(STARTPOS_B, &[]);
+        let book = weighted_book(&path);
+        let mut c = cfg();
+        c.ignore_rate = 100;
+        for seed in [1u64, 2, 3] {
+            let mut prng = Prng::new(seed);
+            assert!(
+                probe_book(
+                    Some(&yprobe(&book, &path)),
+                    &[],
+                    false,
+                    &root,
+                    &c,
+                    &mut prng
+                )
+                .hit
+                .is_none()
+            );
+        }
+    }
+
+    #[cfg(feature = "verbose2")]
+    #[test]
+    fn the_pv_and_ponder_follow_the_extended_path() {
+        // Root → 7g7f (yorkie, shared); after 7g7f → 3c3d (yorkie, path-dependent
+        // on the root, which only the extended path carries); after 3c3d → 2g2f
+        // (a `.ybb` entry, reached once the yorkie book misses).
+        let (root, path) = walk(STARTPOS_B, &[]);
+        let (one_ply, p1) = walk(STARTPOS_B, &["7g7f"]);
+        let (two_ply, _) = walk(STARTPOS_B, &["7g7f", "3c3d"]);
+        let book = build_ykb(
+            &[(path[0], vec![(m16(STARTPOS_B, "7g7f"), 10_000)], vec![])],
+            &[(
+                p1[1],
+                vec![(parse_usi_move("3c3d", &one_ply).unwrap().move16(), 10_000)],
+                vec![path[0]],
+            )],
+        );
+        let ybb = Book::from_memory(build_ybb(&[(
+            sfen_pack(&two_ply),
+            two_ply.ply(),
+            vec![(parse_usi_move("2g2f", &two_ply).unwrap().move16(), 50, 10)],
+        )]))
+        .expect("valid ybb");
+
+        let mut prng = Prng::new(1);
+        let hit = probe_book(
+            Some(&yprobe(&book, &path)),
+            one(&ybb),
+            false,
+            &root,
+            &cfg(),
+            &mut prng,
+        )
+        .hit
+        .expect("hit");
+        assert_eq!(usi(hit.best), "7g7f");
+        assert_eq!(hit.ponder.map(usi), Some("3c3d".to_string()));
+        assert_eq!(
+            hit.info_lines[0]
+                .pv
+                .iter()
+                .copied()
+                .map(usi)
+                .collect::<Vec<_>>(),
+            vec!["7g7f", "3c3d", "2g2f"]
+        );
+        assert_eq!(hit.info_lines[0].depth, 0);
+        assert_eq!(hit.info_lines[0].score, 0);
     }
 }

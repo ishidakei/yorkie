@@ -12,11 +12,13 @@
 #
 # Format rules, each a hard build error and never a silent fallback:
 #
-#   * flat `key = value` pairs only; no `[table]` headers, no arrays;
+#   * flat `key = value` pairs only; no `[table]` headers. The one other form
+#     is an array of inline tables, `[ { key = value, ... }, ... ]`, which may
+#     run over several lines, for the one key that takes a list;
 #   * every key in the schema must be present, exactly once;
 #   * no key outside the schema may appear;
-#   * each value must have the declared type (integer / boolean / string) and
-#     sit inside the declared range or choice list.
+#   * each value must have the declared type (integer / boolean / string /
+#     array) and sit inside the declared range or choice list.
 #
 # `configs/test.toml` is the config the test suite runs against.
 
@@ -138,9 +140,46 @@ book_moves = 16
 book_ignore_rate = 0
 
 # Book file and directory (`BookFile` / `BookDir`). `no_book` is bookless; every
-# other choice names a `.ybb` file, the only book format this engine reads.
+# other choice names a `.ybb` file.
 book_file = "no_book"
 book_dir = "book"
+
+# The yorkie book: a second book format, probed before the `.ybb` book above.
+# Some of its entries are path-dependent — they apply only when certain earlier
+# positions have already occurred in the game — so it is probed with the whole
+# game from the `position` command, not the current position alone. A position
+# it answers is played from it; one it lacks falls through to the `.ybb` probe.
+#
+# The value is a list of yorkie book files, each with a selection weight:
+#
+#     yorkie_book_files = [
+#       { file = "best.ykb", weight = 70 },
+#       { file = "wide.ykb", weight = 30 },
+#     ]
+#
+# At every `usinewgame` the engine draws one entry at random, with probability
+# its `weight` divided by the sum of all weights, reports it as
+# `info string yorkie book: <file>`, and plays that game from it; a session
+# that starts a game without `usinewgame` plays from the first entry. One entry
+# is always chosen, whatever its weight. An empty list, `[]`, disables the
+# yorkie book, and a disabled yorkie book costs nothing.
+#
+# `file` is a file name, resolved inside `book_dir` exactly as `book_file` is;
+# `weight` is an integer from 1 to 4294967295. A weight below 1, an empty
+# `file` and a `file` named twice are build errors. The build generates the
+# list as `YORKIE_BOOK_FILES: &[(&str, u32)]`, `(file, weight)` in the order
+# written.
+#
+# Every file listed is loaded at `isready` and stays loaded for the session, so
+# choosing one at `usinewgame` reads nothing from disk. A file that is missing
+# or fails its format checks (magic, version, checksum, offsets, key order) is
+# reported with an `info string` and `readyok` is withheld.
+#
+# Of the settings above, `usi_own_book` and `book_ignore_rate` apply to it too,
+# and `book_pv_moves` shapes the PV of a hit from it. `book_moves` does not: it
+# is consulted at any ply. Neither do the mirror, ply and move-count settings or
+# the eval / depth filters, which are `.ybb`-only.
+yorkie_book_files = []
 
 # V1 only (`BookEvalDiff`): reject a book move whose value trails the best book
 # move's by more than this.

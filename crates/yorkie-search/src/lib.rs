@@ -29,7 +29,7 @@ mod text_str;
 pub mod timeman;
 pub mod update;
 
-pub use book::{BookConfig, BookHit, BookProbeResult, Prng, probe_book};
+pub use book::{BookConfig, BookHit, BookProbeResult, Prng, YorkieProbe, probe_book};
 // The book probe's diagnostic notices: only a build that prints them.
 #[cfg(feature = "verbose1")]
 pub use book::BookDiagnostic;

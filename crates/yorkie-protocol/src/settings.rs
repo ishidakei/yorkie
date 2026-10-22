@@ -70,6 +70,13 @@ impl Settings {
     pub(crate) fn worker_system_nodes(&self) -> &'static [usize] {
         crate::config::WORKER_SYSTEM_NODES
     }
+
+    /// The yorkie books probed ahead of the `.ybb` book, as `(file, weight)`:
+    /// one is drawn per game, with probability its weight over the sum. Empty
+    /// for none.
+    pub(crate) fn yorkie_book_files(&self) -> &'static [(&'static str, u32)] {
+        crate::config::YORKIE_BOOK_FILES
+    }
 }
 
 /// Define the `spin`-valued accessors: each is its generated constant.

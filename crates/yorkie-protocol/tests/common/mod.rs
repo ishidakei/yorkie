@@ -266,6 +266,63 @@ pub fn drive_with_seed(input: &str, book_seed: u64) -> String {
     String::from_utf8(bytes).expect("utf-8")
 }
 
+/// Like [`drive_with_seed`], with the session reading the yorkie book at
+/// `yorkie_book` — a one-entry list — rather than the ones the config names.
+pub fn drive_with_yorkie_book(input: &str, book_seed: u64, yorkie_book: &Path) -> String {
+    drive_with_yorkie_books(input, book_seed, &[(yorkie_book, 1)])
+}
+
+/// Like [`drive_with_seed`], with the session reading the yorkie books
+/// `books`, as `(file, weight)`, rather than the ones the config names.
+pub fn drive_with_yorkie_books(input: &str, book_seed: u64, books: &[(&Path, u32)]) -> String {
+    let output = Transcript::default();
+    driver(input.as_bytes(), output.clone(), Some(book_seed))
+        .with_yorkie_books(
+            books
+                .iter()
+                .map(|&(path, weight)| (path.to_path_buf(), weight))
+                .collect(),
+        )
+        .run()
+        .expect("driver run");
+    output.text()
+}
+
+/// Room the transcript of [`drive_counting_allocations`] starts with, far more
+/// than such a session writes.
+const COUNTED_TRANSCRIPT_BYTES: usize = 1 << 20;
+
+/// Like [`drive_with_seed`], reading the yorkie book at `yorkie_book` if one is
+/// given, for a session whose `info string stats alloc=` counts are compared.
+///
+/// The transcript buffer is allocated up front: growing it would be counted
+/// against whichever reply happened to fill it, and that is the harness's
+/// allocation, not the engine's.
+pub fn drive_counting_allocations(
+    input: &str,
+    book_seed: u64,
+    yorkie_book: Option<&Path>,
+) -> String {
+    let output = Transcript(Arc::new(Mutex::new(Vec::with_capacity(
+        COUNTED_TRANSCRIPT_BYTES,
+    ))));
+    driver(input.as_bytes(), output.clone(), Some(book_seed))
+        .with_yorkie_books(
+            yorkie_book
+                .map(|path| (path.to_path_buf(), 1))
+                .into_iter()
+                .collect(),
+        )
+        .run()
+        .expect("driver run");
+    let bytes = output.bytes();
+    assert!(
+        bytes.len() <= COUNTED_TRANSCRIPT_BYTES,
+        "the transcript outgrew the room it was given"
+    );
+    String::from_utf8(bytes).expect("utf-8")
+}
+
 /// The directory every driver this harness builds resolves `eval_dir` against,
 /// once a test has staged a network. Unset until then, which is the state the
 /// tests that need the engine to find *no* network rely on.
@@ -457,6 +514,89 @@ pub fn write_ybb(path: &Path, records: &[(&str, Vec<YbbMove<'_>>)]) {
     out.extend_from_slice(&index);
     out.extend_from_slice(&moves);
     std::fs::write(path, &out).expect("write ybb");
+}
+
+// --- Yorkie-book writer. ---
+
+/// A position as the moves that reach it from the initial position.
+pub type Line<'a> = &'a [&'a str];
+
+/// One yorkie-book entry for [`yorkie_book_bytes`]: the position, its moves as
+/// `(usi, weight)` in descending weight, and — for a path-dependent entry — the
+/// positions that must have occurred.
+pub type YkEntry<'a> = (Line<'a>, Vec<(&'a str, u16)>, Vec<Line<'a>>);
+
+/// The position `line` reaches from the initial position.
+pub fn startpos_after(line: Line<'_>) -> Position {
+    let mut pos = Position::startpos();
+    for usi in line {
+        let mv = parse_usi_move(usi, &pos).expect("legal move");
+        pos.do_move(mv);
+    }
+    pos
+}
+
+/// Build a well-formed yorkie-book image. Each section is sorted by key; the
+/// sort is stable, so path-dependent entries sharing a key keep their order.
+pub fn yorkie_book_bytes(shared: &[YkEntry<'_>], pathdep: &[YkEntry<'_>]) -> Vec<u8> {
+    let encode = |entries: &[YkEntry<'_>]| {
+        let mut out: Vec<([u8; 32], Vec<u8>)> = entries
+            .iter()
+            .map(|(line, moves, support)| {
+                let pos = startpos_after(line);
+                let key = sfen_pack(&pos);
+                let mut e = Vec::new();
+                e.extend_from_slice(&key);
+                e.extend_from_slice(&(moves.len() as u16).to_le_bytes());
+                e.extend_from_slice(&(support.len() as u16).to_le_bytes());
+                for (usi, weight) in moves {
+                    let m16 = parse_usi_move(usi, &pos).expect("legal move").move16();
+                    e.extend_from_slice(&m16.to_le_bytes());
+                    e.extend_from_slice(&weight.to_le_bytes());
+                }
+                for line in support {
+                    e.extend_from_slice(&sfen_pack(&startpos_after(line)));
+                }
+                (key, e)
+            })
+            .collect();
+        out.sort_by_key(|(key, _)| *key);
+        out
+    };
+
+    let mut out = vec![0u8; 40];
+    out[..8].copy_from_slice(b"YKBOOK01");
+    out[8..10].copy_from_slice(&2u16.to_le_bytes());
+    out[16..24].copy_from_slice(&(shared.len() as u64).to_le_bytes());
+    out[24..32].copy_from_slice(&(pathdep.len() as u64).to_le_bytes());
+    for (is_pathdep, entries) in [(false, encode(shared)), (true, encode(pathdep))] {
+        let table = out.len();
+        if is_pathdep {
+            out[32..40].copy_from_slice(&(table as u64).to_le_bytes());
+        }
+        out.resize(table + entries.len() * 8, 0);
+        for (i, (_, bytes)) in entries.iter().enumerate() {
+            let off = out.len() as u64;
+            out[table + i * 8..table + i * 8 + 8].copy_from_slice(&off.to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+    }
+    seal_yorkie_book(out)
+}
+
+/// Append the trailer — the SHA-256 of `body`, then the closing magic.
+pub fn seal_yorkie_book(mut body: Vec<u8>) -> Vec<u8> {
+    let digest = yorkie_storage::yorkie_book::sha256(&body);
+    body.extend_from_slice(&digest);
+    body.extend_from_slice(b"YKBOOKED");
+    body
+}
+
+/// Replace the trailer of a sealed image after its body has been edited, so
+/// the edit is the only thing wrong with it.
+pub fn reseal_yorkie_book(mut image: Vec<u8>) -> Vec<u8> {
+    image.truncate(image.len() - 40);
+    seal_yorkie_book(image)
 }
 
 /// Copy the committed `tests/fixtures/book/sample.ybb` into `dir` under

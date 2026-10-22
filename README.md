@@ -325,6 +325,7 @@ TOML ファイルを参照してください。
 | `book_ignore_rate` | 整数 | 0〜100 | 定跡を無視する確率 [%] |
 | `book_file` | 文字列 | `no_book` / `standard_book.ybb` / `yaneura_book1〜4.ybb` / `user_book1〜3.ybb` / `book.ybb` | 使用する定跡ファイル（`no_book` は定跡なし） |
 | `book_dir` | 文字列 | 任意 | 定跡ファイルを置くディレクトリ |
+| `yorkie_book_files` | 配列 | `[]` / `{ file = "<ファイル名>", weight = <重み> }` の並び（`weight` は 1〜4294967295） | `book_file` の定跡より先に引く yorkie 定跡（`YKBOOK01` 形式）のファイルと、それを選ぶ重みの一覧。`[]` で無効。各 `file` は `book_dir` 内で解決する。`usinewgame` のたびに、重みを重みの合計で割った確率で 1 つを選び、その対局ではそのファイルを引く。選んだファイルは、どのビルドでも `info string yorkie book: <file>` で知らせる。`usinewgame` を受けずに最初の対局を始めたときは、先頭のファイルを引く。`weight` が 1 未満の項目、空の `file`、同じ `file` の重複はビルドエラーになる。局面だけでなく対局中に現れた局面の集合にも依存するエントリを持つ。`usi_own_book` と `book_ignore_rate` は共通に効き、`book_moves` などその他の定跡キーは `.ybb` 側だけに効く。一覧のファイルはすべて `isready` で読み、セッションのあいだ読み込んだままにする。どれかが読めない・形式検査に通らないときは `isready` に `info string` で理由を出し、`readyok` を返さない |
 | `book_eval_diff` | 整数 | 0〜99999 | 定跡採用手の評価値の許容差（V1 のみ） |
 | `book_eval_black_diff` | 整数 | 0〜99999 | 先手番での定跡採用手の評価値の許容差（V2 のみ） |
 | `book_eval_white_diff` | 整数 | 0〜99999 | 後手番での定跡採用手の評価値の許容差（V2 のみ） |

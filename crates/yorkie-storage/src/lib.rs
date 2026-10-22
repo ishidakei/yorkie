@@ -1,14 +1,14 @@
 //! Storage layer: a substrate that may depend on std and utility crates only,
 //! never on the State, Evaluation, Search, or Protocol layers.
 //!
-//! It hosts the transposition table ([`tt`]), the `.ybb` opening-book reader
-//! ([`book`]), the huge-page-backed allocator ([`large_page`]) the other layers
-//! use for their big allocations, and the read-only file mapping ([`mapped`])
-//! that puts the evaluation network's pages at an address the caller chose. It
-//! also
-//! declares the process-wide
-//! `#[global_allocator]` ([`allocator`]) — a whole-program property rather than
-//! a Storage concern, placed here for the reason those module docs give.
+//! It hosts the transposition table ([`tt`]), the two opening-book readers —
+//! `.ybb` ([`book`]) and the path-dependent yorkie book ([`yorkie_book`]) —
+//! the huge-page-backed allocator ([`large_page`]) the other layers use for
+//! their big allocations, and the read-only file mapping ([`mapped`]) that puts
+//! the evaluation network's pages at an address the caller chose. It also
+//! declares the process-wide `#[global_allocator]` ([`allocator`]) — a
+//! whole-program property rather than a Storage concern, placed here for the
+//! reason those module docs give.
 //!
 //! The transposition table's size is a setting, and the table is a `static`,
 //! so this crate compiles that setting in the same way the rest of the engine
@@ -22,6 +22,7 @@ mod config;
 pub mod large_page;
 pub mod mapped;
 pub mod tt;
+pub mod yorkie_book;
 
 #[cfg(feature = "verbose1")]
 pub use allocator::{CountingAlloc, clear_alloc_count, take_alloc_count};
@@ -35,3 +36,4 @@ pub use tt::{
     Bound, CLUSTER_COUNT, DEPTH_NONE, Depth, TABLE_BYTES, TT_ALIGN, TTData, TTWriter,
     TranspositionTable, TtSlot, VALUE_NONE, Value,
 };
+pub use yorkie_book::{YorkieBook, YorkieBookError, YorkieEntry, YorkieMove};

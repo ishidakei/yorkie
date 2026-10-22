@@ -81,6 +81,11 @@ enum Kind {
     /// explicit CPU list. Either way the chosen CPUs are generated as constants
     /// and recorded in the ledger.
     CpuAssignment,
+    /// A list of files, each with a selection weight: an array of
+    /// `{ file = "<name>", weight = <n> }` tables, generated as
+    /// `&[(&str, u32)]` in the order written. Every `file` is non-empty and
+    /// named once, and every `weight` is in `[1, u32::MAX]`.
+    WeightedFiles,
 }
 
 /// Every Cargo feature the schema conditions a constant on: the verbosity
@@ -288,6 +293,16 @@ const fn cpu_assignment(key: &'static str, usi: &'static str) -> Spec {
     }
 }
 
+/// A list of weighted files (see [`Kind::WeightedFiles`]).
+const fn weighted_files(key: &'static str, usi: &'static str) -> Spec {
+    Spec {
+        key,
+        usi,
+        kind: Kind::WeightedFiles,
+        gate: None,
+    }
+}
+
 const fn boolean(key: &'static str, usi: &'static str) -> Spec {
     Spec {
         key,
@@ -366,6 +381,10 @@ const SCHEMA: &[Spec] = &[
     int("book_ignore_rate", "BookIgnoreRate", 0, 100),
     choice("book_file", "BookFile", BOOK_FILE_CHOICES),
     text("book_dir", "BookDir"),
+    weighted_files(
+        "yorkie_book_files",
+        "(none: the yorkie books probed ahead of `BookFile`, one drawn per game by weight)",
+    ),
     int("book_eval_diff", "BookEvalDiff", 0, 99_999),
     int("book_eval_black_diff", "BookEvalBlackDiff", 0, 99_999),
     int("book_eval_white_diff", "BookEvalWhiteDiff", 0, 99_999),
@@ -451,7 +470,13 @@ enum Value {
     Int(i64),
     Bool(bool),
     Str(String),
+    /// An array of inline tables, the only array the subset has.
+    Array(Vec<Table>),
 }
+
+/// An inline table's `key = value` pairs in the order written. Its values are
+/// scalars.
+type Table = Vec<(String, Value)>;
 
 impl Value {
     fn type_name(&self) -> &'static str {
@@ -459,13 +484,15 @@ impl Value {
             Value::Int(_) => "integer",
             Value::Bool(_) => "boolean",
             Value::Str(_) => "string",
+            Value::Array(_) => "array",
         }
     }
 }
 
-/// Parse the accepted TOML subset into `key -> entry`: flat `key = value` pairs
-/// whose values are integers, booleans or basic strings, plus `#` comments and
-/// blank lines.
+/// Parse the accepted TOML subset into `key -> entry`: `key = value` pairs
+/// whose values are integers, booleans, basic strings or arrays of inline
+/// tables, plus `#` comments and blank lines. An array may run over several
+/// lines, up to the one that closes it.
 ///
 /// Anything else is an error rather than something quietly skipped, because a
 /// line the engine config does not understand is a setting the operator believes
@@ -475,7 +502,8 @@ impl Value {
 fn parse_config(contents: &str, label: &str) -> Result<BTreeMap<String, Entry>, String> {
     let mut entries: BTreeMap<String, Entry> = BTreeMap::new();
 
-    for (idx, raw) in contents.lines().enumerate() {
+    let mut lines = contents.lines().enumerate();
+    while let Some((idx, raw)) = lines.next() {
         let line_no = idx + 1;
         let line = strip_comment(raw).trim();
         if line.is_empty() {
@@ -499,7 +527,17 @@ fn parse_config(contents: &str, label: &str) -> Result<BTreeMap<String, Entry>, 
                 &format!("`{key}` is not a valid key (lowercase letters, digits and `_` only)"),
             ));
         }
-        let value = parse_value(value.trim(), label, line_no)?;
+        let mut value = value.trim().to_string();
+        if value.starts_with('[') {
+            while bracket_depth(&value) > 0 {
+                let Some((_, next)) = lines.next() else {
+                    return Err(at(label, line_no, "unterminated array value"));
+                };
+                value.push(' ');
+                value.push_str(strip_comment(next).trim());
+            }
+        }
+        let value = parse_value(&value, label, line_no)?;
         if let Some(prev) = entries.insert(
             key.to_string(),
             Entry {
@@ -535,9 +573,130 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
+/// How many `[` outside a string are still open at the end of `text`.
+fn bracket_depth(text: &str) -> i64 {
+    let mut in_string = false;
+    let mut depth = 0;
+    for b in text.bytes() {
+        match b {
+            b'"' => in_string = !in_string,
+            b'[' if !in_string => depth += 1,
+            b']' if !in_string => depth -= 1,
+            _ => {}
+        }
+    }
+    depth
+}
+
+/// Split `text` at every `sep` that is outside a string and outside any
+/// bracket or brace.
+fn split_top_level(text: &str, sep: u8) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut in_string = false;
+    let mut depth = 0i64;
+    let mut start = 0;
+    for (i, b) in text.bytes().enumerate() {
+        match b {
+            b'"' => in_string = !in_string,
+            b'[' | b'{' if !in_string => depth += 1,
+            b']' | b'}' if !in_string => depth -= 1,
+            _ if b == sep && !in_string && depth == 0 => {
+                parts.push(&text[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
+/// Parse the inside of an array's brackets: inline tables separated by
+/// commas, with a trailing comma allowed.
+fn parse_array(body: &str, label: &str, line_no: usize) -> Result<Value, String> {
+    let mut parts: Vec<&str> = split_top_level(body, b',')
+        .into_iter()
+        .map(str::trim)
+        .collect();
+    if parts.last().is_some_and(|last| last.is_empty()) {
+        parts.pop();
+    }
+    let mut tables = Vec::with_capacity(parts.len());
+    for part in parts {
+        let Some(inner) = part
+            .strip_prefix('{')
+            .and_then(|rest| rest.strip_suffix('}'))
+        else {
+            return Err(at(
+                label,
+                line_no,
+                &format!(
+                    "`{part}` is not an inline table; an array element is \
+                     `{{ key = value, ... }}`"
+                ),
+            ));
+        };
+        tables.push(parse_table(inner, label, line_no)?);
+    }
+    Ok(Value::Array(tables))
+}
+
+/// Parse the inside of an inline table's braces: scalar `key = value` pairs
+/// separated by commas.
+fn parse_table(body: &str, label: &str, line_no: usize) -> Result<Table, String> {
+    let mut table: Table = Vec::new();
+    for pair in split_top_level(body, b',') {
+        let Some((key, value)) = pair.split_once('=') else {
+            return Err(at(
+                label,
+                line_no,
+                &format!("expected `key = value` in an inline table, got `{}`", pair.trim()),
+            ));
+        };
+        let key = key.trim();
+        if key.is_empty() || !key.bytes().all(is_key_byte) {
+            return Err(at(
+                label,
+                line_no,
+                &format!("`{key}` is not a valid key (lowercase letters, digits and `_` only)"),
+            ));
+        }
+        let value = value.trim();
+        if split_top_level(value, b'=').len() > 1 {
+            return Err(at(
+                label,
+                line_no,
+                "two fields of an inline table must be separated by `,`",
+            ));
+        }
+        if value.starts_with('[') || value.starts_with('{') {
+            return Err(at(
+                label,
+                line_no,
+                "an inline table holds only integers, booleans and quoted strings",
+            ));
+        }
+        if table.iter().any(|(k, _)| k == key) {
+            return Err(at(
+                label,
+                line_no,
+                &format!("key `{key}` is set twice in one inline table"),
+            ));
+        }
+        table.push((key.to_string(), parse_value(value, label, line_no)?));
+    }
+    Ok(table)
+}
+
 fn parse_value(raw: &str, label: &str, line_no: usize) -> Result<Value, String> {
     if raw.is_empty() {
         return Err(at(label, line_no, "missing value after `=`"));
+    }
+    if let Some(rest) = raw.strip_prefix('[') {
+        let Some(body) = rest.strip_suffix(']') else {
+            return Err(at(label, line_no, "an array value must end with `]`"));
+        };
+        return parse_array(body, label, line_no);
     }
     if let Some(rest) = raw.strip_prefix('"') {
         let Some(body) = rest.strip_suffix('"') else {
@@ -815,6 +974,18 @@ fn generate(
                     resolved.items
                 )
             }
+            (Kind::WeightedFiles, Value::Array(tables)) => {
+                let files = weighted_files_of(spec.key, tables)
+                    .map_err(|e| at(label, entry.line, &e))?;
+                let items: Vec<String> = files
+                    .iter()
+                    .map(|(file, weight)| format!("(\"{}\", {weight})", escape(file)))
+                    .collect();
+                format!(
+                    "pub const {const_name}: &[(&str, u32)] = &[{}];",
+                    items.join(", ")
+                )
+            }
             (kind, value) => {
                 return Err(at(
                     label,
@@ -850,7 +1021,73 @@ fn expected(kind: &Kind) -> &'static str {
         Kind::Text | Kind::Choice(_) => "a string",
         Kind::NodeCount => "an integer or \"auto\"",
         Kind::CpuAssignment => "\"auto\" or a CPU list",
+        Kind::WeightedFiles => "an array of `{ file = \"<name>\", weight = <n> }` tables",
     }
+}
+
+/// The `(file, weight)` pairs of a [`Kind::WeightedFiles`] key, in the order
+/// written, or why the array is refused. Entries are numbered from 1 in the
+/// message, as the operator counts them.
+fn weighted_files_of(key: &str, tables: &[Table]) -> Result<Vec<(String, u32)>, String> {
+    let mut files: Vec<(String, u32)> = Vec::with_capacity(tables.len());
+    for (i, table) in tables.iter().enumerate() {
+        let n = i + 1;
+        let mut file = None;
+        let mut weight = None;
+        for (field, value) in table {
+            match (field.as_str(), value) {
+                ("file", Value::Str(s)) => file = Some(s),
+                ("weight", Value::Int(w)) => weight = Some(*w),
+                ("file", other) => {
+                    return Err(format!(
+                        "`{key}` entry {n}: `file` must be a string, got {}",
+                        other.type_name()
+                    ));
+                }
+                ("weight", other) => {
+                    return Err(format!(
+                        "`{key}` entry {n}: `weight` must be an integer, got {}",
+                        other.type_name()
+                    ));
+                }
+                (other, _) => {
+                    return Err(format!(
+                        "`{key}` entry {n}: unknown field `{other}`; an entry is \
+                         `{{ file = \"<name>\", weight = <n> }}`"
+                    ));
+                }
+            }
+        }
+        let Some(file) = file else {
+            return Err(format!("`{key}` entry {n} has no `file`"));
+        };
+        let Some(weight) = weight else {
+            return Err(format!("`{key}` entry {n} has no `weight`"));
+        };
+        if file.is_empty() {
+            return Err(format!("`{key}` entry {n}: `file` is empty"));
+        }
+        let Ok(weight) = u32::try_from(weight) else {
+            return Err(format!(
+                "`{key}` entry {n}: `weight` = {weight} is outside [1, {}]",
+                u32::MAX
+            ));
+        };
+        if weight < 1 {
+            return Err(format!(
+                "`{key}` entry {n}: `weight` = {weight} is outside [1, {}]",
+                u32::MAX
+            ));
+        }
+        if let Some(first) = files.iter().position(|(f, _)| f == file) {
+            return Err(format!(
+                "`{key}` names `{file}` twice (entries {} and {n})",
+                first + 1
+            ));
+        }
+        files.push((file.clone(), weight));
+    }
+    Ok(files)
 }
 
 fn escape(s: &str) -> String {

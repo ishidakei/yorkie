@@ -31,6 +31,18 @@ const _: () = assert!(
 const _: () = assert!(SLOW_MOVER >= 1, "SLOW_MOVER is a percentage, never 0");
 const _: () = assert!(!EVAL_DIR.is_empty(), "EVAL_DIR must name a directory");
 const _: () = assert!(!BOOK_DIR.is_empty(), "BOOK_DIR must name a directory");
+const _: () = {
+    let mut i = 0;
+    while i < YORKIE_BOOK_FILES.len() {
+        let (file, weight) = YORKIE_BOOK_FILES[i];
+        assert!(
+            !file.is_empty(),
+            "every YORKIE_BOOK_FILES entry names a file"
+        );
+        assert!(weight >= 1, "every YORKIE_BOOK_FILES weight is at least 1");
+        i += 1;
+    }
+};
 const _: () = assert!(NUMA_NODES >= 1, "a machine has at least one NUMA node");
 const _: () = assert!(
     NUMA_NODE_CPUS.len() == NUMA_NODES && NUMA_SYSTEM_NODES.len() == NUMA_NODES,

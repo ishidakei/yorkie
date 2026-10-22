@@ -631,7 +631,23 @@ fn syntax_outside_the_accepted_subset_is_an_error() {
         ("eval-dir = \"eval\"\n", "is not a valid key"),
         (
             "book_file = [\"a\"]\n",
-            "is not an integer, a boolean, or a quoted string",
+            "is not an inline table; an array element is `{ key = value, ... }`",
+        ),
+        (
+            "yorkie_book_files = [\n  { file = \"a.ykb\", weight = 1 },\n",
+            "unterminated array value",
+        ),
+        (
+            "yorkie_book_files = [{ file = \"a.ykb\" weight = 1 }]\n",
+            "two fields of an inline table must be separated by `,`",
+        ),
+        (
+            "yorkie_book_files = [{ file = [\"a.ykb\"], weight = 1 }]\n",
+            "an inline table holds only integers, booleans and quoted strings",
+        ),
+        (
+            "yorkie_book_files = [{ file = \"a.ykb\", file = \"b.ykb\" }]\n",
+            "key `file` is set twice in one inline table",
         ),
     ] {
         let err = compile(body).expect_err("must fail on: {body}");
@@ -676,6 +692,129 @@ fn comments_underscores_and_spacing_are_accepted() {
     let out = compile(&text).expect("must compile");
     assert!(out.contains("pub const BOOK_DIR: &str = \"book#1\";"));
     assert!(out.contains("pub const USI_HASH: i64 = 1024;"));
+}
+
+/// The yorkie-book list is an array of `{ file, weight }` tables, over one line
+/// or several, and generates `(file, weight)` pairs in the order written; an
+/// empty array generates an empty list.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_yorkie_book_list_generates_its_files_and_weights() {
+    let out = compile(&default_with(
+        "yorkie_book_files",
+        Some(
+            "yorkie_book_files = [   # the books\n\
+             \x20 { file = \"best.ykb\", weight = 70 },\n\
+             \x20 # a comment between entries\n\
+             \x20 { weight = 3_0, file = \"wide.ykb\" },\n\
+             ]",
+        ),
+    ))
+    .expect("must compile");
+    assert!(
+        out.contains(
+            "pub const YORKIE_BOOK_FILES: &[(&str, u32)] = &[(\"best.ykb\", 70), (\"wide.ykb\", 30)];"
+        ),
+        "{out}"
+    );
+
+    let out = compile(&default_with(
+        "yorkie_book_files",
+        Some("yorkie_book_files = [{ file = \"only.ykb\", weight = 1 }]"),
+    ))
+    .expect("must compile");
+    assert!(
+        out.contains("pub const YORKIE_BOOK_FILES: &[(&str, u32)] = &[(\"only.ykb\", 1)];"),
+        "{out}"
+    );
+
+    let out = compile(&default_with(
+        "yorkie_book_files",
+        Some("yorkie_book_files = []"),
+    ))
+    .expect("must compile");
+    assert!(
+        out.contains("pub const YORKIE_BOOK_FILES: &[(&str, u32)] = &[];"),
+        "{out}"
+    );
+}
+
+/// A weight below 1, an empty file, a file named twice and a malformed entry
+/// each fail the build, with a message naming the key.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_faulty_yorkie_book_list_is_an_error() {
+    for (entries, want) in [
+        (
+            "{ file = \"a.ykb\", weight = 0 }",
+            "`yorkie_book_files` entry 1: `weight` = 0 is outside [1, 4294967295]",
+        ),
+        (
+            "{ file = \"a.ykb\", weight = 1 }, { file = \"b.ykb\", weight = -5 }",
+            "`yorkie_book_files` entry 2: `weight` = -5 is outside [1, 4294967295]",
+        ),
+        (
+            "{ file = \"a.ykb\", weight = 4294967296 }",
+            "`yorkie_book_files` entry 1: `weight` = 4294967296 is outside [1, 4294967295]",
+        ),
+        (
+            "{ file = \"\", weight = 1 }",
+            "`yorkie_book_files` entry 1: `file` is empty",
+        ),
+        (
+            "{ file = \"a.ykb\", weight = 7 }, { file = \"b.ykb\", weight = 1 }, \
+             { file = \"a.ykb\", weight = 3 }",
+            "`yorkie_book_files` names `a.ykb` twice (entries 1 and 3)",
+        ),
+        (
+            "{ file = \"a.ykb\" }",
+            "`yorkie_book_files` entry 1 has no `weight`",
+        ),
+        (
+            "{ weight = 1 }",
+            "`yorkie_book_files` entry 1 has no `file`",
+        ),
+        (
+            "{ file = \"a.ykb\", weight = \"1\" }",
+            "`yorkie_book_files` entry 1: `weight` must be an integer, got string",
+        ),
+        (
+            "{ file = 3, weight = 1 }",
+            "`yorkie_book_files` entry 1: `file` must be a string, got integer",
+        ),
+        (
+            "{ file = \"a.ykb\", weight = 1, depth = 2 }",
+            "`yorkie_book_files` entry 1: unknown field `depth`",
+        ),
+    ] {
+        let line = format!("yorkie_book_files = [{entries}]");
+        let err = compile(&default_with("yorkie_book_files", Some(&line)))
+            .expect_err("must fail on: {line}");
+        assert!(
+            err.contains(want),
+            "for {line:?} expected {want:?}, got {err}"
+        );
+    }
+
+    let err = compile(&default_with(
+        "yorkie_book_files",
+        Some("yorkie_book_files = \"best.ykb\""),
+    ))
+    .expect_err("a string is not a list");
+    assert!(
+        err.contains(
+            "`yorkie_book_files` must be an array of `{ file = \"<name>\", weight = <n> }` \
+             tables, got string"
+        ),
+        "message: {err}"
+    );
+
+    let err = compile(&default_with("book_dir", Some("book_dir = []")))
+        .expect_err("an array is not a string");
+    assert!(
+        err.contains("`book_dir` must be a string, got array"),
+        "message: {err}"
+    );
 }
 
 #[cfg_attr(miri, ignore)]

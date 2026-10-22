@@ -471,6 +471,12 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
         self
     }
 
+    /// Override the yorkie book list — see [`Engine::set_yorkie_books`].
+    pub fn with_yorkie_books(mut self, books: Vec<(PathBuf, u32)>) -> Self {
+        self.engine.set_yorkie_books(books);
+        self
+    }
+
     /// Override the sysfs root the `isready` layout check reads — see
     /// [`Engine::set_sysfs_root`].
     pub fn with_sysfs_root(mut self, root: PathBuf) -> Self {
@@ -511,7 +517,7 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
                 Command::Usi => self.handle_usi()?,
                 Command::IsReady => self.handle_isready()?,
                 Command::SetOption { name, value } => self.handle_setoption(name, value)?,
-                Command::UsiNewGame => self.handle_usinewgame(),
+                Command::UsiNewGame => self.handle_usinewgame()?,
                 Command::Position { sfen, moves } => self.handle_position(sfen, moves)?,
                 Command::Go(params) => self.handle_go(params)?,
                 #[cfg(not(feature = "verbose2"))]
@@ -588,6 +594,19 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
                 reason.write_message(&mut out);
                 self.out.info_string(out.as_bytes())
             }
+            ReadyOutcome::YorkieBookFailed(path, reason) => {
+                // A book the config names is one the engine is meant to play
+                // from, so a session without it is not ready.
+                let mut bytes = [0u8; NOTICE_BYTES];
+                let mut out = TextWriter::new(&mut bytes);
+                out.bytes(b"yorkie book load failed : ")
+                    .path(&path)
+                    .bytes(b" : ");
+                reason.write_message(|fragment| {
+                    out.bytes(fragment);
+                });
+                self.out.info_string(out.as_bytes())
+            }
         }
     }
 
@@ -596,9 +615,10 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
         self.out.handshake()
     }
 
-    /// `usinewgame`: a fresh game, and nothing to say about it.
-    fn handle_usinewgame(&mut self) {
-        self.engine.new_game();
+    /// `usinewgame`: a fresh game, and nothing to say about it but the yorkie
+    /// book it plays from, when there is one.
+    fn handle_usinewgame(&mut self) -> io::Result<()> {
+        self.engine.new_game()
     }
 
     /// `setoption name <N> value <V>`: the USI minimum, in every build.
@@ -782,7 +802,7 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
         // The `ucinewgame` (`search_clear`) the reference runs once before the
         // positions: clears the TT, resets histories, and rebuilds the pool — the
         // clean, identical starting state that makes two runs report equal nodes.
-        self.handle_usinewgame();
+        self.handle_usinewgame()?;
         // That state covers the evaluation noise too: the seed a new game draws
         // would give each run its own node count.
         #[cfg(feature = "random")]
