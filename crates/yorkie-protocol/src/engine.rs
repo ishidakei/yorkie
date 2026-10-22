@@ -36,9 +36,9 @@ use yorkie_eval::{NetworkParams, NnueError, network_file};
 use yorkie_numa::{CpuIndex, NumaIndex, NumaLayout, SysfsError, mempolicy};
 use yorkie_search::{
     BookConfig, BookHit, EnteringKingConfig, Prng, QSearch, RootMove, SearchControl,
-    SharedHistories, TallySlot, TimeControl, TimeInput, TimeManagement, WorkerHistories,
-    WorkerResult, WorkerVote, YorkieProbe, declaration_win, generate_root_moves, probe_book,
-    select_best_worker,
+    SharedHistories, TallySlot, TimeControl, TimeInput, TimeManagement, VALUE_INFINITE,
+    WorkerHistories, WorkerResult, WorkerVote, YorkieProbe, declaration_win, generate_root_moves,
+    probe_book, select_best_worker,
 };
 // The PV-line surface: only a `verbose2` build renders one, so only it needs
 // the line's data type, the sink trait the search emits through and the output
@@ -263,9 +263,6 @@ pub const MATE_UNLIMITED_MS: u64 = i32::MAX as u64;
 const BENCH_RANDOM_SEED: u64 = 0;
 /// `Eval::PawnValue` / `NormalizeToPawnValue`.
 pub(crate) const PAWN_VALUE: Value = 90;
-/// `VALUE_INFINITE`: the pre-search `rootMoves[0].score` sentinel the
-/// `ResignValue` guard excludes.
-const VALUE_INFINITE: Value = 32001;
 
 /// `ResignValue`: the post-search resign threshold in centipawns. A searched
 /// best score at or below `-RESIGN_VALUE` resigns.
@@ -2348,6 +2345,9 @@ struct HelperJob {
     /// The stop flag every worker of this search polls: [`STOP`] for a `go`,
     /// [`PONDER_STOP`] for the search that thinks past its reply.
     stop: &'static AtomicBool,
+    /// Whether this search is the one that thinks past the reply, whose root has
+    /// the opponent to move.
+    thinking_ahead: bool,
     /// Per-worker node counters; the helper publishes `nodes` to
     /// `node_slots[index]`. The aggregate they form is read by the node ceiling
     /// and by the search `info` lines, both `verbose2`.
@@ -2506,6 +2506,7 @@ fn helper_loop<N: NetworkParams>(
             qs.set_node_tally(job.node_slots, job.index);
             qs.set_best_move_tally(job.bmc_slots, job.index);
             qs.set_entering_king(job.entering_king);
+            qs.set_thinking_ahead(job.thinking_ahead);
             #[cfg(feature = "verbose2")]
             qs.set_mate_mode(job.mate_mode);
             #[cfg(feature = "random")]
@@ -3003,6 +3004,7 @@ impl PonderJob {
                 #[cfg(feature = "verbose2")]
                 limit_depth: SEARCH_MAX_DEPTH,
                 stop: &PONDER_STOP,
+                thinking_ahead: true,
                 #[cfg(feature = "verbose2")]
                 node_slots: self.node_slots,
                 bmc_slots: self.bmc_slots,
@@ -3030,6 +3032,9 @@ impl PonderJob {
         qs.set_node_tally(self.node_slots, 0);
         qs.set_best_move_tally(self.bmc_slots, 0);
         qs.set_entering_king(entering_king);
+        // The engine's side is the one that just moved, not the one to move at
+        // this root.
+        qs.set_thinking_ahead(true);
         #[cfg(feature = "verbose2")]
         qs.set_mate_mode(false);
         #[cfg(feature = "random")]
@@ -3350,6 +3355,7 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
             #[cfg(feature = "verbose2")]
             limit_depth: depth,
             stop: &STOP,
+            thinking_ahead: false,
             #[cfg(feature = "verbose2")]
             node_slots,
             bmc_slots,

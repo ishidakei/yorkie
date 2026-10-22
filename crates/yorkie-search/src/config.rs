@@ -5,8 +5,8 @@
 //! hand-written, and no value can change at run time.
 //!
 //! The search reads the handful of keys that shape a node — the draw horizon,
-//! the per-colour draw contempt, the non-promotion widening and the
-//! entering-king rule. The rest are allowed-but-unused rather than filtered out,
+//! the per-colour draw contempt, the non-promotion widening, the entering-king
+//! rule and how the engine's own mates are scored. The rest are allowed-but-unused rather than filtered out,
 //! so this file cannot drift from the protocol crate's copy.
 
 #![allow(dead_code)]

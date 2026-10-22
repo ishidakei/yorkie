@@ -2,8 +2,8 @@
 //!
 //! The search reads the settings that shape a node: the draw horizon and the
 //! draw contempt it scores a repetition with, whether the generators expose the
-//! suppressed non-promotions, and which entering-king rule decides a
-//! declaration. Every one of them is fixed when the binary is built, so the node
+//! suppressed non-promotions, which entering-king rule decides a declaration,
+//! and whether the engine's own mates are scored flat. Every one of them is fixed when the binary is built, so the node
 //! path reads a constant rather than a field a caller filled in.
 //!
 //! The schema, parser, code generator and path resolution are shared verbatim

@@ -72,6 +72,8 @@ nodes_limit = 3000
 # search adjudicates a draw before it can see the mate.
 max_moves_to_draw = 50
 
+flatten_winning_mate = false
+
 pv_interval = 0
 
 # DIFFERENCE: false in test.toml. Each PV is collected from the transposition

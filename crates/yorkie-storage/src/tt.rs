@@ -146,7 +146,16 @@ pub type Depth = i32;
 pub const DEPTH_NONE: Depth = -3;
 
 /// `VALUE_NONE`, the sentinel returned for a miss.
-pub const VALUE_NONE: Value = 32002;
+///
+/// It sits one above the search's infinity, which itself sits above every score
+/// the search produces. A build that scores the engine's own mates with one flat
+/// value above the whole mate gradient (`flatten_winning_mate`) moves infinity
+/// up by one to make room, and this sentinel with it.
+pub const VALUE_NONE: Value = if crate::config::FLATTEN_WINNING_MATE {
+    32003
+} else {
+    32002
+};
 
 // The `genBound8` bit layout: `generation (5) | bound (2) << 5 | pv (1) << 7`.
 const GENERATION_BITS: u8 = 5;

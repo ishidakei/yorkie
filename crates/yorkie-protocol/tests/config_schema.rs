@@ -29,6 +29,7 @@ const CHECKED_IN_CONFIGS: &[&str] = &[
     "configs/default.toml",
     "configs/test.toml",
     "configs/test-limits.toml",
+    "configs/tournament.toml",
 ];
 
 /// Compile a config body as the build with every gating feature on sees it —

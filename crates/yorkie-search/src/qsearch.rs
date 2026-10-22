@@ -52,12 +52,44 @@ use crate::update::{
 
 /// `MAX_PLY`: the standard engine build value.
 const MAX_PLY: i32 = 246;
-/// `VALUE_INFINITE`.
-const VALUE_INFINITE: Value = 32001;
-/// `VALUE_NONE`.
-const VALUE_NONE: Value = 32002;
+/// Whether a forced mate the engine delivers is scored [`VALUE_MATE_FLAT`]
+/// rather than by its distance (the `flatten_winning_mate` setting).
+///
+/// The reference scores every mate by distance, so a shorter one is always
+/// worth more and the search keeps hunting for it after one is proven. With
+/// this on, the engine's own wins are all worth the same, while a mate against
+/// the engine keeps the gradient, so the longest defence is still preferred.
+const FLATTEN: bool = crate::config::FLATTEN_WINNING_MATE;
 /// `VALUE_MATE`.
 const VALUE_MATE: Value = 32000;
+/// The single score of a forced mate the engine delivers, in a build with the
+/// `flatten_winning_mate` setting on: above the whole `mate_in` gradient, so no
+/// distance-scored mate outranks it, and below [`VALUE_INFINITE`].
+pub const VALUE_MATE_FLAT: Value = VALUE_MATE + 1;
+/// `VALUE_INFINITE`: the reference's, moved up one in a build with the
+/// `flatten_winning_mate` setting on, to make room for [`VALUE_MATE_FLAT`].
+pub const VALUE_INFINITE: Value = infinite_for(FLATTEN);
+/// `VALUE_NONE`: one above [`VALUE_INFINITE`], in either build.
+const VALUE_NONE: Value = none_for(FLATTEN);
+// The table's miss sentinel is the search's, and the search's orderings all
+// hold in both builds.
+const _: () = assert!(VALUE_NONE == yorkie_storage::VALUE_NONE);
+const _: () = assert!(VALUE_MATE < VALUE_MATE_FLAT && VALUE_MATE_FLAT <= VALUE_INFINITE);
+const _: () = assert!(!FLATTEN || VALUE_MATE_FLAT < VALUE_INFINITE);
+
+/// [`VALUE_INFINITE`] in a build with or without [`FLATTEN`].
+const fn infinite_for(flat: bool) -> Value {
+    if flat {
+        VALUE_MATE_FLAT + 1
+    } else {
+        VALUE_MATE + 1
+    }
+}
+
+/// [`VALUE_NONE`] in a build with or without [`FLATTEN`].
+const fn none_for(flat: bool) -> Value {
+    infinite_for(flat) + 1
+}
 /// `VALUE_MATE_IN_MAX_PLY` == `VALUE_TB_WIN_IN_MAX_PLY`.
 const VALUE_TB_WIN_IN_MAX_PLY: Value = VALUE_MATE - MAX_PLY; // 31754
 /// `VALUE_MAX_EVAL` == `VALUE_SUPERIOR`.
@@ -65,9 +97,41 @@ const VALUE_MAX_EVAL: Value = VALUE_TB_WIN_IN_MAX_PLY - 1; // 31753
 /// `VALUE_DRAW`.
 const VALUE_DRAW: Value = 0;
 /// The `rootDelta` a search that has not opened an aspiration window reduces
-/// against: the full window's width.
+/// against: the full window's width, as [`window_width`] measures it.
 const ROOT_DELTA_FULL: NonZeroU32 =
-    NonZeroU32::new(2 * VALUE_INFINITE as u32).expect("the full window has a positive width");
+    NonZeroU32::new(window_width(-VALUE_INFINITE, VALUE_INFINITE) as u32)
+        .expect("the full window has a positive width");
+/// The reference's `VALUE_INFINITE`, which [`VALUE_INFINITE`] is in a build
+/// without [`FLATTEN`].
+const GRADIENT_INFINITE: Value = infinite_for(false);
+
+/// The width of the window `(alpha, beta)` as the reductions read it.
+///
+/// Under [`FLATTEN`] infinity sits one higher, and a width measured against it
+/// would move the reductions a full window feeds by a rounding step, so a search
+/// with no flat mate anywhere in it would still differ from the gradient
+/// build's. Measured against [`GRADIENT_INFINITE`], a window has the width it
+/// has there.
+#[inline(always)]
+const fn window_width(alpha: Value, beta: Value) -> Value {
+    if FLATTEN {
+        min_value(beta, GRADIENT_INFINITE) - max_value(alpha, -GRADIENT_INFINITE)
+    } else {
+        beta - alpha
+    }
+}
+
+/// `min` in a `const` context, where [`Ord::min`] is not available.
+#[inline(always)]
+const fn min_value(a: Value, b: Value) -> Value {
+    if a < b { a } else { b }
+}
+
+/// `max` in a `const` context, where [`Ord::max`] is not available.
+#[inline(always)]
+const fn max_value(a: Value, b: Value) -> Value {
+    if a > b { a } else { b }
+}
 /// `DEPTH_QS`.
 const DEPTH_QS: i32 = 0;
 /// `DEPTH_UNSEARCHED`.
@@ -97,6 +161,27 @@ const fn is_past_move_limit(game_ply: u16) -> bool {
     match MOVE_LIMIT {
         Some(limit) => game_ply as i32 > limit.get(),
         None => false,
+    }
+}
+
+/// Whether a mate delivered by the side to move at `game_ply` lands on a ply
+/// the configured [`MOVE_LIMIT`] still plays.
+///
+/// The mated position sits one ply further on, and past the limit every node
+/// adjudicates a draw before it looks for a mate, so a shortcut that claims the
+/// mate one ply early must ask this first or it scores a game the full search
+/// calls drawn.
+#[inline(always)]
+const fn mate_lands_inside_move_limit(game_ply: u16) -> bool {
+    mate_lands_inside(MOVE_LIMIT, game_ply)
+}
+
+/// [`mate_lands_inside_move_limit`] against an explicit `limit`.
+#[inline(always)]
+const fn mate_lands_inside(limit: Option<NonZeroI32>, game_ply: u16) -> bool {
+    match limit {
+        Some(limit) => (game_ply as i32) < limit.get(),
+        None => true,
     }
 }
 
@@ -173,8 +258,32 @@ fn is_decisive(v: Value) -> bool {
 }
 
 /// `value_to_tt(v, ply)`: shift a mate score away from the root before storing.
+#[inline(always)]
 fn value_to_tt(v: Value, ply: i32) -> Value {
-    if is_win(v) {
+    value_to_tt_for(FLATTEN, v, ply)
+}
+
+/// [`value_to_tt`] in a build with or without [`FLATTEN`].
+///
+/// Under [`FLATTEN`] the flat mate carries no distance, so it is stored as it
+/// is, and every other decisive value is clamped to `[-VALUE_MATE,
+/// VALUE_MATE]`. The clamp is what keeps the two apart: the repetition
+/// sentinels and the infinity bound are not distances either, and shifted by a
+/// ply they can step onto `±VALUE_MATE_FLAT` and come back from the table as a
+/// proven mate nothing proved.
+#[inline(always)]
+fn value_to_tt_for(flat: bool, v: Value, ply: i32) -> Value {
+    if flat {
+        if v.abs() == VALUE_MATE_FLAT {
+            v
+        } else if is_win(v) {
+            (v + ply).min(VALUE_MATE)
+        } else if is_loss(v) {
+            (v - ply).max(-VALUE_MATE)
+        } else {
+            v
+        }
+    } else if is_win(v) {
         v + ply
     } else if is_loss(v) {
         v - ply
@@ -185,9 +294,19 @@ fn value_to_tt(v: Value, ply: i32) -> Value {
 
 /// `value_from_tt(v, ply)` (non-`STOCKFISH` variant — no rule50 downgrade):
 /// shift a stored mate score back toward the root.
+#[inline(always)]
 fn value_from_tt(v: Value, ply: i32) -> Value {
-    if !is_valid(v) {
-        VALUE_NONE
+    value_from_tt_for(FLATTEN, v, ply)
+}
+
+/// [`value_from_tt`] in a build with or without [`FLATTEN`]; the flat mate
+/// comes back as it was stored.
+#[inline(always)]
+fn value_from_tt_for(flat: bool, v: Value, ply: i32) -> Value {
+    if v == none_for(flat) {
+        none_for(flat)
+    } else if flat && v.abs() == VALUE_MATE_FLAT {
+        v
     } else if is_win(v) {
         v - ply
     } else if is_loss(v) {
@@ -664,6 +783,21 @@ pub struct QSearch<N: NetworkParams> {
     /// worker, which alone reads every slot. Declared last, so it takes a byte
     /// of the struct's tail rather than moving a field before it.
     main_tally: bool,
+    /// The side the engine plays in the game, set from the root at the start of
+    /// every search: the side to move there, or the other one when the search
+    /// thinks ahead ([`Self::set_thinking_ahead`]). Under [`FLATTEN`] it decides
+    /// which side's mates are flat, so it has to name the same side in every
+    /// search of a game: a table entry the search after the engine's own move
+    /// stores is read by the next `go`'s.
+    ///
+    /// This and the next field are arrays of length one under [`FLATTEN`] and
+    /// of length zero without it, so a build that scores by distance carries
+    /// neither and lays the struct out exactly as it would with no such
+    /// setting. Read through [`Self::is_engine`].
+    engine_us: [Color; FLATTEN as usize],
+    /// Whether the root is the position after the engine's own move — the
+    /// opponent to move — rather than one the engine is to move in.
+    thinking_ahead: [bool; FLATTEN as usize],
 }
 
 /// The result one worker's iterative deepening produces, consumed by
@@ -945,6 +1079,8 @@ impl<N: NetworkParams> QSearch<N> {
             random_amplitude: 0,
             #[cfg(feature = "random")]
             random_seed: 0,
+            engine_us: [Color::Black; FLATTEN as usize],
+            thinking_ahead: [false; FLATTEN as usize],
         }
     }
 
@@ -998,6 +1134,59 @@ impl<N: NetworkParams> QSearch<N> {
     /// invariant across the search.
     pub fn set_entering_king(&mut self, config: EnteringKingConfig) {
         self.entering_king = config;
+    }
+
+    /// Declare whether the coming search's root is the position the engine's
+    /// own move just reached, with the opponent to move: the search that thinks
+    /// past a reply. The engine's side is then the one not to move at the root.
+    /// `false` (the default) is every other search.
+    pub fn set_thinking_ahead(&mut self, thinking_ahead: bool) {
+        if let Some(slot) = self.thinking_ahead.first_mut() {
+            *slot = thinking_ahead;
+        }
+    }
+
+    /// Fix the two sides a search scores against, from the side to move at its
+    /// root: that side itself for the draw contempt, and the engine's side for
+    /// the flat mate.
+    fn set_root_side(&mut self, root_side: Color) {
+        self.root_us = root_side;
+        if let Some(slot) = self.engine_us.first_mut() {
+            *slot = if self.thinking_ahead.first() == Some(&true) {
+                root_side.flip()
+            } else {
+                root_side
+            };
+        }
+    }
+
+    /// Whether `c` is the engine's side; always `false` without [`FLATTEN`],
+    /// which keeps no side.
+    #[inline(always)]
+    fn is_engine(&self, c: Color) -> bool {
+        self.engine_us.first() == Some(&c)
+    }
+
+    /// `mate_in(ply)` for a mate `us` delivers: [`VALUE_MATE_FLAT`] when `us` is
+    /// the engine under [`FLATTEN`].
+    #[inline(always)]
+    fn mate_for(&self, us: Color, ply: i32) -> Value {
+        if FLATTEN && self.is_engine(us) {
+            VALUE_MATE_FLAT
+        } else {
+            mate_in(ply)
+        }
+    }
+
+    /// `mated_in(ply)` for a mate `us` suffers: `-VALUE_MATE_FLAT` when `us` is
+    /// the engine's opponent under [`FLATTEN`].
+    #[inline(always)]
+    fn mated_for(&self, us: Color, ply: i32) -> Value {
+        if FLATTEN && !self.is_engine(us) {
+            -VALUE_MATE_FLAT
+        } else {
+            mated_in(ply)
+        }
     }
 
     /// Install this game's evaluation noise: `amplitude` in the unit the search
@@ -1232,7 +1421,7 @@ impl<N: NetworkParams> QSearch<N> {
         self.sel_depth = 0;
         self.pv_node = pv_node;
         self.set_read_tt(read_tt);
-        self.root_us = pos.side_to_move();
+        self.set_root_side(pos.side_to_move());
         self.stopped = false;
         self.calls_cnt = CHECK_INTERVAL;
 
@@ -1372,9 +1561,15 @@ impl<N: NetworkParams> QSearch<N> {
 
     /// `drawValueTable[rs][c]` (defaults, with the `REPETITION_DRAW` row
     /// overwritten from contempt at search start).
+    ///
+    /// A win by the opponent's perpetual check is a mate like any other, so
+    /// under [`FLATTEN`] the engine's is flat; a flat value passes through the
+    /// callers' [`value_from_tt`] unshifted.
     fn draw_value(&self, rs: RepetitionState, c: Color) -> Value {
         match rs {
             RepetitionState::None => VALUE_DRAW,
+            RepetitionState::Win if FLATTEN && self.is_engine(c) => VALUE_MATE_FLAT,
+            RepetitionState::Lose if FLATTEN && !self.is_engine(c) => -VALUE_MATE_FLAT,
             RepetitionState::Win => VALUE_MATE,
             RepetitionState::Lose => -VALUE_MATE,
             RepetitionState::Draw => {
@@ -1624,9 +1819,13 @@ impl<N: NetworkParams> QSearch<N> {
                     best_value = tt_value;
                 }
             } else {
-                // 🌈 1-ply mate check, only when the TT missed.
-                if let Some(mate_move) = pos.mate_1ply() {
-                    best_value = mate_in(ply + 1);
+                // 🌈 1-ply mate check, only when the TT missed. Under
+                // `FLATTEN` the mate must also land inside the move limit, as
+                // the flat value claims a game won rather than a distance.
+                if (!FLATTEN || mate_lands_inside_move_limit(pos.ply()))
+                    && let Some(mate_move) = pos.mate_1ply()
+                {
+                    best_value = self.mate_for(us, ply + 1);
                     // The stored value is the raw root-relative
                     // `mate_in(ply+1)`, deliberately not `value_to_tt`-converted.
                     let tt_pv = self.stack[Self::si(ply)].tt_pv;
@@ -1785,6 +1984,14 @@ impl<N: NetworkParams> QSearch<N> {
                     } else {
                         break; // fail high
                     }
+                    // Nothing outranks a flat mate; see the interior search.
+                    if FLATTEN && value == VALUE_MATE_FLAT {
+                        break;
+                    }
+                } else if FLATTEN && pv_node && value == -VALUE_MATE_FLAT {
+                    // A first move the engine mates, kept as the PV; see the
+                    // interior search.
+                    self.update_pv(ply, mv);
                 }
             }
         }
@@ -1793,7 +2000,7 @@ impl<N: NetworkParams> QSearch<N> {
         // checkmate; the reference uses the `moveCount == 0` form, not
         // Stockfish's `bestValue == -VALUE_INFINITE`.
         if in_check && move_count == 0 {
-            return mated_in(ply);
+            return self.mated_for(us, ply);
         }
 
         if !is_decisive(best_value) && best_value > beta {
@@ -1894,9 +2101,10 @@ impl<N: NetworkParams> QSearch<N> {
                     ..ValueMarks::NONE
                 };
             }
+            self.set_root_side(pos.side_to_move());
             return RootOutcome {
                 best_move: Move::win(),
-                score: mate_in(1),
+                score: self.mate_for(pos.side_to_move(), 1),
                 nodes: 0,
                 pv: vec![Move::win()],
                 depth: 0,
@@ -1943,7 +2151,7 @@ impl<N: NetworkParams> QSearch<N> {
         mut root_moves: Vec<RootMove>,
         limit_depth: i32,
     ) -> WorkerResult {
-        self.root_us = root_pos.side_to_move();
+        self.set_root_side(root_pos.side_to_move());
         self.set_read_tt(true);
         self.nodes = 0;
         #[cfg(feature = "verbose1")]
@@ -2151,6 +2359,19 @@ impl<N: NetworkParams> QSearch<N> {
             completed_depth = root_depth;
             self.completed_depth = root_depth;
 
+            // An exact flat mate is the engine's win proven, and no deeper
+            // iteration can improve on it, so deepening stops — under `go
+            // infinite` and while thinking ahead as well. When the reply goes
+            // out is still the caller's stop rules' to decide. With several
+            // lines, one line's mate must not end the others' search.
+            #[cfg(feature = "verbose2")]
+            let single_line = multi_pv == 1;
+            #[cfg(not(feature = "verbose2"))]
+            let single_line = true;
+            if FLATTEN && single_line && iter_best_value.abs() == VALUE_MATE_FLAT {
+                break;
+            }
+
             // Early mate / mated termination: stop once the search depth
             // outruns 2.5× the mate distance. Suppressed for MultiPV > 1, where
             // one PV finding a mate must not stop the others, and under `go
@@ -2334,7 +2555,7 @@ impl<N: NetworkParams> QSearch<N> {
         loop {
             let adjusted_depth =
                 1.max(root_depth - failed_high_cnt - 3 * (search_again_counter + 1) / 4);
-            self.set_root_delta(beta - alpha);
+            self.set_root_delta(window_width(alpha, beta));
             self.root_depth = root_depth;
             // Slot 0 still holds the root refresh seeded by the caller.
             self.acc_depth = 0;
@@ -2782,9 +3003,9 @@ impl<N: NetworkParams> QSearch<N> {
     ) -> Value {
         self.nodes = 0;
         self.sel_depth = 0;
-        self.root_us = pos.side_to_move();
+        self.set_root_side(pos.side_to_move());
         self.set_read_tt(true);
-        self.set_root_delta(beta - alpha);
+        self.set_root_delta(window_width(alpha, beta));
         self.root_depth = depth;
         self.last_iteration_pv.clear();
         self.stopped = false;
@@ -2907,9 +3128,37 @@ impl<N: NetworkParams> QSearch<N> {
                 return self.draw_value(RepetitionState::Draw, us) + value_draw(self.nodes);
             }
 
-            // Step 3. Mate distance pruning.
-            alpha = mated_in(ply).max(alpha);
-            beta = mate_in(ply + 1).min(beta);
+            // Step 3. Mate distance pruning. Under `FLATTEN` the bound on the
+            // engine's loss — the floor where the engine is to move, the
+            // ceiling where its opponent is — is the reference's. The other
+            // bound is a distance the engine's own mates do not carry: it still
+            // narrows the window as long as the window stays open, so a search
+            // with no flat mate in it runs exactly as the gradient build's, but
+            // it never closes the window, since pruning on it would cut a flat
+            // mate off as if it were a longer one. In its place the flat mate
+            // itself bounds the window, as nothing outranks it.
+            if FLATTEN && self.is_engine(us) {
+                alpha = mated_in(ply).max(alpha);
+                let ceiling = mate_in(ply + 1);
+                if ceiling > alpha {
+                    beta = ceiling.min(beta);
+                }
+                if alpha >= VALUE_MATE_FLAT {
+                    return alpha;
+                }
+            } else if FLATTEN {
+                beta = mate_in(ply + 1).min(beta);
+                let floor = mated_in(ply);
+                if floor < beta {
+                    alpha = floor.max(alpha);
+                }
+                if beta <= -VALUE_MATE_FLAT {
+                    return -VALUE_MATE_FLAT;
+                }
+            } else {
+                alpha = mated_in(ply).max(alpha);
+                beta = mate_in(ply + 1).min(beta);
+            }
             if alpha >= beta {
                 return alpha;
             }
@@ -3014,9 +3263,10 @@ impl<N: NetworkParams> QSearch<N> {
             && !tt_hit
             && !excluded_move.is_some_and(Move::is_ok)
             && !in_check
+            && (!FLATTEN || mate_lands_inside_move_limit(pos.ply()))
             && let Some(mate_move) = pos.mate_1ply()
         {
-            best_value = mate_in(ply + 1);
+            best_value = self.mate_for(us, ply + 1);
             self.tt_store(
                 tt_slot,
                 pos_key,
@@ -3036,7 +3286,7 @@ impl<N: NetworkParams> QSearch<N> {
             {
                 self.marks.decl_rule = true;
             }
-            return mate_in(ply + 1);
+            return self.mate_for(us, ply + 1);
         }
 
         // Step 6. Static evaluation.
@@ -3383,7 +3633,7 @@ impl<N: NetworkParams> QSearch<N> {
             let moved_piece = mv.moved_piece_after();
             let gives_check = pos.gives_check(mv);
             let mut new_depth = depth - 1;
-            let delta = beta - alpha;
+            let delta = window_width(alpha, beta);
             let mut r = self.reduction(improving, depth, move_count, delta);
             // `ss->ttPv` is read live here and at every in-loop site below:
             // an earlier move's singular re-entry can flip it, and the flip
@@ -3815,6 +4065,17 @@ impl<N: NetworkParams> QSearch<N> {
                         depth -= 2;
                     }
                     alpha = value;
+                    // Nothing outranks a flat mate, so the remaining moves
+                    // cannot change this node's value.
+                    if FLATTEN && value == VALUE_MATE_FLAT {
+                        break;
+                    }
+                } else if FLATTEN && pv_node && !root_node && value == -VALUE_MATE_FLAT {
+                    // The first move of a node the engine mates whatever it
+                    // plays. Nothing scores below the flat mate, so this
+                    // value is exact although it fails low, and its line is
+                    // kept: the reported mate length is read off the PV.
+                    self.update_pv(ply, mv);
                 }
             }
             if Some(mv) != best_move && move_count <= SEARCHED_LIST_CAPACITY as i32 {
@@ -3843,7 +4104,7 @@ impl<N: NetworkParams> QSearch<N> {
             best_value = if excluded_move.is_some_and(Move::is_ok) {
                 alpha
             } else {
-                mated_in(ply)
+                self.mated_for(us, ply)
             };
         } else if let Some(best) = best_move.filter(|m| m.is_ok()) {
             update_all_stats(
@@ -4158,6 +4419,93 @@ mod tests {
     }
 
     #[test]
+    fn the_flat_mate_sits_between_the_gradient_and_infinity() {
+        assert_eq!(VALUE_MATE_FLAT, VALUE_MATE + 1);
+        assert_eq!(infinite_for(false), 32001);
+        assert_eq!(none_for(false), 32002);
+        assert!(VALUE_MATE_FLAT < infinite_for(true));
+        assert!(infinite_for(true) < none_for(true));
+        assert_eq!(VALUE_INFINITE, infinite_for(FLATTEN));
+        assert_eq!(VALUE_NONE, none_for(FLATTEN));
+        // Every value both builds' checks read as a mate still reads as one.
+        assert!(is_win(VALUE_MATE_FLAT) && is_loss(-VALUE_MATE_FLAT));
+    }
+
+    /// Every value the search stores that is not a flat mate — the mate
+    /// gradient, the repetition sentinels, the threshold values and the
+    /// infinity bound — stored at any ply and read back at any ply under the
+    /// flat build, must never come back as `±VALUE_MATE_FLAT`: that would be a
+    /// mate proven by nothing. The flat mate itself must come back unchanged.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn no_stored_sentinel_comes_back_as_a_flat_mate_at_any_ply() {
+        let flat_infinite = infinite_for(true);
+        let mut sentinels = vec![
+            VALUE_MAX_EVAL,
+            VALUE_TB_WIN_IN_MAX_PLY,
+            VALUE_MATE,
+            flat_infinite,
+            VALUE_DRAW,
+        ];
+        sentinels.extend((0..=MAX_PLY).map(mate_in));
+        let negated: Vec<Value> = sentinels.iter().map(|v| -v).collect();
+        sentinels.extend(negated);
+
+        for store_ply in 0..=MAX_PLY {
+            for &v in &sentinels {
+                let stored = value_to_tt_for(true, v, store_ply);
+                assert!(
+                    (-VALUE_MATE..=VALUE_MATE).contains(&stored),
+                    "{v} stored at ply {store_ply} left the gradient range: {stored}"
+                );
+                for load_ply in 0..=MAX_PLY {
+                    let loaded = value_from_tt_for(true, stored, load_ply);
+                    assert_ne!(
+                        loaded.abs(),
+                        VALUE_MATE_FLAT,
+                        "{v} stored at ply {store_ply}, loaded at ply {load_ply}"
+                    );
+                }
+            }
+            for flat in [VALUE_MATE_FLAT, -VALUE_MATE_FLAT] {
+                let stored = value_to_tt_for(true, flat, store_ply);
+                assert_eq!(stored, flat);
+                for load_ply in 0..=MAX_PLY {
+                    assert_eq!(value_from_tt_for(true, stored, load_ply), flat);
+                }
+            }
+            // The repetition rows reach the search through `value_from_tt`
+            // without a store first.
+            for v in [VALUE_MATE, -VALUE_MATE, VALUE_MAX_EVAL, -VALUE_MAX_EVAL] {
+                assert_ne!(value_from_tt_for(true, v, store_ply).abs(), VALUE_MATE_FLAT);
+            }
+        }
+        // The miss sentinel survives, and the gradient build is the
+        // reference's shift, unclamped.
+        assert_eq!(value_from_tt_for(true, none_for(true), 7), none_for(true));
+        assert_eq!(value_to_tt_for(false, -infinite_for(false), 3), -32004);
+    }
+
+    #[test]
+    fn a_mate_lands_inside_the_move_limit_only_below_it() {
+        let limit = NonZeroI32::new(50);
+        assert!(mate_lands_inside(limit, 0));
+        assert!(mate_lands_inside(limit, 49));
+        // At the limit the move is still played, but the position it mates is
+        // past the limit and adjudicated a draw.
+        assert!(!mate_lands_inside(limit, 50));
+        assert!(!mate_lands_inside(limit, 51));
+        assert!(mate_lands_inside(None, u16::MAX));
+        // The compiled limit agrees with the draw rule one ply on.
+        for ply in [0u16, 1, 49, 50, 51, 100, 1000] {
+            assert_eq!(
+                mate_lands_inside_move_limit(ply),
+                !is_past_move_limit(ply + 1)
+            );
+        }
+    }
+
+    #[test]
     fn value_draw_dither_is_keyed_on_bit_one() {
         assert_eq!(value_draw(0), -1);
         assert_eq!(value_draw(1), -1); // bit 1 clear
@@ -4173,13 +4521,25 @@ mod tests {
         let _tt = fresh_tt();
         let mut q = QSearch::new(net.network());
         // Emulate a root search with Black to move.
-        q.root_us = Color::Black;
+        q.set_root_side(Color::Black);
 
         // Every row but REPETITION_DRAW is a fixed `drawValueTable` value, the
-        // same for either side.
+        // same for either side — except, under `FLATTEN`, the engine's win by
+        // its opponent's perpetual check, which is a flat mate.
         for c in [Color::Black, Color::White] {
-            assert_eq!(q.draw_value(RepetitionState::Win, c), VALUE_MATE);
-            assert_eq!(q.draw_value(RepetitionState::Lose, c), -VALUE_MATE);
+            let engine = c == Color::Black;
+            let win = if FLATTEN && engine {
+                VALUE_MATE_FLAT
+            } else {
+                VALUE_MATE
+            };
+            let lose = if FLATTEN && !engine {
+                -VALUE_MATE_FLAT
+            } else {
+                -VALUE_MATE
+            };
+            assert_eq!(q.draw_value(RepetitionState::Win, c), win);
+            assert_eq!(q.draw_value(RepetitionState::Lose, c), lose);
             assert_eq!(q.draw_value(RepetitionState::Superior, c), VALUE_MAX_EVAL);
             assert_eq!(q.draw_value(RepetitionState::Inferior, c), -VALUE_MAX_EVAL);
             assert_eq!(q.draw_value(RepetitionState::None, c), VALUE_DRAW);
@@ -4529,7 +4889,8 @@ mod tests {
             let mut q = QSearch::new(net.network());
             q.run(&mut p.clone(), 418, 419, false, true)
         };
-        assert_eq!(out.value, mate_in(1), "the checking capture mates");
+        let want = if FLATTEN { VALUE_MATE_FLAT } else { mate_in(1) };
+        assert_eq!(out.value, want, "the checking capture mates");
         assert_eq!(out.nodes, 1, "only the mating capture is searched");
     }
 
@@ -4613,16 +4974,123 @@ mod tests {
             let mut q = QSearch::new(net.network());
             q.run(&mut p.clone(), -VALUE_INFINITE, VALUE_INFINITE, true, true)
         };
-        assert_eq!(out.value, mate_in(1)); // mate_in(ss->ply + 1) at ply 0
+        // mate_in(ss->ply + 1) at ply 0, or the flat mate: the root side is
+        // the engine's.
+        let want = if FLATTEN { VALUE_MATE_FLAT } else { mate_in(1) };
+        assert_eq!(out.value, want);
         assert_eq!(out.nodes, 0, "the mate is found before any do_move");
 
         let (found, data) = probe_root(&table, &p);
         assert!(found);
         assert_eq!(data.bound, Bound::Exact);
         assert_eq!(data.depth, DEPTH_QS);
-        assert_eq!(data.value, mate_in(1), "raw mate score, not value_to_tt'd");
+        assert_eq!(data.value, want, "raw mate score, not value_to_tt'd");
         assert_eq!(data.eval, VALUE_NONE, "unadjustedStaticEval is still NONE");
         assert_eq!(data.move16, move16_of(p.mate_1ply()));
+    }
+
+    /// The search after the engine's own move has the opponent to move at its
+    /// root, so a mate the root side delivers there is the opponent's and keeps
+    /// the gradient, and a mate the root side suffers is the engine's.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn thinking_ahead_scores_the_mates_for_the_side_that_just_moved() {
+        let net = zero_net();
+        let tt = fresh_tt();
+        let mut q = QSearch::new(net.network());
+        q.set_thinking_ahead(true);
+        let out = q.run(
+            &mut pos(MATE_IN_1),
+            -VALUE_INFINITE,
+            VALUE_INFINITE,
+            true,
+            true,
+        );
+        assert_eq!(out.value, mate_in(1));
+        drop(tt);
+
+        let _tt = fresh_tt();
+        let mut q = QSearch::new(net.network());
+        q.set_thinking_ahead(true);
+        let out = q.run(
+            &mut pos(BLACK_MATED),
+            -VALUE_INFINITE,
+            VALUE_INFINITE,
+            true,
+            true,
+        );
+        let want = if FLATTEN {
+            -VALUE_MATE_FLAT
+        } else {
+            mated_in(0)
+        };
+        assert_eq!(out.value, want);
+    }
+
+    /// The root search scores the engine's mate flat and, the win being proven
+    /// exactly, deepens no further than the iteration that proved it. The
+    /// gradient build keeps deepening until the depth outruns the distance.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn run_root_stops_deepening_at_an_exact_flat_mate() {
+        let net = zero_net();
+        let _tt = fresh_tt();
+        let out = {
+            let mut q = QSearch::new(net.network());
+            q.run_root(&pos(MATE_IN_1), 8)
+        };
+        assert_eq!(out.pv.len(), 1);
+        if FLATTEN {
+            assert_eq!(out.score, VALUE_MATE_FLAT);
+            assert_eq!(out.depth, 1);
+        } else {
+            assert_eq!(out.score, mate_in(1));
+            assert!(out.depth > 1);
+        }
+    }
+
+    /// A mate-in-one found at the move limit's own ply mates a position past
+    /// the limit, which every node adjudicates a draw. Under `FLATTEN` the two
+    /// shortcuts that claim a mate one ply early — qsearch's and the interior
+    /// search's — must not claim it there. Without a limit the same position is
+    /// a plain mate.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn the_one_ply_mate_shortcuts_respect_the_move_limit_boundary() {
+        let game_ply = MOVE_LIMIT.map_or(100, |limit| limit.get() as u16);
+        let sfen = format!("k8/9/G1N6/9/9/9/9/9/8K b G {game_ply}");
+        let net = zero_net();
+
+        let tt = fresh_tt();
+        let qsearch_value = {
+            let mut q = QSearch::new(net.network());
+            q.run(&mut pos(&sfen), -VALUE_INFINITE, VALUE_INFINITE, true, true)
+                .value
+        };
+        drop(tt);
+        let _tt = fresh_tt();
+        let search_value = {
+            let mut q = QSearch::new(net.network());
+            q.run_search(
+                &mut pos(&sfen),
+                -VALUE_INFINITE,
+                VALUE_INFINITE,
+                1,
+                false,
+                true,
+            )
+        };
+
+        for value in [qsearch_value, search_value] {
+            if mate_lands_inside_move_limit(game_ply) {
+                assert!(is_win(value), "a mate inside the limit, got {value}");
+            } else if FLATTEN {
+                assert!(
+                    !is_decisive(value),
+                    "a mate past the limit must not be claimed, got {value}"
+                );
+            }
+        }
     }
 
     // Repetition draws + the ±1 dither.
@@ -5107,7 +5575,8 @@ mod tests {
         };
         assert_eq!(out.kind, RootKind::DeclarationWin);
         assert_eq!(out.best_move, Move::win());
-        assert_eq!(out.score, mate_in(1));
+        let want = if FLATTEN { VALUE_MATE_FLAT } else { mate_in(1) };
+        assert_eq!(out.score, want);
         assert_eq!(out.nodes, 0);
     }
 

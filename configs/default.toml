@@ -238,6 +238,18 @@ nodes_limit = 0
 # (`MaxMovesToDraw`); `0` is unlimited.
 max_moves_to_draw = 0
 
+# Score every forced mate the engine delivers with one flat winning value
+# instead of the usual "shorter mate scores higher" gradient. A shorter mate is
+# then worth no more than a longer one, so once any mate is proven the search
+# stops spending time on finding a shorter one. Being mated keeps the gradient,
+# so the engine still prefers the longest defence. A mate counts as the
+# engine's only when it lands inside the `max_moves_to_draw` limit.
+#
+# The engine's side is the side it plays in the game, also while it searches
+# the position after its own move (`ponder` above). `info` lines still print
+# `score mate N`, with N taken from the length of the principal variation.
+flatten_winning_mate = false
+
 # PV-output throttle in milliseconds, `0` meaning never suppress
 # (`PvInterval`).
 pv_interval = 300

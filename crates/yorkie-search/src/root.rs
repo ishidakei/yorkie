@@ -14,10 +14,7 @@ use yorkie_storage::Value;
 use yorkie_storage::ValueMarks;
 
 use crate::config::GENERATE_ALL_LEGAL_MOVES;
-
-/// `VALUE_INFINITE`, duplicated from [`crate::qsearch`] so the pure root-move
-/// initialisation does not reach into that module's private constants.
-const VALUE_INFINITE: Value = 32001;
+use crate::qsearch::VALUE_INFINITE;
 
 /// `MAX_PLY`, used by the proven-win / proven-loss thresholds below.
 const MAX_PLY: Value = 246;

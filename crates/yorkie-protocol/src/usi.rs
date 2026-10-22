@@ -21,7 +21,7 @@ use yorkie_search::BookHit;
 // The PV-line surface: only a `verbose2` build renders one, so only it needs
 // the line's data type, its bound marker and the sink trait.
 #[cfg(feature = "verbose2")]
-use yorkie_search::{PvBound, PvInfo, PvSink};
+use yorkie_search::{PvBound, PvInfo, PvSink, VALUE_MATE_FLAT};
 use yorkie_state::TextWriter;
 // A move's text inside a longer line: what is left of it are the optional
 // surfaces that interpolate a move into one. A `bestmove` reply, which every
@@ -115,6 +115,28 @@ fn write_score(out: &mut TextWriter<'_>, v: Value) {
         out.bytes(b"mate ").i64(i64::from(mate));
     } else {
         out.bytes(b"cp ").i64(i64::from(100 * v / PAWN_VALUE));
+    }
+}
+
+/// Append the score of one PV line: [`write_score`], except for a mate the
+/// engine delivers under `flatten_winning_mate`, whose value carries no
+/// distance. Its distance is read off the PV instead, as the first ply at or
+/// past the PV's end on which the mate can fall — odd when the side to move at
+/// the root delivers it, even when that side suffers it. The PV can stop one
+/// ply short of the mate, where a shortcut proved the last move without
+/// playing it.
+#[cfg(feature = "verbose2")]
+fn write_pv_score(out: &mut TextWriter<'_>, v: Value, pv_len: usize) {
+    if crate::config::FLATTEN_WINNING_MATE && v.abs() == VALUE_MATE_FLAT {
+        let plies = pv_len as i64;
+        let mate = if v > 0 {
+            plies | 1
+        } else {
+            -((plies + 1) & !1).max(2)
+        };
+        out.bytes(b"mate ").i64(mate);
+    } else {
+        write_score(out, v);
     }
 }
 
@@ -900,7 +922,7 @@ fn write_pv_info<W: Write + ?Sized>(w: &mut W, info: &PvInfo) -> io::Result<()> 
     }
     body.bytes(b" multipv ").u64(info.multipv as u64);
     body.bytes(b" score ");
-    write_score(&mut body, info.score);
+    write_pv_score(&mut body, info.score, info.pv.len());
     match info.bound {
         PvBound::Lower => {
             body.bytes(b" lowerbound");
@@ -1184,6 +1206,34 @@ mod tests {
             )),
             "info depth 12 seldepth 19 multipv 2 score mate -5 nodes 1234567890 nps 2469135780 hashfull 314 time 500 pv 7g7f\n"
         );
+    }
+
+    /// Under `flatten_winning_mate` the flat mate's distance is the PV's: the
+    /// first ply of the right parity at or past its end, so a PV stopped one
+    /// ply short of the mating move still reports the mate it proves. A
+    /// gradient build never produces the flat value, and renders its
+    /// neighbours by distance as before.
+    #[cfg(feature = "verbose2")]
+    #[test]
+    fn a_flat_mate_reports_the_distance_its_pv_shows() {
+        let score = |v: Value, pv: &[&str]| {
+            let mut bytes = [0u8; 64];
+            let mut out = TextWriter::new(&mut bytes);
+            write_pv_score(&mut out, v, pv.len());
+            String::from_utf8(out.as_bytes().to_vec()).expect("ASCII")
+        };
+        let three = ["7g7f", "3c3d", "2g2f"];
+        if crate::config::FLATTEN_WINNING_MATE {
+            assert_eq!(score(VALUE_MATE_FLAT, &three), "mate 3");
+            assert_eq!(score(VALUE_MATE_FLAT, &three[..2]), "mate 3");
+            assert_eq!(score(VALUE_MATE_FLAT, &three[..1]), "mate 1");
+            assert_eq!(score(-VALUE_MATE_FLAT, &three[..2]), "mate -2");
+            assert_eq!(score(-VALUE_MATE_FLAT, &three), "mate -4");
+            assert_eq!(score(-VALUE_MATE_FLAT, &three[..1]), "mate -2");
+        }
+        assert_eq!(score(VALUE_MATE - 5, &three), "mate 5");
+        assert_eq!(score(-(VALUE_MATE - 4), &three), "mate -4");
+        assert_eq!(score(100, &three), "cp 111");
     }
 
     /// A drop move, the `depth 0` / `nodes 0` / `nps 0` extremes, the floored

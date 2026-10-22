@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use yorkie_state::{Color, Move, Piece, Position, Square};
-use yorkie_storage::Value;
+use yorkie_storage::{VALUE_NONE, Value};
 
 use crate::history::{
     ButterflyHistory, CapturePieceToHistory, ContPlane, ContinuationCorrectionHistory,
@@ -253,7 +253,7 @@ impl Default for SearchStackCell {
             stat_score: 0,
             ply: 0,
             // `VALUE_NONE` — the reference pre-root sentinel.
-            static_eval: 32002,
+            static_eval: VALUE_NONE,
             reduction: 0,
             cutoff_cnt: 0,
             excluded_move: None,

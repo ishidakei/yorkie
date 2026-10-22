@@ -437,6 +437,10 @@ const SCHEMA: &[Spec] = &[
          bounds every search by the clock",
     ),
     int("max_moves_to_draw", "MaxMovesToDraw", 0, 100_000),
+    boolean(
+        "flatten_winning_mate",
+        "(none: score every forced mate the engine delivers with one flat value)",
+    ),
     int("pv_interval", "PvInterval", 0, 100_000_000),
     boolean("consideration_mode", "ConsiderationMode"),
     boolean("output_fail_lh_pv", "OutputFailLHPV"),

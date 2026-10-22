@@ -1,9 +1,10 @@
 //! Compile the engine's settings into the storage layer.
 //!
-//! The storage layer needs exactly one setting, `usi_hash`, which is the size of
-//! the transposition table. The table is a `static`, so its cluster count is an
+//! The storage layer needs two settings. `usi_hash` is the size of the
+//! transposition table; the table is a `static`, so its cluster count is an
 //! array length — a value that has to exist before the crate is compiled, not
-//! one a caller can hand over.
+//! one a caller can hand over. `flatten_winning_mate` decides where the table's
+//! miss sentinel sits, above every score the search can store.
 //!
 //! The schema, parser, code generator and path resolution are shared verbatim
 //! with the protocol crate's build script, so the two builds cannot read the
@@ -12,7 +13,7 @@
 //! building.
 //!
 //! The generated module carries every schema key it can render on its own, not
-//! just `usi_hash`: the generator renders the schema as a whole, and allowing
+//! just those two: the generator renders the schema as a whole, and allowing
 //! the unused ones is cheaper than a second, divergent code path here. The one
 //! it leaves out is the NUMA layout, which is not a value in the file but the
 //! machine's own, and which only the crate that plans thread binding compiles
@@ -53,9 +54,9 @@ fn main() {
         &label,
         &display_source(&repo_root, &path),
         &config_name(&path),
-        // This crate reads only `usi_hash`, which no feature gates; the crate
-        // that declares the gating features is where a config a build cannot
-        // honour is refused or reported.
+        // This crate reads only keys no feature gates; the crate that declares
+        // the gating features is where a config a build cannot honour is
+        // refused or reported.
         &Gating::Absent,
         // Nothing here places memory per node, so this crate compiles in no NUMA
         // layout and reads none.
