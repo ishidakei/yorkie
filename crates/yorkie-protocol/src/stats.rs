@@ -6,11 +6,15 @@
 //! omitted, and a line left with no item is not written at all: a reply that has
 //! nothing to report says nothing rather than saying that nothing happened.
 //!
-//! Every build that writes the line has four counted items, each covering the
+//! Every build that writes the line has six counted items, each covering the
 //! interval the reply ends: `alloc`, the heap allocations, then `nodes`,
-//! `tt_update` and `eval_dup`, what the searches of that interval did on every
-//! thread (see [`SearchCounts`]). A `verbose3` build adds three more: the value
-//! marks of the score the reply rests on.
+//! `tt_update`, `eval_dup`, `evals` and `eval_tt_hits`, what the searches of
+//! that interval did on every thread (see [`SearchCounts`]). A `verbose3` build
+//! adds three more: the value marks of the score the reply rests on.
+//!
+//! A `verbose3` build's `bench` also writes one line after its summary, in the
+//! same format, carrying the search counts summed over every position of the
+//! run (see [`take_bench_counts`]).
 //!
 //! What the line reports is the interval it ends, so composing it must not
 //! disturb what it measures. It is rendered into a stack buffer sized for the
@@ -29,7 +33,14 @@ const PREFIX: &[u8] = b"info string stats";
 
 /// The four counted items' keys, in the order they are written, each with the
 /// space that separates it from what comes before.
-const COUNT_KEYS: [&[u8]; 4] = [b" alloc=", b" nodes=", b" tt_update=", b" eval_dup="];
+const COUNT_KEYS: [&[u8]; 6] = [
+    b" alloc=",
+    b" nodes=",
+    b" tt_update=",
+    b" eval_dup=",
+    b" evals=",
+    b" eval_tt_hits=",
+];
 
 /// The decimal width of the widest `u64`.
 const U64_DIGITS: usize = 20;
@@ -39,6 +50,8 @@ const COUNT_ITEMS_MAX: usize = COUNT_KEYS[0].len()
     + COUNT_KEYS[1].len()
     + COUNT_KEYS[2].len()
     + COUNT_KEYS[3].len()
+    + COUNT_KEYS[4].len()
+    + COUNT_KEYS[5].len()
     + COUNT_KEYS.len() * U64_DIGITS;
 
 /// The three mark items, in the order they are written.
@@ -70,6 +83,9 @@ const MAX_LINE: usize = PREFIX.len()
 /// - `eval_dup`: the stores of a freshly computed static eval after a probe
 ///   miss that found the same position's static eval already in the entry,
 ///   whether or not the store then replaced it.
+/// - `evals`: the static evaluations computed for a node.
+/// - `eval_tt_hits`: the nodes that took their static eval from the
+///   transposition-table entry instead of evaluating.
 ///
 /// Each worker counts into plain integers of its own while it searches; they
 /// are added to the interval's tally once per worker, when its search ends, so
@@ -79,37 +95,93 @@ pub(crate) struct SearchCounts {
     pub(crate) nodes: u64,
     pub(crate) tt_update: u64,
     pub(crate) eval_dup: u64,
+    pub(crate) evals: u64,
+    pub(crate) eval_tt_hits: u64,
 }
 
-/// The interval's [`SearchCounts`] as they stand, one tally per item.
-static NODES: AtomicU64 = AtomicU64::new(0);
-static TT_UPDATES: AtomicU64 = AtomicU64::new(0);
-static EVAL_DUPS: AtomicU64 = AtomicU64::new(0);
+/// [`SearchCounts`] as they stand, one sum per item.
+struct Tally {
+    nodes: AtomicU64,
+    tt_updates: AtomicU64,
+    eval_dups: AtomicU64,
+    evals: AtomicU64,
+    eval_tt_hits: AtomicU64,
+}
+
+impl Tally {
+    const fn new() -> Self {
+        Self {
+            nodes: AtomicU64::new(0),
+            tt_updates: AtomicU64::new(0),
+            eval_dups: AtomicU64::new(0),
+            evals: AtomicU64::new(0),
+            eval_tt_hits: AtomicU64::new(0),
+        }
+    }
+
+    fn add(&self, r: &WorkerResult) {
+        self.nodes.fetch_add(r.nodes, Ordering::Relaxed);
+        self.tt_updates.fetch_add(r.tt_updates, Ordering::Relaxed);
+        self.eval_dups.fetch_add(r.eval_dups, Ordering::Relaxed);
+        self.evals.fetch_add(r.evals, Ordering::Relaxed);
+        self.eval_tt_hits
+            .fetch_add(r.eval_tt_hits, Ordering::Relaxed);
+    }
+
+    fn take(&self) -> SearchCounts {
+        SearchCounts {
+            nodes: self.nodes.swap(0, Ordering::Relaxed),
+            tt_update: self.tt_updates.swap(0, Ordering::Relaxed),
+            eval_dup: self.eval_dups.swap(0, Ordering::Relaxed),
+            evals: self.evals.swap(0, Ordering::Relaxed),
+            eval_tt_hits: self.eval_tt_hits.swap(0, Ordering::Relaxed),
+        }
+    }
+
+    fn clear(&self) {
+        self.take();
+    }
+}
+
+/// The tally of the interval the next reply ends.
+static INTERVAL: Tally = Tally::new();
+
+/// The tally of the `bench` run in progress. Every reply takes the interval's
+/// tally, and a run answers once per position, so the run's sum is kept apart.
+#[cfg(feature = "verbose3")]
+static BENCH_RUN: Tally = Tally::new();
 
 /// Add the counts of finished workers to the interval's tally.
 pub(crate) fn add_search<'a>(results: impl IntoIterator<Item = &'a WorkerResult>) {
     for r in results {
-        NODES.fetch_add(r.nodes, Ordering::Relaxed);
-        TT_UPDATES.fetch_add(r.tt_updates, Ordering::Relaxed);
-        EVAL_DUPS.fetch_add(r.eval_dups, Ordering::Relaxed);
+        INTERVAL.add(r);
+        #[cfg(feature = "verbose3")]
+        BENCH_RUN.add(r);
     }
 }
 
 /// Read the interval's tally and reset it to zero, so what is returned covers
 /// exactly the interval since the previous take or clear.
 pub(crate) fn take_search_counts() -> SearchCounts {
-    SearchCounts {
-        nodes: NODES.swap(0, Ordering::Relaxed),
-        tt_update: TT_UPDATES.swap(0, Ordering::Relaxed),
-        eval_dup: EVAL_DUPS.swap(0, Ordering::Relaxed),
-    }
+    INTERVAL.take()
 }
 
 /// Drop the interval's tally, so what came before is attributed to no reply.
 pub(crate) fn clear_search_counts() {
-    NODES.store(0, Ordering::Relaxed);
-    TT_UPDATES.store(0, Ordering::Relaxed);
-    EVAL_DUPS.store(0, Ordering::Relaxed);
+    INTERVAL.clear();
+}
+
+/// Read the `bench` run's tally — every search since the previous
+/// [`clear_bench_counts`] — and reset it to zero.
+#[cfg(feature = "verbose3")]
+pub(crate) fn take_bench_counts() -> SearchCounts {
+    BENCH_RUN.take()
+}
+
+/// Start a `bench` run's tally from zero.
+#[cfg(feature = "verbose3")]
+pub(crate) fn clear_bench_counts() {
+    BENCH_RUN.clear();
 }
 
 /// The stack buffer a line is composed in.
@@ -146,7 +218,14 @@ pub(crate) fn render(
     let mut out = TextWriter::new(&mut buf.bytes);
     out.bytes(PREFIX);
     let mut carried = false;
-    let counts = [alloc, search.nodes, search.tt_update, search.eval_dup];
+    let counts = [
+        alloc,
+        search.nodes,
+        search.tt_update,
+        search.eval_dup,
+        search.evals,
+        search.eval_tt_hits,
+    ];
     for (key, value) in COUNT_KEYS.iter().zip(counts) {
         if value != 0 {
             out.bytes(key).u64(value);
@@ -194,6 +273,25 @@ mod tests {
             nodes,
             tt_update,
             eval_dup,
+            ..SearchCounts::default()
+        }
+    }
+
+    fn evaluated(evals: u64, eval_tt_hits: u64) -> SearchCounts {
+        SearchCounts {
+            evals,
+            eval_tt_hits,
+            ..SearchCounts::default()
+        }
+    }
+
+    fn all(value: u64) -> SearchCounts {
+        SearchCounts {
+            nodes: value,
+            tt_update: value,
+            eval_dup: value,
+            evals: value,
+            eval_tt_hits: value,
         }
     }
 
@@ -234,16 +332,57 @@ mod tests {
         assert_eq!(counted(&mut buf, 0, search(0, 0, 0)), None);
     }
 
+    #[test]
+    fn the_evaluation_items_follow_eval_dup_and_zero_ones_are_omitted() {
+        let mut buf = StatsBuf::new();
+        assert_eq!(
+            counted(
+                &mut buf,
+                3,
+                SearchCounts {
+                    evals: 900,
+                    eval_tt_hits: 250,
+                    ..search(1200, 450, 7)
+                }
+            ),
+            Some(
+                &b"info string stats alloc=3 nodes=1200 tt_update=450 eval_dup=7 \
+                   evals=900 eval_tt_hits=250"[..]
+            )
+        );
+        assert_eq!(
+            counted(&mut buf, 0, evaluated(900, 0)),
+            Some(&b"info string stats evals=900"[..])
+        );
+        assert_eq!(
+            counted(&mut buf, 0, evaluated(0, 250)),
+            Some(&b"info string stats eval_tt_hits=250"[..])
+        );
+        assert_eq!(
+            counted(
+                &mut buf,
+                0,
+                SearchCounts {
+                    nodes: 8,
+                    ..evaluated(5, 2)
+                }
+            ),
+            Some(&b"info string stats nodes=8 evals=5 eval_tt_hits=2"[..])
+        );
+        assert_eq!(counted(&mut buf, 0, evaluated(0, 0)), None);
+    }
+
     #[cfg(not(feature = "verbose3"))]
     #[test]
     fn the_widest_line_fits_the_buffer() {
         let mut buf = StatsBuf::new();
-        let line = counted(&mut buf, u64::MAX, search(u64::MAX, u64::MAX, u64::MAX))
-            .expect("a non-zero count is reported");
+        let line =
+            counted(&mut buf, u64::MAX, all(u64::MAX)).expect("a non-zero count is reported");
         assert_eq!(
             line,
             &b"info string stats alloc=18446744073709551615 nodes=18446744073709551615 \
-               tt_update=18446744073709551615 eval_dup=18446744073709551615"[..]
+               tt_update=18446744073709551615 eval_dup=18446744073709551615 \
+               evals=18446744073709551615 eval_tt_hits=18446744073709551615"[..]
         );
         assert_eq!(line.len(), MAX_LINE);
     }
@@ -266,17 +405,28 @@ mod tests {
     /// clear, so nothing carries into the next interval.
     #[test]
     fn the_search_tally_is_emptied_by_a_take_and_by_a_clear() {
-        clear_search_counts();
-        assert_eq!(take_search_counts(), SearchCounts::default());
-        NODES.fetch_add(10, Ordering::Relaxed);
-        TT_UPDATES.fetch_add(4, Ordering::Relaxed);
-        NODES.fetch_add(5, Ordering::Relaxed);
-        EVAL_DUPS.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(take_search_counts(), search(15, 4, 1));
-        assert_eq!(take_search_counts(), SearchCounts::default());
-        NODES.fetch_add(3, Ordering::Relaxed);
-        clear_search_counts();
-        assert_eq!(take_search_counts(), SearchCounts::default());
+        let tally = Tally::new();
+        assert_eq!(tally.take(), SearchCounts::default());
+        tally.nodes.fetch_add(10, Ordering::Relaxed);
+        tally.tt_updates.fetch_add(4, Ordering::Relaxed);
+        tally.nodes.fetch_add(5, Ordering::Relaxed);
+        tally.eval_dups.fetch_add(1, Ordering::Relaxed);
+        tally.evals.fetch_add(9, Ordering::Relaxed);
+        tally.eval_tt_hits.fetch_add(6, Ordering::Relaxed);
+        tally.evals.fetch_add(2, Ordering::Relaxed);
+        assert_eq!(
+            tally.take(),
+            SearchCounts {
+                evals: 11,
+                eval_tt_hits: 6,
+                ..search(15, 4, 1)
+            }
+        );
+        assert_eq!(tally.take(), SearchCounts::default());
+        tally.nodes.fetch_add(3, Ordering::Relaxed);
+        tally.eval_tt_hits.fetch_add(3, Ordering::Relaxed);
+        tally.clear();
+        assert_eq!(tally.take(), SearchCounts::default());
     }
 
     /// The three items a `verbose3` build adds: the marks of the value the reply
@@ -351,13 +501,13 @@ mod tests {
         #[test]
         fn the_widest_line_fits_the_buffer() {
             let mut buf = StatsBuf::new();
-            let all = search(u64::MAX, u64::MAX, u64::MAX);
-            let line = render(&mut buf, u64::MAX, all, marks(true, true, true))
+            let line = render(&mut buf, u64::MAX, all(u64::MAX), marks(true, true, true))
                 .expect("a marked reply is reported");
             assert_eq!(
                 line,
                 &b"info string stats alloc=18446744073709551615 nodes=18446744073709551615 \
                    tt_update=18446744073709551615 eval_dup=18446744073709551615 \
+                   evals=18446744073709551615 eval_tt_hits=18446744073709551615 \
                    pathdep=1 declrule=1 movelimit=1"[..]
             );
             assert_eq!(line.len(), MAX_LINE);

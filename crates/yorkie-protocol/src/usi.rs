@@ -833,6 +833,7 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
         // The reference resets `elapsed` right after `search_clear`, so the timing
         // excludes the clear itself.
         let start = Instant::now();
+        crate::stats::clear_bench_counts();
         let mut total_nodes: u64 = 0;
         let mut positions: u64 = 0;
         for fen in &config.fens {
@@ -884,7 +885,21 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
             .u64(time_ms)
             .bytes(b" nps=")
             .u64(nps);
-        self.out.info_string(out.as_bytes())
+        self.out.info_string(out.as_bytes())?;
+
+        // Each position's reply already wrote the statistics of its own search;
+        // this line sums the search counts over the run. It carries no `alloc`
+        // item: the allocations stay reported per position, on those lines.
+        let mut buf = StatsBuf::new();
+        if let Some(line) = crate::stats::render(
+            &mut buf,
+            0,
+            crate::stats::take_bench_counts(),
+            ValueMarks::NONE,
+        ) {
+            Formatter::new(&mut *self.out.lock()).composed_line(line)?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "verbose1")]

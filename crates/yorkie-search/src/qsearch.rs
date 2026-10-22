@@ -573,6 +573,15 @@ pub struct QSearch<N: NetworkParams> {
     /// never read by the search.
     #[cfg(feature = "verbose1")]
     eval_dups: u64,
+    /// Static evaluations this worker computed for a node, since the search
+    /// started. Reported, never read by the search.
+    #[cfg(feature = "verbose1")]
+    evals: u64,
+    /// Nodes this worker gave the static eval stored in their table entry
+    /// instead of evaluating, since the search started. Reported, never read
+    /// by the search.
+    #[cfg(feature = "verbose1")]
+    eval_tt_hits: u64,
     /// `selDepth`.
     sel_depth: i32,
     /// `nmpMinPly`: while a null-move verification search runs, the ply below
@@ -822,6 +831,14 @@ pub struct WorkerResult {
     /// same position's static eval, for the per-reply statistics line.
     #[cfg(feature = "verbose1")]
     pub eval_dups: u64,
+    /// This worker's static evaluations of a node, for the per-reply
+    /// statistics line.
+    #[cfg(feature = "verbose1")]
+    pub evals: u64,
+    /// This worker's nodes that took their static eval from the table entry
+    /// instead of evaluating, for the per-reply statistics line.
+    #[cfg(feature = "verbose1")]
+    pub eval_tt_hits: u64,
     /// Whether this worker (only meaningful for the main worker) already
     /// emitted the last completed iteration's final PV during iterative
     /// deepening — the reference `uciPvSent` return of `iterative_deepening`.
@@ -1000,6 +1017,10 @@ impl<N: NetworkParams> QSearch<N> {
             tt_updates: 0,
             #[cfg(feature = "verbose1")]
             eval_dups: 0,
+            #[cfg(feature = "verbose1")]
+            evals: 0,
+            #[cfg(feature = "verbose1")]
+            eval_tt_hits: 0,
             sel_depth: 0,
             nmp_min_ply: 0,
             pv_node: false,
@@ -1496,9 +1517,14 @@ impl<N: NetworkParams> QSearch<N> {
     /// Being the one site every evaluation reaches is also what makes it the
     /// place the per-game `noise` is added: a value the search derives for
     /// itself — a mate distance, a repetition verdict, the superior / inferior
-    /// scores — never comes through here, and so carries no noise.
+    /// scores — never comes through here, and so carries no noise. For the
+    /// same reason it is where the evaluations are counted.
     #[inline]
-    fn static_eval(&self, pos: &Position) -> Value {
+    fn static_eval(&mut self, pos: &Position) -> Value {
+        #[cfg(feature = "verbose1")]
+        {
+            self.evals += 1;
+        }
         let value = evaluate_with(self.net, self.acc(), pos);
         #[cfg(test)]
         if self.verify_accumulator {
@@ -1803,6 +1829,10 @@ impl<N: NetworkParams> QSearch<N> {
 
             if tt_hit {
                 unadjusted_static_eval = tt_data.eval;
+                #[cfg(feature = "verbose1")]
+                {
+                    self.eval_tt_hits += u64::from(is_valid(unadjusted_static_eval) && !pv_node);
+                }
                 if !is_valid(unadjusted_static_eval) {
                     unadjusted_static_eval = self.static_eval(pos);
                 } else if pv_node {
@@ -2158,6 +2188,8 @@ impl<N: NetworkParams> QSearch<N> {
         {
             self.tt_updates = 0;
             self.eval_dups = 0;
+            self.evals = 0;
+            self.eval_tt_hits = 0;
         }
         self.sel_depth = 0;
         self.last_iteration_pv.clear();
@@ -2503,6 +2535,10 @@ impl<N: NetworkParams> QSearch<N> {
             tt_updates: self.tt_updates,
             #[cfg(feature = "verbose1")]
             eval_dups: self.eval_dups,
+            #[cfg(feature = "verbose1")]
+            evals: self.evals,
+            #[cfg(feature = "verbose1")]
+            eval_tt_hits: self.eval_tt_hits,
             #[cfg(feature = "verbose2")]
             uci_pv_sent,
             #[cfg(feature = "verbose2")]
@@ -3312,6 +3348,10 @@ impl<N: NetworkParams> QSearch<N> {
                 eval = static_eval;
             } else if tt_hit {
                 unadjusted_static_eval = tt_data.eval;
+                #[cfg(feature = "verbose1")]
+                {
+                    self.eval_tt_hits += u64::from(is_valid(unadjusted_static_eval) && !pv_node);
+                }
                 if !is_valid(unadjusted_static_eval) {
                     unadjusted_static_eval = self.static_eval(pos);
                 } else if pv_node {

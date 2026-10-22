@@ -6,8 +6,8 @@
 //! `info_gating.rs`, which pins that no such line appears.
 //!
 //! Beside `alloc` the line counts what the searches of the interval did —
-//! `nodes`, `tt_update` and `eval_dup` — and leaves out any of them that is
-//! zero, as a reply that ran no search shows.
+//! `nodes`, `tt_update`, `eval_dup`, `evals` and `eval_tt_hits` — and leaves
+//! out any of them that is zero, as a reply that ran no search shows.
 //!
 //! The line is written by taking the counter, so what the previous reply
 //! reported can never be reported again — the two numbers below being drawn from
@@ -31,8 +31,15 @@ fn stats_items(line: &str) -> Option<Vec<&str>> {
     Some(line.strip_prefix(STATS_PREFIX)?.split(' ').collect())
 }
 
-/// The four counted items, in the order the line writes them.
-const COUNT_KEYS: [&str; 4] = ["alloc", "nodes", "tt_update", "eval_dup"];
+/// The six counted items, in the order the line writes them.
+const COUNT_KEYS: [&str; 6] = [
+    "alloc",
+    "nodes",
+    "tt_update",
+    "eval_dup",
+    "evals",
+    "eval_tt_hits",
+];
 
 /// The value of the `key` item on the statistics line `line`. An omitted item
 /// is a zero one.
@@ -210,6 +217,50 @@ fn a_single_threaded_replys_nodes_are_its_last_info_lines() {
     assert_eq!(stats_count(line, "nodes"), info_nodes, "in:\n{out}");
 }
 
+/// A searched reply counts the static evaluations its search made and the ones
+/// it took from the table. With one search thread no other worker can write a
+/// node's eval between its probe and its store, and this search leaves no other
+/// way for a store to find one, so no store is a duplicate.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_single_threaded_reply_counts_its_evaluations_and_no_duplicate() {
+    use yorkie_protocol::config;
+
+    assert_eq!(config::THREADS, 1, "this pins a single-threaded search");
+    let _session = common::serial_session();
+    stage_configured_eval_dir();
+    // A fixed node count where the build accepts the clause; a build without
+    // `verbose2` refuses it, so there the search is bounded by the clock.
+    let go = if cfg!(feature = "verbose2") {
+        "go nodes 20000"
+    } else {
+        "go byoyomi 1000"
+    };
+    let out = drive(&format!(
+        "usi\n\
+         isready\n\
+         usinewgame\n\
+         position startpos moves 7g7f 3c3d\n\
+         {go}\n\
+         quit\n"
+    ));
+    assert!(
+        out.contains("readyok\n"),
+        "the network must load in:\n{out}"
+    );
+    let line = out
+        .lines()
+        .find(|l| l.starts_with(STATS_PREFIX))
+        .unwrap_or_else(|| panic!("a statistics line must be in:\n{out}"));
+    assert!(line.contains(" evals="), "{line:?} in:\n{out}");
+    assert!(line.contains(" eval_tt_hits="), "{line:?} in:\n{out}");
+    assert!(
+        stats_count(line, "evals") + stats_count(line, "eval_tt_hits") > 0,
+        "{line:?} in:\n{out}"
+    );
+    assert!(!line.contains("eval_dup"), "{line:?} in:\n{out}");
+}
+
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_reply_that_starts_no_search_still_reports_its_interval() {
@@ -233,7 +284,7 @@ fn a_reply_that_starts_no_search_still_reports_its_interval() {
     );
     // No search ran, so its counts are zero and left off the line.
     let line = out.lines().nth(stats[0].0).expect("the statistics line");
-    for key in ["nodes", "tt_update", "eval_dup"] {
+    for key in ["nodes", "tt_update", "eval_dup", "evals", "eval_tt_hits"] {
         assert_eq!(stats_count(line, key), 0, "{line:?} in:\n{out}");
         assert!(!line.contains(key), "a zero {key} is omitted, got {line:?}");
     }

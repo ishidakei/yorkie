@@ -188,6 +188,37 @@ fn two_process_launches_report_identical_nodes() {
     );
 }
 
+/// After the summary, one statistics line sums the search counts over every
+/// position of the run, so its `nodes` is the summary's.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn the_summary_is_followed_by_the_runs_statistics() {
+    let _session = common::serial_session();
+    let out = bench_session("bench 16 1 6 default depth");
+    let lines: Vec<&str> = out.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.contains("bench: positions="))
+        .unwrap_or_else(|| panic!("no bench summary line in:\n{out}"));
+    let stats = lines
+        .get(at + 1)
+        .and_then(|l| l.strip_prefix("info string stats "))
+        .unwrap_or_else(|| panic!("a statistics line must follow the summary in:\n{out}"));
+    let nodes: u64 = stats
+        .split(' ')
+        .find_map(|item| item.strip_prefix("nodes="))
+        .unwrap_or_else(|| panic!("no nodes= item in {stats:?}"))
+        .parse()
+        .expect("nodes= is an integer");
+    let summary = bench_summary_nodes(&out);
+    assert!(summary > 0, "real search:\n{out}");
+    assert_eq!(nodes, summary, "in:\n{out}");
+    assert!(
+        !stats.split(' ').any(|item| item.starts_with("alloc=")),
+        "the run's line carries the search counts only: {stats:?}"
+    );
+}
+
 // A threads=2 bench completes and reports a summary (no determinism).
 
 #[cfg_attr(miri, ignore)]

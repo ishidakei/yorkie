@@ -472,13 +472,13 @@ yorkie perft sfen <SFEN> moves <m1> [<m2> …] <depth>
 出力します。
 
 ```
-info string stats alloc=40321 nodes=1834762 tt_update=1290311 eval_dup=4127
+info string stats alloc=40321 nodes=1834762 tt_update=1290311 eval_dup=4127 evals=1046215 eval_tt_hits=388904
 bestmove 7g7f
 ```
 
 固定の接頭辞 `info string stats` のあとに `key=value` の項目を半角空白区切りで
 並べた行です。値が 0 の項目は書かれず、項目が 1 つも残らない場合は行そのものを
-出力しません。`verbose1` のビルドの項目は次の 4 つで、この順に並びます。どれも
+出力しません。`verbose1` のビルドの項目は次の 6 つで、この順に並びます。どれも
 前回の応答からこの応答までの区間を数えたものです。
 
 | 項目 | 数えるもの |
@@ -487,14 +487,22 @@ bestmove 7g7f
 | `nodes` | 探索したノード数。探索の `info` 行が `nodes` として報告するものと同じ量を、全スレッドについて合計したもの |
 | `tt_update` | 置換表への書き込みのうち、置き換え条件が成り立ってエントリの中身を書いたもの。深さを問わず、別の局面や空のエントリへの書き込みも含む。指し手だけを書き換えて中身の書き込みを見送ったものは含まない |
 | `eval_dup` | 置換表を引いて外れたあと、計算した静的評価値だけを `DEPTH_UNSEARCHED` で書き込むもの（`search` の `Bound::None` の書き込みと、静的評価値だけで beta を超えたときに `qsearch` が `Bound::Lower` で行う書き込み）のうち、書き込む直前に読んだ時点で、そのエントリがすでに同じ局面の静的評価値（`VALUE_NONE` でないもの）を持っていたもの。その後に中身を置き換えたかどうかは問わない |
+| `evals` | `search` と `qsearch` がノードの静的評価値を計算した回数。置換表を引いて外れたとき、当たったエントリが静的評価値を持っていなかったとき、PV ノード（エントリが持っていても計算し直す）で数える |
+| `eval_tt_hits` | `search` と `qsearch` で、置換表を引いて当たったエントリの静的評価値を、計算せずにそのまま使ったノードの数（PV ノードでないもの） |
+
+`evals` と `eval_tt_hits` を足すと、静的評価値を求めたノードの数になります。
+例外は singular extension の検証探索で、このノードは元のノードが求めた静的評価値を
+そのまま使うため、どちらにも数えません。王手がかかっているノードは静的評価値を
+求めないので、これもどちらにも数えません。`eval_dup` は `evals`（実際に計算した
+回数）と比べて読むための数です。
 
 この区間は `readyok` の直後と `usinewgame` の最後にも始まり直すので、起動時の
 確保と対局開始の準備は最初の指し手には計上されません。`ponder` 設定が有効な
 ビルドが自分の `bestmove` のあとに相手の手番の局面を探索した分は、その応答の
 あとに行われるので、次の応答の行に計上されます。探索しなかった応答（定跡の手、
 入玉宣言、指せる手がない局面、評価関数を読み込む前の `go`）では、この探索に
-よる先読みが区間内になければ `nodes` / `tt_update` / `eval_dup` は 0 なので
-書かれません。
+よる先読みが区間内になければ `nodes` / `tt_update` / `eval_dup` / `evals` /
+`eval_tt_hits` は 0 なので書かれません。
 
 数えることで探索の判断が変わることはありません。各スレッドは自分の持つ整数に
 数え、全スレッドが共有する置換表は、中身を書いたかどうかを書き込んだスレッドの
@@ -514,7 +522,7 @@ bestmove 7g7f
 求められたかを表す印です。
 
 ```
-info string stats alloc=40321 nodes=1834762 tt_update=1290311 eval_dup=4127 pathdep=1 declrule=1 movelimit=1
+info string stats alloc=40321 nodes=1834762 tt_update=1290311 eval_dup=4127 evals=1046215 eval_tt_hits=388904 pathdep=1 declrule=1 movelimit=1
 bestmove 7g7f ponder 3c3d
 ```
 
@@ -534,6 +542,22 @@ bestmove 7g7f ponder 3c3d
 統計行は実際に指した手の評価値の印を伝えます。なお、この印を読んで探索の判断が
 変わることはありません。
 `verbose3` のビルドも印を持たないビルドとまったく同じ木を探索します。
+
+#### `bench` 1 回ぶんの統計行（`verbose3`）
+
+`bench` の各局面も `bestmove` で終わるので、局面ごとにその直前に統計行が出力
+されます。そのうえで `bench` は集計行 `bench: positions=…` のあとに、同じ形式の
+統計行をもう 1 行出力します。この行は探索の 5 項目を実行した全局面について
+合計したもので、`alloc` と印の項目は含みません。`nodes` は集計行の `nodes=` と
+一致します。
+
+```
+info string bench: positions=4 nodes=4183920 time_ms=4012 nps=1042851
+info string stats nodes=4183920 tt_update=2791044 eval_dup=10233 evals=2397140 eval_tt_hits=880312
+```
+
+合計は `bench` の開始時に 0 から始まるため、それ以前の探索は含みません。
+スレッド数を変えた計測で、`go` を使わずに 1 回の実行全体の数を読むための行です。
 
 ## 実装上の特記事項
 
