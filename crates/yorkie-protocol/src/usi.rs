@@ -63,7 +63,7 @@ use crate::stats::{StatsBuf, clear_search_counts, take_search_counts};
 /// The version part is this project's own generation number (see
 /// `CHANGELOG.md`), not an upstream-tracking number; the upstream YaneuraOu
 /// baseline is documented in `README.md` instead.
-pub const ENGINE_NAME: &[u8] = b"Yorkie 3.1.0";
+pub const ENGINE_NAME: &[u8] = b"Yorkie 3.2.0";
 pub const ENGINE_AUTHOR: &[u8] = b"Kei Ishida <ishida.kei@gmail.com>";
 
 /// Room a diagnostic `info string` body is composed in.

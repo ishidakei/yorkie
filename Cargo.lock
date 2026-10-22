@@ -756,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "clap",
  "yorkie-state",
@@ -764,7 +764,7 @@ dependencies = [
 
 [[package]]
 name = "yorkie"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -775,7 +775,7 @@ dependencies = [
 
 [[package]]
 name = "yorkie-eval"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "proptest",
  "serde_json",
@@ -786,14 +786,14 @@ dependencies = [
 
 [[package]]
 name = "yorkie-numa"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "yorkie-protocol"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "libc",
  "serde",
@@ -807,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "yorkie-search"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -818,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "yorkie-state"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "proptest",
  "serde_json",
@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "yorkie-storage"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "libc",
  "mimalloc",

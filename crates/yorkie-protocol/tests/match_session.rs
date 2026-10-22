@@ -73,7 +73,7 @@ fn whole_session_including_the_handshake() {
     assert_eq!(
         without_stats(&out),
         format!(
-            "id name Yorkie 3.1.0\n\
+            "id name Yorkie 3.2.0\n\
              id author Kei Ishida <ishida.kei@gmail.com>\n\
              usiok\n\
              {}",

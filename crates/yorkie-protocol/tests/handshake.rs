@@ -40,7 +40,7 @@ fn diag_line(body: &str) -> String {
 fn full_usi_to_usiok_golden() {
     let out = drive("usi\nquit\n");
     let expected = "\
-id name Yorkie 3.1.0\n\
+id name Yorkie 3.2.0\n\
 id author Kei Ishida <ishida.kei@gmail.com>\n\
 usiok\n";
     assert_eq!(out, expected);
@@ -134,7 +134,7 @@ fn oversized_line_emits_command_too_long() {
 #[test]
 fn full_handshake_then_consumed_setoption_then_quit() {
     let out = drive("usi\nsetoption name USI_Hash value 256\nisready\nquit\n");
-    assert!(out.starts_with("id name Yorkie 3.1.0\n"));
+    assert!(out.starts_with("id name Yorkie 3.2.0\n"));
     assert!(out.contains("usiok\n"));
     // The session is still usable: `isready` behaves exactly as it does with no
     // `setoption` at all (no evaluation file where the driver looks → the load
