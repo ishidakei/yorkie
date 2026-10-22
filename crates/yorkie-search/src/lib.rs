@@ -16,6 +16,7 @@ pub mod book;
 mod config;
 pub mod history;
 pub mod movepick;
+pub mod params;
 pub mod qsearch;
 pub mod root;
 /// The text forms this crate's own unit tests read through.

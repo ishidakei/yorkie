@@ -86,12 +86,17 @@ serde_json = "~1.0"
 # This crate owns the `random` setting the amplitude comes from and the per-game
 # seed the search is handed, so the constant, the seed and its hand-over are all
 # behind the feature here too. Off by default.
+#
+# `tune` is the Search-layer feature that makes the search parameters settable
+# at startup, likewise orthogonal. This crate reads the `YORKIE_TUNE` environment
+# variable they are set from, behind the feature. Off by default.
 [features]
 verbose1 = ["yorkie-search/verbose1", "yorkie-storage/verbose1"]
 verbose2 = ["verbose1", "yorkie-search/verbose2"]
 verbose3 = ["verbose2", "yorkie-search/verbose3", "yorkie-storage/verbose3"]
 tt-entry16 = ["yorkie-search/tt-entry16", "yorkie-storage/tt-entry16"]
 random = ["yorkie-search/random"]
+tune = ["yorkie-search/tune"]
 
 [lints]
 workspace = true

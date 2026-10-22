@@ -21,6 +21,12 @@ usage:
 const MESSAGE_BYTES: usize = 8 * 1024;
 
 fn main() -> ExitCode {
+    // The parameters are written here, before any other thread exists.
+    #[cfg(feature = "tune")]
+    match yorkie_protocol::tune::apply_env(&mut stdout().lock()) {
+        Ok(true) => {}
+        Ok(false) | Err(_) => return ExitCode::from(2),
+    }
     // The arguments arrive as the bytes the operating system holds them as:
     // this engine's own text is ASCII, and anything else is quoted back rather
     // than decoded.

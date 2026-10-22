@@ -52,8 +52,14 @@ yorkie-eval = { path = "../yorkie-eval", features = ["source-network"] }
 # one. The whole of it — the amplitude, the seed, the noise function and the
 # branch that adds it — is behind the feature, and a build without it evaluates
 # exactly as before. Off by default.
+#
+# `tune` is orthogonal too: it turns the search parameters `params` registers
+# from constants into statics written once at startup from a tuning list, so a
+# tuning run can vary them without a rebuild. A `tune` build given no list
+# searches exactly as the build without it. Off by default.
 [features]
 random = []
+tune = []
 tt-entry16 = ["yorkie-storage/tt-entry16"]
 verbose1 = ["yorkie-storage/verbose1"]
 verbose2 = ["verbose1", "yorkie-storage/verbose2"]

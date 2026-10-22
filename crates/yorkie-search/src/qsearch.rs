@@ -39,6 +39,7 @@ use crate::history::{
     ContPlane, ContinuationCorrectionHistory, ContinuationHistory, CorrChannel, CorrPlane,
 };
 use crate::movepick::{MovePicker, PickerScratch};
+use crate::params;
 use crate::root::{
     EnteringKingConfig, RootKind, RootMove, RootOutcome, declaration_win, generate_root_moves,
 };
@@ -136,10 +137,6 @@ const fn max_value(a: Value, b: Value) -> Value {
 const DEPTH_QS: i32 = 0;
 /// `DEPTH_UNSEARCHED`.
 const DEPTH_UNSEARCHED: i32 = -2;
-/// Futility margin added to `ss->staticEval`.
-const FUTILITY_MARGIN: Value = 328;
-/// SEE cutoff for a capture with no futility exemption.
-const SEE_CAPTURE_MARGIN: i32 = -73;
 /// The `MaxMovesToDraw` limit this binary plays under, when one is configured:
 /// the game ply past which every interior / qsearch node adjudicates an
 /// unconditional draw. A configured `0` means unlimited and compiles to `None`.
@@ -1905,7 +1902,7 @@ impl<N: NetworkParams> QSearch<N> {
             // which the `ttValue` refinement above does not touch — so it is
             // recomputed here rather than read back off `best_value`.
             futility_base = to_corrected_static_eval(unadjusted_static_eval, correction_value)
-                + FUTILITY_MARGIN;
+                + params::QS_FUTILITY_MARGIN.get();
         }
 
         // Step 5-8. Move loop.
@@ -1959,7 +1956,7 @@ impl<N: NetworkParams> QSearch<N> {
                     continue;
                 }
 
-                if !pos.see_ge(mv, SEE_CAPTURE_MARGIN) {
+                if !pos.see_ge(mv, params::QS_SEE_MARGIN.get()) {
                     continue;
                 }
             }
@@ -2578,7 +2575,8 @@ impl<N: NetworkParams> QSearch<N> {
         let line = &root_moves[pv_idx];
         #[cfg(not(feature = "verbose2"))]
         let line = &root_moves[0];
-        let mut delta: Value = 5 + (line.mean_squared_score.unsigned_abs() / 9000) as Value;
+        let mut delta: Value = params::ASPIRATION_DELTA.get()
+            + (line.mean_squared_score.unsigned_abs() / 9000) as Value;
         let avg = line.average_score;
         let mut alpha = (avg - delta).max(-VALUE_INFINITE);
         let mut beta = (avg + delta).min(VALUE_INFINITE);
@@ -2965,9 +2963,9 @@ impl<N: NetworkParams> QSearch<N> {
     /// `reduction(i, d, mn, delta)`, scaled by 1024.
     fn reduction(&self, improving: bool, d: i32, mn: i32, delta: i32) -> i32 {
         let reduction_scale = REDUCTIONS[d as usize] * REDUCTIONS[mn as usize];
-        reduction_scale - delta * 585 / self.root_delta_divisor()
+        reduction_scale - delta * params::LMR_DELTA.get() / self.root_delta_divisor()
             + (!improving as i32) * reduction_scale * 206 / 512
-            + 1133
+            + params::LMR_BASE.get()
     }
 
     /// `correction_value(*this, pos, ss)`: a weighted sum of the side-to-move
@@ -3420,14 +3418,17 @@ impl<N: NetworkParams> QSearch<N> {
             }
 
             // Step 7. Razoring.
-            if !pv_node && eval < alpha - 502 - 306 * depth * depth {
+            if !pv_node
+                && eval
+                    < alpha - params::RAZOR_BASE.get() - params::RAZOR_DEPTH.get() * depth * depth
+            {
                 self.pv_node = false;
                 self.set_read_tt(true);
                 return self.qsearch(pos, ply, alpha, beta, scratch);
             }
 
             // Step 8. Futility pruning.
-            let futility_mult = 76 - 21 * (!tt_hit) as i32;
+            let futility_mult = params::FUTILITY_MULT.get() - 21 * (!tt_hit) as i32;
             let margin = futility_mult * depth
                 - (2686 * improving as i32 + 362 * opponent_worsening as i32) * futility_mult
                     / 1024
@@ -3448,12 +3449,13 @@ impl<N: NetworkParams> QSearch<N> {
             // `#if STOCKFISH`, so it is absent here; `ss->ply >= nmpMinPly` is
             // what disables the pass while a verification search is in flight.
             if cut_node
-                && static_eval >= beta - 16 * depth - 53 * improving as i32 + 378
+                && static_eval
+                    >= beta - 16 * depth - 53 * improving as i32 + params::NMP_MARGIN.get()
                 && !excluded_move.is_some_and(Move::is_ok)
                 && ply >= self.nmp_min_ply
                 && !is_loss(beta)
             {
-                let r = 7 + depth / 3;
+                let r = params::NMP_REDUCTION.get() + depth / 3;
                 self.stack[s].current_move = Some(Move::null());
                 self.stack[s].cont_hist = NULL_MOVE_CONT_PLANE;
                 self.stack[s].cont_corr = CorrPlane::SENTINEL;
@@ -3545,7 +3547,7 @@ impl<N: NetworkParams> QSearch<N> {
             }
 
             // Step 11. ProbCut.
-            let prob_cut_beta = beta + 224 - 61 * improving as i32;
+            let prob_cut_beta = beta + params::PROBCUT_MARGIN.get() - 61 * improving as i32;
             if depth >= 3 && !is_decisive(beta) && !(is_valid(tt_value) && tt_value < prob_cut_beta)
             {
                 let prob_cut_depth = depth - 4;
@@ -3619,7 +3621,7 @@ impl<N: NetworkParams> QSearch<N> {
         // moves_loop: in-check nodes resume here.
 
         // Step 12. Small ProbCut.
-        let prob_cut_beta = beta + 416;
+        let prob_cut_beta = beta + params::SMALL_PROBCUT_MARGIN.get();
         if bound_matches(tt_data.bound, true)
             && tt_data.depth >= depth - 4
             && tt_value >= prob_cut_beta
@@ -3732,7 +3734,7 @@ impl<N: NetworkParams> QSearch<N> {
                     let futility_value = static_eval
                         + 42
                         + 151 * (!best_move.is_some_and(Move::is_ok)) as i32
-                        + 120 * lmr_depth
+                        + params::QUIET_FUTILITY_DEPTH.get() * lmr_depth
                         + 86 * (static_eval > alpha) as i32;
                     if !in_check && lmr_depth < 13 && futility_value <= alpha {
                         if best_value <= futility_value
@@ -3764,8 +3766,11 @@ impl<N: NetworkParams> QSearch<N> {
                 && tt_data.depth >= depth - 3
                 && !self.is_shuffling(mv, capture, ply, pos)
             {
-                let singular_beta =
-                    tt_value - (60 + 66 * (self.stack[s].tt_pv && !pv_node) as i32) * depth / 55;
+                let singular_beta = tt_value
+                    - (params::SINGULAR_MARGIN.get()
+                        + 66 * (self.stack[s].tt_pv && !pv_node) as i32)
+                        * depth
+                        / 55;
                 let singular_depth = new_depth / 2;
 
                 // Re-enter on the *same* node with `move` excluded. Any `ss`
@@ -3862,7 +3867,7 @@ impl<N: NetworkParams> QSearch<N> {
             r -= move_count * 65;
             r -= correction_value.abs() / 25600;
             if cut_node {
-                r += 3611 + 985 * tt_move.is_none() as i32;
+                r += params::LMR_CUT_NODE.get() + 985 * tt_move.is_none() as i32;
             }
             if tt_capture {
                 r += 1054;
