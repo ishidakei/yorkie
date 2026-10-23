@@ -1,14 +1,15 @@
 //! The engine config's schema and parser: what it accepts, and how loudly it
 //! refuses everything else.
 //!
-//! `build_config.rs` is `include!`d here exactly as `build.rs` includes it, so
-//! these tests exercise the same code that decides whether a build happens. The
-//! whole design rests on one promise: a config the engine cannot make sense of
-//! never becomes a binary.
+//! `build_config.rs` and `build_exe_dir.rs` are `include!`d here exactly as
+//! `build.rs` includes them, so these tests exercise the same code that decides
+//! whether a build happens. The whole design rests on one promise: a config the
+//! engine cannot make sense of never becomes a binary.
 
 #![allow(dead_code)]
 
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/build_config.rs"));
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/build_exe_dir.rs"));
 
 /// The play config — the real thing, read off disk, so these tests are a live
 /// check that `configs/default.toml` still satisfies the schema.
@@ -875,4 +876,62 @@ fn the_generated_header_records_a_repository_relative_source() {
         "/etc/yorkie/event.toml"
     );
     assert_eq!(config_name(Path::new("/repo/configs/test.toml")), "test");
+}
+
+#[test]
+fn the_binary_directory_is_found_under_either_out_dir_layout() {
+    use std::path::Path;
+
+    // `<pkg>-<hash>/out`.
+    assert_eq!(
+        exe_dir(Path::new(
+            "/repo/target/release/build/yorkie-eval-0123abcd/out"
+        )),
+        Ok(PathBuf::from("/repo/target/release"))
+    );
+    assert_eq!(
+        exe_dir(Path::new(
+            "/repo/target/x86_64-unknown-linux-gnu/release/build/yorkie-eval-0123abcd/out"
+        )),
+        Ok(PathBuf::from(
+            "/repo/target/x86_64-unknown-linux-gnu/release"
+        ))
+    );
+    // `<pkg>/<hash>/out`, one level deeper; the binary has not moved.
+    assert_eq!(
+        exe_dir(Path::new(
+            "/repo/target/release/build/yorkie-eval/0123abcd/out"
+        )),
+        Ok(PathBuf::from("/repo/target/release"))
+    );
+    assert_eq!(
+        exe_dir(Path::new(
+            "/repo/target/x86_64-unknown-linux-gnu/release/build/yorkie-eval/0123abcd/out"
+        )),
+        Ok(PathBuf::from(
+            "/repo/target/x86_64-unknown-linux-gnu/release"
+        ))
+    );
+    // A `build` further up than the profile's is not the one that counts.
+    assert_eq!(
+        exe_dir(Path::new(
+            "/build/repo/target/release/build/yorkie-eval-0123abcd/out"
+        )),
+        Ok(PathBuf::from("/build/repo/target/release"))
+    );
+}
+
+#[test]
+fn an_out_dir_with_no_build_ancestor_is_an_error() {
+    use std::path::Path;
+
+    let err = exe_dir(Path::new("/repo/target/release/yorkie-eval-0123abcd/out"))
+        .expect_err("no `build` ancestor");
+    assert!(
+        err.contains("/repo/target/release/yorkie-eval-0123abcd/out"),
+        "the message names OUT_DIR: {err}"
+    );
+    assert!(err.contains("not a layout"), "{err}");
+    // `OUT_DIR` itself named `build` is not its own ancestor.
+    assert!(exe_dir(Path::new("/repo/out/build")).is_err());
 }

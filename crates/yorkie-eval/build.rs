@@ -30,6 +30,7 @@
 //! missing network when it is asked to be ready.
 
 include!("../yorkie-protocol/build_config.rs");
+include!("../yorkie-protocol/build_exe_dir.rs");
 
 #[path = "nnue_layout.rs"]
 #[allow(dead_code)]
@@ -51,6 +52,7 @@ fn fail(msg: &str) -> ! {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../yorkie-protocol/build_config.rs");
+    println!("cargo:rerun-if-changed=../yorkie-protocol/build_exe_dir.rs");
     println!("cargo:rerun-if-changed=nnue_layout.rs");
     println!("cargo:rerun-if-changed=nnue_source.rs");
     println!("cargo:rerun-if-env-changed={CONFIG_ENV}");
@@ -126,7 +128,9 @@ fn prepare_network(repo_root: &Path, out_dir: &Path, entries: &BTreeMap<String, 
     let source_path = source_dir.join(SOURCE_FILE_NAME);
     println!("cargo:rerun-if-changed={}", source_path.display());
 
-    let eval_dir = resolve_dir(&exe_dir(out_dir), &text_key(entries, "eval_dir"));
+    // A relative `eval_dir` resolves against the directory the binary sits in.
+    let exe_dir = exe_dir(out_dir).unwrap_or_else(|e| fail(&e));
+    let eval_dir = resolve_dir(&exe_dir, &text_key(entries, "eval_dir"));
     let target = eval_dir.join(nnue_layout::FILE_NAME);
     // The file this writes is also an input: deleting it is how an operator
     // asks for it to be made again, and without this cargo would see nothing
@@ -317,18 +321,6 @@ fn text_key(entries: &BTreeMap<String, Entry>, key: &str) -> String {
         Some(Value::Str(s)) => s.clone(),
         _ => fail(&format!("`{key}` must be a string")),
     }
-}
-
-/// The directory the engine binary this build produces will sit in, which is
-/// where its relative `eval_dir` resolves: three levels above `OUT_DIR`
-/// (`<target>/[<triple>/]<profile>/build/<pkg>-<hash>/out`).
-fn exe_dir(out_dir: &Path) -> PathBuf {
-    out_dir
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| out_dir.to_path_buf())
 }
 
 /// How many NUMA nodes the building machine has.

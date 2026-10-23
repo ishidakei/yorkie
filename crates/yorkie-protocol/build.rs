@@ -27,12 +27,14 @@
 //!
 //! This file is the impure half — environment, filesystem, exit code. The
 //! schema, parser, code generator and path resolution live in
-//! `build_config.rs`, the machine's layout in `build_numa.rs`, and the CPU
-//! assignment in `build_cpus.rs`.
+//! `build_config.rs`, the machine's layout in `build_numa.rs`, the CPU
+//! assignment in `build_cpus.rs`, and where the binary sits in
+//! `build_exe_dir.rs`.
 
 include!("build_config.rs");
 include!("build_numa.rs");
 include!("build_cpus.rs");
+include!("build_exe_dir.rs");
 
 /// Report a build-stopping configuration error and exit. `process::exit` rather
 /// than `panic!` so the message cargo surfaces is the message, without a
@@ -47,6 +49,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build_config.rs");
     println!("cargo:rerun-if-changed=build_numa.rs");
     println!("cargo:rerun-if-changed=build_cpus.rs");
+    println!("cargo:rerun-if-changed=build_exe_dir.rs");
     println!("cargo:rerun-if-env-changed={CONFIG_ENV}");
 
     let repo_root = repo_root();
@@ -64,8 +67,12 @@ fn main() {
     };
 
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
+    // The binary's directory is what tells two builds apart in the CPU ledger:
+    // two binaries in one directory are the same binary, and one in another
+    // directory is another one, whichever features or profile produced it.
+    let exe_dir = exe_dir(&out_dir).unwrap_or_else(|e| fail(&e));
     let identity = BuildIdentity {
-        out_dir: exe_dir(&out_dir).display().to_string(),
+        out_dir: exe_dir.display().to_string(),
         config: display_source(&repo_root, &path),
         version: std::env::var("CARGO_PKG_VERSION").unwrap_or_default(),
     };
@@ -109,21 +116,6 @@ fn active_gates() -> Vec<&'static str> {
             std::env::var_os(format!("CARGO_FEATURE_{}", feature.to_ascii_uppercase())).is_some()
         })
         .collect()
-}
-
-/// The directory the engine binary this build produces will sit in: three levels
-/// above `OUT_DIR` (`<target>/[<triple>/]<profile>/build/<pkg>-<hash>/out`).
-///
-/// This is what tells two builds apart in the CPU ledger — two binaries in one
-/// directory are the same binary, and one in another directory is another one,
-/// whichever features or profile produced it.
-fn exe_dir(out_dir: &Path) -> PathBuf {
-    out_dir
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| out_dir.to_path_buf())
 }
 
 /// The repository root: two levels above this crate (`crates/yorkie-protocol`).
