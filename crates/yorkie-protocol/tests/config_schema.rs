@@ -827,7 +827,7 @@ fn a_faulty_yorkie_book_list_is_an_error() {
 fn negative_values_round_trip() {
     let out = compile(&default_config_text()).expect("compiles");
     assert!(out.contains("pub const BOOK_EVAL_WHITE_LIMIT: i64 = -140;"));
-    assert!(out.contains("pub const DRAW_VALUE_BLACK: i64 = -2;"));
+    assert!(out.contains("pub const DRAW_VALUE_BLACK: i64 = -240;"));
 }
 
 // --- Which file a build selects -------------------------------------------

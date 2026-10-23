@@ -625,6 +625,103 @@ mod tests {
         }
     }
 
+    /// A 3-minute (black) / 10-minute (white) clock with a 2-second increment
+    /// and a 512-move cap, under the time settings above. Every case below is
+    /// a Fischer clock, so the move horizon is `180 - min(ply, 80)`, and the
+    /// minimum is `max(2000 - 120, 1000) = 1880`, which `round_up` keeps:
+    /// `max(2000, 2000) - 120 = 1880`.
+    mod match_clock {
+        use super::*;
+
+        const MATCH: TimeSettings = TimeSettings {
+            network_delay: 120,
+            network_delay2: 1120,
+            minimum_thinking_time: 2000,
+            slow_mover: 100,
+            round_up_to_fullsecond: true,
+            max_moves_to_draw: 512,
+        };
+
+        fn budget(time_us: i64, ply: i32) -> (i64, i64, i64) {
+            let tm = init_settings(
+                &TimeInput {
+                    time_us,
+                    inc_us: 2_000,
+                    ply,
+                    ..base()
+                },
+                &MATCH,
+            );
+            (tm.minimum(), tm.optimum(), tm.maximum())
+        }
+
+        #[test]
+        fn black_first_move() {
+            // remain_time = 180000 - 1120 = 178880; horizon 179;
+            // MTG = min(512 - 1 + 2, 179) / 2 = 89.
+            // estimate = 180000 + 2000*89 - 90*1000 = 268000.
+            // t1 = 1880 + 268000/89 (3011) = 4891.
+            // t2 = 1880 + 268000*5/89 (15056) = 16936, under 0.3 cap 80400.
+            // maximum = round_up(16936): 17000 - 120 = 16880 < 16936 -> 17880.
+            assert_eq!(budget(180_000, 1), (1880, 4891, 17880));
+        }
+
+        #[test]
+        fn black_base_nearly_spent_in_the_middlegame() {
+            // remain_time = 10000 - 1120 = 8880; horizon 100;
+            // MTG = min(433, 100) / 2 = 50.
+            // estimate = 10000 + 2000*50 - 51*1000 = 59000.
+            // t1 = 1880 + 59000/50 (1180) = 3060.
+            // t2 = 1880 + 59000*5/50 (5900) = 7780, under 0.3 cap 17700.
+            // maximum = round_up(7780): 8000 - 120 = 7880.
+            assert_eq!(budget(10_000, 81), (1880, 3060, 7880));
+        }
+
+        #[test]
+        fn black_near_the_cap() {
+            // remain_time = 4000 - 1120 = 2880; horizon 100;
+            // MTG = min(512 - 501 + 2, 100) / 2 = 6.
+            // estimate = 4000 + 2000*6 - 7*1000 = 9000.
+            // t1 = 1880 + 9000/6 (1500) = 3380 -> capped at remain_time 2880.
+            // t2 = 1880 + 9000*5/6 (7500) = 9380 -> 0.3 cap 2700.
+            // maximum = round_up(2700): 3000 - 120 = 2880, capped at 2880.
+            assert_eq!(budget(4_000, 501), (1880, 2880, 2880));
+        }
+
+        #[test]
+        fn white_first_move() {
+            // remain_time = 600000 - 1120 = 598880; horizon 178;
+            // MTG = min(512, 178) / 2 = 89.
+            // estimate = 600000 + 2000*89 - 90*1000 = 688000.
+            // t1 = 1880 + 688000/89 (7730) = 9610.
+            // t2 = 1880 + 688000*5/89 (38651) = 40531, under 0.3 cap 206400.
+            // maximum = round_up(40531): 41000 - 120 = 40880.
+            assert_eq!(budget(600_000, 2), (1880, 9610, 40880));
+        }
+
+        #[test]
+        fn white_in_the_middlegame() {
+            // remain_time = 300000 - 1120 = 298880; horizon 100;
+            // MTG = min(432, 100) / 2 = 50.
+            // estimate = 300000 + 2000*50 - 51*1000 = 349000.
+            // t1 = 1880 + 349000/50 (6980) = 8860.
+            // t2 = 1880 + 349000*5/50 (34900) = 36780, under 0.3 cap 104700.
+            // maximum = round_up(36780): 37000 - 120 = 36880.
+            assert_eq!(budget(300_000, 82), (1880, 8860, 36880));
+        }
+
+        #[test]
+        fn white_near_the_cap() {
+            // remain_time = 20000 - 1120 = 18880; horizon 100;
+            // MTG = min(512 - 502 + 2, 100) / 2 = 6.
+            // estimate = 20000 + 2000*6 - 7*1000 = 25000.
+            // t1 = 1880 + 25000/6 (4166) = 6046.
+            // t2 = 1880 + 25000*5/6 (20833) = 22713 -> 0.3 cap 7500.
+            // maximum = round_up(7500): 8000 - 120 = 7880.
+            assert_eq!(budget(20_000, 502), (1880, 6046, 7880));
+        }
+    }
+
     #[test]
     fn round_up_boundaries_full_second_branch() {
         // `round_up` reads only the option defaults (minimum_thinking_time 2000,

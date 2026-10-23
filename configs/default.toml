@@ -242,8 +242,10 @@ depth_limit = 0
 nodes_limit = 0
 
 # Ply past which the search adjudicates an unconditional draw
-# (`MaxMovesToDraw`); `0` is unlimited.
-max_moves_to_draw = 0
+# (`MaxMovesToDraw`); `0` is unlimited. A position reached after the last move
+# is a draw even when that move mates. The time management also plans its
+# remaining-move estimate against this ply.
+max_moves_to_draw = 512
 
 # Score every forced mate the engine delivers with one flat winning value
 # instead of the usual "shorter mate scores higher" gradient. A shorter mate is
@@ -277,9 +279,13 @@ consideration_mode = false
 output_fail_lh_pv = true
 
 # Per-colour draw score in centipawns, from each colour's own perspective
-# (`DrawValueBlack` / `DrawValueWhite`).
-draw_value_black = -2
-draw_value_white = -2
+# (`DrawValueBlack` / `DrawValueWhite`). Set for a game in which a draw counts
+# 0.4 to black and 0.6 to white: under the win-rate model
+# `1 / (1 + exp(-cp / 600))` those expectations are about -243 cp and +243 cp,
+# rounded here to -240 and +240. Black then avoids a draw unless it is more than
+# 240 cp behind, and white takes one unless it is more than 240 cp ahead.
+draw_value_black = -240
+draw_value_white = 240
 
 # Resign when the centipawn-normalized best score is at or below `-this`
 # (`ResignValue`). The default is effectively unreachable.
