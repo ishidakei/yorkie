@@ -9,7 +9,7 @@
 mod common;
 
 use common::{
-    TEST_BOOK_SEED, TempDir, YkEntry, bestmove_lines, drive_with_yorkie_book,
+    TEST_BOOK_SEED, TempDir, YkEntry, bestmove_lines, drive_with_seed, drive_with_yorkie_book,
     drive_with_yorkie_books, reseal_yorkie_book, seal_yorkie_book, serial_session,
     stage_configured_eval_dir, yorkie_book_bytes,
 };
@@ -71,6 +71,86 @@ fn a_loaded_yorkie_book_answers_shared_and_path_dependent_positions() {
     // has no ply limit, and the third position is only in its path-dependent
     // section.
     assert_eq!(bestmove_lines(&out), vec!["2g2f", "2f2e", "8c8d"], "{out}");
+}
+
+/// A book whose only entry is path-dependent: the position `2g2f 3c3d 7g7f`
+/// reaches answers [`TRANSPOSED_BOOK_MOVE`], provided the post-`2g2f` position
+/// occurred.
+fn transposed_book_image() -> Vec<u8> {
+    let pathdep: Vec<YkEntry<'_>> = vec![(
+        &["2g2f", "3c3d", "7g7f"],
+        vec![(TRANSPOSED_BOOK_MOVE, 10_000)],
+        vec![&["2g2f"]],
+    )];
+    yorkie_book_bytes(&[], &pathdep)
+}
+
+/// A king step no search prefers there, so playing it means the entry fired.
+const TRANSPOSED_BOOK_MOVE: &str = "5a4b";
+
+/// A path-dependent entry answers its position only when the game passed
+/// through the position its support names: reached by `2g2f 3c3d 7g7f` it
+/// fires, reached by the transposition `7g7f 3c3d 2g2f` it does not, and the
+/// reply is the one a session with no yorkie book gives.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_path_dependent_entry_misses_a_transposition_that_skips_its_support() {
+    let _session = serial_session();
+    stage_configured_eval_dir();
+    let dir = TempDir::new("yorkie-transposed");
+    let path = write(&dir, "transposed.ykb", &transposed_book_image());
+
+    let out = drive_with_yorkie_book(
+        &format!(
+            "isready\n\
+             usinewgame\n\
+             position startpos moves 2g2f 3c3d 7g7f\n\
+             {GO}\
+             usinewgame\n\
+             position startpos moves 7g7f 3c3d 2g2f\n\
+             {GO}\
+             quit\n"
+        ),
+        TEST_BOOK_SEED,
+        &path,
+    );
+    assert!(
+        out.contains("info string yorkie book loaded : 0 shared + 1 path-dependent entries\n"),
+        "{out}"
+    );
+    let played = bestmove_lines(&out);
+    assert_eq!(played.len(), 2, "{out}");
+    assert_eq!(
+        played[0], TRANSPOSED_BOOK_MOVE,
+        "the support occurred: {out}"
+    );
+    assert_ne!(
+        played[1], TRANSPOSED_BOOK_MOVE,
+        "the support never occurred: {out}"
+    );
+
+    // Each game draws its evaluation noise from process entropy, so two noisy
+    // sessions run different searches and their replies are not comparable.
+    #[cfg(feature = "random")]
+    if yorkie_protocol::config::RANDOM != 0 {
+        eprintln!("skipped: this build's evaluation noise differs between the two sessions");
+        return;
+    }
+    let without = drive_with_seed(
+        &format!(
+            "isready\n\
+             usinewgame\n\
+             position startpos moves 7g7f 3c3d 2g2f\n\
+             {GO}\
+             quit\n"
+        ),
+        TEST_BOOK_SEED,
+    );
+    assert_eq!(
+        bestmove_lines(&without),
+        vec![played[1]],
+        "{out}\n{without}"
+    );
 }
 
 /// A book whose only entry answers the initial position with `mv`.
