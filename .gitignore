@@ -31,3 +31,8 @@ settings.local.json
 # The per-machine record of which logical CPUs each build took. It describes one
 # machine's allocation and means nothing on another, so it is never committed.
 /.yorkie-cpu-ledger*
+
+# Python bytecode caches. CPython regenerates them per interpreter on every
+# machine that runs a script, so they are never committed.
+__pycache__/
+*.py[cod]
