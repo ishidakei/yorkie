@@ -39,7 +39,8 @@ use yorkie_state::{Color, Position, Square};
 use crate::features::{
     DiffScratch, FeatureIndex, MAX_ACTIVE_FEATURES, active_features_into, changed_indices_into,
 };
-use crate::transformer::{apply_diff, refresh_perspective};
+use crate::simd::transformer_kernel;
+use crate::transformer::refresh_perspective;
 use crate::types::{HIDDEN_SIZE, NetworkParams};
 
 /// One cached refreshed half: the accumulation and the active-feature list it
@@ -152,8 +153,9 @@ impl FinnyCache {
             // so the padding feature cancels in the multiset diff exactly as it
             // does for an ordinary incremental update.
             changed_indices_into(&entry.active, scratch_active, diff);
-            apply_diff(
+            transformer_kernel::sub_add_features_tee(
                 &mut entry.accumulation,
+                dst,
                 net.ft_weights(),
                 &diff.added,
                 &diff.removed,
@@ -167,9 +169,9 @@ impl FinnyCache {
                 scratch_active,
             );
             entry.initialized = true;
+            *dst = entry.accumulation;
         }
 
-        *dst = entry.accumulation;
         // The old list becomes the next call's scratch, so the steady state
         // allocates nothing.
         std::mem::swap(&mut entry.active, scratch_active);

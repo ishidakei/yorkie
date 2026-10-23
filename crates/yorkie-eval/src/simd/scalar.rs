@@ -63,8 +63,133 @@ pub fn add_sub_sub_features(
     }
 }
 
+/// `dst = src - col` (`SUB`) or `dst = src + col`, one pass over the half.
+#[inline]
+fn column_from<const SUB: bool>(
+    src: &[i16; HIDDEN_SIZE],
+    dst: &mut [i16; HIDDEN_SIZE],
+    col: &[i16; HIDDEN_SIZE],
+) {
+    for ((d, &s), &w) in dst.iter_mut().zip(src.iter()).zip(col.iter()) {
+        *d = if SUB {
+            s.wrapping_sub(w)
+        } else {
+            s.wrapping_add(w)
+        };
+    }
+}
+
+/// `out -= col` (`SUB`) or `out += col` in place, storing each result lane to
+/// `copy` as well.
+#[inline]
+fn column_tee<const SUB: bool>(
+    out: &mut [i16; HIDDEN_SIZE],
+    copy: &mut [i16; HIDDEN_SIZE],
+    col: &[i16; HIDDEN_SIZE],
+) {
+    for ((o, c), &w) in out.iter_mut().zip(copy.iter_mut()).zip(col.iter()) {
+        *o = if SUB {
+            o.wrapping_sub(w)
+        } else {
+            o.wrapping_add(w)
+        };
+        *c = *o;
+    }
+}
+
+/// `dst = src + add - sub`, in one pass over the half.
+pub fn add_sub_features_from(
+    src: &[i16; HIDDEN_SIZE],
+    dst: &mut [i16; HIDDEN_SIZE],
+    weights: &[i16],
+    added: FeatureIndex,
+    removed: FeatureIndex,
+) {
+    let add = ft_column(weights, added);
+    let sub = ft_column(weights, removed);
+    for (((d, &s), &a), &r) in dst
+        .iter_mut()
+        .zip(src.iter())
+        .zip(add.iter())
+        .zip(sub.iter())
+    {
+        *d = s.wrapping_add(a).wrapping_sub(r);
+    }
+}
+
+/// `dst = src + add - sub_a - sub_b`, in one pass over the half.
+pub fn add_sub_sub_features_from(
+    src: &[i16; HIDDEN_SIZE],
+    dst: &mut [i16; HIDDEN_SIZE],
+    weights: &[i16],
+    added: FeatureIndex,
+    removed_a: FeatureIndex,
+    removed_b: FeatureIndex,
+) {
+    let add = ft_column(weights, added);
+    let sub_a = ft_column(weights, removed_a);
+    let sub_b = ft_column(weights, removed_b);
+    for ((((d, &s), &a), &sa), &sb) in dst
+        .iter_mut()
+        .zip(src.iter())
+        .zip(add.iter())
+        .zip(sub_a.iter())
+        .zip(sub_b.iter())
+    {
+        *d = s.wrapping_add(a).wrapping_sub(sa).wrapping_sub(sb);
+    }
+}
+
+/// `dst = src - sum(removed) + sum(added)` for lists of any length: the first
+/// column's pass reads `src` and writes `dst`, every later one runs in place on
+/// `dst`. Both lists empty is a plain copy.
+pub fn sub_add_features_from(
+    src: &[i16; HIDDEN_SIZE],
+    dst: &mut [i16; HIDDEN_SIZE],
+    weights: &[i16],
+    added: &[FeatureIndex],
+    removed: &[FeatureIndex],
+) {
+    match (removed, added) {
+        ([first, rest @ ..], _) => {
+            column_from::<true>(src, dst, ft_column(weights, *first));
+            sub_features(dst, weights, rest);
+            add_features(dst, weights, added);
+        }
+        ([], [first, rest @ ..]) => {
+            column_from::<false>(src, dst, ft_column(weights, *first));
+            add_features(dst, weights, rest);
+        }
+        ([], []) => *dst = *src,
+    }
+}
+
+/// Apply `-sum(removed) + sum(added)` to `out` in place and leave the result in
+/// `copy` as well: the last column's pass stores each lane to both, so the copy
+/// costs no pass of its own. Both lists empty is a plain copy.
+pub fn sub_add_features_tee(
+    out: &mut [i16; HIDDEN_SIZE],
+    copy: &mut [i16; HIDDEN_SIZE],
+    weights: &[i16],
+    added: &[FeatureIndex],
+    removed: &[FeatureIndex],
+) {
+    match (removed, added) {
+        (_, [rest @ .., last]) => {
+            sub_features(out, weights, removed);
+            add_features(out, weights, rest);
+            column_tee::<false>(out, copy, ft_column(weights, *last));
+        }
+        ([rest @ .., last], []) => {
+            sub_features(out, weights, rest);
+            column_tee::<true>(out, copy, ft_column(weights, *last));
+        }
+        ([], []) => *copy = *out,
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn fill_weights(weights: &mut [i16], seed: i16) {
@@ -160,6 +285,81 @@ mod tests {
         sub_features(&mut unfused, &weights, &removed_b);
 
         assert_eq!(fused, unfused);
+    }
+
+    /// A deterministic xorshift stream, so the "random" inputs below are the
+    /// same on every run.
+    pub(crate) struct Lanes(pub(crate) u64);
+
+    impl Lanes {
+        pub(crate) fn next(&mut self) -> i16 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 48) as i16
+        }
+
+        pub(crate) fn half(&mut self) -> [i16; HIDDEN_SIZE] {
+            std::array::from_fn(|_| self.next())
+        }
+
+        pub(crate) fn weights(&mut self, columns: usize) -> Box<[i16]> {
+            (0..columns * HIDDEN_SIZE).map(|_| self.next()).collect()
+        }
+    }
+
+    /// The arities the update path produces, plus empty lists and a repeated
+    /// column. Full-range lanes make the wrapping arithmetic overflow.
+    pub(crate) const DIFFS: &[(&[FeatureIndex], &[FeatureIndex])] = &[
+        (&[], &[]),
+        (&[3], &[]),
+        (&[], &[5]),
+        (&[1], &[6]),
+        (&[2], &[5, 7]),
+        (&[0, 4], &[1, 7]),
+        (&[6, 6, 2], &[3]),
+    ];
+
+    #[test]
+    fn from_kernels_match_copy_then_update_in_place() {
+        let mut rng = Lanes(0x9e37_79b9_7f4a_7c15);
+        let weights = rng.weights(8);
+        for &(added, removed) in DIFFS {
+            let src = rng.half();
+            let mut expected = src;
+            sub_features(&mut expected, &weights, removed);
+            add_features(&mut expected, &weights, added);
+
+            let mut dst = rng.half();
+            sub_add_features_from(&src, &mut dst, &weights, added, removed);
+            assert_eq!(dst, expected, "sub_add_features_from {added:?} {removed:?}");
+
+            if let ([a], [r]) = (added, removed) {
+                let mut dst = rng.half();
+                add_sub_features_from(&src, &mut dst, &weights, *a, *r);
+                assert_eq!(dst, expected, "add_sub_features_from {added:?} {removed:?}");
+            }
+            if let ([a], [r0, r1]) = (added, removed) {
+                let mut dst = rng.half();
+                add_sub_sub_features_from(&src, &mut dst, &weights, *a, *r0, *r1);
+                assert_eq!(
+                    dst, expected,
+                    "add_sub_sub_features_from {added:?} {removed:?}"
+                );
+            }
+
+            let mut out = src;
+            let mut copy = rng.half();
+            sub_add_features_tee(&mut out, &mut copy, &weights, added, removed);
+            assert_eq!(
+                out, expected,
+                "sub_add_features_tee (in place) {added:?} {removed:?}"
+            );
+            assert_eq!(
+                copy, expected,
+                "sub_add_features_tee (copy) {added:?} {removed:?}"
+            );
+        }
     }
 
     #[test]

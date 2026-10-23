@@ -186,15 +186,13 @@ impl Accumulator {
         for color in [Color::Black, Color::White] {
             let i = color.index();
             match delta.half(color) {
-                Some(pd) => {
-                    dst.perspectives[i] = src.perspectives[i];
-                    apply_diff(
-                        &mut dst.perspectives[i],
-                        net.ft_weights(),
-                        pd.added(),
-                        pd.removed(),
-                    );
-                }
+                Some(pd) => apply_diff_from(
+                    &src.perspectives[i],
+                    &mut dst.perspectives[i],
+                    net.ft_weights(),
+                    pd.added(),
+                    pd.removed(),
+                ),
                 None => {
                     let mut feats = FeatureList::new();
                     active_features_into(post_pos, color, &mut feats);
@@ -233,15 +231,13 @@ impl Accumulator {
         for color in [Color::Black, Color::White] {
             let i = color.index();
             match delta.half(color) {
-                Some(pd) => {
-                    dst.perspectives[i] = src.perspectives[i];
-                    apply_diff(
-                        &mut dst.perspectives[i],
-                        net.ft_weights(),
-                        pd.added(),
-                        pd.removed(),
-                    );
-                }
+                Some(pd) => apply_diff_from(
+                    &src.perspectives[i],
+                    &mut dst.perspectives[i],
+                    net.ft_weights(),
+                    pd.added(),
+                    pd.removed(),
+                ),
                 None => cache.refresh_into(net, post_pos, color, &mut dst.perspectives[i]),
             }
         }
@@ -319,6 +315,30 @@ pub(crate) fn apply_diff(
             transformer_kernel::sub_features(out, weights, removed);
             transformer_kernel::add_features(out, weights, added);
         }
+    }
+}
+
+/// Write `src` with a feature delta applied into `dst`, the two halves being
+/// distinct. For the common single-add arities every lane is read once from
+/// `src` and written once to `dst`, so deriving a child's half costs one pass
+/// over it rather than a copy and then an update in place; any other shape
+/// makes its first column's pass from `src` and the rest in place on `dst`.
+/// The result is bit-identical to that copy-then-update,
+/// which [`Accumulator::update_after_move`] keeps doing as an independent
+/// check on this path.
+pub(crate) fn apply_diff_from(
+    src: &[i16; HIDDEN_SIZE],
+    dst: &mut [i16; HIDDEN_SIZE],
+    weights: &[i16],
+    added: &[FeatureIndex],
+    removed: &[FeatureIndex],
+) {
+    match (added, removed) {
+        ([a], [r]) => transformer_kernel::add_sub_features_from(src, dst, weights, *a, *r),
+        ([a], [r0, r1]) => {
+            transformer_kernel::add_sub_sub_features_from(src, dst, weights, *a, *r0, *r1)
+        }
+        _ => transformer_kernel::sub_add_features_from(src, dst, weights, added, removed),
     }
 }
 

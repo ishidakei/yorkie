@@ -143,6 +143,60 @@ pub mod transformer_kernel {
         // SAFETY: see `add_features`.
         unsafe { avx512::add_sub_sub_features(out, weights, added, removed_a, removed_b) }
     }
+
+    /// [`add_sub_features`] reading `src` and writing `dst`.
+    #[inline]
+    pub fn add_sub_features_from(
+        src: &[i16; HIDDEN_SIZE],
+        dst: &mut [i16; HIDDEN_SIZE],
+        weights: &[i16],
+        added: FeatureIndex,
+        removed: FeatureIndex,
+    ) {
+        // SAFETY: see `add_features`.
+        unsafe { avx512::add_sub_features_from(src, dst, weights, added, removed) }
+    }
+
+    /// [`add_sub_sub_features`] reading `src` and writing `dst`.
+    #[inline]
+    pub fn add_sub_sub_features_from(
+        src: &[i16; HIDDEN_SIZE],
+        dst: &mut [i16; HIDDEN_SIZE],
+        weights: &[i16],
+        added: FeatureIndex,
+        removed_a: FeatureIndex,
+        removed_b: FeatureIndex,
+    ) {
+        // SAFETY: see `add_features`.
+        unsafe { avx512::add_sub_sub_features_from(src, dst, weights, added, removed_a, removed_b) }
+    }
+
+    /// `dst = src - sum(removed) + sum(added)`, the first pass reading `src`.
+    #[inline]
+    pub fn sub_add_features_from(
+        src: &[i16; HIDDEN_SIZE],
+        dst: &mut [i16; HIDDEN_SIZE],
+        weights: &[i16],
+        added: &[FeatureIndex],
+        removed: &[FeatureIndex],
+    ) {
+        // SAFETY: see `add_features`.
+        unsafe { avx512::sub_add_features_from(src, dst, weights, added, removed) }
+    }
+
+    /// Update `out` in place and leave the result in `copy` too, the last pass
+    /// storing to both.
+    #[inline]
+    pub fn sub_add_features_tee(
+        out: &mut [i16; HIDDEN_SIZE],
+        copy: &mut [i16; HIDDEN_SIZE],
+        weights: &[i16],
+        added: &[FeatureIndex],
+        removed: &[FeatureIndex],
+    ) {
+        // SAFETY: see `add_features`.
+        unsafe { avx512::sub_add_features_tee(out, copy, weights, added, removed) }
+    }
 }
 
 /// Feature-transformer kernels, scalar arm; the AVX-512 arm above carries the
@@ -153,7 +207,10 @@ pub mod transformer_kernel {
     target_feature = "avx512bw"
 )))]
 pub mod transformer_kernel {
-    pub use super::scalar::{add_features, add_sub_features, add_sub_sub_features, sub_features};
+    pub use super::scalar::{
+        add_features, add_sub_features, add_sub_features_from, add_sub_sub_features,
+        add_sub_sub_features_from, sub_add_features_from, sub_add_features_tee, sub_features,
+    };
 }
 
 /// Output-transform and layer element-wise kernels, selected on the same
