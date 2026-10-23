@@ -419,6 +419,9 @@ struct SearchState {
     /// The collection buffers the coordinator filled, handed back for the next
     /// `go` to fill again.
     vote_buffers: VoteBuffers,
+    /// What the search past the reply left for the next `go`'s clock, if one
+    /// ran.
+    ponder: Option<PonderRecord>,
 }
 
 /// The workers a pool can hold: the `threads` setting, which is the size of
@@ -806,6 +809,14 @@ pub struct Engine<P: EngineSink> {
     best_previous_score: Value,
     best_previous_average_score: Value,
     previous_time_reduction: f64,
+    /// What the last search past a reply left behind, kept from the join that
+    /// ended it until the next `go` or new game.
+    ponder_record: Option<PonderRecord>,
+    /// The time in ms [`Self::ponder_record`] spent on the reply the current
+    /// position plays, `0` when the position is not its root plus one reply.
+    /// Decided by each `position`, and consumed by the `go` after it, which
+    /// counts `ponder_credit` percent of it as already elapsed.
+    pondered_ms: i64,
     /// The root game ply of the last completed real search
     /// (`main_manager()->lastGamePly`), reset to `0` by [`Self::new_game`].
     ///
@@ -941,6 +952,8 @@ impl<P: EngineSink> Engine<P> {
             best_previous_score: VALUE_INFINITE,
             best_previous_average_score: VALUE_INFINITE,
             previous_time_reduction: 0.85,
+            ponder_record: None,
+            pondered_ms: 0,
             last_game_ply: 0,
             last_position: RetainedPosition::new(),
             pending_position: RetainedPosition::new(),
@@ -1061,6 +1074,7 @@ impl<P: EngineSink> Engine<P> {
                 .expect("search worker thread must not panic");
             self.histories = Some(state.histories);
             self.vote_buffers = Some(state.vote_buffers);
+            self.ponder_record = state.ponder;
             // Carry the finished search's time-management outputs forward. The
             // reference runs this bookkeeping on every path, so the
             // short-circuits carry too, but with `tr == None`, since
@@ -1589,6 +1603,10 @@ impl<P: EngineSink> Engine<P> {
         if record_path {
             pending.path.push(sfen_pack(scratch));
         }
+        // The position the command's last move is played from, and that move:
+        // what decides whether this command continues the game the search past
+        // the reply was thinking about.
+        let mut before_last = None;
         for mv in yorkie_state::text::tokens(moves) {
             if pending.moves.len() == MAX_POSITION_MOVES {
                 return Err(PositionRefusal::TooManyMoves);
@@ -1600,6 +1618,7 @@ impl<P: EngineSink> Engine<P> {
             if !legal_buf.contains(&parsed) {
                 return Err(PositionRefusal::IllegalMove(mv));
             }
+            before_last = Some((scratch.key(), parsed));
             scratch.do_move(parsed);
             pending.moves.push(parsed);
             if record_path {
@@ -1611,6 +1630,13 @@ impl<P: EngineSink> Engine<P> {
         // reach the allocator only for the first of them.
         std::mem::swap(&mut self.pos, &mut self.scratch_pos);
         std::mem::swap(&mut self.last_position, &mut self.pending_position);
+        // Only a position that is the thought-about root plus the one reply the
+        // opponent played is credited; any other — a new game, a position the
+        // host edited — is budgeted from its own clock alone.
+        self.pondered_ms = match (&self.ponder_record, before_last) {
+            (Some(record), Some((key, reply))) if key == record.key => record.spent_on(reply),
+            _ => 0,
+        };
         Ok(())
     }
 
@@ -1644,6 +1670,10 @@ impl<P: EngineSink> Engine<P> {
         self.best_previous_score = VALUE_INFINITE;
         self.best_previous_average_score = VALUE_INFINITE;
         self.previous_time_reduction = 0.85;
+        // What the last game's search past a reply left is no part of this one,
+        // even where a position of this game repeats its root.
+        self.ponder_record = None;
+        self.pondered_ms = 0;
         // Reset the side-flip detector and the retained command state (the
         // `last_position` default is the reference's `"position startpos"`).
         self.last_game_ply = 0;
@@ -1681,10 +1711,23 @@ impl<P: EngineSink> Engine<P> {
         let received = Instant::now();
         // A new `go` supersedes any lingering search; reclaim its state first.
         self.finish_search_join();
+        // What was pondered on this position was decided when the position was
+        // set, from the search that command ended. A record a later join left
+        // belongs to no position, and this `go` starts the search that will
+        // leave the next one.
+        self.ponder_record = None;
+        let pondered = std::mem::take(&mut self.pondered_ms);
 
         // Whether this `go` is answered with a move and then thought past: a
         // clocked request in a build that thinks ahead at all.
         let ponder_after_reply = self.settings.ponder() && is_a_game_move(&params);
+        // Only a game move runs on a clock that time spent earlier can stand in
+        // for; an analysis is bounded by something else.
+        let credit = if is_a_game_move(&params) {
+            pondered * config::PONDER_CREDIT / 100
+        } else {
+            0
+        };
 
         // The ply the search runs at, carried so a completed real search updates
         // `last_game_ply`.
@@ -1696,6 +1739,7 @@ impl<P: EngineSink> Engine<P> {
         let Some(job) = self.prepare_coordinator_job(
             params,
             received,
+            credit,
             ponder_after_reply,
             #[cfg(feature = "verbose2")]
             false,
@@ -1712,6 +1756,7 @@ impl<P: EngineSink> Engine<P> {
                 histories: outcome.histories,
                 time_state: outcome.time_state,
                 vote_buffers: outcome.vote_buffers,
+                ponder: outcome.ponder,
             }
         });
 
@@ -1741,7 +1786,9 @@ impl<P: EngineSink> Engine<P> {
     ///
     /// Returns `None` when no network is loaded; the caller emits the resign or
     /// notice appropriate to its context. `received` is the instant the request
-    /// arrived, which is where its clock starts. `ponder_after_reply` asks the
+    /// arrived, which is where its clock starts, and `credit_ms` the time that
+    /// clock counts as spent before it ([`TimeManagement::set_credit`]).
+    /// `ponder_after_reply` asks the
     /// coordinator to keep searching once it has replied — never for a
     /// measurement run, which has to end when its position does.
     /// `disable_pv_interval` forces the per-iteration PV interval to zero so
@@ -1751,6 +1798,7 @@ impl<P: EngineSink> Engine<P> {
         &mut self,
         limits: GoParams,
         received: Instant,
+        credit_ms: i64,
         ponder_after_reply: bool,
         #[cfg(feature = "verbose2")] disable_pv_interval: bool,
     ) -> Option<CoordinatorJob<P>> {
@@ -1858,7 +1906,7 @@ impl<P: EngineSink> Engine<P> {
             // build that has the clause.
             #[cfg(feature = "verbose2")]
             let mut prng = Prng::new(self.book_seed ^ 0xA5A5_5A5A_1234_5678);
-            let tm = TimeManagement::init(
+            let mut tm = TimeManagement::init(
                 &TimeInput {
                     time_us: time_opt.unwrap_or(0) as i64,
                     inc_us: inc_opt.unwrap_or(0) as i64,
@@ -1873,6 +1921,7 @@ impl<P: EngineSink> Engine<P> {
                 #[cfg(feature = "verbose2")]
                 &mut prng,
             );
+            tm.set_credit(credit_ms);
             #[cfg(feature = "verbose1")]
             if tm.mtg_error {
                 self.sink
@@ -2078,7 +2127,7 @@ impl<P: EngineSink> Engine<P> {
         // The measurement command is `verbose3`, so the PV interval it disables
         // always exists. A measurement position is answered and left: a search
         // that outlived it would be measured into the next one.
-        let job = self.prepare_coordinator_job(params, Instant::now(), false, true)?;
+        let job = self.prepare_coordinator_job(params, Instant::now(), 0, false, true)?;
         let node = self.worker_plan.system_node(0);
         let outcome = with_eval_network!(node, |net| run_coordinated(net, job));
         // Return the session state the job borrowed (the async path reclaims
@@ -3015,9 +3064,52 @@ struct PonderJob {
     multi_pv: usize,
 }
 
+/// What a search past a reply leaves for the next `go`'s clock: how long it
+/// ran, and how its main worker spread that time over the opponent's replies.
+///
+/// Nothing in it is allocated for the purpose: the root moves are the list the
+/// search ran on, each carrying the nodes spent below it.
+struct PonderRecord {
+    /// The position key of the search's root, the position the engine's own
+    /// move reached.
+    key: u64,
+    /// When the search started and when its main worker stopped.
+    started: Instant,
+    stopped: Instant,
+    /// The main worker's root moves, and the best move it moved out of them if
+    /// it was stopped before its first iteration completed
+    /// ([`QSearch::run_worker_on`]).
+    root_moves: Vec<RootMove>,
+    best: RootMove,
+    /// The main worker's node count, the whole that the efforts are shares of.
+    nodes: u64,
+}
+
+impl PonderRecord {
+    /// The time in ms the search spent on `reply`: its duration, in the share of
+    /// the main worker's nodes spent below that move. A reply the search never
+    /// reached has no effort and was spent nothing on.
+    fn spent_on(&self, reply: Move) -> i64 {
+        let effort = self
+            .root_moves
+            .iter()
+            .chain([&self.best])
+            .find(|rm| rm.mv == reply)
+            .map_or(0, |rm| rm.effort);
+        let duration = self
+            .stopped
+            .saturating_duration_since(self.started)
+            .as_millis() as i64;
+        // Wide enough that an hour's search over a billion nodes per second
+        // cannot overflow the product.
+        (i128::from(duration) * i128::from(effort) / i128::from(self.nodes.max(1))) as i64
+    }
+}
+
 impl PonderJob {
     /// Search on from `pos` with `played` applied, until the stop flag is
-    /// raised or the search ends by itself, and hand the histories back.
+    /// raised or the search ends by itself, and hand the histories back with
+    /// the record of what was searched, if anything was.
     ///
     /// Nothing is emitted here but the two `verbose1` markers: this search has
     /// no reply to give, and a `bestmove` out of it would be a second answer to
@@ -3029,31 +3121,32 @@ impl PonderJob {
         sink: &P,
         pos: &Position,
         played: Move,
-    ) -> WorkerHistories {
+    ) -> (WorkerHistories, Option<PonderRecord>) {
         // The sink is here for those markers alone, so a build that prints
         // neither touches it at all.
         #[cfg(not(feature = "verbose1"))]
         let _ = sink;
         if !self.enabled || !played.is_ok() {
-            return histories;
+            return (histories, None);
         }
         // The command that ends this search may have arrived while the reply
         // was being written, in which case there is nothing to start.
         if PONDER_STOP.load(Ordering::Relaxed) {
-            return histories;
+            return (histories, None);
         }
         let mut root = pos.clone();
         root.do_move(played);
         // A position the engine reads as a game end has nothing to think about:
         // no legal reply to the move just played, or past the draw horizon.
         if root.ply() as i32 > DRAW_HORIZON {
-            return histories;
+            return (histories, None);
         }
-        let root_moves = generate_root_moves(&root);
+        let mut root_moves = generate_root_moves(&root);
         if root_moves.is_empty() {
-            return histories;
+            return (histories, None);
         }
 
+        let started = Instant::now();
         PONDERING.store(true, Ordering::Relaxed);
         #[cfg(feature = "verbose1")]
         sink.diagnostic(b"ponder start");
@@ -3114,10 +3207,10 @@ impl PonderJob {
         // No PV sink: the main worker of this search prints nothing either.
         // The reply this search follows is already out, so what each of its
         // workers did counts towards the next one.
+        let result = qs.run_worker_on(&root, &mut root_moves, SEARCH_MAX_DEPTH);
+        let stopped = Instant::now();
         #[cfg(feature = "verbose1")]
-        crate::stats::add_search([&qs.run_worker(&root, root_moves, SEARCH_MAX_DEPTH)]);
-        #[cfg(not(feature = "verbose1"))]
-        qs.run_worker(&root, root_moves, SEARCH_MAX_DEPTH);
+        crate::stats::add_search([&result]);
 
         // Whatever ended this search ends the helpers with it, and each is
         // collected before the thread returns — a slot left holding a result
@@ -3134,7 +3227,15 @@ impl PonderJob {
         #[cfg(feature = "verbose1")]
         sink.diagnostic(b"ponder stop");
         PONDERING.store(false, Ordering::Relaxed);
-        qs.into_histories()
+        let record = PonderRecord {
+            key: root.key(),
+            started,
+            stopped,
+            root_moves,
+            best: result.best,
+            nodes: result.nodes,
+        };
+        (qs.into_histories(), Some(record))
     }
 }
 
@@ -3235,6 +3336,8 @@ struct CoordinatedOutcome {
     #[cfg(feature = "verbose3")]
     nodes: u64,
     time_state: Option<(Value, Value, Option<f64>)>,
+    /// What the search past the reply left, if one ran.
+    ponder: Option<PonderRecord>,
 }
 
 /// The time-management carry-forward for a search-skipping short-circuit — a
@@ -3318,6 +3421,7 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
             #[cfg(feature = "verbose3")]
             nodes: 0,
             time_state: skip_search_carry(),
+            ponder: None,
         };
     }
 
@@ -3348,6 +3452,7 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
             #[cfg(feature = "verbose3")]
             nodes: 0,
             time_state: skip_search_carry(),
+            ponder: None,
         };
     }
 
@@ -3403,13 +3508,14 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
             );
             // A book move is thought past like any other: the opponent's reply
             // may leave the book, and a warm table costs nothing.
-            let histories = ponder.run(net, histories, &sink, &pos, hit.best);
+            let (histories, ponder) = ponder.run(net, histories, &sink, &pos, hit.best);
             return CoordinatedOutcome {
                 histories,
                 vote_buffers,
                 #[cfg(feature = "verbose3")]
                 nodes: 0,
                 time_state: skip_search_carry(),
+                ponder,
             };
         }
     }
@@ -3590,9 +3696,9 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     // — the reply is out and flushed, so nothing it does delays the host.
     // Resigning ends the game, so only a played move is thought past.
     let histories = qs.into_histories();
-    let histories = match reply {
+    let (histories, ponder) = match reply {
         Reply::BestMove { mv } => ponder.run(net, histories, &sink, &pos, mv),
-        Reply::Resign | Reply::Win => histories,
+        Reply::Resign | Reply::Win => (histories, None),
     };
 
     CoordinatedOutcome {
@@ -3607,6 +3713,7 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
             // (`mainThread->previousTimeReduction`).
             Some(out_previous_time_reduction),
         )),
+        ponder,
     }
 }
 
@@ -3763,6 +3870,104 @@ mod tests {
             .expect("both moves are legal");
         assert!(engine.last_position.path.is_empty());
         assert_eq!(engine.last_position.path.capacity(), 0);
+    }
+
+    /// A record of a 2000 ms search past `7g7f` whose main worker spent 300 of
+    /// its 1000 nodes below `3c3d` and none below any other reply. Its `best` is
+    /// the copy a completed iteration leaves, of a move still in the list.
+    fn record_past_7g7f() -> PonderRecord {
+        let mut root = Position::startpos();
+        root.do_move(parse_usi_move(b"7g7f", &root).expect("legal"));
+        let reply = parse_usi_move(b"3c3d", &root).expect("legal");
+        let mut root_moves = generate_root_moves(&root);
+        for rm in &mut root_moves {
+            rm.effort = if rm.mv == reply { 300 } else { 0 };
+        }
+        let best = root_moves
+            .iter()
+            .find(|rm| rm.mv != reply)
+            .expect("more than one reply")
+            .clone();
+        let started = Instant::now();
+        PonderRecord {
+            key: root.key(),
+            started,
+            stopped: started + std::time::Duration::from_millis(2000),
+            root_moves,
+            best,
+            nodes: 1000,
+        }
+    }
+
+    /// What the record above spent on `3c3d`: 2000 ms × 300 / 1000.
+    const SPENT_ON_3C3D: i64 = 600;
+
+    /// The time spent on a reply is the search's time in the share of its nodes
+    /// the reply took, whether the reply is still in the list or was moved out
+    /// of it as the best move so far.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_reply_takes_its_share_of_the_search_past_the_move() {
+        let record = record_past_7g7f();
+        let mut root = Position::startpos();
+        root.do_move(parse_usi_move(b"7g7f", &root).expect("legal"));
+        let reply = parse_usi_move(b"3c3d", &root).expect("legal");
+        let unsearched = parse_usi_move(b"8c8d", &root).expect("legal");
+        assert_eq!(record.spent_on(reply), SPENT_ON_3C3D);
+        assert_eq!(record.spent_on(unsearched), 0, "no effort, no time");
+
+        let mut moved_out = record_past_7g7f();
+        let at = moved_out
+            .root_moves
+            .iter()
+            .position(|rm| rm.mv == reply)
+            .expect("3c3d is a root move");
+        moved_out.best = moved_out.root_moves.swap_remove(at);
+        assert_eq!(moved_out.spent_on(reply), SPENT_ON_3C3D);
+    }
+
+    /// Only the root plus one reply is credited, a refused command leaves the
+    /// standing position's credit, and a new game discards what the last one
+    /// left.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn only_the_root_plus_one_reply_is_credited() {
+        let _session = serial_session();
+        let mut engine = idle_engine();
+        engine.ponder_record = Some(record_past_7g7f());
+
+        for (moves, pondered) in [
+            (&b"7g7f 3c3d"[..], SPENT_ON_3C3D),
+            (b"7g7f 8c8d", 0),
+            (b"7g7f", 0),
+            (b"7g7f 3c3d 2g2f", 0),
+            (b"2g2f 3c3d", 0),
+            (b"7g7f 3c3d", SPENT_ON_3C3D),
+        ] {
+            engine
+                .set_position(PositionSfen::StartPos, moves)
+                .expect("legal moves");
+            assert_eq!(
+                engine.pondered_ms,
+                pondered,
+                "position startpos moves {}",
+                String::from_utf8_lossy(moves)
+            );
+        }
+
+        let _ = engine.set_position(PositionSfen::StartPos, b"7g7f 9z9z");
+        assert_eq!(engine.pondered_ms, SPENT_ON_3C3D);
+
+        engine.new_game().expect("a new game starts");
+        assert!(engine.ponder_record.is_none());
+        assert_eq!(engine.pondered_ms, 0);
+        engine
+            .set_position(PositionSfen::StartPos, b"7g7f 3c3d")
+            .expect("legal moves");
+        assert_eq!(
+            engine.pondered_ms, 0,
+            "the last game's search counts for nothing"
+        );
     }
 
     /// What a refused command must leave behind, read off the engine itself: the
@@ -4223,6 +4428,7 @@ mod tests {
             histories: WorkerHistories::new(),
             time_state: skip_search_carry(),
             vote_buffers: VoteBuffers::for_pool(1),
+            ponder: None,
         });
         engine.search = Some(ActiveSearch {
             handle,
@@ -4255,6 +4461,7 @@ mod tests {
             histories: WorkerHistories::new(),
             time_state: Some((10, 20, Some(1.25))),
             vote_buffers: VoteBuffers::for_pool(1),
+            ponder: None,
         });
         engine.search = Some(ActiveSearch {
             handle,

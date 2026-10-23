@@ -1463,7 +1463,8 @@ impl<N: NetworkParams> QSearch<N> {
         let Some(tc) = self.control.time.as_ref() else {
             return;
         };
-        let elapsed = tc.tm.elapsed_from(Instant::now());
+        let now = Instant::now();
+        let elapsed = tc.tm.elapsed_from(now);
         #[cfg(feature = "verbose2")]
         if let Some(movetime) = tc.movetime
             && elapsed >= movetime
@@ -1481,18 +1482,20 @@ impl<N: NetworkParams> QSearch<N> {
         // 1./2. the maximum think time is exceeded ⇒ round up to a whole second
         // via set_search_end rather than stopping now. Every `go` a build
         // without `verbose2` accepts is clock-managed, so there the budget alone
-        // decides.
+        // decides. The budget is measured in credited time; the end time it
+        // fixes is real.
+        let credited = tc.tm.credited_elapsed_from(now);
         #[cfg(feature = "verbose2")]
-        let past_budget = tc.use_time_management && elapsed > tc.tm.maximum();
+        let past_budget = tc.use_time_management && credited > tc.tm.maximum();
         #[cfg(not(feature = "verbose2"))]
-        let past_budget = elapsed > tc.tm.maximum();
+        let past_budget = credited > tc.tm.maximum();
         if past_budget {
             self.control
                 .time
                 .as_mut()
                 .expect("time control present")
                 .tm
-                .set_search_end(elapsed);
+                .set_search_end(credited);
         }
     }
 
@@ -2267,6 +2270,22 @@ impl<N: NetworkParams> QSearch<N> {
         mut root_moves: Vec<RootMove>,
         limit_depth: i32,
     ) -> WorkerResult {
+        self.run_worker_on(root_pos, &mut root_moves, limit_depth)
+    }
+
+    /// [`Self::run_worker`] on a root-move list the caller keeps: once the
+    /// search is over, each move in it carries the `effort` spent on its
+    /// subtree.
+    ///
+    /// The list is left in the search's order, with one exception: when the
+    /// search was stopped before its first iteration completed, the best move
+    /// so far is moved out of it into the result's `best`, its effort with it.
+    pub fn run_worker_on(
+        &mut self,
+        root_pos: &Position,
+        root_moves: &mut Vec<RootMove>,
+        limit_depth: i32,
+    ) -> WorkerResult {
         self.set_root_side(root_pos.side_to_move());
         self.set_read_tt(true);
         self.nodes = 0;
@@ -2389,7 +2408,7 @@ impl<N: NetworkParams> QSearch<N> {
 
             // The aspiration seed for the next iteration; all
             // `-VALUE_INFINITE` on the first.
-            for rm in &mut root_moves {
+            for rm in root_moves.iter_mut() {
                 rm.previous_score = rm.score;
             }
 
@@ -2412,7 +2431,7 @@ impl<N: NetworkParams> QSearch<N> {
                 self.pv_idx = pv_idx;
                 iter_best_value = self.aspiration_search(
                     &mut work,
-                    &mut root_moves,
+                    root_moves,
                     root_depth,
                     search_again_counter,
                     root_pos,
@@ -2430,7 +2449,7 @@ impl<N: NetworkParams> QSearch<N> {
                     && !(self.stopped && is_loss(root_moves[0].uci_score))
                     && self.pv_interval_elapsed()
                 {
-                    self.emit_pv(root_pos, &root_moves, pv_idx, root_depth, multi_pv);
+                    self.emit_pv(root_pos, root_moves, pv_idx, root_depth, multi_pv);
                     self.last_pv_info_time = Instant::now();
                     uci_pv_sent = pv_idx + 1 == multi_pv;
                 }
@@ -2440,12 +2459,8 @@ impl<N: NetworkParams> QSearch<N> {
                 }
             } // MultiPV loop
             #[cfg(not(feature = "verbose2"))]
-            let iter_best_value = self.aspiration_search(
-                &mut work,
-                &mut root_moves,
-                root_depth,
-                search_again_counter,
-            );
+            let iter_best_value =
+                self.aspiration_search(&mut work, root_moves, root_depth, search_again_counter);
 
             #[cfg(feature = "verbose2")]
             {
@@ -2549,7 +2564,9 @@ impl<N: NetworkParams> QSearch<N> {
                 let tc = self.control.time.as_ref().expect("time control present");
                 let optimum = tc.tm.optimum() as f64;
                 let maximum = tc.tm.maximum() as f64;
-                let elapsed = tc.tm.elapsed_from(Instant::now());
+                // Credited: what thinking ahead spent on this position counts
+                // against the budget too.
+                let elapsed = tc.tm.credited_elapsed_from(Instant::now());
 
                 let nodes_effort = effort * 100_000 / own_nodes;
 
@@ -2605,8 +2622,8 @@ impl<N: NetworkParams> QSearch<N> {
 
         // Only an abort during iteration 1 leaves `completed_best` empty, and
         // then `root_moves[0]` — the best-so-far after the partial iteration's
-        // sort — is still a legal move. Nothing reads the list afterwards, so it
-        // is taken out of it rather than copied.
+        // sort — is still a legal move. It is taken out of the list rather than
+        // copied, so this end of the search never reaches the allocator.
         #[cfg(test)]
         {
             self.last_root_moves = root_moves.clone();

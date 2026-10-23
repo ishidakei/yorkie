@@ -473,6 +473,12 @@ const SCHEMA: &[Spec] = &[
         1,
         30_000,
     ),
+    int(
+        "ponder_credit",
+        "(none: percent of that search's time on the opponent's reply counted as spent)",
+        0,
+        100,
+    ),
     // --- Time management.
     int("network_delay", "NetworkDelay", 0, 10_000),
     int("network_delay2", "NetworkDelay2", 0, 10_000),

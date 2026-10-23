@@ -10,8 +10,12 @@
 //! computed budgets match bit-for-bit given the same inputs.
 //!
 //! The budget is the same whether or not the engine keeps searching after its
-//! move: there is no ponderhit to convert time already spent into time saved,
-//! so nothing here is worth a bonus that a measurement has not asked for.
+//! move, so nothing here is worth a bonus that a measurement has not asked for.
+//! What thinking ahead does change is how much of the budget is left: the time
+//! that search spent on the reply the opponent then played is handed in as a
+//! credit ([`TimeManagement::set_credit`]), which every stop decision counts as
+//! already elapsed. The clamps to the real remaining time keep reading the real
+//! clock, so a credit can only make a search stop sooner.
 
 use std::time::Instant;
 
@@ -96,8 +100,9 @@ const COMPILED: TimeSettings = TimeSettings {
 pub struct TimeManagement {
     /// `startTime` — the origin for [`Self::elapsed`] (`now() - startTime`).
     pub start_time: Instant,
-    /// `search_end` [ms from `start_time`]: `0` means "not yet decided"; once
-    /// set, the search stops when `search_end <= elapsed`.
+    /// `search_end` [ms from `start_time`, real time]: `0` means "not yet
+    /// decided"; once set, the search stops when `search_end <= elapsed`, the
+    /// credit not counted.
     pub search_end: i64,
     /// True only for the `MTG <= 0` error path, so the driver can emit the
     /// reference `info string Error!` diagnostic.
@@ -111,7 +116,14 @@ pub struct TimeManagement {
     network_delay: i64,
     remain_time: i64,
     round_up_to_fullsecond: bool,
+    /// The time in ms counted as already elapsed before `start_time`. A `u32`
+    /// rather than an `i64` so it sits in the tail padding the fields above
+    /// leave: the struct is part of every search's state, and a wider one would
+    /// move the fields laid out after it.
+    credit: u32,
 }
+
+const _: () = assert!(size_of::<TimeManagement>() == 80);
 
 impl TimeManagement {
     /// Compute the think-time budget for one `go`. The PRNG draws the decaying
@@ -163,6 +175,7 @@ impl TimeManagement {
             network_delay,
             remain_time: 0,
             round_up_to_fullsecond,
+            credit: 0,
         };
 
         // Byoyomi is folded in here because it is available for *this* move;
@@ -280,15 +293,20 @@ impl TimeManagement {
     /// at `MinimumThinkingTime` and capped at `remain_time`. A no-op rounding
     /// when `RoundUpToFullSecond` is off.
     pub fn round_up(&self, t0: i64) -> i64 {
+        self.round_up_over(t0, self.minimum_thinking_time)
+    }
+
+    /// [`Self::round_up`] with `floor` in place of `MinimumThinkingTime`.
+    fn round_up_over(&self, t0: i64, floor: i64) -> i64 {
         if self.round_up_to_fullsecond {
-            let mut t = (((t0 + 999) / 1000) * 1000).max(self.minimum_thinking_time);
+            let mut t = (((t0 + 999) / 1000) * 1000).max(floor);
             t -= self.network_delay;
             if t < t0 {
                 t += 1000;
             }
             t.min(self.remain_time)
         } else {
-            let mut t = t0.max(self.minimum_thinking_time);
+            let mut t = t0.max(floor);
             t -= self.network_delay;
             t.min(self.remain_time)
         }
@@ -298,15 +316,41 @@ impl TimeManagement {
     /// search decided to stop, rounding the used time up to a full second and
     /// storing it as an offset from `start_time`.
     ///
-    /// The floor is [`Self::minimum`]: a search that decided to stop before the
-    /// minimum think time still spends it.
+    /// `e` is the credited elapsed time ([`Self::credited_elapsed_from`]). With
+    /// no credit the floor is [`Self::minimum`]: a search that decided to stop
+    /// before the minimum think time still spends it. With one, the search
+    /// stands on time spent before this `go`, so there is no floor; the rounding
+    /// still applies to the real elapsed time, because the part of the current
+    /// wall second the clock charges anyway is still the engine's to use.
     pub fn set_search_end(&mut self, e: i64) {
-        self.search_end = self.round_up(e.max(self.minimum_time));
+        self.search_end = if self.credit == 0 {
+            self.round_up(e.max(self.minimum_time))
+        } else {
+            self.round_up_over(e - i64::from(self.credit), 0)
+        };
     }
 
-    /// Elapsed time in ms since `startTime`, measured against `now`.
+    /// Count `ms` as already elapsed when this `go` arrived. Clamped at zero,
+    /// and at the largest credit the field holds, which is weeks.
+    pub fn set_credit(&mut self, ms: i64) {
+        self.credit = ms.clamp(0, i64::from(u32::MAX)) as u32;
+    }
+
+    /// The credit [`Self::set_credit`] installed, in ms.
+    pub fn credit(&self) -> i64 {
+        i64::from(self.credit)
+    }
+
+    /// Elapsed time in ms since `startTime`, measured against `now`: the real
+    /// time this `go` has run, which the clock checks read.
     pub fn elapsed_from(&self, now: Instant) -> i64 {
         now.saturating_duration_since(self.start_time).as_millis() as i64
+    }
+
+    /// The elapsed time every stop decision reads: [`Self::elapsed_from`] plus
+    /// the credit.
+    pub fn credited_elapsed_from(&self, now: Instant) -> i64 {
+        self.elapsed_from(now) + i64::from(self.credit)
     }
 
     /// Elapsed time in ms since `startTime`, measured now.
@@ -794,5 +838,107 @@ mod tests {
         // min(1880, remain_time=380) = 380.
         tm.set_search_end(100);
         assert_eq!(tm.search_end, 380);
+    }
+
+    /// The 5 min + 5 s, ply 20 budget of [`fischer_time_plus_increment`]
+    /// (minimum 1880, optimum 9617, maximum 40880), credited with `credit` ms,
+    /// and an instant `real` ms after its `go` arrived.
+    fn credited(credit: i64, real: u64) -> (TimeManagement, Instant) {
+        let mut tm = init(&TimeInput {
+            time_us: 300_000,
+            inc_us: 5_000,
+            ply: 20,
+            ..base()
+        });
+        tm.set_credit(credit);
+        let now = tm.start_time + std::time::Duration::from_millis(real);
+        (tm, now)
+    }
+
+    #[test]
+    fn a_credit_counts_as_elapsed_and_leaves_the_budget_alone() {
+        let (plain, plain_now) = credited(0, 700);
+        let (tm, now) = credited(3_000, 700);
+        assert_eq!(
+            (tm.minimum(), tm.optimum(), tm.maximum()),
+            (plain.minimum(), plain.optimum(), plain.maximum()),
+            "the budget and its real-time clamps do not read the credit"
+        );
+        assert_eq!(
+            tm.elapsed_from(now),
+            700,
+            "the real clock is the real clock"
+        );
+        assert_eq!(tm.credited_elapsed_from(now), 3_700);
+        assert_eq!(plain.credited_elapsed_from(plain_now), 700);
+
+        let mut clamped = tm.clone();
+        clamped.set_credit(-5);
+        assert_eq!(clamped.credit(), 0);
+        clamped.set_credit(i64::MAX);
+        assert_eq!(clamped.credit(), i64::from(u32::MAX));
+    }
+
+    /// The two checks the search makes — past the optimum, past the maximum —
+    /// read the credited time, so each fires `credit` ms of real time sooner.
+    #[test]
+    fn a_credit_brings_the_optimum_and_maximum_checks_forward_by_itself() {
+        const C: i64 = 4_000;
+        for limit in [9617, 40880] {
+            let fires = |credit: i64, real: i64| {
+                let (tm, now) = credited(credit, real as u64);
+                tm.credited_elapsed_from(now) > limit
+            };
+            assert!(
+                !fires(0, limit) && fires(0, limit + 1),
+                "uncredited at {limit}"
+            );
+            assert!(
+                !fires(C, limit - C) && fires(C, limit - C + 1),
+                "credited {C} ms at {limit}"
+            );
+        }
+    }
+
+    /// A credit beyond the maximum makes the very first check stop the search:
+    /// the end it fixes rounds the real time up to the wall second the clock
+    /// charges anyway, with no minimum think time under it.
+    #[test]
+    fn a_credit_past_the_maximum_ends_the_search_at_the_first_check() {
+        let (mut tm, now) = credited(50_000, 30);
+        let e = tm.credited_elapsed_from(now);
+        assert!(e > tm.maximum());
+        tm.set_search_end(e);
+        // Real 30: ceil 1000; -120 = 880; not below 30.
+        assert_eq!(tm.search_end, 880);
+        assert!(
+            tm.search_end < tm.minimum(),
+            "no floor under a credited end"
+        );
+
+        // Real 1500: ceil 2000; -120 = 1880.
+        let (mut tm, now) = credited(50_000, 1500);
+        tm.set_search_end(tm.credited_elapsed_from(now));
+        assert_eq!(tm.search_end, 1880);
+        // Real 1950: ceil 2000; -120 = 1880 < 1950, so 2880.
+        let (mut tm, now) = credited(50_000, 1950);
+        tm.set_search_end(tm.credited_elapsed_from(now));
+        assert_eq!(tm.search_end, 2880);
+    }
+
+    /// No credit is today's arithmetic, floor included.
+    #[test]
+    fn no_credit_ends_the_search_as_it_always_has() {
+        for real in [30, 700, 5000] {
+            let (mut tm, now) = credited(0, real);
+            let mut reference = tm.clone();
+            tm.set_search_end(tm.credited_elapsed_from(now));
+            let e = reference.elapsed_from(now);
+            reference.search_end = reference.round_up(e.max(reference.minimum()));
+            assert_eq!(tm.search_end, reference.search_end, "real {real}");
+        }
+        let (mut tm, now) = credited(0, 30);
+        tm.set_search_end(tm.credited_elapsed_from(now));
+        assert_eq!(tm.search_end, 1880, "the minimum think time is the floor");
     }
 }

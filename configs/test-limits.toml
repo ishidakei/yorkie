@@ -105,6 +105,7 @@ random = 100
 
 ponder_root_moves = 1
 ponder_root_margin = 500
+ponder_credit = 0
 
 # ---------------------------------------------------------------------------
 # Time management

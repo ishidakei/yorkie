@@ -79,6 +79,7 @@ generate_all_legal_moves = false
 random = 0
 ponder_root_moves = 0
 ponder_root_margin = 500
+ponder_credit = 100
 
 # ---------------------------------------------------------------------------
 # Time management

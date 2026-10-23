@@ -317,6 +317,12 @@ ponder_root_moves = 0
 # says. Read only by that search.
 ponder_root_margin = 500
 
+# How much of the time the ponder search spent on the reply the opponent then
+# played is counted as already elapsed by the next search, in percent of that
+# time. `0` counts none of it (the search budgets its time as if it had not
+# pondered); `100` counts all of it. Read only when `ponder` is true.
+ponder_credit = 100
+
 # ---------------------------------------------------------------------------
 # Time management
 # ---------------------------------------------------------------------------

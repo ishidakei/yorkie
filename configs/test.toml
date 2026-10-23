@@ -105,6 +105,11 @@ random = 0
 ponder_root_moves = 1
 ponder_root_margin = 500
 
+# TEST VALUE: the play value is 100. With `ponder` off no search follows a
+# reply, so there is nothing to credit either way; 0 states that a `go` here
+# budgets its time from its own clock alone.
+ponder_credit = 0
+
 # ---------------------------------------------------------------------------
 # Time management
 # ---------------------------------------------------------------------------
