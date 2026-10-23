@@ -257,7 +257,10 @@ max_moves_to_draw = 512
 # The engine's side is the side it plays in the game, also while it searches
 # the position after its own move (`ponder` above). `info` lines still print
 # `score mate N`, with N taken from the length of the principal variation.
-flatten_winning_mate = false
+#
+# On here, so the tournament binary plays with it: in a game the only question
+# about a mate is whether it is forced, not how short it is.
+flatten_winning_mate = true
 
 # Inside the search, treat a position as repeated the second time it appears
 # among the last 16 plies, instead of only at its fourth occurrence (the game's
@@ -267,7 +270,11 @@ flatten_winning_mate = false
 # earlier occurrence. The lookback may reach into the game played before the
 # position the search starts from. This is a search shortcut only: the game
 # still ends in a repetition draw at the fourth occurrence alone.
-quick_draw = false
+#
+# On here, so the tournament binary plays with it: a line that returns to a
+# recent position is cut there, which spends the search on lines that make
+# progress.
+quick_draw = true
 
 # PV-output throttle in milliseconds, `0` meaning never suppress
 # (`PvInterval`).

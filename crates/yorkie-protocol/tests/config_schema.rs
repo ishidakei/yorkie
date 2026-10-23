@@ -29,7 +29,6 @@ const CHECKED_IN_CONFIGS: &[&str] = &[
     "configs/default.toml",
     "configs/test.toml",
     "configs/test-limits.toml",
-    "configs/tournament.toml",
     "configs/tune.toml",
 ];
 
