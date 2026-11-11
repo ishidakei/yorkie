@@ -288,6 +288,24 @@ pub fn drive_with_yorkie_books(input: &str, book_seed: u64, books: &[(&Path, u32
     output.text()
 }
 
+/// Like [`drive_with_yorkie_book`], with the yorkie book's game path leaving
+/// out the first `skip_moves` moves of each `position` command rather than the
+/// count the config names.
+pub fn drive_with_yorkie_book_skipping(
+    input: &str,
+    book_seed: u64,
+    yorkie_book: &Path,
+    skip_moves: usize,
+) -> String {
+    let output = Transcript::default();
+    driver(input.as_bytes(), output.clone(), Some(book_seed))
+        .with_yorkie_books(vec![(yorkie_book.to_path_buf(), 1)])
+        .with_yorkie_book_path_skip_moves(skip_moves)
+        .run()
+        .expect("driver run");
+    output.text()
+}
+
 /// Room the transcript of [`drive_counting_allocations`] starts with, far more
 /// than such a session writes.
 const COUNTED_TRANSCRIPT_BYTES: usize = 1 << 20;

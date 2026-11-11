@@ -489,6 +489,19 @@ static BMC_SLOTS: [TallySlot; POOL_CAPACITY] = [const { TallySlot::new() }; POOL
 /// loaded.
 static GAME_PATH: Mutex<Vec<PackedSfen>> = Mutex::new(Vec::new());
 
+/// The part of a game path — a `position` command's starting position, then
+/// the position after each of its moves — that counts as having occurred once
+/// its first `skip_moves` moves are left out: the position after move
+/// `skip_moves` and every one after it. A path of fewer moves than that keeps
+/// its last position alone, and an empty path stays empty.
+///
+/// The left-out moves are a preamble a tournament server plays before the game
+/// proper; a book built for the game proper never meant the positions it
+/// passes through to count.
+fn seen_positions(path: &[PackedSfen], skip_moves: usize) -> &[PackedSfen] {
+    &path[skip_moves.min(path.len().saturating_sub(1))..]
+}
+
 /// The node counters of a pool of `workers`, one slot per worker.
 #[cfg(feature = "verbose2")]
 fn node_tally(workers: usize) -> &'static [TallySlot] {
@@ -784,6 +797,10 @@ pub struct Engine<P: EngineSink> {
     /// progress plays from: drawn at every [`Self::new_game`], and the first
     /// entry until the first one.
     yorkie_choice: usize,
+    /// How many leading moves of the `position` command [`Self::fill_game_path`]
+    /// leaves out of the game path: the config's `yorkie_book_path_skip_moves`,
+    /// overridable through [`Self::set_yorkie_book_path_skip_moves`].
+    yorkie_path_skip: usize,
     /// The generator [`Self::new_game`] draws the yorkie book from, seeded from
     /// the session seed so [`Engine::with_book_seed`] pins it too.
     yorkie_prng: Prng,
@@ -932,12 +949,14 @@ impl<P: EngineSink> Engine<P> {
                 weight,
             })
             .collect();
+        let yorkie_path_skip = settings.yorkie_book_path_skip_moves();
         Self {
             sink,
             settings,
             yorkie_choices,
             yorkie_books: None,
             yorkie_choice: 0,
+            yorkie_path_skip,
             yorkie_prng: Prng::new(book_seed ^ YORKIE_DRAW_SEED_MIX),
             pos: Position::startpos(),
             eval: None,
@@ -1004,6 +1023,16 @@ impl<P: EngineSink> Engine<P> {
                 weight,
             })
             .collect();
+    }
+
+    /// Override how many leading moves of the `position` command the yorkie
+    /// book's game path leaves out: the starting position and the positions
+    /// after the first `moves - 1` moves do not count as having occurred.
+    ///
+    /// `yorkie_book_path_skip_moves` is compiled in like every other setting,
+    /// so a test that drives a session under another count names it here.
+    pub fn set_yorkie_book_path_skip_moves(&mut self, moves: usize) {
+        self.yorkie_path_skip = moves;
     }
 
     /// Override the sysfs root the [`Self::ready`] layout check reads, so a test
@@ -1379,8 +1408,9 @@ impl<P: EngineSink> Engine<P> {
 
     /// Write into `out` every position of the game the last `position` command
     /// named: its starting position, then the position after each of its
-    /// moves, the current one last. What a path-dependent yorkie-book entry is
-    /// matched against.
+    /// moves, the current one last — less the leading positions
+    /// [`seen_positions`] trims away. What a path-dependent yorkie-book entry
+    /// is matched against.
     ///
     /// A command read before the book was loaded recorded no path, and the
     /// current position then stands alone.
@@ -1389,7 +1419,10 @@ impl<P: EngineSink> Engine<P> {
         if self.last_position.path.is_empty() {
             out.push(sfen_pack(&self.pos));
         } else {
-            out.extend_from_slice(&self.last_position.path);
+            out.extend_from_slice(seen_positions(
+                &self.last_position.path,
+                self.yorkie_path_skip,
+            ));
         }
     }
 
@@ -3857,6 +3890,81 @@ mod tests {
         for retained in [&engine.last_position, &engine.pending_position] {
             assert_eq!(retained.path.capacity(), GAME_PATH_CAPACITY);
         }
+    }
+
+    /// A game path of `moves` moves of the four-move preamble's king shuffle
+    /// and on: the starting position, then the position after each move.
+    fn path_of(moves: usize) -> Vec<PackedSfen> {
+        const MOVES: [&[u8]; 6] = [b"5i5h", b"5a5b", b"5h5i", b"5b5a", b"7g7f", b"3c3d"];
+        let mut pos = Position::startpos();
+        let mut path = vec![sfen_pack(&pos)];
+        for mv in &MOVES[..moves] {
+            pos.do_move(parse_usi_move(mv, &pos).expect("legal"));
+            path.push(sfen_pack(&pos));
+        }
+        path
+    }
+
+    /// Leaving out no moves keeps the whole path.
+    #[test]
+    fn skipping_no_moves_keeps_the_whole_path() {
+        let path = path_of(6);
+        assert_eq!(seen_positions(&path, 0), &path[..]);
+        let start = path_of(0);
+        assert_eq!(seen_positions(&start, 0), &start[..]);
+    }
+
+    /// With more moves than are left out, the path starts at the position
+    /// after the last move left out.
+    #[test]
+    fn skipping_fewer_moves_than_the_command_has_starts_after_the_last_skipped() {
+        let path = path_of(6);
+        assert_eq!(seen_positions(&path, 4), &path[4..]);
+        assert_eq!(seen_positions(&path, 4).len(), 3);
+        assert_eq!(seen_positions(&path, 1), &path[1..]);
+    }
+
+    /// Leaving out exactly as many moves as the command has keeps the current
+    /// position alone.
+    #[test]
+    fn skipping_as_many_moves_as_the_command_has_keeps_the_current_position() {
+        let path = path_of(4);
+        assert_eq!(seen_positions(&path, 4), &path[4..]);
+        assert_eq!(seen_positions(&path, 4), &[path[4]]);
+    }
+
+    /// Leaving out more moves than the command has keeps the current position
+    /// alone too, and an empty path stays empty.
+    #[test]
+    fn skipping_more_moves_than_the_command_has_keeps_the_current_position() {
+        for moves in 0..4 {
+            let path = path_of(moves);
+            assert_eq!(seen_positions(&path, 4), &[path[moves]], "{moves} moves");
+        }
+        assert_eq!(seen_positions(&[], 4), &[] as &[PackedSfen]);
+        assert_eq!(seen_positions(&[], 0), &[] as &[PackedSfen]);
+    }
+
+    /// The engine trims the path it hands a `go` by the count it was given.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn the_game_path_leaves_out_the_skipped_moves() {
+        let _session = serial_session();
+        let mut engine = idle_engine();
+        engine.yorkie_books = Some((
+            vec![PathBuf::from("book.ykb")],
+            Vec::leak(vec![empty_yorkie_book()]),
+        ));
+        engine.reserve_game_path();
+        engine.set_yorkie_book_path_skip_moves(4);
+        engine
+            .set_position(PositionSfen::StartPos, b"5i5h 5a5b 5h5i 5b5a 7g7f 3c3d")
+            .expect("every move is legal");
+        assert_eq!(game_path(&engine), path_of(6)[4..].to_vec());
+        engine
+            .set_position(PositionSfen::StartPos, b"5i5h 5a5b")
+            .expect("both moves are legal");
+        assert_eq!(game_path(&engine), vec![sfen_pack(&engine.pos)]);
     }
 
     /// Without a yorkie book nothing is recorded, and no room is taken for it.

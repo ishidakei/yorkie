@@ -188,6 +188,29 @@ book_dir = "book"
 # the eval / depth filters, which are `.ybb`-only.
 yorkie_book_files = []
 
+# How many leading moves of the `position` command the yorkie book's game path
+# leaves out. A path-dependent entry applies only when every position in its
+# support list has occurred in the game, and the positions counted as occurred
+# are the starting position of the `position` command and the position after
+# each of its moves. With this set to N, the starting position and the
+# positions after moves 1 to N-1 are not counted: the position after move N is
+# the first that is. A command with fewer than N moves counts the current
+# position alone.
+#
+# This is for a tournament whose server plays a fixed preamble before the game
+# proper — for example four king moves, `5i5h 5a5b 5h5i 5b5a`, that return the
+# board to the initial position. The preamble then arrives as the first moves of
+# every `position` command, and the positions it passes through were never
+# meant to count as part of the game the book was built for. Such a tournament
+# sets this to the preamble's length, 4 in that example, in its own copy of
+# this config.
+#
+# `0` counts every position, and is free: with it the probe reads exactly the
+# positions it would without this key. Nothing but the path-dependent entries'
+# support check reads it — shared entries, the `.ybb` book, the search and its
+# repetition detection all see the whole game. An integer from 0 to 1024.
+yorkie_book_path_skip_moves = 0
+
 # V1 only (`BookEvalDiff`): reject a book move whose value trails the best book
 # move's by more than this.
 book_eval_diff = 30

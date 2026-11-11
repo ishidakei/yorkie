@@ -386,6 +386,12 @@ const SCHEMA: &[Spec] = &[
         "yorkie_book_files",
         "(none: the yorkie books probed ahead of `BookFile`, one drawn per game by weight)",
     ),
+    int(
+        "yorkie_book_path_skip_moves",
+        "(none: leading moves of the `position` command the yorkie-book path leaves out)",
+        0,
+        1_024,
+    ),
     int("book_eval_diff", "BookEvalDiff", 0, 99_999),
     int("book_eval_black_diff", "BookEvalBlackDiff", 0, 99_999),
     int("book_eval_white_diff", "BookEvalWhiteDiff", 0, 99_999),

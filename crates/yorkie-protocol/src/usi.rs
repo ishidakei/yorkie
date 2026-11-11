@@ -499,6 +499,14 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
         self
     }
 
+    /// Override how many leading moves of the `position` command the yorkie
+    /// book's game path leaves out — see
+    /// [`Engine::set_yorkie_book_path_skip_moves`].
+    pub fn with_yorkie_book_path_skip_moves(mut self, moves: usize) -> Self {
+        self.engine.set_yorkie_book_path_skip_moves(moves);
+        self
+    }
+
     /// Override the sysfs root the `isready` layout check reads — see
     /// [`Engine::set_sysfs_root`].
     pub fn with_sysfs_root(mut self, root: PathBuf) -> Self {

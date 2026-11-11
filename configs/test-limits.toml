@@ -43,6 +43,7 @@ book_ignore_rate = 0
 book_file = "no_book"
 book_dir = "book"
 yorkie_book_files = []
+yorkie_book_path_skip_moves = 0
 book_eval_diff = 30
 book_eval_black_diff = 0
 book_eval_white_diff = 0

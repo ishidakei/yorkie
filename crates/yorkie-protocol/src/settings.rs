@@ -87,6 +87,13 @@ impl Settings {
     pub(crate) fn yorkie_book_files(&self) -> &'static [(&'static str, u32)] {
         crate::config::YORKIE_BOOK_FILES
     }
+
+    /// How many leading moves of a `position` command the yorkie book's game
+    /// path leaves out: the positions before the N-th move's are not counted
+    /// as having occurred.
+    pub(crate) fn yorkie_book_path_skip_moves(&self) -> usize {
+        crate::config::YORKIE_BOOK_PATH_SKIP_MOVES as usize
+    }
 }
 
 /// Define the `spin`-valued accessors: each is its generated constant.
