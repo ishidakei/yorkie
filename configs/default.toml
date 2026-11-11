@@ -141,7 +141,13 @@ usi_own_book = true
 narrow_book = false
 
 # Ply past which the book is no longer consulted (`BookMoves`).
-book_moves = 16
+#
+# 10000 is the top of the key's range and above the length of any game, so
+# this config consults the `.ybb` book at every ply. A ply cut-off would also
+# fall short when a tournament server plays moves before the game proper: those
+# moves count towards the game ply, and a cut-off at ply N would then stop the
+# book that many moves early.
+book_moves = 10000
 
 # Percentage chance of ignoring the book on any one probe (`BookIgnoreRate`).
 book_ignore_rate = 0
@@ -245,7 +251,15 @@ book_pv_moves = 8
 
 # Match book positions ignoring their recorded ply (`IgnoreBookPly`). The V2
 # default is `true`; V1's is `false`.
-ignore_book_ply = false
+#
+# On here. Some tournament servers play a fixed preamble before the game proper
+# — for example four king moves, `5i5h 5a5b 5h5i 5b5a`, that return the board
+# to the initial position — and the preamble arrives as the first moves of
+# every `position` command. The game then starts on ply 5, every position sits
+# four plies later than the ply its `.ybb` entry was recorded at, and with the
+# ply compared no entry would match. Ignoring the ply matches each entry by its
+# board alone.
+ignore_book_ply = true
 
 # Also probe the mirrored position (`FlippedBook`).
 flipped_book = true

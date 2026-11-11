@@ -186,12 +186,12 @@ fn a_path_dependent_yorkie_book_entry_applies_once_its_support_occurred_after_th
 }
 
 /// The `.ybb` selection settings, every one spelled out: the book is consulted
-/// up to ply 16, never skipped, and no entry below is filtered away.
-fn book_config() -> BookConfig {
+/// up to ply `book_moves`, never skipped, and no entry below is filtered away.
+fn book_config(book_moves: i64) -> BookConfig {
     BookConfig {
         book_options_v2: false,
         narrow_book: false,
-        book_moves: 16,
+        book_moves,
         ignore_rate: 0,
         eval_diff: 30,
         eval_black_diff: 0,
@@ -221,27 +221,47 @@ fn game_path(moves: &[&str]) -> Vec<PackedSfen> {
         .collect()
 }
 
-/// What the probe a `go` runs plays at the position behind the preamble, given
-/// the yorkie book `yorkie` and the `.ybb` book `ybb`, with the ply-matching
-/// rule `ignore_book_ply`.
-fn probe_after_preamble(
+/// What the probe a `go` runs plays at the position the game `moves` reaches,
+/// given the yorkie book `yorkie` and the `.ybb` book `ybb`, with the
+/// ply-matching rule `ignore_book_ply` and the ply limit `book_moves`.
+fn probe_game(
+    moves: &[&str],
     yorkie: Option<&YorkieBook>,
     ybb: &Book,
     ignore_book_ply: bool,
+    book_moves: i64,
 ) -> Option<Move> {
-    let pos = startpos_after(&PREAMBLE);
-    let path = game_path(&PREAMBLE);
+    let pos = startpos_after(moves);
+    let path = game_path(moves);
     let probe = yorkie.map(|book| YorkieProbe { book, path: &path });
     probe_book(
         probe.as_ref(),
         std::slice::from_ref(ybb),
         ignore_book_ply,
         &pos,
-        &book_config(),
+        &book_config(book_moves),
         &mut Prng::new(TEST_BOOK_SEED),
     )
     .hit
     .map(|hit| hit.best)
+}
+
+/// [`probe_game`] at the position behind the preamble, consulting the `.ybb`
+/// book up to ply 16.
+fn probe_after_preamble(
+    yorkie: Option<&YorkieBook>,
+    ybb: &Book,
+    ignore_book_ply: bool,
+) -> Option<Move> {
+    probe_game(&PREAMBLE, yorkie, ybb, ignore_book_ply, 16)
+}
+
+/// A `.ybb` book whose one entry is the initial board recorded at `ply`,
+/// answering `7g7f`.
+fn initial_board_ybb(dir: &TempDir, ply: u16) -> Book {
+    let path = dir.path().join(format!("ply{ply}.ybb"));
+    write_ybb(&path, &[(&initial_board_at(ply), vec![("7g7f", 0, 0)])]);
+    Book::open_in_memory(&path).expect("open the .ybb book")
 }
 
 /// The move `usi` in the position behind the preamble.
@@ -259,13 +279,8 @@ fn preamble_move(usi: &str) -> Move {
 #[test]
 fn behind_the_preamble_the_yorkie_book_is_probed_ahead_of_the_ybb_book() {
     let dir = TempDir::new("preamble-ybb");
-    let ybb_at = |ply: u16| {
-        let path = dir.path().join(format!("ply{ply}.ybb"));
-        write_ybb(&path, &[(&initial_board_at(ply), vec![("7g7f", 0, 0)])]);
-        Book::open_in_memory(&path).expect("open the .ybb book")
-    };
-    let at_ply_5 = ybb_at(5);
-    let at_ply_1 = ybb_at(1);
+    let at_ply_5 = initial_board_ybb(&dir, 5);
+    let at_ply_1 = initial_board_ybb(&dir, 1);
 
     let answering: Vec<YkEntry<'_>> = vec![(&[], vec![("2g2f", 10_000)], vec![])];
     let answering = YorkieBook::from_bytes(yorkie_book_bytes(&answering, &[]))
@@ -299,6 +314,76 @@ fn behind_the_preamble_the_yorkie_book_is_probed_ahead_of_the_ybb_book() {
     }
     // The ply-1 entry is not the ply-5 position's while the ply is checked.
     assert_eq!(probe_after_preamble(None, &at_ply_1, false), None);
+}
+
+/// Behind the preamble, with the `.ybb` book consulted at every ply
+/// (`book_moves = 10000`), an entry recorded for the initial board at ply 1
+/// answers the initial board at ply 5 when the recorded ply is ignored
+/// (`ignore_book_ply = true`), and misses when it is compared
+/// (`ignore_book_ply = false`).
+#[cfg_attr(miri, ignore)]
+#[test]
+fn behind_the_preamble_a_ply_1_ybb_entry_answers_only_with_ignore_book_ply() {
+    let dir = TempDir::new("preamble-ignore-ply");
+    let at_ply_1 = initial_board_ybb(&dir, 1);
+    let ybb_move = preamble_move("7g7f");
+
+    assert_eq!(
+        probe_game(&PREAMBLE, None, &at_ply_1, true, 10_000),
+        Some(ybb_move),
+        "ignore_book_ply = true: the ply-1 entry answers at ply 5"
+    );
+    assert_eq!(
+        probe_game(&PREAMBLE, None, &at_ply_1, false, 10_000),
+        None,
+        "ignore_book_ply = false: the ply-1 entry misses at ply 5"
+    );
+}
+
+/// The preamble played five times over: twenty king moves that leave the
+/// initial board at ply 21.
+fn five_preambles() -> Vec<&'static str> {
+    PREAMBLE.iter().copied().cycle().take(20).collect()
+}
+
+/// A `.ybb` entry is found at a game ply above 16 when the book is consulted at
+/// every ply (`book_moves = 10000`), and not when it is consulted only up to
+/// ply 16 (`book_moves = 16`) — whether the entry matches through its recorded
+/// ply (`ignore_book_ply = false`, an entry recorded at ply 21) or regardless
+/// of it (`ignore_book_ply = true`, an entry recorded at ply 1).
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_ybb_entry_answers_past_ply_16_only_with_book_moves_10000() {
+    let moves = five_preambles();
+    let pos = startpos_after(&moves);
+    assert_eq!(pos.ply(), 21);
+    assert_eq!(sfen_pack(&pos), sfen_pack(&Position::startpos()));
+    let ybb_move = yorkie_state::parse_usi_move("7g7f".as_bytes(), &pos).expect("legal move");
+
+    let dir = TempDir::new("ybb-past-ply-16");
+    for (ybb, ignore_book_ply, what) in [
+        (
+            initial_board_ybb(&dir, 21),
+            false,
+            "a ply-21 entry, ply checked",
+        ),
+        (
+            initial_board_ybb(&dir, 1),
+            true,
+            "a ply-1 entry, ply ignored",
+        ),
+    ] {
+        assert_eq!(
+            probe_game(&moves, None, &ybb, ignore_book_ply, 10_000),
+            Some(ybb_move),
+            "book_moves = 10000 ({what}): found at ply 21"
+        );
+        assert_eq!(
+            probe_game(&moves, None, &ybb, ignore_book_ply, 16),
+            None,
+            "book_moves = 16 ({what}): not consulted at ply 21"
+        );
+    }
 }
 
 /// Whether `reply` is a legal move in the position the game `moves` reaches.

@@ -830,6 +830,20 @@ fn negative_values_round_trip() {
     assert!(out.contains("pub const DRAW_VALUE_BLACK: i64 = -240;"));
 }
 
+/// The play config consults the `.ybb` book at every ply and matches its
+/// entries whatever ply they were recorded at, so a server that plays moves
+/// before the game proper, shifting the game ply, misses no entry.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn the_play_config_consults_the_ybb_book_regardless_of_ply() {
+    let out = compile(&default_config_text()).expect("compiles");
+    assert!(
+        out.contains("pub const IGNORE_BOOK_PLY: bool = true;"),
+        "{out}"
+    );
+    assert!(out.contains("pub const BOOK_MOVES: i64 = 10000;"), "{out}");
+}
+
 // --- Which file a build selects -------------------------------------------
 
 #[test]
