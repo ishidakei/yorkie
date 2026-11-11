@@ -472,6 +472,60 @@ pub fn bestmove_lines(out: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Whether the last reply of the session `out`, the answer to the position
+/// `line` reaches, came from a search rather than from a book. Asked right after
+/// the session, before another one runs.
+///
+/// From `verbose1` up the reply says so itself: the statistics line written
+/// before its `bestmove` counts the nodes searched since the previous reply, and
+/// a book reply searched none. A `verbose2` reply also carries its `info depth`
+/// lines, a book's being the single `depth 0` one.
+///
+/// Below `verbose1` the reply is the `bestmove` line alone, the same for both,
+/// so the answer is read from the transposition table instead: `usinewgame`
+/// empties it and a book reply writes nothing to it, while a search stores the
+/// position it searched.
+pub fn last_reply_searched(out: &str, line: Line<'_>) -> bool {
+    if !cfg!(feature = "verbose1") {
+        let pos = startpos_after(line);
+        let side = pos.side_to_move().index() as u8;
+        return yorkie_storage::TranspositionTable::shared()
+            .probe(pos.key(), side)
+            .0;
+    }
+    let mut lines: Vec<&str> = out.lines().collect();
+    let last = lines
+        .iter()
+        .rposition(|l| l.starts_with("bestmove "))
+        .unwrap_or_else(|| panic!("no reply in:\n{out}"));
+    lines.truncate(last);
+    let start = lines
+        .iter()
+        .rposition(|l| l.starts_with("bestmove "))
+        .map_or(0, |i| i + 1);
+    let reply = &lines[start..];
+    let nodes = reply.iter().any(|l| {
+        l.strip_prefix("info string stats ").is_some_and(|items| {
+            items
+                .split(' ')
+                .any(|item| item.strip_prefix("nodes=").is_some_and(|n| n != "0"))
+        })
+    });
+    if cfg!(feature = "verbose2") {
+        let depths: Vec<&str> = reply
+            .iter()
+            .filter_map(|l| l.strip_prefix("info depth "))
+            .filter_map(|l| l.split(' ').next())
+            .collect();
+        assert_eq!(
+            nodes,
+            !depths.is_empty() && !depths.contains(&"0"),
+            "the node count and the depth lines disagree on the last reply in:\n{out}"
+        );
+    }
+    nodes
+}
+
 // --- `.ybb` writer (mirrors xtask capture-book's serializer). ---
 
 /// One book move for [`write_ybb`]: `(usi, value, depth)`.

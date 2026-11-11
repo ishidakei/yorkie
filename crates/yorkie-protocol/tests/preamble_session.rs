@@ -18,8 +18,8 @@ mod common;
 
 use common::{
     TEST_BOOK_SEED, TempDir, YkEntry, bestmove_lines, drive_with_yorkie_book,
-    drive_with_yorkie_books, legal, serial_session, stage_configured_eval_dir, startpos_after,
-    write_ybb, yorkie_book_bytes,
+    drive_with_yorkie_books, last_reply_searched, legal, serial_session, stage_configured_eval_dir,
+    startpos_after, write_ybb, yorkie_book_bytes,
 };
 use yorkie_protocol::config;
 use yorkie_search::book::{BookConfig, Prng, YorkieProbe, probe_book};
@@ -129,7 +129,7 @@ fn a_shared_yorkie_book_entry_for_the_initial_board_answers_after_the_preamble()
     assert_eq!(played(&out), vec!["2g2f", "2g2f"], "{out}");
 }
 
-/// A king step no search prefers there, so playing it means the entry fired.
+/// The entry's answer, a king step.
 const PATH_DEPENDENT_MOVE: &str = "5a4b";
 
 /// A path-dependent entry whose support is a position reached after the
@@ -179,8 +179,10 @@ fn a_path_dependent_yorkie_book_entry_applies_once_its_support_occurred_after_th
         played[0], PATH_DEPENDENT_MOVE,
         "the support occurred: {out}"
     );
-    assert_ne!(
-        played[1], PATH_DEPENDENT_MOVE,
+    // A search may choose the entry's move too, so the miss is told by the
+    // reply having been searched, not by the move it carries.
+    assert!(
+        last_reply_searched(&out, &transposed),
         "the support never occurred: {out}"
     );
 }

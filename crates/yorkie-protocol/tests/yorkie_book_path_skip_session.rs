@@ -14,7 +14,8 @@ mod common;
 
 use common::{
     TEST_BOOK_SEED, TempDir, YkEntry, bestmove_lines, drive_with_yorkie_book_skipping,
-    serial_session, stage_configured_eval_dir, startpos_after, yorkie_book_bytes,
+    last_reply_searched, serial_session, stage_configured_eval_dir, startpos_after,
+    yorkie_book_bytes,
 };
 use yorkie_protocol::config;
 use yorkie_state::sfen_pack;
@@ -80,7 +81,7 @@ fn require_book_settings() {
     );
 }
 
-/// A king step no search prefers there, so playing it means the entry fired.
+/// The entries' answer, a king step.
 const PATH_DEPENDENT_MOVE: &str = "5a4b";
 
 /// The game the path-dependent entries below sit at the end of.
@@ -91,8 +92,8 @@ fn target() -> Vec<&'static str> {
 /// One game, `moves`, played from a single path-dependent entry at the end of
 /// [`target`] whose support is the position `support` reaches, with the first
 /// `skip_moves` moves of the command left out of the game path. Returns the
-/// move played.
-fn play_with_support(support: &[&str], skip_moves: usize) -> String {
+/// move played and whether a search, rather than the entry, chose it.
+fn play_with_support(support: &[&str], skip_moves: usize) -> (String, bool) {
     let dir = TempDir::new(&format!("path-skip-{}-{skip_moves}", support.len()));
     let target = target();
     let pathdep: Vec<YkEntry<'_>> =
@@ -116,7 +117,7 @@ fn play_with_support(support: &[&str], skip_moves: usize) -> String {
     );
     let played = played(&out);
     assert_eq!(played.len(), 1, "{out}");
-    played[0].to_string()
+    (played[0].to_string(), last_reply_searched(&out, &target))
 }
 
 /// With the preamble left out, an entry whose support is a position only the
@@ -135,13 +136,14 @@ fn a_support_inside_the_preamble_counts_only_when_nothing_is_skipped() {
         "the support is not the board the preamble ends on"
     );
 
-    assert_ne!(
-        play_with_support(&support, PREAMBLE_SKIP),
-        PATH_DEPENDENT_MOVE,
+    // A search may choose the entry's move too, so the miss is told by the
+    // reply having been searched, not by the move it carries.
+    assert!(
+        play_with_support(&support, PREAMBLE_SKIP).1,
         "a preamble position does not count once the preamble is skipped"
     );
     assert_eq!(
-        play_with_support(&support, 0),
+        play_with_support(&support, 0).0,
         PATH_DEPENDENT_MOVE,
         "with nothing skipped every position of the command counts"
     );
@@ -157,7 +159,7 @@ fn a_support_after_the_preamble_counts_when_the_preamble_is_skipped() {
     stage_configured_eval_dir();
     let support = after_preamble(&["7g7f"]);
     assert_eq!(
-        play_with_support(&support, PREAMBLE_SKIP),
+        play_with_support(&support, PREAMBLE_SKIP).0,
         PATH_DEPENDENT_MOVE,
         "the support occurred after the preamble"
     );

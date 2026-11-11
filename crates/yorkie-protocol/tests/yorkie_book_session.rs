@@ -10,8 +10,8 @@ mod common;
 
 use common::{
     TEST_BOOK_SEED, TempDir, YkEntry, bestmove_lines, drive_with_seed, drive_with_yorkie_book,
-    drive_with_yorkie_books, reseal_yorkie_book, seal_yorkie_book, serial_session,
-    stage_configured_eval_dir, yorkie_book_bytes,
+    drive_with_yorkie_books, last_reply_searched, reseal_yorkie_book, seal_yorkie_book,
+    serial_session, stage_configured_eval_dir, yorkie_book_bytes,
 };
 
 /// Two shared entries — the initial position answers `2g2f`, the position after
@@ -85,7 +85,7 @@ fn transposed_book_image() -> Vec<u8> {
     yorkie_book_bytes(&[], &pathdep)
 }
 
-/// A king step no search prefers there, so playing it means the entry fired.
+/// The entry's answer, a king step.
 const TRANSPOSED_BOOK_MOVE: &str = "5a4b";
 
 /// A path-dependent entry answers its position only when the game passed
@@ -99,6 +99,7 @@ fn a_path_dependent_entry_misses_a_transposition_that_skips_its_support() {
     stage_configured_eval_dir();
     let dir = TempDir::new("yorkie-transposed");
     let path = write(&dir, "transposed.ykb", &transposed_book_image());
+    let transposed = ["7g7f", "3c3d", "2g2f"];
 
     let out = drive_with_yorkie_book(
         &format!(
@@ -124,8 +125,10 @@ fn a_path_dependent_entry_misses_a_transposition_that_skips_its_support() {
         played[0], TRANSPOSED_BOOK_MOVE,
         "the support occurred: {out}"
     );
-    assert_ne!(
-        played[1], TRANSPOSED_BOOK_MOVE,
+    // A search may choose the entry's move too, so the miss is told by the
+    // reply having been searched, not by the move it carries.
+    assert!(
+        last_reply_searched(&out, &transposed),
         "the support never occurred: {out}"
     );
 
