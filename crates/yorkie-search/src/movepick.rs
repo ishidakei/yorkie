@@ -761,6 +761,13 @@ impl<'a> MovePicker<'a> {
     pub fn skip_quiet_moves(&mut self) {
         self.skip_quiets = true;
     }
+
+    /// Whether the move [`Self::next_move`] last handed out came from a quiet
+    /// stage, the stages [`Self::skip_quiet_moves`] skips.
+    #[cfg(lazy_smp_spread)]
+    pub fn in_quiet_stage(&self) -> bool {
+        matches!(self.stage, Stage::GoodQuiet | Stage::BadQuiet)
+    }
 }
 
 /// A multi-`Vec` `MovePicker`, kept as a test-only twin: the single-buffer

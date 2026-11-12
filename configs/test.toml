@@ -110,6 +110,7 @@ ponder_root_margin = 500
 # reply, so there is nothing to credit either way; 0 states that a `go` here
 # budgets its time from its own clock alone.
 ponder_credit = 0
+lazy_smp_spread = false
 
 # ---------------------------------------------------------------------------
 # Time management

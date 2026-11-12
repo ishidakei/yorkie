@@ -12,6 +12,10 @@
 //! because a build script cannot depend on a member of the workspace it is
 //! building.
 //!
+//! One switch reshapes the search rather than setting a value in it: with
+//! `lazy_smp_spread` on, this script sets the `cfg` of the same name, behind
+//! which the workers' move-order spread is compiled; off, none of it exists.
+//!
 //! The generated module carries every schema key it can render on its own, not
 //! just the ones read here: the generator renders the schema as a whole, and
 //! allowing the unused ones is cheaper than a second, divergent code path. The
@@ -68,6 +72,7 @@ fn main() {
         Ok(g) => g,
         Err(e) => fail(&e),
     };
+    emit_switch_cfgs(&generated.cfgs);
 
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"))
         .join("engine_config.rs");
@@ -76,6 +81,20 @@ fn main() {
             "cannot write the generated config `{}`: {e}",
             out.display()
         ));
+    }
+}
+
+/// Set the `cfg` of every [`CFG_SWITCHES`] entry the config turns on, or whose
+/// same-named Cargo feature (`lazy_smp_spread` ↔ `lazy-smp-spread`) this build
+/// carries. The feature compiles a switch's code in without the config turning
+/// it on, which is how the tests reach code no test config enables.
+fn emit_switch_cfgs(on: &[&str]) {
+    for (_, cfg) in CFG_SWITCHES {
+        println!("cargo::rustc-check-cfg=cfg({cfg})");
+        let feature = format!("CARGO_FEATURE_{}", cfg.to_ascii_uppercase());
+        if on.contains(cfg) || std::env::var_os(feature).is_some() {
+            println!("cargo::rustc-cfg={cfg}");
+        }
     }
 }
 

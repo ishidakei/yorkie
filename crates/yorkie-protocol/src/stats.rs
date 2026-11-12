@@ -9,8 +9,10 @@
 //! Every build that writes the line has six counted items, each covering the
 //! interval the reply ends: `alloc`, the heap allocations, then `nodes`,
 //! `tt_update`, `eval_dup`, `evals` and `eval_tt_hits`, what the searches of
-//! that interval did on every thread (see [`SearchCounts`]). A `verbose3` build
-//! adds three more: the value marks of the score the reply rests on.
+//! that interval did on every thread (see [`SearchCounts`]). A build with the
+//! workers' move-order spread compiled in follows them with `spread_dups`,
+//! `spread_shifts` and `spread_peak`. A `verbose3` build adds three more: the
+//! value marks of the score the reply rests on.
 //!
 //! A `verbose3` build's `bench` also writes one line after its summary, in the
 //! same format, carrying the search counts summed over every position of the
@@ -28,6 +30,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use yorkie_search::WorkerResult;
 #[cfg(feature = "dupstats")]
 use yorkie_search::dupstats::{DupCounts, PRESENCE_KEYS, PresenceKind, STORE_KEYS, StoreKind};
+#[cfg(lazy_smp_spread)]
+use yorkie_search::spread::SpreadCounts;
 use yorkie_state::TextWriter;
 #[cfg(feature = "verbose3")]
 use yorkie_storage::ValueMarks;
@@ -114,13 +118,27 @@ const LINE_MAX: usize = PREFIX.len()
     + MARK_ITEMS[1].len()
     + MARK_ITEMS[2].len();
 
+/// The move-order spread's items, in the order they are written, each with the
+/// space that separates it from what comes before.
+#[cfg(lazy_smp_spread)]
+const SPREAD_KEYS: [&[u8]; 3] = [b" spread_dups=", b" spread_shifts=", b" spread_peak="];
+
+/// The spread items at their widest: every key with a 20-digit value.
+#[cfg(lazy_smp_spread)]
+const SPREAD_ITEMS_MAX: usize =
+    SPREAD_KEYS[0].len() + SPREAD_KEYS[1].len() + SPREAD_KEYS[2].len() + 3 * U64_DIGITS;
+
+/// A build without the move-order spread writes none of its items.
+#[cfg(not(lazy_smp_spread))]
+const SPREAD_ITEMS_MAX: usize = 0;
+
 /// The longest line [`render`] can produce.
 #[cfg(not(feature = "dupstats"))]
-const MAX_LINE: usize = LINE_MAX;
+const MAX_LINE: usize = LINE_MAX + SPREAD_ITEMS_MAX;
 
 /// The longest line [`render`] can produce, the duplication items included.
 #[cfg(feature = "dupstats")]
-const MAX_LINE: usize = LINE_MAX + DUP_ITEMS_MAX;
+const MAX_LINE: usize = LINE_MAX + SPREAD_ITEMS_MAX + DUP_ITEMS_MAX;
 
 /// What the searches of one interval did, summed over every thread that
 /// searched in it.
@@ -152,6 +170,10 @@ pub(crate) struct SearchCounts {
     /// How the workers of each search were spread when it ended.
     #[cfg(feature = "dupstats")]
     pub(crate) spread: Spread,
+    /// What the workers' move-order spread counted: the duplicates and shifted
+    /// picks summed over every worker, the peak the highest any worker reached.
+    #[cfg(lazy_smp_spread)]
+    pub(crate) smp: SpreadCounts,
 }
 
 /// How the workers of the searches of an interval were spread when each search
@@ -237,6 +259,13 @@ struct Tally {
     eval_dups: AtomicU64,
     evals: AtomicU64,
     eval_tt_hits: AtomicU64,
+    #[cfg(lazy_smp_spread)]
+    spread_dups: AtomicU64,
+    #[cfg(lazy_smp_spread)]
+    spread_shifts: AtomicU64,
+    /// The highest of the workers' peaks, not a sum.
+    #[cfg(lazy_smp_spread)]
+    spread_peak: AtomicU64,
     /// Too many counts for one atomic each, and added once per worker per
     /// search, so a lock costs nothing that matters.
     #[cfg(feature = "dupstats")]
@@ -251,6 +280,12 @@ impl Tally {
             eval_dups: AtomicU64::new(0),
             evals: AtomicU64::new(0),
             eval_tt_hits: AtomicU64::new(0),
+            #[cfg(lazy_smp_spread)]
+            spread_dups: AtomicU64::new(0),
+            #[cfg(lazy_smp_spread)]
+            spread_shifts: AtomicU64::new(0),
+            #[cfg(lazy_smp_spread)]
+            spread_peak: AtomicU64::new(0),
             #[cfg(feature = "dupstats")]
             dup: Mutex::new(DupTally {
                 dup: DupCounts::ZERO,
@@ -273,6 +308,13 @@ impl Tally {
         self.evals.fetch_add(r.evals, Ordering::Relaxed);
         self.eval_tt_hits
             .fetch_add(r.eval_tt_hits, Ordering::Relaxed);
+        #[cfg(lazy_smp_spread)]
+        {
+            self.spread_dups.fetch_add(r.spread.dups, Ordering::Relaxed);
+            self.spread_shifts
+                .fetch_add(r.spread.shifts, Ordering::Relaxed);
+            self.spread_peak.fetch_max(r.spread.peak, Ordering::Relaxed);
+        }
         #[cfg(feature = "dupstats")]
         self.dup_tally().dup.add(&r.dup);
     }
@@ -302,6 +344,12 @@ impl Tally {
             eval_dup: self.eval_dups.swap(0, Ordering::Relaxed),
             evals: self.evals.swap(0, Ordering::Relaxed),
             eval_tt_hits: self.eval_tt_hits.swap(0, Ordering::Relaxed),
+            #[cfg(lazy_smp_spread)]
+            smp: SpreadCounts {
+                dups: self.spread_dups.swap(0, Ordering::Relaxed),
+                shifts: self.spread_shifts.swap(0, Ordering::Relaxed),
+                peak: self.spread_peak.swap(0, Ordering::Relaxed),
+            },
             #[cfg(feature = "dupstats")]
             dup,
             #[cfg(feature = "dupstats")]
@@ -408,6 +456,17 @@ pub(crate) fn render(
         search.eval_tt_hits,
     ];
     for (key, value) in COUNT_KEYS.iter().zip(counts) {
+        if value != 0 {
+            out.bytes(key).u64(value);
+            carried = true;
+        }
+    }
+    #[cfg(lazy_smp_spread)]
+    for (key, value) in
+        SPREAD_KEYS
+            .iter()
+            .zip([search.smp.dups, search.smp.shifts, search.smp.peak])
+    {
         if value != 0 {
             out.bytes(key).u64(value);
             carried = true;
@@ -561,6 +620,12 @@ mod tests {
             eval_dup: value,
             evals: value,
             eval_tt_hits: value,
+            #[cfg(lazy_smp_spread)]
+            smp: SpreadCounts {
+                dups: value,
+                shifts: value,
+                peak: value,
+            },
             #[cfg(feature = "dupstats")]
             dup: DupCounts::ZERO,
             #[cfg(feature = "dupstats")]
@@ -645,7 +710,7 @@ mod tests {
         assert_eq!(counted(&mut buf, 0, evaluated(0, 0)), None);
     }
 
-    #[cfg(not(any(feature = "verbose3", feature = "dupstats")))]
+    #[cfg(not(any(feature = "verbose3", feature = "dupstats", lazy_smp_spread)))]
     #[test]
     fn the_widest_line_fits_the_buffer() {
         let mut buf = StatsBuf::new();
@@ -771,7 +836,7 @@ mod tests {
             );
         }
 
-        #[cfg(not(feature = "dupstats"))]
+        #[cfg(not(any(feature = "dupstats", lazy_smp_spread)))]
         #[test]
         fn the_widest_line_fits_the_buffer() {
             let mut buf = StatsBuf::new();
@@ -784,6 +849,57 @@ mod tests {
                    evals=18446744073709551615 eval_tt_hits=18446744073709551615 \
                    pathdep=1 declrule=1 movelimit=1"[..]
             );
+            assert_eq!(line.len(), MAX_LINE);
+        }
+    }
+
+    /// The items a build with the move-order spread adds.
+    #[cfg(lazy_smp_spread)]
+    mod move_order_spread {
+        use super::*;
+
+        fn spread(dups: u64, shifts: u64, peak: u64) -> SearchCounts {
+            SearchCounts {
+                smp: SpreadCounts { dups, shifts, peak },
+                ..search(100, 0, 0)
+            }
+        }
+
+        /// The three items follow the counted ones, and a zero one is omitted.
+        #[test]
+        fn the_items_follow_the_counted_ones() {
+            let mut buf = StatsBuf::new();
+            assert_eq!(
+                counted(&mut buf, 0, spread(12, 30, 2)),
+                Some(
+                    &b"info string stats nodes=100 spread_dups=12 spread_shifts=30 spread_peak=2"[..]
+                )
+            );
+            assert_eq!(
+                counted(&mut buf, 0, spread(0, 0, 1)),
+                Some(&b"info string stats nodes=100 spread_peak=1"[..])
+            );
+        }
+
+        /// The tally sums the duplicates and shifts and keeps the highest peak.
+        #[test]
+        fn the_tally_sums_the_counts_and_keeps_the_highest_peak() {
+            let tally = Tally::new();
+            for (dups, shifts, peak) in [(3, 5, 2), (4, 1, 1)] {
+                tally.spread_dups.fetch_add(dups, Ordering::Relaxed);
+                tally.spread_shifts.fetch_add(shifts, Ordering::Relaxed);
+                tally.spread_peak.fetch_max(peak, Ordering::Relaxed);
+            }
+            assert_eq!(tally.take().smp, spread(7, 6, 2).smp);
+            assert_eq!(tally.take().smp, SpreadCounts::default());
+        }
+
+        #[cfg(not(any(feature = "verbose3", feature = "dupstats")))]
+        #[test]
+        fn the_widest_line_fits_the_buffer() {
+            let mut buf = StatsBuf::new();
+            let line =
+                counted(&mut buf, u64::MAX, all(u64::MAX)).expect("a non-zero count is reported");
             assert_eq!(line.len(), MAX_LINE);
         }
     }
@@ -893,6 +1009,8 @@ mod tests {
                 eval_tt_hits: 0,
                 dup: Box::new(DupCounts::ZERO),
                 stopped_on: on.map(|i| moves[i].mv),
+                #[cfg(lazy_smp_spread)]
+                spread: SpreadCounts::default(),
                 #[cfg(feature = "verbose2")]
                 uci_pv_sent: false,
                 #[cfg(feature = "verbose2")]

@@ -22,6 +22,10 @@ pub mod movepick;
 pub mod params;
 pub mod qsearch;
 pub mod root;
+// Parallel workers shifting their move order apart: only a build that asks for
+// it, through the config or the feature.
+#[cfg(lazy_smp_spread)]
+pub mod spread;
 /// The text forms this crate's own unit tests read through.
 ///
 /// The engine speaks bytes: an SFEN and a USI move are `&[u8]` everywhere it

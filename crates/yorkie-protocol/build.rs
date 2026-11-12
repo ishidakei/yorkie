@@ -94,6 +94,7 @@ fn main() {
     for warning in &generated.warnings {
         println!("cargo:warning={warning}");
     }
+    emit_switch_cfgs(&generated.cfgs);
 
     let out = out_dir.join("engine_config.rs");
     if let Err(e) = std::fs::write(&out, generated.code) {
@@ -116,6 +117,20 @@ fn active_gates() -> Vec<&'static str> {
             std::env::var_os(format!("CARGO_FEATURE_{}", feature.to_ascii_uppercase())).is_some()
         })
         .collect()
+}
+
+/// Set the `cfg` of every [`CFG_SWITCHES`] entry the config turns on, or whose
+/// same-named Cargo feature (`lazy_smp_spread` ↔ `lazy-smp-spread`) this build
+/// carries. The feature compiles a switch's code in without the config turning
+/// it on, which is how the tests reach code no test config enables.
+fn emit_switch_cfgs(on: &[&str]) {
+    for (_, cfg) in CFG_SWITCHES {
+        println!("cargo::rustc-check-cfg=cfg({cfg})");
+        let feature = format!("CARGO_FEATURE_{}", cfg.to_ascii_uppercase());
+        if on.contains(cfg) || std::env::var_os(feature).is_some() {
+            println!("cargo::rustc-cfg={cfg}");
+        }
+    }
 }
 
 /// The repository root: two levels above this crate (`crates/yorkie-protocol`).

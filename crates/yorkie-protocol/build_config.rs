@@ -485,6 +485,10 @@ const SCHEMA: &[Spec] = &[
         0,
         100,
     ),
+    boolean(
+        "lazy_smp_spread",
+        "(none: a parallel worker that keeps meeting other workers' results shifts its move order)",
+    ),
     // --- Time management.
     int("network_delay", "NetworkDelay", 0, 10_000),
     int("network_delay2", "NetworkDelay2", 0, 10_000),
@@ -777,7 +781,18 @@ struct Generated {
     /// features can produce, or has to report, any.
     #[allow(dead_code)]
     warnings: Vec<String>,
+    /// The `cfg` names of the [`CFG_SWITCHES`] this config turns on, for the
+    /// build scripts whose crates hold code behind them.
+    #[allow(dead_code)]
+    cfgs: Vec<&'static str>,
 }
+
+/// The boolean keys whose `true` compiles code in rather than only setting a
+/// constant: each with the `cfg` name a build script sets for it. A switch whose
+/// code reshapes data structures cannot be folded away behind a constant, and a
+/// build with the switch off has to be exactly the build without the code.
+#[allow(dead_code)]
+const CFG_SWITCHES: &[(&str, &str)] = &[("lazy_smp_spread", "lazy_smp_spread")];
 
 /// Type-check and range-check every schema key against the parsed file, reject
 /// anything left over, and render the generated module.
@@ -1042,9 +1057,16 @@ fn generate(
         let _ = writeln!(out, "{rendered}");
     }
 
+    let cfgs = CFG_SWITCHES
+        .iter()
+        .filter(|(key, _)| matches!(entries.get(*key), Some(Entry { value: Value::Bool(true), .. })))
+        .map(|(_, cfg)| *cfg)
+        .collect();
+
     Ok(Generated {
         code: out,
         warnings,
+        cfgs,
     })
 }
 

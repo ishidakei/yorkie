@@ -651,7 +651,6 @@ impl Cluster {
 
     /// The depth `slot` holds the position `k` names at, or `None` when it
     /// holds another position or nothing.
-    #[cfg(feature = "dupstats")]
     #[inline]
     fn depth_of(&self, slot: usize, k: TteKey) -> Option<Depth> {
         let entry = &self.entry[slot];
@@ -1131,8 +1130,9 @@ impl TranspositionTable {
 
     /// The depth the entry [`Self::locate`] captured holds the position `key`
     /// names at, or `None` when it holds another position or nothing — read
-    /// before a store into that entry, to tell what the store finds there.
-    #[cfg(feature = "dupstats")]
+    /// before a store into that entry, to tell what the store finds there. The
+    /// store about to follow touches the same cache line, so the read costs no
+    /// table traffic of its own.
     #[inline]
     pub fn depth_at(&self, slot: TtSlot, key: u64) -> Option<Depth> {
         self.clusters[slot.cluster].depth_of(slot.entry, tte_key(key))

@@ -625,6 +625,14 @@ pub struct QSearch<N: NetworkParams> {
     /// it. Zero on the single-worker path.
     #[cfg(feature = "dupstats")]
     dup_worker: u8,
+    /// This worker's move-order spread: its duplicate count and the moves each
+    /// ply has pulled out of its order without searching them yet.
+    #[cfg(lazy_smp_spread)]
+    spread: crate::spread::Spread<Move>,
+    /// What the tests read off the nodes whose TT move went through a singular
+    /// search.
+    #[cfg(all(lazy_smp_spread, test))]
+    singular_audit: SingularAudit,
     /// `selDepth`.
     sel_depth: i32,
     /// `nmpMinPly`: while a null-move verification search runs, the ply below
@@ -892,6 +900,15 @@ impl HeldWidth {
     }
 }
 
+/// The nodes whose TT move went through a singular search, and how many moves
+/// such a node counted that it had counted before.
+#[cfg(all(lazy_smp_spread, test))]
+#[derive(Clone, Copy, Debug, Default)]
+struct SingularAudit {
+    nodes: u64,
+    repeats: u64,
+}
+
 /// The result one worker's iterative deepening produces, consumed by
 /// the driver's Lazy-SMP orchestration to vote for and report a single result.
 #[derive(Clone, Debug)]
@@ -931,6 +948,10 @@ pub struct WorkerResult {
     /// `None` when its last iteration ran to its end.
     #[cfg(feature = "dupstats")]
     pub stopped_on: Option<Move>,
+    /// What this worker's move-order spread counted, for the per-reply
+    /// statistics line.
+    #[cfg(all(lazy_smp_spread, feature = "verbose1"))]
+    pub spread: crate::spread::SpreadCounts,
     /// Whether this worker (only meaningful for the main worker) already
     /// emitted the last completed iteration's final PV during iterative
     /// deepening — the reference `uciPvSent` return of `iterative_deepening`.
@@ -1117,6 +1138,11 @@ impl<N: NetworkParams> QSearch<N> {
             dup: crate::dupstats::DupCounts::ZERO,
             #[cfg(feature = "dupstats")]
             dup_worker: 0,
+            #[cfg(lazy_smp_spread)]
+            // Alone until a pool says otherwise (`set_best_move_tally`).
+            spread: crate::spread::Spread::new(STACK_LEN, crate::config::LAZY_SMP_SPREAD, 1),
+            #[cfg(all(lazy_smp_spread, test))]
+            singular_audit: SingularAudit::default(),
             sel_depth: 0,
             nmp_min_ply: 0,
             pv_node: false,
@@ -1349,6 +1375,22 @@ impl<N: NetworkParams> QSearch<N> {
         {
             self.dup_worker = index.min(u8::MAX as usize) as u8;
         }
+        // `slots` holds one slot per worker of the pool this search runs, which
+        // can be smaller than the build's `threads`.
+        #[cfg(lazy_smp_spread)]
+        {
+            self.spread.seed(index);
+            self.spread.set_workers(slots.len());
+        }
+    }
+
+    /// Turn this worker's move-order spread on or off, for a pool of `workers`.
+    /// A worker starts with the switch as the config's `lazy_smp_spread` sets
+    /// it, and alone; [`Self::set_best_move_tally`] tells it the pool's size.
+    /// One worker never spreads.
+    #[cfg(lazy_smp_spread)]
+    pub fn set_spread(&mut self, on: bool, workers: usize) {
+        self.spread.set(on, workers);
     }
 
     /// Install the raw `MultiPV` option value for this `go`. Every worker gets
@@ -1776,6 +1818,17 @@ impl<N: NetworkParams> QSearch<N> {
     #[inline]
     fn count_eval_dup(&mut self, slot: TtSlot, key: u64) {
         self.eval_dups += u64::from(TranspositionTable::shared().holds_eval_at(slot, key));
+    }
+
+    /// Let the spread see the store of depth `depth` about to end a node: what
+    /// `slot` holds for the position `key` before the store overwrites it.
+    #[cfg(lazy_smp_spread)]
+    #[inline]
+    fn spread_note_store(&mut self, slot: TtSlot, key: u64, depth: i32) {
+        if self.spread.active() {
+            let found = TranspositionTable::shared().depth_at(slot, key);
+            self.spread.note_store(key, found, depth, self.root_depth);
+        }
     }
 
     /// Who this worker is, as the duplication statistics' writer table records
@@ -2407,6 +2460,8 @@ impl<N: NetworkParams> QSearch<N> {
             self.dup = crate::dupstats::DupCounts::ZERO;
             crate::dupstats::clear_path();
         }
+        #[cfg(lazy_smp_spread)]
+        self.spread.reset();
         self.sel_depth = 0;
         self.last_iteration_pv.clear();
         // Fresh abort state for this `go`; the counter is seeded so the first
@@ -2765,6 +2820,8 @@ impl<N: NetworkParams> QSearch<N> {
             } else {
                 None
             },
+            #[cfg(all(lazy_smp_spread, feature = "verbose1"))]
+            spread: self.spread.counts(),
             #[cfg(feature = "verbose2")]
             uci_pv_sent,
             #[cfg(feature = "verbose2")]
@@ -3893,8 +3950,35 @@ impl<N: NetworkParams> QSearch<N> {
         let mut quiets_searched = SearchedList::new();
         let mut captures_searched = SearchedList::new();
 
+        // The next move to search: the picker's, or, while this worker's spread
+        // is shifting, one from a little further down the picker's order.
+        #[cfg(not(lazy_smp_spread))]
+        macro_rules! next_move {
+            ($this:expr) => {
+                mp.next_move(pos, &$this.histories)
+            };
+        }
+        #[cfg(lazy_smp_spread)]
+        self.spread.begin_node(s);
+        #[cfg(lazy_smp_spread)]
+        macro_rules! next_move {
+            ($this:expr) => {
+                $this.spread.pick(s, move_count == 0, || {
+                    mp.next_move(pos, &$this.histories)
+                        .map(|mv| (mv, mp.in_quiet_stage()))
+                })
+            };
+        }
+
+        #[cfg(all(lazy_smp_spread, test))]
+        let mut audit_counted: Vec<Move> = Vec::new();
+        #[cfg(all(lazy_smp_spread, test))]
+        let mut audit_repeats = 0u64;
+        #[cfg(all(lazy_smp_spread, test))]
+        let mut audit_singular = false;
+
         // Step 13. Loop through the moves.
-        while let Some(mv) = mp.next_move(pos, &self.histories) {
+        while let Some(mv) = next_move!(self) {
             if Some(mv) == excluded_move {
                 continue;
             }
@@ -3919,6 +4003,11 @@ impl<N: NetworkParams> QSearch<N> {
             if pv_node {
                 self.stack[s + 1].pv.clear();
             }
+            #[cfg(all(lazy_smp_spread, test))]
+            {
+                audit_repeats += u64::from(audit_counted.contains(&mv));
+                audit_counted.push(mv);
+            }
 
             let mut extension = 0;
             let capture = Self::is_capture(pos, mv);
@@ -3940,6 +4029,8 @@ impl<N: NetworkParams> QSearch<N> {
             if !root_node && !is_loss(best_value) {
                 if move_count >= (3 + depth * depth) / (2 - improving as i32) {
                     mp.skip_quiet_moves();
+                    #[cfg(lazy_smp_spread)]
+                    self.spread.skip_quiets(s);
                 }
                 let mut lmr_depth = new_depth - r / 1024;
                 if capture || gives_check {
@@ -4031,6 +4122,10 @@ impl<N: NetworkParams> QSearch<N> {
                 self.set_read_tt(true);
                 #[cfg(feature = "verbose3")]
                 let node_marks = self.marks;
+                // The re-entry shares this node's ply of pending moves too, and
+                // may cut off with some of its own still there.
+                #[cfg(lazy_smp_spread)]
+                let held = self.spread.hold(s);
                 let s_value = self.search(
                     pos,
                     ply,
@@ -4048,6 +4143,12 @@ impl<N: NetworkParams> QSearch<N> {
                 #[cfg(feature = "verbose3")]
                 let singular_marks = self.child_marks(node_marks);
                 self.stack[s].excluded_move = None;
+                #[cfg(lazy_smp_spread)]
+                self.spread.restore(s, held);
+                #[cfg(all(lazy_smp_spread, test))]
+                {
+                    audit_singular = true;
+                }
 
                 if s_value < singular_beta {
                     let corr_val_adj = correction_value.abs() / 210590;
@@ -4424,6 +4525,11 @@ impl<N: NetworkParams> QSearch<N> {
                 }
             }
         }
+        #[cfg(all(lazy_smp_spread, test))]
+        if audit_singular {
+            self.singular_audit.nodes += 1;
+            self.singular_audit.repeats += audit_repeats;
+        }
 
         // Step 21-23. Mate check, stat updates, TT write.
         if best_value >= beta && !is_decisive(best_value) && !is_decisive(alpha) {
@@ -4533,6 +4639,8 @@ impl<N: NetworkParams> QSearch<N> {
             };
             #[cfg(feature = "dupstats")]
             let dup_updates = self.dup_store(tt_slot, pos_key, store_depth, tt_hit, dup_at);
+            #[cfg(lazy_smp_spread)]
+            self.spread_note_store(tt_slot, pos_key, store_depth);
             self.tt_store(
                 tt_slot,
                 pos_key,
@@ -6960,6 +7068,63 @@ mod tests {
                     "{usi}: subtree single-line {one}, narrow {narrow}, wide {wide}"
                 );
             }
+        }
+    }
+
+    /// The move-order spread with two workers, at the nodes whose TT move went
+    /// through a singular search: that search re-enters on the node's own ply,
+    /// and the node must not inherit what it left pending there.
+    #[cfg(lazy_smp_spread)]
+    mod spread_singular {
+        use super::*;
+        use crate::generate_root_moves;
+
+        const POSITIONS: [&str; 3] = [
+            "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
+            "l7l/1r1sg2k1/2nppgsp1/p1p3p1p/1p2N4/2P1P1P2/PPSP1PB1P/3GG1SR1/LN2K3L b BNPp 1",
+            "4k4/3P3+PL/2N2PR2/1L2BNS2/4N4/9/9/9/4K4 b - 1",
+        ];
+        const DEPTH: i32 = 11;
+
+        static SLOTS: [TallySlot; 2] = [const { TallySlot::new() }; 2];
+
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn no_move_is_searched_twice_after_a_singular_search() {
+            let path = real_nn_bin();
+            if !path.exists() {
+                eprintln!("skipping: {} not present", path.display());
+                return;
+            }
+            let owned = yorkie_eval::load_network(&path).expect("real nn.bin loads");
+            let net = owned.network();
+            let _tt = fresh_tt();
+            let mut total = SingularAudit::default();
+            for sfen in POSITIONS {
+                TranspositionTable::shared().clear();
+                TranspositionTable::shared().new_search();
+                let p = pos(sfen);
+                let p = &p;
+                let audits = std::thread::scope(|scope| {
+                    [0, 1]
+                        .map(|index| {
+                            scope.spawn(move || {
+                                let mut search = QSearch::new(net);
+                                search.set_best_move_tally(&SLOTS, index);
+                                search.set_spread(true, 2);
+                                search.run_worker(p, generate_root_moves(p), DEPTH);
+                                search.singular_audit
+                            })
+                        })
+                        .map(|w| w.join().expect("a worker finishes"))
+                });
+                for audit in audits {
+                    total.nodes += audit.nodes;
+                    total.repeats += audit.repeats;
+                }
+            }
+            assert!(total.nodes > 0, "some singular searches ran");
+            assert_eq!(total.repeats, 0, "moves searched twice: {total:?}");
         }
     }
 }

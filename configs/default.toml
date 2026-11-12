@@ -367,6 +367,19 @@ ponder_root_margin = 500
 # pondered); `100` counts all of it. Read only when `ponder` is true.
 ponder_credit = 100
 
+# Spread the parallel workers apart. Every worker of a multi-worker build
+# searches the same tree in the same move order, sharing only the
+# transposition table, so much of what one worker searches another has already
+# searched. With this on, each worker keeps a duplicate count: a store at the
+# end of a node that finds an entry for the position at least as deep, not
+# written by this worker in this iteration, raises it by one (up to `threads`),
+# any other such store lowers it by one. While the count `c` is above zero, every
+# move of a node after its first is taken a random distance `k` in `0..n` ahead
+# of the next one in the move order, `n` being the smaller of `2^c`, 16 and the
+# moves left (the passed-over moves follow in their order). Off, nothing of
+# it is compiled in. With `threads = 1` it has no effect at all.
+lazy_smp_spread = false
+
 # ---------------------------------------------------------------------------
 # Time management
 # ---------------------------------------------------------------------------

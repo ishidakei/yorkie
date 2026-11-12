@@ -64,7 +64,15 @@ yorkie-eval = { path = "../yorkie-eval", features = ["source-network"] }
 # decision, but the tables cost memory traffic, so a build with it is slower
 # than one without and its timings are not comparable with theirs. It implies
 # `verbose1`, whose statistics line carries its totals. Off by default.
+#
+# `lazy-smp-spread` compiles in the move-order spread of the `spread` module
+# without turning it on. The config key `lazy_smp_spread` compiles the same code
+# in and turns it on for a build with more than one worker; without either, none
+# of it exists in the crate. The feature is how the tests reach the code under a
+# config that leaves the key off: they turn a worker's spread on themselves.
+# Off by default.
 [features]
+lazy-smp-spread = []
 random = []
 tune = []
 tt-entry16 = ["yorkie-storage/tt-entry16"]
