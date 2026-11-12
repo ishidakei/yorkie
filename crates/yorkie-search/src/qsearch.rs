@@ -617,6 +617,14 @@ pub struct QSearch<N: NetworkParams> {
     /// by the search.
     #[cfg(feature = "verbose1")]
     eval_tt_hits: u64,
+    /// How this worker's search repeated work already done, since the search
+    /// started. Reported, never read by the search.
+    #[cfg(feature = "dupstats")]
+    dup: crate::dupstats::DupCounts,
+    /// This worker's index in its pool, as the duplication statistics record
+    /// it. Zero on the single-worker path.
+    #[cfg(feature = "dupstats")]
+    dup_worker: u8,
     /// `selDepth`.
     sel_depth: i32,
     /// `nmpMinPly`: while a null-move verification search runs, the ply below
@@ -914,6 +922,15 @@ pub struct WorkerResult {
     /// instead of evaluating, for the per-reply statistics line.
     #[cfg(feature = "verbose1")]
     pub eval_tt_hits: u64,
+    /// How this worker's search repeated work already done, for the per-reply
+    /// statistics line. Boxed: the counts are a few kilobytes, and a result is
+    /// moved between threads.
+    #[cfg(feature = "dupstats")]
+    pub dup: Box<crate::dupstats::DupCounts>,
+    /// The root move this worker was searching when the search was stopped, or
+    /// `None` when its last iteration ran to its end.
+    #[cfg(feature = "dupstats")]
+    pub stopped_on: Option<Move>,
     /// Whether this worker (only meaningful for the main worker) already
     /// emitted the last completed iteration's final PV during iterative
     /// deepening — the reference `uciPvSent` return of `iterative_deepening`.
@@ -1096,6 +1113,10 @@ impl<N: NetworkParams> QSearch<N> {
             evals: 0,
             #[cfg(feature = "verbose1")]
             eval_tt_hits: 0,
+            #[cfg(feature = "dupstats")]
+            dup: crate::dupstats::DupCounts::ZERO,
+            #[cfg(feature = "dupstats")]
+            dup_worker: 0,
             sel_depth: 0,
             nmp_min_ply: 0,
             pv_node: false,
@@ -1324,6 +1345,10 @@ impl<N: NetworkParams> QSearch<N> {
     pub fn set_best_move_tally(&mut self, slots: &'static [TallySlot], index: usize) {
         self.best_move_tally = Some(&slots[index..]);
         self.main_tally = index == 0;
+        #[cfg(feature = "dupstats")]
+        {
+            self.dup_worker = index.min(u8::MAX as usize) as u8;
+        }
     }
 
     /// Install the raw `MultiPV` option value for this `go`. Every worker gets
@@ -1751,6 +1776,87 @@ impl<N: NetworkParams> QSearch<N> {
     #[inline]
     fn count_eval_dup(&mut self, slot: TtSlot, key: u64) {
         self.eval_dups += u64::from(TranspositionTable::shared().holds_eval_at(slot, key));
+    }
+
+    /// Who this worker is, as the duplication statistics' writer table records
+    /// a store.
+    #[cfg(feature = "dupstats")]
+    fn dup_writer_id(&self) -> crate::dupstats::WriterId {
+        crate::dupstats::WriterId {
+            generation: TranspositionTable::shared().generation(),
+            worker: self.dup_worker,
+            iteration: self.root_depth.clamp(0, u8::MAX as i32) as u8,
+        }
+    }
+
+    /// Enter the node at `ply` (stack index `s`) whose position `key` names, at
+    /// remaining depth `depth`: push its path frame, take its place in the
+    /// presence table when it is deep enough, and count what that found. The two
+    /// holds are released when the returned guards drop — on whichever return
+    /// leaves the node.
+    #[cfg(feature = "dupstats")]
+    fn dup_enter(
+        &mut self,
+        key: u64,
+        depth: i32,
+        ply: i32,
+        pv_node: bool,
+        cut_node: bool,
+        s: usize,
+    ) -> (
+        crate::dupstats::Where,
+        crate::dupstats::PathFrame,
+        Option<crate::dupstats::PresenceHold>,
+    ) {
+        use crate::dupstats::{
+            PRESENCE_MIN_DEPTH, PresenceKind, Where, enter_path, enter_presence,
+        };
+        let at = Where::new(depth, ply, pv_node, cut_node, self.stack[s - 1].move_count);
+        let frame = enter_path(self.nodes);
+        let hold = (depth >= PRESENCE_MIN_DEPTH).then(|| {
+            let (seen, hold) = enter_presence(key, self.dup_worker, depth);
+            self.dup.count_presence(PresenceKind::Entered, at);
+            if let Some(kind) = seen.kind() {
+                self.dup.count_presence(kind, at);
+            }
+            hold
+        });
+        (at, frame, hold)
+    }
+
+    /// Classify the store of depth `depth` about to end the node in `at`, whose
+    /// probe found its position when `probe_hit`, by what `slot` holds, and
+    /// credit the node's subtree when another worker had already stored this
+    /// position at least as deep. Returns the table-update count before the
+    /// store, for [`Self::dup_stored`].
+    #[cfg(feature = "dupstats")]
+    fn dup_store(
+        &mut self,
+        slot: TtSlot,
+        key: u64,
+        depth: i32,
+        probe_hit: bool,
+        at: crate::dupstats::Where,
+    ) -> u64 {
+        use crate::dupstats::{StoreKind, Writer, classify, credit_subtree, writer_of};
+        let found = TranspositionTable::shared().depth_at(slot, key);
+        let previous = found.and_then(|_| writer_of(key));
+        let kind = classify(found, depth, probe_hit, previous, self.dup_writer_id());
+        self.dup.count_store(kind, at);
+        if kind == StoreKind::AlreadyThere(Writer::OtherWorker) {
+            self.dup.dup_nodes += credit_subtree(self.nodes);
+        }
+        self.tt_updates
+    }
+
+    /// After a store [`Self::dup_store`] classified: when it wrote the entry,
+    /// record this worker as the entry's writer.
+    #[cfg(feature = "dupstats")]
+    fn dup_stored(&mut self, key: u64, updates_before: u64) {
+        if self.tt_updates != updates_before {
+            let replaced = crate::dupstats::set_writer(key, self.dup_writer_id());
+            self.dup.writer_replaced += u64::from(replaced);
+        }
     }
 
     /// Hand back the marks of the value a sub-search just returned, restoring
@@ -2296,6 +2402,11 @@ impl<N: NetworkParams> QSearch<N> {
             self.evals = 0;
             self.eval_tt_hits = 0;
         }
+        #[cfg(feature = "dupstats")]
+        {
+            self.dup = crate::dupstats::DupCounts::ZERO;
+            crate::dupstats::clear_path();
+        }
         self.sel_depth = 0;
         self.last_iteration_pv.clear();
         // Fresh abort state for this `go`; the counter is seeded so the first
@@ -2646,6 +2757,14 @@ impl<N: NetworkParams> QSearch<N> {
             evals: self.evals,
             #[cfg(feature = "verbose1")]
             eval_tt_hits: self.eval_tt_hits,
+            #[cfg(feature = "dupstats")]
+            dup: Box::new(self.dup),
+            #[cfg(feature = "dupstats")]
+            stopped_on: if self.stopped {
+                self.stack[Self::si(0)].current_move
+            } else {
+                None
+            },
             #[cfg(feature = "verbose2")]
             uci_pv_sent,
             #[cfg(feature = "verbose2")]
@@ -3401,6 +3520,12 @@ impl<N: NetworkParams> QSearch<N> {
             return tt_value;
         }
 
+        // From here on the node searches. Held to its end: dropping them
+        // leaves its place on the path and in the presence table.
+        #[cfg(feature = "dupstats")]
+        let (dup_at, _dup_frame, _dup_presence) =
+            self.dup_enter(pos_key, depth, ply, pv_node, cut_node, s);
+
         // Step 5. Mate-in-1 and declaration win.
         let mut unadjusted_static_eval = VALUE_NONE;
         if !root_node
@@ -3411,6 +3536,14 @@ impl<N: NetworkParams> QSearch<N> {
             && let Some(mate_move) = pos.mate_1ply()
         {
             best_value = self.mate_for(us, ply + 1);
+            #[cfg(feature = "dupstats")]
+            let dup_updates = self.dup_store(
+                tt_slot,
+                pos_key,
+                (MAX_PLY - 1).min(depth + 6),
+                tt_hit,
+                dup_at,
+            );
             self.tt_store(
                 tt_slot,
                 pos_key,
@@ -3421,6 +3554,8 @@ impl<N: NetworkParams> QSearch<N> {
                 move16_of(Some(mate_move)),
                 unadjusted_static_eval,
             );
+            #[cfg(feature = "dupstats")]
+            self.dup_stored(pos_key, dup_updates);
             return best_value;
         }
         if (tt_move.is_none() || pv_node) && declaration_win(pos, &self.entering_king).is_some() {
@@ -3710,6 +3845,9 @@ impl<N: NetworkParams> QSearch<N> {
                         // marks.
                         #[cfg(feature = "verbose3")]
                         self.marks.merge(child_marks);
+                        #[cfg(feature = "dupstats")]
+                        let dup_updates =
+                            self.dup_store(tt_slot, pos_key, prob_cut_depth + 1, tt_hit, dup_at);
                         self.tt_store(
                             tt_slot,
                             pos_key,
@@ -3720,6 +3858,8 @@ impl<N: NetworkParams> QSearch<N> {
                             move16_of(Some(mv)),
                             unadjusted_static_eval,
                         );
+                        #[cfg(feature = "dupstats")]
+                        self.dup_stored(pos_key, dup_updates);
                         if !is_decisive(value) {
                             return value - (prob_cut_beta - beta);
                         }
@@ -4391,6 +4531,8 @@ impl<N: NetworkParams> QSearch<N> {
             } else {
                 (MAX_PLY - 1).min(depth + 6)
             };
+            #[cfg(feature = "dupstats")]
+            let dup_updates = self.dup_store(tt_slot, pos_key, store_depth, tt_hit, dup_at);
             self.tt_store(
                 tt_slot,
                 pos_key,
@@ -4401,6 +4543,8 @@ impl<N: NetworkParams> QSearch<N> {
                 move16_of(best_move),
                 unadjusted_static_eval,
             );
+            #[cfg(feature = "dupstats")]
+            self.dup_stored(pos_key, dup_updates);
         }
 
         // The clamp bound is `CORRECTION_HISTORY_LIMIT / 4`.

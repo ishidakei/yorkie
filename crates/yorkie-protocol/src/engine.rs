@@ -3626,6 +3626,8 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     // Every worker's counts go to the interval the reply below ends.
     #[cfg(feature = "verbose1")]
     crate::stats::add_search(&results);
+    #[cfg(feature = "dupstats")]
+    crate::stats::add_spread(&results);
 
     // Aggregated node count for the `info` line and for `bench` — every worker's
     // exact final count (the reference `threads.nodes_searched()`). Both readers

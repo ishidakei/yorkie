@@ -219,6 +219,49 @@ fn the_summary_is_followed_by_the_runs_statistics() {
     );
 }
 
+/// A `dupstats` build follows the run's statistics line with the histograms of
+/// its duplication counts: the bucket labels, one line per store and presence
+/// outcome, and the workers' spread, one search per position.
+#[cfg(feature = "dupstats")]
+#[cfg_attr(miri, ignore)]
+#[test]
+fn the_runs_statistics_are_followed_by_the_duplication_histograms() {
+    let _session = common::serial_session();
+    let out = bench_session("bench 16 2 3 default depth");
+    let lines: Vec<&str> = out.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.contains("bench: positions="))
+        .unwrap_or_else(|| panic!("no bench summary line in:\n{out}"));
+    let stats = lines[at + 1]
+        .strip_prefix("info string stats ")
+        .unwrap_or_else(|| panic!("a statistics line must follow the summary in:\n{out}"));
+    let count = |key: &str| -> u64 {
+        stats
+            .split(' ')
+            .find_map(|item| item.strip_prefix(key)?.strip_prefix('='))
+            .map_or(0, |n| n.parse().expect("an integer"))
+    };
+    let positions = bench_summary_positions(&out);
+    assert_eq!(count("sp_searches"), positions, "{stats:?}");
+    assert!(count("st_new") > 0, "{stats:?}");
+    assert!(count("pr_enter") > 0, "{stats:?}");
+
+    let hist: Vec<&str> = lines[at + 2..]
+        .iter()
+        .map_while(|l| l.strip_prefix("info string duphist "))
+        .collect();
+    assert_eq!(hist.len(), 1 + 12 + 5 + 1, "in:\n{out}");
+    assert!(hist[0].starts_with("buckets depth="), "{:?}", hist[0]);
+    assert!(hist[1].starts_with("st_new depth="), "{:?}", hist[1]);
+    assert!(hist[18].starts_with("spread behind="), "{:?}", hist[18]);
+    let behind: u64 = hist[18]["spread behind=".len()..]
+        .split(',')
+        .map(|n| n.parse::<u64>().expect("an integer"))
+        .sum();
+    assert_eq!(behind, count("sp_workers"), "every worker is in the spread");
+}
+
 // A threads=2 bench completes and reports a summary (no determinism).
 
 #[cfg_attr(miri, ignore)]

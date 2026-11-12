@@ -14,6 +14,9 @@ use yorkie_state::{Move, Position};
 
 pub mod book;
 mod config;
+// How parallel workers repeat each other's work: only a build that measures it.
+#[cfg(feature = "dupstats")]
+pub mod dupstats;
 pub mod history;
 pub mod movepick;
 pub mod params;

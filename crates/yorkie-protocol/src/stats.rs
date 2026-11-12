@@ -21,9 +21,13 @@
 //! longest line it can produce and handed to the writer as those bytes, so
 //! nothing on this path reaches the heap.
 
+#[cfg(feature = "dupstats")]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use yorkie_search::WorkerResult;
+#[cfg(feature = "dupstats")]
+use yorkie_search::dupstats::{DupCounts, PRESENCE_KEYS, PresenceKind, STORE_KEYS, StoreKind};
 use yorkie_state::TextWriter;
 #[cfg(feature = "verbose3")]
 use yorkie_storage::ValueMarks;
@@ -58,20 +62,65 @@ const COUNT_ITEMS_MAX: usize = COUNT_KEYS[0].len()
 #[cfg(feature = "verbose3")]
 const MARK_ITEMS: [&[u8]; 3] = [b" pathdep=1", b" declrule=1", b" movelimit=1"];
 
-/// The longest line [`render`] can produce: the prefix, then every item at its
-/// widest.
-#[cfg(not(feature = "verbose3"))]
-const MAX_LINE: usize = PREFIX.len() + COUNT_ITEMS_MAX;
+/// The duplication items' keys after the store-outcome and presence ones, in
+/// the order they are written.
+#[cfg(feature = "dupstats")]
+const DUP_TAIL_KEYS: [&str; 7] = [
+    "dup_nodes",
+    "wt_replaced",
+    "sp_searches",
+    "sp_workers",
+    "sp_behind",
+    "sp_stopped",
+    "sp_moves",
+];
 
-/// The longest line [`render`] can produce, with the three mark items of a
-/// `verbose3` build after the counted ones. Each is written only when its mark
-/// is set, so the widest line is the one that carries all three.
+/// How many duplication items there are.
+#[cfg(feature = "dupstats")]
+const DUP_ITEMS: usize = STORE_KEYS.len() + PRESENCE_KEYS.len() + DUP_TAIL_KEYS.len();
+
+/// The total length of `keys`, each with the ` ` before it and the `=` after.
+#[cfg(feature = "dupstats")]
+const fn keys_len(keys: &[&str]) -> usize {
+    let mut len = 0;
+    let mut i = 0;
+    while i < keys.len() {
+        len += keys[i].len() + 2;
+        i += 1;
+    }
+    len
+}
+
+/// The duplication items at their widest: every key with a 20-digit value.
+#[cfg(feature = "dupstats")]
+const DUP_ITEMS_MAX: usize = keys_len(&STORE_KEYS)
+    + keys_len(&PRESENCE_KEYS)
+    + keys_len(&DUP_TAIL_KEYS)
+    + DUP_ITEMS * U64_DIGITS;
+
+/// The longest line [`render`] can produce without the duplication items: the
+/// prefix, then every item at its widest.
+#[cfg(not(feature = "verbose3"))]
+const LINE_MAX: usize = PREFIX.len() + COUNT_ITEMS_MAX;
+
+/// The longest line [`render`] can produce without the duplication items, with
+/// the three mark items of a `verbose3` build after the counted ones. Each is
+/// written only when its mark is set, so the widest line is the one that carries
+/// all three.
 #[cfg(feature = "verbose3")]
-const MAX_LINE: usize = PREFIX.len()
+const LINE_MAX: usize = PREFIX.len()
     + COUNT_ITEMS_MAX
     + MARK_ITEMS[0].len()
     + MARK_ITEMS[1].len()
     + MARK_ITEMS[2].len();
+
+/// The longest line [`render`] can produce.
+#[cfg(not(feature = "dupstats"))]
+const MAX_LINE: usize = LINE_MAX;
+
+/// The longest line [`render`] can produce, the duplication items included.
+#[cfg(feature = "dupstats")]
+const MAX_LINE: usize = LINE_MAX + DUP_ITEMS_MAX;
 
 /// What the searches of one interval did, summed over every thread that
 /// searched in it.
@@ -97,6 +146,88 @@ pub(crate) struct SearchCounts {
     pub(crate) eval_dup: u64,
     pub(crate) evals: u64,
     pub(crate) eval_tt_hits: u64,
+    /// How the workers repeated each other's work, summed over every worker.
+    #[cfg(feature = "dupstats")]
+    pub(crate) dup: DupCounts,
+    /// How the workers of each search were spread when it ended.
+    #[cfg(feature = "dupstats")]
+    pub(crate) spread: Spread,
+}
+
+/// How the workers of the searches of an interval were spread when each search
+/// ended, summed over those searches. A search that thinks ahead past the reply
+/// is not among them: its workers are collected one at a time.
+#[cfg(feature = "dupstats")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Spread {
+    /// The searches.
+    pub(crate) searches: u64,
+    /// Their workers.
+    pub(crate) workers: u64,
+    /// Over every worker, how many root iterations its completed depth was
+    /// behind the deepest worker of its search.
+    pub(crate) behind: u64,
+    /// The workers by that distance: 0, 1, 2, 3 or more.
+    pub(crate) behind_hist: [u64; 4],
+    /// The workers that were inside an iteration when the search was stopped.
+    pub(crate) stopped: u64,
+    /// Over every search, the number of distinct root moves its stopped workers
+    /// were searching.
+    pub(crate) root_moves: u64,
+}
+
+#[cfg(feature = "dupstats")]
+impl Spread {
+    /// The spread of one search's `results`.
+    pub(crate) fn of(results: &[WorkerResult]) -> Self {
+        let deepest = results.iter().map(|r| r.completed_depth).max().unwrap_or(0);
+        let mut spread = Self {
+            searches: u64::from(!results.is_empty()),
+            workers: results.len() as u64,
+            ..Self::default()
+        };
+        for (i, r) in results.iter().enumerate() {
+            let behind = (deepest - r.completed_depth).max(0) as u64;
+            spread.behind += behind;
+            spread.behind_hist[behind.min(3) as usize] += 1;
+            if let Some(mv) = r.stopped_on {
+                spread.stopped += 1;
+                let seen = results[..i].iter().any(|o| o.stopped_on == Some(mv));
+                spread.root_moves += u64::from(!seen);
+            }
+        }
+        spread
+    }
+
+    fn add(&mut self, other: &Self) {
+        self.searches += other.searches;
+        self.workers += other.workers;
+        self.behind += other.behind;
+        for (mine, theirs) in self.behind_hist.iter_mut().zip(other.behind_hist) {
+            *mine += theirs;
+        }
+        self.stopped += other.stopped;
+        self.root_moves += other.root_moves;
+    }
+
+    /// The items the statistics line writes after the duplication counts, in
+    /// [`DUP_TAIL_KEYS`] order from `sp_searches` on.
+    fn items(&self) -> [u64; 5] {
+        [
+            self.searches,
+            self.workers,
+            self.behind,
+            self.stopped,
+            self.root_moves,
+        ]
+    }
+}
+
+/// The duplication counts and the spread of an interval, as they stand.
+#[cfg(feature = "dupstats")]
+struct DupTally {
+    dup: DupCounts,
+    spread: Spread,
 }
 
 /// [`SearchCounts`] as they stand, one sum per item.
@@ -106,6 +237,10 @@ struct Tally {
     eval_dups: AtomicU64,
     evals: AtomicU64,
     eval_tt_hits: AtomicU64,
+    /// Too many counts for one atomic each, and added once per worker per
+    /// search, so a lock costs nothing that matters.
+    #[cfg(feature = "dupstats")]
+    dup: Mutex<DupTally>,
 }
 
 impl Tally {
@@ -116,6 +251,18 @@ impl Tally {
             eval_dups: AtomicU64::new(0),
             evals: AtomicU64::new(0),
             eval_tt_hits: AtomicU64::new(0),
+            #[cfg(feature = "dupstats")]
+            dup: Mutex::new(DupTally {
+                dup: DupCounts::ZERO,
+                spread: Spread {
+                    searches: 0,
+                    workers: 0,
+                    behind: 0,
+                    behind_hist: [0; 4],
+                    stopped: 0,
+                    root_moves: 0,
+                },
+            }),
         }
     }
 
@@ -126,15 +273,39 @@ impl Tally {
         self.evals.fetch_add(r.evals, Ordering::Relaxed);
         self.eval_tt_hits
             .fetch_add(r.eval_tt_hits, Ordering::Relaxed);
+        #[cfg(feature = "dupstats")]
+        self.dup_tally().dup.add(&r.dup);
+    }
+
+    #[cfg(feature = "dupstats")]
+    fn dup_tally(&self) -> std::sync::MutexGuard<'_, DupTally> {
+        self.dup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[cfg(feature = "dupstats")]
+    fn add_spread(&self, spread: &Spread) {
+        self.dup_tally().spread.add(spread);
     }
 
     fn take(&self) -> SearchCounts {
+        #[cfg(feature = "dupstats")]
+        let (dup, spread) = {
+            let mut tally = self.dup_tally();
+            let dup = std::mem::take(&mut tally.dup);
+            (dup, std::mem::take(&mut tally.spread))
+        };
         SearchCounts {
             nodes: self.nodes.swap(0, Ordering::Relaxed),
             tt_update: self.tt_updates.swap(0, Ordering::Relaxed),
             eval_dup: self.eval_dups.swap(0, Ordering::Relaxed),
             evals: self.evals.swap(0, Ordering::Relaxed),
             eval_tt_hits: self.eval_tt_hits.swap(0, Ordering::Relaxed),
+            #[cfg(feature = "dupstats")]
+            dup,
+            #[cfg(feature = "dupstats")]
+            spread,
         }
     }
 
@@ -158,6 +329,16 @@ pub(crate) fn add_search<'a>(results: impl IntoIterator<Item = &'a WorkerResult>
         #[cfg(feature = "verbose3")]
         BENCH_RUN.add(r);
     }
+}
+
+/// Add how the workers of one finished search were spread — `results` holds
+/// every one of its workers — to the interval's tally.
+#[cfg(feature = "dupstats")]
+pub(crate) fn add_spread(results: &[WorkerResult]) {
+    let spread = Spread::of(results);
+    INTERVAL.add_spread(&spread);
+    #[cfg(feature = "verbose3")]
+    BENCH_RUN.add_spread(&spread);
 }
 
 /// Read the interval's tally and reset it to zero, so what is returned covers
@@ -232,6 +413,13 @@ pub(crate) fn render(
             carried = true;
         }
     }
+    #[cfg(feature = "dupstats")]
+    for (key, value) in dup_items(&search) {
+        if value != 0 {
+            out.byte(b' ').bytes(key.as_bytes()).byte(b'=').u64(value);
+            carried = true;
+        }
+    }
     #[cfg(feature = "verbose3")]
     for (item, set) in MARK_ITEMS
         .iter()
@@ -245,6 +433,87 @@ pub(crate) fn render(
     debug_assert!(!out.overflowed(), "the widest line fits MAX_LINE");
     let len = out.len();
     carried.then_some(&buf.bytes[..len])
+}
+
+/// The duplication items of `search`, `(key, value)` in the order the line
+/// writes them: each store outcome's and presence outcome's total, then
+/// [`DUP_TAIL_KEYS`].
+#[cfg(feature = "dupstats")]
+fn dup_items(search: &SearchCounts) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+    let stores = StoreKind::ALL.map(|kind| search.dup.stores_of(kind));
+    let presence = PresenceKind::ALL.map(|kind| search.dup.presence_of(kind));
+    let tail = [search.dup.dup_nodes, search.dup.writer_replaced]
+        .into_iter()
+        .chain(search.spread.items());
+    STORE_KEYS
+        .into_iter()
+        .zip(stores)
+        .chain(PRESENCE_KEYS.into_iter().zip(presence))
+        .chain(DUP_TAIL_KEYS.into_iter().zip(tail))
+}
+
+/// The widest histogram line: the `duphist ` lead and a key, then each
+/// dimension's name and its buckets as 20-digit values.
+#[cfg(all(feature = "dupstats", feature = "verbose3"))]
+const HIST_LINE: usize = 1024;
+
+/// Hand `emit` the body of each histogram line of `search`: first the bucket
+/// labels of every dimension (`duphist buckets depth=1-2,3-5,… ply=…`), then
+/// one line per store outcome and presence outcome, with that count broken down
+/// over each dimension (`duphist <key> depth=<n>,<n>,… ply=…`), and last the
+/// workers' spread (`duphist spread behind=<0>,<1>,<2>,<3+>`). A body is what
+/// follows `info string `.
+#[cfg(all(feature = "dupstats", feature = "verbose3"))]
+pub(crate) fn histogram_lines<E>(
+    search: &SearchCounts,
+    mut emit: impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<(), E> {
+    use yorkie_search::dupstats::{BUCKET_NAMES, DIM_NAMES};
+
+    let mut bytes = [0u8; HIST_LINE];
+    let mut out = TextWriter::new(&mut bytes);
+    out.bytes(b"duphist buckets");
+    for (name, labels) in DIM_NAMES.iter().zip(BUCKET_NAMES) {
+        out.byte(b' ').bytes(name.as_bytes()).byte(b'=');
+        for (i, label) in labels.iter().enumerate() {
+            if i != 0 {
+                out.byte(b',');
+            }
+            out.bytes(label.as_bytes());
+        }
+    }
+    debug_assert!(!out.overflowed(), "the widest line fits HIST_LINE");
+    emit(out.as_bytes())?;
+
+    let hists = STORE_KEYS
+        .iter()
+        .zip(&search.dup.stores)
+        .chain(PRESENCE_KEYS.iter().zip(&search.dup.presence));
+    for (key, hist) in hists {
+        out.clear();
+        out.bytes(b"duphist ").bytes(key.as_bytes());
+        for ((name, labels), row) in DIM_NAMES.iter().zip(BUCKET_NAMES).zip(hist) {
+            out.byte(b' ').bytes(name.as_bytes()).byte(b'=');
+            for (i, n) in row[..labels.len()].iter().enumerate() {
+                if i != 0 {
+                    out.byte(b',');
+                }
+                out.u64(*n);
+            }
+        }
+        debug_assert!(!out.overflowed(), "the widest line fits HIST_LINE");
+        emit(out.as_bytes())?;
+    }
+
+    out.clear();
+    out.bytes(b"duphist spread behind=");
+    for (i, n) in search.spread.behind_hist.iter().enumerate() {
+        if i != 0 {
+            out.byte(b',');
+        }
+        out.u64(*n);
+    }
+    emit(out.as_bytes())
 }
 
 #[cfg(test)]
@@ -292,6 +561,10 @@ mod tests {
             eval_dup: value,
             evals: value,
             eval_tt_hits: value,
+            #[cfg(feature = "dupstats")]
+            dup: DupCounts::ZERO,
+            #[cfg(feature = "dupstats")]
+            spread: Spread::default(),
         }
     }
 
@@ -372,7 +645,7 @@ mod tests {
         assert_eq!(counted(&mut buf, 0, evaluated(0, 0)), None);
     }
 
-    #[cfg(not(feature = "verbose3"))]
+    #[cfg(not(any(feature = "verbose3", feature = "dupstats")))]
     #[test]
     fn the_widest_line_fits_the_buffer() {
         let mut buf = StatsBuf::new();
@@ -498,6 +771,7 @@ mod tests {
             );
         }
 
+        #[cfg(not(feature = "dupstats"))]
         #[test]
         fn the_widest_line_fits_the_buffer() {
             let mut buf = StatsBuf::new();
@@ -511,6 +785,168 @@ mod tests {
                    pathdep=1 declrule=1 movelimit=1"[..]
             );
             assert_eq!(line.len(), MAX_LINE);
+        }
+    }
+
+    /// The items a `dupstats` build adds: how the workers repeated each other's
+    /// work, and how they were spread when each search ended.
+    #[cfg(feature = "dupstats")]
+    mod duplication {
+        use super::*;
+        use yorkie_search::dupstats::{Where, Writer};
+
+        fn render_plain(buf: &mut StatsBuf, search: SearchCounts) -> Option<&[u8]> {
+            render(
+                buf,
+                0,
+                search,
+                #[cfg(feature = "verbose3")]
+                ValueMarks::NONE,
+            )
+        }
+
+        #[test]
+        fn the_items_follow_the_counted_ones_and_zero_ones_are_omitted() {
+            let mut dup = DupCounts::ZERO;
+            let at = Where::new(4, 2, false, true, 1);
+            dup.count_store(StoreKind::New, at);
+            dup.count_store(StoreKind::New, at);
+            dup.count_store(StoreKind::AlreadyThere(Writer::OtherWorker), at);
+            dup.count_presence(PresenceKind::Entered, at);
+            dup.dup_nodes = 40;
+            let search = SearchCounts {
+                dup,
+                spread: Spread {
+                    searches: 1,
+                    workers: 2,
+                    behind: 1,
+                    behind_hist: [1, 1, 0, 0],
+                    stopped: 1,
+                    root_moves: 1,
+                },
+                ..search(100, 0, 0)
+            };
+            let mut buf = StatsBuf::new();
+            assert_eq!(
+                render_plain(&mut buf, search),
+                Some(
+                    &b"info string stats nodes=100 st_new=2 st_there_other=1 pr_enter=1 \
+                       dup_nodes=40 sp_searches=1 sp_workers=2 sp_behind=1 sp_stopped=1 \
+                       sp_moves=1"[..]
+                )
+            );
+        }
+
+        #[test]
+        fn the_widest_line_fits_the_buffer() {
+            let mut dup = DupCounts::ZERO;
+            for hist in dup.stores.iter_mut().chain(dup.presence.iter_mut()) {
+                hist[0][0] = u64::MAX;
+            }
+            dup.dup_nodes = u64::MAX;
+            dup.writer_replaced = u64::MAX;
+            let spread = Spread {
+                searches: u64::MAX,
+                workers: u64::MAX,
+                behind: u64::MAX,
+                behind_hist: [0; 4],
+                stopped: u64::MAX,
+                root_moves: u64::MAX,
+            };
+            let search = SearchCounts {
+                dup,
+                spread,
+                ..all(u64::MAX)
+            };
+            let mut buf = StatsBuf::new();
+            #[cfg(feature = "verbose3")]
+            let marks = ValueMarks {
+                path_dep: true,
+                decl_rule: true,
+                move_limit: true,
+            };
+            let line = render(
+                &mut buf,
+                u64::MAX,
+                search,
+                #[cfg(feature = "verbose3")]
+                marks,
+            )
+            .expect("a non-zero count is reported");
+            assert_eq!(line.len(), MAX_LINE);
+        }
+
+        /// The spread of one search: how far behind the deepest worker each one
+        /// stopped, and how many distinct root moves the stopped ones were on.
+        #[test]
+        fn the_spread_of_a_search_counts_depths_behind_and_distinct_moves() {
+            use yorkie_search::{RootMove, generate_root_moves};
+            let pos = yorkie_state::Position::startpos();
+            let moves: Vec<RootMove> = generate_root_moves(&pos);
+            let worker = |depth: i32, on: Option<usize>| WorkerResult {
+                best: moves[0].clone(),
+                completed_depth: depth,
+                nodes: 0,
+                tt_updates: 0,
+                eval_dups: 0,
+                evals: 0,
+                eval_tt_hits: 0,
+                dup: Box::new(DupCounts::ZERO),
+                stopped_on: on.map(|i| moves[i].mv),
+                #[cfg(feature = "verbose2")]
+                uci_pv_sent: false,
+                #[cfg(feature = "verbose2")]
+                pv_lines: Vec::new(),
+                time_reduction: 1.0,
+            };
+            let results = [
+                worker(12, None),
+                worker(11, Some(0)),
+                worker(12, Some(0)),
+                worker(9, Some(3)),
+            ];
+            assert_eq!(
+                Spread::of(&results),
+                Spread {
+                    searches: 1,
+                    workers: 4,
+                    behind: 4,
+                    behind_hist: [2, 1, 0, 1],
+                    stopped: 3,
+                    root_moves: 2,
+                }
+            );
+            assert_eq!(Spread::of(&[]), Spread::default());
+        }
+
+        #[test]
+        fn the_histogram_lines_carry_every_outcome_and_the_spread() {
+            #[cfg(feature = "verbose3")]
+            {
+                let mut dup = DupCounts::ZERO;
+                dup.count_store(StoreKind::New, Where::new(4, 2, false, true, 1));
+                let search = SearchCounts {
+                    dup,
+                    ..SearchCounts::default()
+                };
+                let mut lines: Vec<String> = Vec::new();
+                histogram_lines::<()>(&search, |l| {
+                    lines.push(String::from_utf8(l.to_vec()).expect("text"));
+                    Ok(())
+                })
+                .expect("collected");
+                assert_eq!(lines.len(), 1 + STORE_KEYS.len() + PRESENCE_KEYS.len() + 1);
+                assert_eq!(
+                    lines[0],
+                    "duphist buckets depth=1-2,3-5,6-9,10+ ply=0-3,4-7,8-11,12-19,20+ \
+                     type=pv,cut,all move=none,1,2-4,5+"
+                );
+                assert_eq!(
+                    lines[1],
+                    "duphist st_new depth=0,1,0,0 ply=1,0,0,0,0 type=0,1,0 move=0,1,0,0"
+                );
+                assert_eq!(lines[lines.len() - 1], "duphist spread behind=0,0,0,0");
+            }
         }
     }
 }

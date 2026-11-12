@@ -54,11 +54,17 @@ libc = "0.2"
 #
 # They keep the implication chain of the Protocol layer, and all are off by
 # default. None changes anything else about the table.
+#
+# `dupstats` is the measuring feature that counts how parallel search workers
+# repeat each other's work. Here it adds one read: the depth an entry holds a
+# position at, which a store looks at before it writes. It implies `verbose1`
+# and is off by default.
 [features]
 tt-entry16 = []
 verbose1 = []
 verbose2 = ["verbose1"]
 verbose3 = ["verbose2"]
+dupstats = ["verbose1"]
 
 [lints]
 workspace = true

@@ -899,14 +899,14 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
         // this line sums the search counts over the run. It carries no `alloc`
         // item: the allocations stay reported per position, on those lines.
         let mut buf = StatsBuf::new();
-        if let Some(line) = crate::stats::render(
-            &mut buf,
-            0,
-            crate::stats::take_bench_counts(),
-            ValueMarks::NONE,
-        ) {
+        let counts = crate::stats::take_bench_counts();
+        if let Some(line) = crate::stats::render(&mut buf, 0, counts, ValueMarks::NONE) {
             Formatter::new(&mut *self.out.lock()).composed_line(line)?;
         }
+        // The full histograms behind the duplication items the line above
+        // totals, one line per count.
+        #[cfg(feature = "dupstats")]
+        crate::stats::histogram_lines(&counts, |body| self.out.info_string(body))?;
         Ok(())
     }
 

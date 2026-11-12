@@ -648,6 +648,16 @@ impl Cluster {
         let entry = &self.entry[slot];
         key_matches(entry.key.load(REL), k) && entry.eval16.load(REL) as Value != VALUE_NONE
     }
+
+    /// The depth `slot` holds the position `k` names at, or `None` when it
+    /// holds another position or nothing.
+    #[cfg(feature = "dupstats")]
+    #[inline]
+    fn depth_of(&self, slot: usize, k: TteKey) -> Option<Depth> {
+        let entry = &self.entry[slot];
+        let depth8 = entry.depth8.load(REL);
+        (depth8 != 0 && key_matches(entry.key.load(REL), k)).then_some(depth8 as Depth + DEPTH_NONE)
+    }
 }
 
 #[cfg(feature = "verbose3")]
@@ -1117,6 +1127,15 @@ impl TranspositionTable {
     #[inline]
     pub fn holds_eval_at(&self, slot: TtSlot, key: u64) -> bool {
         self.clusters[slot.cluster].holds_eval(slot.entry, tte_key(key))
+    }
+
+    /// The depth the entry [`Self::locate`] captured holds the position `key`
+    /// names at, or `None` when it holds another position or nothing — read
+    /// before a store into that entry, to tell what the store finds there.
+    #[cfg(feature = "dupstats")]
+    #[inline]
+    pub fn depth_at(&self, slot: TtSlot, key: u64) -> Option<Depth> {
+        self.clusters[slot.cluster].depth_of(slot.entry, tte_key(key))
     }
 }
 

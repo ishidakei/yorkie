@@ -57,6 +57,13 @@ yorkie-eval = { path = "../yorkie-eval", features = ["source-network"] }
 # from constants into statics written once at startup from a tuning list, so a
 # tuning run can vary them without a rebuild. A `tune` build given no list
 # searches exactly as the build without it. Off by default.
+#
+# `dupstats` is a measuring feature: it counts where and how much parallel
+# search workers repeat each other's work (the `dupstats` module), using two
+# statistics-only tables beside the transposition table. It changes no search
+# decision, but the tables cost memory traffic, so a build with it is slower
+# than one without and its timings are not comparable with theirs. It implies
+# `verbose1`, whose statistics line carries its totals. Off by default.
 [features]
 random = []
 tune = []
@@ -64,6 +71,7 @@ tt-entry16 = ["yorkie-storage/tt-entry16"]
 verbose1 = ["yorkie-storage/verbose1"]
 verbose2 = ["verbose1", "yorkie-storage/verbose2"]
 verbose3 = ["verbose2", "yorkie-storage/verbose3"]
+dupstats = ["verbose1", "yorkie-storage/dupstats"]
 
 [lints]
 workspace = true

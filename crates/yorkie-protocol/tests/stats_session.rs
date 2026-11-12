@@ -261,6 +261,52 @@ fn a_single_threaded_reply_counts_its_evaluations_and_no_duplicate() {
     assert!(!line.contains("eval_dup"), "{line:?} in:\n{out}");
 }
 
+/// A `dupstats` build's line also totals how the workers repeated each other's
+/// work. With one search thread every store finds its own work or none, and no
+/// node entry finds another worker inside its position, so every count that
+/// names another worker is zero and left off the line.
+#[cfg(feature = "dupstats")]
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_single_threaded_reply_counts_its_stores_and_no_other_worker() {
+    use yorkie_protocol::config;
+
+    assert_eq!(config::THREADS, 1, "this pins a single-threaded search");
+    let _session = common::serial_session();
+    stage_configured_eval_dir();
+    let out = drive(
+        "usi\n\
+         isready\n\
+         usinewgame\n\
+         position startpos moves 7g7f 3c3d\n\
+         go byoyomi 1000\n\
+         quit\n",
+    );
+    let line = out
+        .lines()
+        .find(|l| l.starts_with(STATS_PREFIX))
+        .unwrap_or_else(|| panic!("a statistics line must be in:\n{out}"));
+    for key in ["st_new", "pr_enter", "sp_searches", "sp_workers"] {
+        assert!(stats_count(line, key) > 0, "{key} in {line:?}");
+    }
+    assert_eq!(stats_count(line, "sp_searches"), 1, "{line:?}");
+    assert_eq!(stats_count(line, "sp_workers"), 1, "{line:?}");
+    for key in [
+        "st_deep_other",
+        "st_there_other",
+        "pr_deeper",
+        "pr_equal",
+        "pr_shallower",
+        "dup_nodes",
+        "sp_behind",
+    ] {
+        assert!(
+            !line.contains(&format!(" {key}=")),
+            "{key} must be zero in {line:?}"
+        );
+    }
+}
+
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_reply_that_starts_no_search_still_reports_its_interval() {
@@ -356,6 +402,16 @@ mod value_marks {
             .unwrap_or_else(|| panic!("{line:?} must be the statistics line in:\n{out}"))
     }
 
+    /// Whether `key` is one of the counts a `dupstats` build adds — how the
+    /// search workers repeated each other's work. No key is, in a build without
+    /// it.
+    fn is_dup_key(key: &str) -> bool {
+        cfg!(feature = "dupstats")
+            && (["st_", "pr_", "sp_"].iter().any(|p| key.starts_with(p))
+                || key == "dup_nodes"
+                || key == "wt_replaced")
+    }
+
     /// Whether the reply's statistics line carries each mark, in the order
     /// `pathdep`, `declrule`, `movelimit`.
     fn reply_marks(out: &str) -> [bool; 3] {
@@ -448,7 +504,7 @@ mod value_marks {
         assert!(
             items.iter().all(|item| item
                 .split_once('=')
-                .is_some_and(|(key, _)| COUNT_KEYS.contains(&key))),
+                .is_some_and(|(key, _)| COUNT_KEYS.contains(&key) || is_dup_key(key))),
             "and nothing but its counts, in:\n{out}"
         );
     }
