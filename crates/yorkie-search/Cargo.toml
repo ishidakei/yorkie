@@ -60,7 +60,10 @@ yorkie-eval = { path = "../yorkie-eval", features = ["source-network"] }
 #
 # `dupstats` is a measuring feature: it counts where and how much parallel
 # search workers repeat each other's work (the `dupstats` module), using two
-# statistics-only tables beside the transposition table. It changes no search
+# statistics-only tables beside the transposition table, and what each worker's
+# search does with the table and in its move loop: the shallower stores that
+# overwrite deeper entries, the table cutoffs, the singular extensions and where
+# a beta cutoff comes. It changes no search
 # decision, but the tables cost memory traffic, so a build with it is slower
 # than one without and its timings are not comparable with theirs. It also
 # keeps each worker's record of when it finished each root iteration (the

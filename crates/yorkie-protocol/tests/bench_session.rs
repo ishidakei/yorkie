@@ -220,8 +220,10 @@ fn the_summary_is_followed_by_the_runs_statistics() {
 }
 
 /// A `dupstats` build follows the run's statistics line with the histograms of
-/// its duplication counts: the bucket labels, one line per store and presence
-/// outcome, and the workers' spread, one search per position.
+/// its duplication counts: the bucket labels, one line per store outcome,
+/// presence outcome and event, and the workers' spread, one search per
+/// position. The table outcomes of the node entries add up to them, and the
+/// cutoff positions to the cutoffs.
 #[cfg(feature = "dupstats")]
 #[cfg_attr(miri, ignore)]
 #[test]
@@ -251,11 +253,42 @@ fn the_runs_statistics_are_followed_by_the_duplication_histograms() {
         .iter()
         .map_while(|l| l.strip_prefix("info string duphist "))
         .collect();
-    assert_eq!(hist.len(), 1 + 12 + 5 + 1, "in:\n{out}");
+    assert_eq!(hist.len(), 1 + 12 + 5 + 19 + 1, "in:\n{out}");
     assert!(hist[0].starts_with("buckets depth="), "{:?}", hist[0]);
+    assert!(hist[0].ends_with(" lost=1,2,3,4+"), "{:?}", hist[0]);
     assert!(hist[1].starts_with("st_new depth="), "{:?}", hist[1]);
-    assert!(hist[18].starts_with("spread behind="), "{:?}", hist[18]);
-    let behind: u64 = hist[18]["spread behind=".len()..]
+    assert!(
+        hist[18].starts_with("ow_shallow_self depth="),
+        "{:?}",
+        hist[18]
+    );
+    assert!(hist[18].contains(" lost="), "{:?}", hist[18]);
+    let last = hist.len() - 1;
+    assert!(hist[last].starts_with("spread behind="), "{:?}", hist[last]);
+
+    let tt = ["tt_cut", "tt_deep_nocut", "tt_shallow", "tt_miss"].map(count);
+    assert!(count("tt_miss") > 0, "{stats:?}");
+    // Every node entry deep enough is either cut off by the table or goes on
+    // into the presence table.
+    assert_eq!(
+        tt.iter().sum::<u64>(),
+        count("tt_cut") + count("pr_enter"),
+        "{stats:?}"
+    );
+    let cuts = ["cut_first", "cut_2to4", "cut_later"].map(count);
+    assert_eq!(cuts.iter().sum::<u64>(), count("cuts"), "{stats:?}");
+    assert!(count("cut_first_ttmove") <= count("cut_first"), "{stats:?}");
+    let se = [
+        "se_ext1",
+        "se_ext2plus",
+        "se_multicut",
+        "se_negative",
+        "se_none",
+    ]
+    .map(count);
+    assert_eq!(se.iter().sum::<u64>(), count("se_tried"), "{stats:?}");
+
+    let behind: u64 = hist[last]["spread behind=".len()..]
         .split(',')
         .map(|n| n.parse::<u64>().expect("an integer"))
         .sum();

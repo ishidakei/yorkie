@@ -889,6 +889,25 @@ pub struct QSearch<N: NetworkParams> {
     root_width: HeldWidth,
 }
 
+/// What a node's store found in the table entry and who stored, read before
+/// the store so it can be told afterwards what the store did to the entry.
+#[cfg(feature = "dupstats")]
+#[derive(Clone, Copy)]
+struct DupStore {
+    /// The worker's table-update count before the store: a store whose
+    /// replacement condition held raises it.
+    updates_before: u64,
+    /// The depth the entry held the node's position at, and whether the
+    /// running search wrote it; `None` for another position or nothing.
+    found: Option<(i32, bool)>,
+    /// Who last wrote the entry, when the side table still knows.
+    previous: Option<crate::dupstats::WriterId>,
+    /// The store's depth.
+    depth: i32,
+    /// The node's histogram buckets.
+    at: crate::dupstats::Where,
+}
+
 /// A [`RootWidth`] as the search holds it: three bytes of alignment one with no
 /// niche, which the compiler lays out after every other field, in the struct's
 /// tail. Any wider field, or one it sorts in among the four-byte ones, moves the
@@ -1920,29 +1939,21 @@ impl<N: NetworkParams> QSearch<N> {
         }
     }
 
-    /// Enter the node at `ply` (stack index `s`) whose position `key` names, at
-    /// remaining depth `depth`: push its path frame, take its place in the
-    /// presence table when it is deep enough, and count what that found. The two
-    /// holds are released when the returned guards drop — on whichever return
-    /// leaves the node.
+    /// Enter the node in `at`, at remaining depth `depth`, whose position `key`
+    /// names: push its path frame, take its place in the presence table when it
+    /// is deep enough, and count what that found. The two holds are released
+    /// when the returned guards drop — on whichever return leaves the node.
     #[cfg(feature = "dupstats")]
     fn dup_enter(
         &mut self,
         key: u64,
         depth: i32,
-        ply: i32,
-        pv_node: bool,
-        cut_node: bool,
-        s: usize,
+        at: crate::dupstats::Where,
     ) -> (
-        crate::dupstats::Where,
         crate::dupstats::PathFrame,
         Option<crate::dupstats::PresenceHold>,
     ) {
-        use crate::dupstats::{
-            PRESENCE_MIN_DEPTH, PresenceKind, Where, enter_path, enter_presence,
-        };
-        let at = Where::new(depth, ply, pv_node, cut_node, self.stack[s - 1].move_count);
+        use crate::dupstats::{PRESENCE_MIN_DEPTH, PresenceKind, enter_path, enter_presence};
         let frame = enter_path(self.nodes);
         let hold = (depth >= PRESENCE_MIN_DEPTH).then(|| {
             let (seen, hold) = enter_presence(key, self.dup_worker, depth);
@@ -1952,14 +1963,14 @@ impl<N: NetworkParams> QSearch<N> {
             }
             hold
         });
-        (at, frame, hold)
+        (frame, hold)
     }
 
     /// Classify the store of depth `depth` about to end the node in `at`, whose
     /// probe found its position when `probe_hit`, by what `slot` holds, and
     /// credit the node's subtree when another worker had already stored this
-    /// position at least as deep. Returns the table-update count before the
-    /// store, for [`Self::dup_stored`].
+    /// position at least as deep. Returns what [`Self::dup_stored`] needs to
+    /// tell, once the store is made, what it did to the entry.
     #[cfg(feature = "dupstats")]
     fn dup_store(
         &mut self,
@@ -1968,24 +1979,48 @@ impl<N: NetworkParams> QSearch<N> {
         depth: i32,
         probe_hit: bool,
         at: crate::dupstats::Where,
-    ) -> u64 {
+    ) -> DupStore {
         use crate::dupstats::{StoreKind, Writer, classify, credit_subtree, writer_of};
-        let found = TranspositionTable::shared().depth_at(slot, key);
+        let found = TranspositionTable::shared().depth_and_age_at(slot, key);
         let previous = found.and_then(|_| writer_of(key));
-        let kind = classify(found, depth, probe_hit, previous, self.dup_writer_id());
+        let kind = classify(
+            found.map(|(d, _)| d),
+            depth,
+            probe_hit,
+            previous,
+            self.dup_writer_id(),
+        );
         self.dup.count_store(kind, at);
         if kind == StoreKind::AlreadyThere(Writer::OtherWorker) {
             self.dup.dup_nodes += credit_subtree(self.nodes);
         }
-        self.tt_updates
+        DupStore {
+            updates_before: self.tt_updates,
+            found,
+            previous,
+            depth,
+            at,
+        }
     }
 
-    /// After a store [`Self::dup_store`] classified: when it wrote the entry,
-    /// record this worker as the entry's writer.
+    /// After a store [`Self::dup_store`] classified: count what it did to a
+    /// deeper entry of the running search, and when it wrote the entry, record
+    /// this worker as the entry's writer.
     #[cfg(feature = "dupstats")]
-    fn dup_stored(&mut self, key: u64, updates_before: u64) {
-        if self.tt_updates != updates_before {
-            let replaced = crate::dupstats::set_writer(key, self.dup_writer_id());
+    fn dup_stored(&mut self, key: u64, before: DupStore) {
+        let wrote = self.tt_updates != before.updates_before;
+        let me = self.dup_writer_id();
+        if let Some(overwrite) = crate::dupstats::classify_overwrite(
+            before.found,
+            before.depth,
+            wrote,
+            before.previous,
+            me,
+        ) {
+            self.dup.count_overwrite(overwrite, before.at);
+        }
+        if wrote {
+            let replaced = crate::dupstats::set_writer(key, me);
             self.dup.writer_replaced += u64::from(replaced);
         }
     }
@@ -3664,6 +3699,44 @@ impl<N: NetworkParams> QSearch<N> {
         let mut ttpv = self.stack[s].tt_pv;
         let tt_capture = tt_move.is_some_and(|m| Self::is_capture(pos, m));
 
+        // The node's buckets, and whether it is deep enough for the counts of
+        // what the table and the move loop did — taken here, before the table
+        // cutoff, so a node the cutoff ends is counted among the rest.
+        #[cfg(feature = "dupstats")]
+        let dup_at = crate::dupstats::Where::new(
+            depth,
+            ply,
+            pv_node,
+            cut_node,
+            self.stack[s - 1].move_count,
+        );
+        #[cfg(feature = "dupstats")]
+        let dup_deep = depth >= crate::dupstats::PRESENCE_MIN_DEPTH;
+        #[cfg(feature = "dupstats")]
+        if dup_deep {
+            use crate::dupstats::Event;
+            // The cutoff's condition below, split: whether the entry is deep
+            // enough, and whether everything else allows the cutoff. The
+            // condition itself is left as it is, so the playing builds' code is
+            // what it is without the counts.
+            let tt_deep = tt_data.depth > depth - (tt_value <= beta) as i32;
+            let tt_cut = !pv_node
+                && !excluded_move.is_some_and(Move::is_ok)
+                && tt_deep
+                && is_valid(tt_value)
+                && bound_matches(tt_data.bound, tt_value >= beta)
+                && (cut_node == (tt_value >= beta) || depth > 5);
+            let event = if tt_cut {
+                Event::TtCut
+            } else if !tt_hit {
+                Event::TtMiss
+            } else if tt_deep {
+                Event::TtDeepNoCut
+            } else {
+                Event::TtShallow
+            };
+            self.dup.count(event, dup_at);
+        }
         if !pv_node
             && !excluded_move.is_some_and(Move::is_ok)
             && tt_data.depth > depth - (tt_value <= beta) as i32
@@ -3715,8 +3788,7 @@ impl<N: NetworkParams> QSearch<N> {
         // From here on the node searches. Held to its end: dropping them
         // leaves its place on the path and in the presence table.
         #[cfg(feature = "dupstats")]
-        let (dup_at, _dup_frame, _dup_presence) =
-            self.dup_enter(pos_key, depth, ply, pv_node, cut_node, s);
+        let (_dup_frame, _dup_presence) = self.dup_enter(pos_key, depth, dup_at);
 
         // Step 5. Mate-in-1 and declaration win.
         let mut unadjusted_static_eval = VALUE_NONE;
@@ -4275,6 +4347,8 @@ impl<N: NetworkParams> QSearch<N> {
                         * depth
                         / 55;
                 let singular_depth = new_depth / 2;
+                #[cfg(feature = "dupstats")]
+                self.dup.count(crate::dupstats::Event::SeTried, dup_at);
 
                 // Re-enter on the *same* node with `move` excluded. Any `ss`
                 // field the inner search overwrites is intentionally shared,
@@ -4349,11 +4423,26 @@ impl<N: NetworkParams> QSearch<N> {
                         .update((-424 - 107 * depth).max(-3375));
                     #[cfg(feature = "verbose3")]
                     self.marks.merge(singular_marks);
+                    #[cfg(feature = "dupstats")]
+                    self.dup.count(crate::dupstats::Event::SeMulticut, dup_at);
                     return s_value;
                 } else if tt_value >= beta {
                     extension = -3;
                 } else if cut_node {
                     extension = -2;
+                }
+                // Every branch but the multi-cut's leaves its outcome in
+                // `extension`, which is 0 until this block sets it.
+                #[cfg(feature = "dupstats")]
+                {
+                    use crate::dupstats::Event;
+                    let event = match extension {
+                        1 => Event::SeExt1,
+                        2.. => Event::SeExt2Plus,
+                        0 => Event::SeNone,
+                        _ => Event::SeNegative,
+                    };
+                    self.dup.count(event, dup_at);
                 }
             }
 
@@ -4703,6 +4792,19 @@ impl<N: NetworkParams> QSearch<N> {
                     }
                     if value >= beta {
                         self.stack[s].cutoff_cnt += ((extension < 2) || pv_node) as i32;
+                        #[cfg(feature = "dupstats")]
+                        if dup_deep {
+                            use crate::dupstats::Event;
+                            let event = match move_count {
+                                ..=1 => Event::CutFirst,
+                                2..=4 => Event::Cut2To4,
+                                _ => Event::CutLater,
+                            };
+                            self.dup.count(event, dup_at);
+                            if event == Event::CutFirst && Some(mv) == tt_move {
+                                self.dup.count(Event::CutFirstTtMove, dup_at);
+                            }
+                        }
                         break;
                     }
                     if depth > 2 && depth < 14 && !is_decisive(value) {
@@ -4734,6 +4836,13 @@ impl<N: NetworkParams> QSearch<N> {
         if audit_singular {
             self.singular_audit.nodes += 1;
             self.singular_audit.repeats += audit_repeats;
+        }
+
+        // Counted apart from the cutoff itself, by the value the loop ended
+        // with, so the two can be checked against each other.
+        #[cfg(feature = "dupstats")]
+        if dup_deep && move_count != 0 && best_value >= beta {
+            self.dup.count(crate::dupstats::Event::Cuts, dup_at);
         }
 
         // Step 21-23. Mate check, stat updates, TT write.

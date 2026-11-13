@@ -4,7 +4,8 @@
 //!
 //! Every worker of a parallel search shares one transposition table and nothing
 //! else, so two workers can search the same subtree, one after the other or both
-//! at once. Three kinds of count say where and how much:
+//! at once. Three kinds of count say where and how much, and a fourth what
+//! the sharing does to each worker's search:
 //!
 //! - **Store outcomes.** At each store that ends a node, what the table entry
 //!   held before it: another position or nothing, or only what the node itself
@@ -25,9 +26,14 @@
 //!   there and written by another worker, the node count of the subtree under the
 //!   storing node is added to [`DupCounts::dup_nodes`] — once, for the outermost
 //!   such node on the path ([`credit_subtree`]).
+//! - **What the table and the move loop did** ([`Event`]): stores that lowered
+//!   the depth of an entry the running search had written, by who wrote it
+//!   ([`classify_overwrite`]); whether the table's entry cut a node off, and
+//!   why not when it did not; singular-extension verification searches and
+//!   what came of them; and where in the move loop a beta cutoff came.
 //!
-//! Each store-outcome and presence count is kept as a small histogram over four
-//! dimensions of the node it was taken at ([`Where`]).
+//! Each count is kept as a small histogram over four dimensions of the node it
+//! was taken at ([`Where`]); the overwrites also by the depth they lost.
 //!
 //! Nothing here is read by the search: its decisions, node counts and best
 //! moves are those of a build without the feature. The side tables do cost
@@ -257,6 +263,194 @@ impl PresenceKind {
     }
 }
 
+/// What a node did with the table and in its move loop: the counts that tell
+/// apart three ways a worker of a parallel search can need more nodes than a
+/// lone worker to reach a depth — workers overwriting each other's deeper
+/// entries, more singular-extension work, and worse move ordering.
+///
+/// Every count but the four `Ow*` ones is taken only at a node of remaining
+/// depth [`PRESENCE_MIN_DEPTH`] or more on entry, the floor the presence counts
+/// use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// A store overwrote a deeper entry of its own position, written in the
+    /// running search by this worker.
+    OwShallowSelf,
+    /// The same, the entry written by another worker.
+    OwShallowOther,
+    /// The same, with no record left of who wrote the entry.
+    OwShallowUnknown,
+    /// A store left a deeper entry of its own position, written in the running
+    /// search, as it was: the depth rule refused the overwrite.
+    OwKept,
+    /// The table's entry cut the node off.
+    TtCut,
+    /// The entry held the position deep enough to cut the node off, but its
+    /// bound, its value or the node's type did not allow the cutoff.
+    TtDeepNoCut,
+    /// The entry held the position, not deep enough to cut the node off — an
+    /// entry holding only a static eval among them.
+    TtShallow,
+    /// The entry held another position or nothing.
+    TtMiss,
+    /// A singular-extension verification search ran.
+    SeTried,
+    /// It failed low, and the table move is extended by one ply.
+    SeExt1,
+    /// It failed low by enough that the table move is extended by two plies or
+    /// three.
+    SeExt2Plus,
+    /// It failed high over the node's own beta: the node returns its value
+    /// without searching a move (multi-cut).
+    SeMulticut,
+    /// It failed high over the singular beta only, and the table move is
+    /// searched shallower: by three plies when the table value is at or over the
+    /// node's beta, by two at a cut node.
+    SeNegative,
+    /// It failed high over the singular beta only, and the table move is
+    /// searched at its usual depth.
+    SeNone,
+    /// The node ended in a beta cutoff on the first move of its loop.
+    CutFirst,
+    /// On the second, third or fourth.
+    Cut2To4,
+    /// On a later one.
+    CutLater,
+    /// Of [`Event::CutFirst`], those whose move was the table move.
+    CutFirstTtMove,
+    /// The node ended its move loop with a value at or over its beta, counted
+    /// apart from the three above: their sum.
+    Cuts,
+}
+
+/// Each [`Event`]'s item key on the statistics line, in [`Event::index`] order.
+pub const EVENT_KEYS: [&str; Event::COUNT] = [
+    "ow_shallow_self",
+    "ow_shallow_other",
+    "ow_shallow_unknown",
+    "ow_kept",
+    "tt_cut",
+    "tt_deep_nocut",
+    "tt_shallow",
+    "tt_miss",
+    "se_tried",
+    "se_ext1",
+    "se_ext2plus",
+    "se_multicut",
+    "se_negative",
+    "se_none",
+    "cut_first",
+    "cut_2to4",
+    "cut_later",
+    "cut_first_ttmove",
+    "cuts",
+];
+
+impl Event {
+    /// How many events there are.
+    pub const COUNT: usize = 19;
+
+    /// Every event, in [`Self::index`] order.
+    pub const ALL: [Event; Self::COUNT] = [
+        Event::OwShallowSelf,
+        Event::OwShallowOther,
+        Event::OwShallowUnknown,
+        Event::OwKept,
+        Event::TtCut,
+        Event::TtDeepNoCut,
+        Event::TtShallow,
+        Event::TtMiss,
+        Event::SeTried,
+        Event::SeExt1,
+        Event::SeExt2Plus,
+        Event::SeMulticut,
+        Event::SeNegative,
+        Event::SeNone,
+        Event::CutFirst,
+        Event::Cut2To4,
+        Event::CutLater,
+        Event::CutFirstTtMove,
+        Event::Cuts,
+    ];
+
+    /// The event's position in [`DupCounts::events`].
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// The event's row in [`DupCounts::ow_lost`], for the three that overwrite
+    /// a deeper entry.
+    pub const fn lost_row(self) -> Option<usize> {
+        match self {
+            Event::OwShallowSelf => Some(0),
+            Event::OwShallowOther => Some(1),
+            Event::OwShallowUnknown => Some(2),
+            _ => None,
+        }
+    }
+}
+
+/// The buckets of the depth an overwrite lost: 1, 2, 3, 4 or more.
+pub const LOST_BUCKETS: usize = 4;
+/// The lost-depth dimension's name, as the histogram output writes it.
+pub const LOST_NAME: &str = "lost";
+/// The lost-depth dimension's bucket labels.
+pub const LOST_BUCKET_NAMES: [&str; LOST_BUCKETS] = ["1", "2", "3", "4+"];
+
+/// What a store did to an entry that held its position at a searched depth,
+/// written in the running search, when the store was shallower than it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Overwrite {
+    /// The store overwrote the entry, losing `lost` plies of depth;
+    /// `by` is one of the three `Ow` events naming who wrote the entry.
+    Shallower {
+        /// [`Event::OwShallowSelf`], [`Event::OwShallowOther`] or
+        /// [`Event::OwShallowUnknown`].
+        by: Event,
+        /// The old depth less the new one: 1 or more.
+        lost: i32,
+    },
+    /// The depth rule refused the overwrite.
+    Kept,
+}
+
+/// Classify a store of depth `store_depth` by the entry it found:
+/// `found` is the depth the entry held the store's own position at and whether
+/// the running search wrote it (`None`: another position or nothing), `wrote`
+/// whether the table's replacement condition held and so the store wrote the
+/// entry's body, `previous` who last wrote the entry (`None`: not known), and
+/// `me` who stores.
+///
+/// Only an entry of the running search, at a searched depth greater than the
+/// store's, is classified; anything else is `None`. Any store at least as deep
+/// as the entry overwrites it, so a store that wrote nothing was refused by the
+/// depth rule. A record of who wrote the entry from another search than the
+/// entry's own is stale, and reads as unknown.
+pub fn classify_overwrite(
+    found: Option<(i32, bool)>,
+    store_depth: i32,
+    wrote: bool,
+    previous: Option<WriterId>,
+    me: WriterId,
+) -> Option<Overwrite> {
+    let (depth, current) = found?;
+    if depth < 1 || !current || depth <= store_depth {
+        return None;
+    }
+    if !wrote {
+        return Some(Overwrite::Kept);
+    }
+    let by = match previous {
+        Some(w) if w.generation == me.generation && w.worker == me.worker => Event::OwShallowSelf,
+        Some(w) if w.generation == me.generation => Event::OwShallowOther,
+        _ => Event::OwShallowUnknown,
+    };
+    Some(Overwrite::Shallower {
+        by,
+        lost: depth - store_depth,
+    })
+}
+
 /// One worker's counts over one search, or a sum of several.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DupCounts {
@@ -264,6 +458,12 @@ pub struct DupCounts {
     pub stores: [Hist; StoreKind::COUNT],
     /// One histogram per [`PresenceKind`], at [`PresenceKind::index`].
     pub presence: [Hist; PresenceKind::COUNT],
+    /// One histogram per [`Event`], at [`Event::index`].
+    pub events: [Hist; Event::COUNT],
+    /// The depth each of the three overwriting events lost, at
+    /// [`Event::lost_row`]: one bucket each for 1, 2 and 3 plies, then one for
+    /// more.
+    pub ow_lost: [[u64; LOST_BUCKETS]; 3],
     /// The nodes searched under a subtree whose root store found the entry
     /// already there, written by another worker — each node once.
     pub dup_nodes: u64,
@@ -277,9 +477,35 @@ impl DupCounts {
     pub const ZERO: Self = Self {
         stores: [[[0; BUCKETS]; DIMS]; StoreKind::COUNT],
         presence: [[[0; BUCKETS]; DIMS]; PresenceKind::COUNT],
+        events: [[[0; BUCKETS]; DIMS]; Event::COUNT],
+        ow_lost: [[0; LOST_BUCKETS]; 3],
         dup_nodes: 0,
         writer_replaced: 0,
     };
+
+    /// Count one `event` at a node in `at`.
+    pub fn count(&mut self, event: Event, at: Where) {
+        at.record(&mut self.events[event.index()]);
+    }
+
+    /// Count one store [`classify_overwrite`] classified, at a node in `at`.
+    pub fn count_overwrite(&mut self, overwrite: Overwrite, at: Where) {
+        match overwrite {
+            Overwrite::Kept => self.count(Event::OwKept, at),
+            Overwrite::Shallower { by, lost } => {
+                self.count(by, at);
+                if let Some(row) = by.lost_row() {
+                    let bucket = (lost.clamp(1, LOST_BUCKETS as i32) - 1) as usize;
+                    self.ow_lost[row][bucket] += 1;
+                }
+            }
+        }
+    }
+
+    /// The total of `event`.
+    pub fn events_of(&self, event: Event) -> u64 {
+        total(&self.events[event.index()])
+    }
 
     /// Count one store of `kind` at a node in `at`.
     pub fn count_store(&mut self, kind: StoreKind, at: Where) {
@@ -297,12 +523,18 @@ impl DupCounts {
             .stores
             .iter_mut()
             .zip(&other.stores)
-            .chain(self.presence.iter_mut().zip(&other.presence));
+            .chain(self.presence.iter_mut().zip(&other.presence))
+            .chain(self.events.iter_mut().zip(&other.events));
         for (mine, theirs) in pairs {
             for (row, other_row) in mine.iter_mut().zip(theirs) {
                 for (cell, n) in row.iter_mut().zip(other_row) {
                     *cell += n;
                 }
+            }
+        }
+        for (row, other_row) in self.ow_lost.iter_mut().zip(&other.ow_lost) {
+            for (cell, n) in row.iter_mut().zip(other_row) {
+                *cell += n;
             }
         }
         self.dup_nodes += other.dup_nodes;
@@ -678,10 +910,103 @@ mod tests {
         }
     }
 
+    /// An entry as a store finds it: the depth it holds the store's own
+    /// position at, and whether the running search wrote it.
+    fn entry(depth: i32, current: bool) -> Option<(i32, bool)> {
+        Some((depth, current))
+    }
+
+    #[test]
+    fn a_shallower_store_that_wrote_is_split_by_who_wrote_the_entry() {
+        let earlier_iteration = WriterId { iteration: 2, ..ME };
+        let other_worker = WriterId { worker: 7, ..ME };
+        let earlier_search = WriterId {
+            generation: 2,
+            ..ME
+        };
+        let cases = [
+            (Some(ME), Event::OwShallowSelf),
+            (Some(earlier_iteration), Event::OwShallowSelf),
+            (Some(other_worker), Event::OwShallowOther),
+            (Some(earlier_search), Event::OwShallowUnknown),
+            (None, Event::OwShallowUnknown),
+        ];
+        for (previous, by) in cases {
+            for (old, new, lost) in [(9, 8, 1), (9, 7, 2), (9, 6, 3), (12, 2, 10)] {
+                assert_eq!(
+                    classify_overwrite(entry(old, true), new, true, previous, ME),
+                    Some(Overwrite::Shallower { by, lost }),
+                    "{previous:?}, {old} -> {new}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_shallower_store_that_wrote_nothing_kept_the_entry() {
+        for previous in [Some(ME), Some(WriterId { worker: 0, ..ME }), None] {
+            assert_eq!(
+                classify_overwrite(entry(9, true), 4, false, previous, ME),
+                Some(Overwrite::Kept)
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_deeper_searched_entry_of_the_running_search_is_classified() {
+        let other = Some(WriterId { worker: 0, ..ME });
+        // Another position or nothing.
+        assert_eq!(classify_overwrite(None, 5, true, other, ME), None);
+        // An earlier search's entry, however deep.
+        assert_eq!(
+            classify_overwrite(entry(9, false), 5, true, other, ME),
+            None
+        );
+        assert_eq!(
+            classify_overwrite(entry(9, false), 5, false, other, ME),
+            None
+        );
+        // No searched depth: a static eval or a quiescence result.
+        assert_eq!(
+            classify_overwrite(entry(0, true), -1, true, other, ME),
+            None
+        );
+        // As deep as the store, or shallower.
+        assert_eq!(classify_overwrite(entry(5, true), 5, true, other, ME), None);
+        assert_eq!(classify_overwrite(entry(4, true), 5, true, other, ME), None);
+    }
+
+    #[test]
+    fn an_overwrite_counts_its_event_and_the_depth_it_lost() {
+        let at = Where::new(4, 2, false, true, 1);
+        let mut counts = DupCounts::ZERO;
+        for (by, lost) in [
+            (Event::OwShallowOther, 1),
+            (Event::OwShallowOther, 3),
+            (Event::OwShallowOther, 6),
+            (Event::OwShallowSelf, 2),
+        ] {
+            counts.count_overwrite(Overwrite::Shallower { by, lost }, at);
+        }
+        counts.count_overwrite(Overwrite::Kept, at);
+        assert_eq!(counts.events_of(Event::OwShallowOther), 3);
+        assert_eq!(counts.events_of(Event::OwShallowSelf), 1);
+        assert_eq!(counts.events_of(Event::OwKept), 1);
+        assert_eq!(counts.ow_lost, [[0, 1, 0, 0], [1, 0, 1, 1], [0; 4]]);
+        let mut sum = DupCounts::ZERO;
+        sum.add(&counts);
+        sum.add(&counts);
+        assert_eq!(sum.ow_lost[1], [2, 0, 2, 2]);
+        assert_eq!(sum.events_of(Event::OwKept), 2);
+    }
+
     #[test]
     fn every_store_kind_has_its_own_index() {
         for (i, kind) in StoreKind::ALL.iter().enumerate() {
             assert_eq!(kind.index(), i, "{kind:?}");
+        }
+        for (i, event) in Event::ALL.iter().enumerate() {
+            assert_eq!(event.index(), i, "{event:?}");
         }
         for (i, kind) in PresenceKind::ALL.iter().enumerate() {
             assert_eq!(kind.index(), i, "{kind:?}");

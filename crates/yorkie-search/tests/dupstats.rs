@@ -6,7 +6,8 @@
 //! With one worker the counts must not change the search — the fixtures' node
 //! counts and best moves are the plain build's — and nothing can be another
 //! worker's. With two, both workers finish the fixtures and each finds work the
-//! other did. Skipped with a notice when `nn.bin` is absent.
+//! other did. Either way the counts of what the table and the move loop did
+//! add up. Skipped with a notice when `nn.bin` is absent.
 
 #![cfg(feature = "dupstats")]
 
@@ -16,7 +17,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use yorkie_search::dupstats::{
-    DupCounts, PresenceKind, StoreKind, Writer, path_len, presence_occupancy,
+    DupCounts, Event, PresenceKind, StoreKind, Writer, path_len, presence_occupancy,
 };
 use yorkie_search::timeline::{Iteration, RootEntry};
 use yorkie_search::{QSearch, SearchControl, TallySlot, WorkerResult, generate_root_moves};
@@ -82,7 +83,7 @@ fn setup(fixture: &FixtureJson) -> Position {
 }
 
 /// The counts that can only come from another worker.
-fn other_worker_counts(dup: &DupCounts) -> [u64; 6] {
+fn other_worker_counts(dup: &DupCounts) -> [u64; 7] {
     [
         dup.stores_of(StoreKind::Deepened(Writer::OtherWorker)),
         dup.stores_of(StoreKind::AlreadyThere(Writer::OtherWorker)),
@@ -90,7 +91,65 @@ fn other_worker_counts(dup: &DupCounts) -> [u64; 6] {
         dup.presence_of(PresenceKind::Equal),
         dup.presence_of(PresenceKind::Shallower),
         dup.dup_nodes,
+        dup.events_of(Event::OwShallowOther),
     ]
+}
+
+fn sum_of(dup: &DupCounts, events: &[Event]) -> u64 {
+    events.iter().map(|e| dup.events_of(*e)).sum()
+}
+
+/// The sums that hold whatever the workers did: every node entry deep enough
+/// is cut off by its table entry or goes on into the presence table, and falls
+/// in one table outcome; every verification search in one singular-extension
+/// outcome; every cutoff at one place in the move loop; and every overwrite of
+/// a deeper entry in one lost-depth bucket.
+fn check_sums(dup: &DupCounts, what: &str) {
+    let tt = sum_of(
+        dup,
+        &[
+            Event::TtCut,
+            Event::TtDeepNoCut,
+            Event::TtShallow,
+            Event::TtMiss,
+        ],
+    );
+    assert_eq!(
+        tt,
+        dup.events_of(Event::TtCut) + dup.presence_of(PresenceKind::Entered),
+        "{what}: {dup:?}"
+    );
+    let se = sum_of(
+        dup,
+        &[
+            Event::SeExt1,
+            Event::SeExt2Plus,
+            Event::SeMulticut,
+            Event::SeNegative,
+            Event::SeNone,
+        ],
+    );
+    assert_eq!(se, dup.events_of(Event::SeTried), "{what}: {dup:?}");
+    let cuts = sum_of(dup, &[Event::CutFirst, Event::Cut2To4, Event::CutLater]);
+    assert_eq!(cuts, dup.events_of(Event::Cuts), "{what}: {dup:?}");
+    assert!(
+        dup.events_of(Event::CutFirstTtMove) <= dup.events_of(Event::CutFirst),
+        "{what}: {dup:?}"
+    );
+    for (event, row) in [
+        Event::OwShallowSelf,
+        Event::OwShallowOther,
+        Event::OwShallowUnknown,
+    ]
+    .into_iter()
+    .zip(dup.ow_lost)
+    {
+        assert_eq!(
+            row.iter().sum::<u64>(),
+            dup.events_of(event),
+            "{what}: {event:?}"
+        );
+    }
 }
 
 fn stores(dup: &DupCounts) -> u64 {
@@ -131,6 +190,7 @@ fn one_worker_matches_the_fixtures_and_sees_no_other_worker() {
     let Some(owned) = network() else { return };
     let net = owned.network();
     let mut first_move_nodes = 0;
+    let mut total = DupCounts::ZERO;
     for name in FIXTURES {
         let fixture = load_fixture(name);
         TranspositionTable::shared().clear();
@@ -156,7 +216,9 @@ fn one_worker_matches_the_fixtures_and_sees_no_other_worker() {
             "{name}: {:?}",
             result.dup
         );
-        assert_eq!(other_worker_counts(&result.dup), [0; 6], "{name}");
+        assert_eq!(other_worker_counts(&result.dup), [0; 7], "{name}");
+        check_sums(&result.dup, name);
+        total.add(&result.dup);
         assert_eq!(result.stopped_on, None, "{name}: ran to its depth");
         check_timeline(&result, fixture.depth, false, name);
         for it in result.timeline.iterations() {
@@ -169,6 +231,9 @@ fn one_worker_matches_the_fixtures_and_sees_no_other_worker() {
     // A root answered without a move loop (a mate found before it) splits
     // nothing, but the fixtures between them search their root moves.
     assert!(first_move_nodes > 0);
+    // Between them, too, the fixtures meet the table and cut nodes off.
+    assert!(total.events_of(Event::TtMiss) > 0, "{total:?}");
+    assert!(total.events_of(Event::Cuts) > 0, "{total:?}");
 }
 
 static SLOTS: [TallySlot; 2] = [TallySlot::new(), TallySlot::new()];
@@ -214,6 +279,7 @@ fn two_workers_finish_the_fixtures_and_find_each_others_work() {
         for r in &results {
             assert_eq!(r.completed_depth, fixture.depth, "{name}");
             total.add(&r.dup);
+            check_sums(&r.dup, name);
             check_timeline(r, fixture.depth, false, name);
         }
         assert_eq!(results[0].timeline.worker, 0, "{name}");
@@ -222,6 +288,24 @@ fn two_workers_finish_the_fixtures_and_find_each_others_work() {
     }
     let other: u64 = other_worker_counts(&total)[..2].iter().sum();
     assert!(other > 0, "{total:?}");
+    check_sums(&total, "every fixture");
+}
+
+/// One worker deep enough for singular extensions: the verification searches
+/// run, and every one of them has its outcome.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn one_worker_counts_each_verification_search_once() {
+    let Some(owned) = network() else { return };
+    let net = owned.network();
+    TranspositionTable::shared().clear();
+    TranspositionTable::shared().new_search();
+    let pos = Position::startpos();
+    let mut search = QSearch::new(net);
+    let result = search.run_worker(&pos, generate_root_moves(&pos), 9);
+    check_sums(&result.dup, "startpos to depth 9");
+    assert!(result.dup.events_of(Event::SeTried) > 0, "{:?}", result.dup);
+    assert_eq!(result.dup.events_of(Event::OwShallowOther), 0);
 }
 
 static STOP: AtomicBool = AtomicBool::new(false);

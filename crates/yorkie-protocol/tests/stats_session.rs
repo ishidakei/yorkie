@@ -299,6 +299,7 @@ fn a_single_threaded_reply_counts_its_stores_and_no_other_worker() {
         "pr_shallower",
         "dup_nodes",
         "sp_behind",
+        "ow_shallow_other",
     ] {
         assert!(
             !line.contains(&format!(" {key}=")),
@@ -403,11 +404,17 @@ mod value_marks {
     }
 
     /// Whether `key` is one of the counts a `dupstats` build adds — how the
-    /// search workers repeated each other's work. No key is, in a build without
+    /// search workers repeated each other's work, and what each one's search
+    /// did with the table and in its move loop. No key is, in a build without
     /// it.
     fn is_dup_key(key: &str) -> bool {
+        const TABLE_KEYS: [&str; 4] = ["tt_cut", "tt_deep_nocut", "tt_shallow", "tt_miss"];
         cfg!(feature = "dupstats")
-            && (["st_", "pr_", "sp_"].iter().any(|p| key.starts_with(p))
+            && (["st_", "pr_", "sp_", "ow_", "se_", "cut_"]
+                .iter()
+                .any(|p| key.starts_with(p))
+                || TABLE_KEYS.contains(&key)
+                || key == "cuts"
                 || key == "dup_nodes"
                 || key == "wt_replaced")
     }

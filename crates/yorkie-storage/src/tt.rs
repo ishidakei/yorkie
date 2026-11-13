@@ -703,6 +703,23 @@ impl Cluster {
         let depth8 = entry.depth8.load(REL);
         (depth8 != 0 && key_matches(entry.key.load(REL), k)).then_some(depth8 as Depth + DEPTH_NONE)
     }
+
+    /// [`Self::depth_of`], with whether the entry was written in the
+    /// generation `curr_generation`.
+    #[cfg(feature = "dupstats")]
+    #[inline]
+    fn depth_and_age_of(
+        &self,
+        slot: usize,
+        k: TteKey,
+        curr_generation: u8,
+    ) -> Option<(Depth, bool)> {
+        let entry = &self.entry[slot];
+        let depth8 = entry.depth8.load(REL);
+        let current = relative_age(entry.gen_bound8.load(REL), curr_generation) == 0;
+        (depth8 != 0 && key_matches(entry.key.load(REL), k))
+            .then_some((depth8 as Depth + DEPTH_NONE, current))
+    }
 }
 
 #[cfg(feature = "verbose3")]
@@ -1182,6 +1199,15 @@ impl TranspositionTable {
     #[inline]
     pub fn depth_at(&self, slot: TtSlot, key: u64) -> Option<Depth> {
         self.clusters[slot.cluster].depth_of(slot.entry, tte_key(key))
+    }
+
+    /// [`Self::depth_at`], with whether the entry was written in the current
+    /// generation — that is, by the search running now. Read before a store,
+    /// to tell whether the store overwrites a deeper result of this search.
+    #[cfg(feature = "dupstats")]
+    #[inline]
+    pub fn depth_and_age_at(&self, slot: TtSlot, key: u64) -> Option<(Depth, bool)> {
+        self.clusters[slot.cluster].depth_and_age_of(slot.entry, tte_key(key), self.generation())
     }
 }
 

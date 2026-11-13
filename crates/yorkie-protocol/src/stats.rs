@@ -35,7 +35,9 @@ use yorkie_search::WorkerResult;
 #[cfg(lazy_smp_defer)]
 use yorkie_search::defer::DeferCounts;
 #[cfg(feature = "dupstats")]
-use yorkie_search::dupstats::{DupCounts, PRESENCE_KEYS, PresenceKind, STORE_KEYS, StoreKind};
+use yorkie_search::dupstats::{
+    DupCounts, EVENT_KEYS, Event, PRESENCE_KEYS, PresenceKind, STORE_KEYS, StoreKind,
+};
 #[cfg(lazy_smp_spread)]
 use yorkie_search::spread::SpreadCounts;
 #[cfg(all(feature = "dupstats", feature = "verbose3"))]
@@ -74,8 +76,8 @@ const COUNT_ITEMS_MAX: usize = COUNT_KEYS[0].len()
 #[cfg(feature = "verbose3")]
 const MARK_ITEMS: [&[u8]; 3] = [b" pathdep=1", b" declrule=1", b" movelimit=1"];
 
-/// The duplication items' keys after the store-outcome and presence ones, in
-/// the order they are written.
+/// The duplication items' keys after the store-outcome, presence and event
+/// ones, in the order they are written.
 #[cfg(feature = "dupstats")]
 const DUP_TAIL_KEYS: [&str; 7] = [
     "dup_nodes",
@@ -89,7 +91,8 @@ const DUP_TAIL_KEYS: [&str; 7] = [
 
 /// How many duplication items there are.
 #[cfg(feature = "dupstats")]
-const DUP_ITEMS: usize = STORE_KEYS.len() + PRESENCE_KEYS.len() + DUP_TAIL_KEYS.len();
+const DUP_ITEMS: usize =
+    STORE_KEYS.len() + PRESENCE_KEYS.len() + EVENT_KEYS.len() + DUP_TAIL_KEYS.len();
 
 /// The total length of `keys`, each with the ` ` before it and the `=` after.
 #[cfg(feature = "dupstats")]
@@ -107,6 +110,7 @@ const fn keys_len(keys: &[&str]) -> usize {
 #[cfg(feature = "dupstats")]
 const DUP_ITEMS_MAX: usize = keys_len(&STORE_KEYS)
     + keys_len(&PRESENCE_KEYS)
+    + keys_len(&EVENT_KEYS)
     + keys_len(&DUP_TAIL_KEYS)
     + DUP_ITEMS * U64_DIGITS;
 
@@ -661,12 +665,13 @@ pub(crate) fn render(
 }
 
 /// The duplication items of `search`, `(key, value)` in the order the line
-/// writes them: each store outcome's and presence outcome's total, then
-/// [`DUP_TAIL_KEYS`].
+/// writes them: each store outcome's, presence outcome's and event's total,
+/// then [`DUP_TAIL_KEYS`].
 #[cfg(feature = "dupstats")]
 fn dup_items(search: &SearchCounts) -> impl Iterator<Item = (&'static str, u64)> + '_ {
     let stores = StoreKind::ALL.map(|kind| search.dup.stores_of(kind));
     let presence = PresenceKind::ALL.map(|kind| search.dup.presence_of(kind));
+    let events = Event::ALL.map(|event| search.dup.events_of(event));
     let tail = [search.dup.dup_nodes, search.dup.writer_replaced]
         .into_iter()
         .chain(search.spread.items());
@@ -674,6 +679,7 @@ fn dup_items(search: &SearchCounts) -> impl Iterator<Item = (&'static str, u64)>
         .into_iter()
         .zip(stores)
         .chain(PRESENCE_KEYS.into_iter().zip(presence))
+        .chain(EVENT_KEYS.into_iter().zip(events))
         .chain(DUP_TAIL_KEYS.into_iter().zip(tail))
 }
 
@@ -683,22 +689,29 @@ fn dup_items(search: &SearchCounts) -> impl Iterator<Item = (&'static str, u64)>
 const HIST_LINE: usize = 1024;
 
 /// Hand `emit` the body of each histogram line of `search`: first the bucket
-/// labels of every dimension (`duphist buckets depth=1-2,3-5,… ply=…`), then
-/// one line per store outcome and presence outcome, with that count broken down
-/// over each dimension (`duphist <key> depth=<n>,<n>,… ply=…`), and last the
-/// workers' spread (`duphist spread behind=<0>,<1>,<2>,<3+>`). A body is what
-/// follows `info string `.
+/// labels of every dimension (`duphist buckets depth=1-2,3-5,… ply=… lost=…`),
+/// then one line per store outcome, presence outcome and event, with that count
+/// broken down over each dimension (`duphist <key> depth=<n>,<n>,… ply=…`) —
+/// the three overwrites of a deeper entry also over the depth they lost
+/// (`lost=<1>,<2>,<3>,<4+>`) — and last the workers' spread
+/// (`duphist spread behind=<0>,<1>,<2>,<3+>`). A body is what follows
+/// `info string `.
 #[cfg(all(feature = "dupstats", feature = "verbose3"))]
 pub(crate) fn histogram_lines<E>(
     search: &SearchCounts,
     mut emit: impl FnMut(&[u8]) -> Result<(), E>,
 ) -> Result<(), E> {
-    use yorkie_search::dupstats::{BUCKET_NAMES, DIM_NAMES};
+    use yorkie_search::dupstats::{BUCKET_NAMES, DIM_NAMES, LOST_BUCKET_NAMES, LOST_NAME};
 
     let mut bytes = [0u8; HIST_LINE];
     let mut out = TextWriter::new(&mut bytes);
     out.bytes(b"duphist buckets");
-    for (name, labels) in DIM_NAMES.iter().zip(BUCKET_NAMES) {
+    let lost: &[&str] = &LOST_BUCKET_NAMES;
+    for (name, labels) in DIM_NAMES
+        .iter()
+        .zip(BUCKET_NAMES)
+        .chain([(&LOST_NAME, lost)])
+    {
         out.byte(b' ').bytes(name.as_bytes()).byte(b'=');
         for (i, label) in labels.iter().enumerate() {
             if i != 0 {
@@ -710,16 +723,33 @@ pub(crate) fn histogram_lines<E>(
     debug_assert!(!out.overflowed(), "the widest line fits HIST_LINE");
     emit(out.as_bytes())?;
 
+    let lost_rows = Event::ALL.map(|event| event.lost_row().map(|row| &search.dup.ow_lost[row]));
     let hists = STORE_KEYS
         .iter()
         .zip(&search.dup.stores)
-        .chain(PRESENCE_KEYS.iter().zip(&search.dup.presence));
-    for (key, hist) in hists {
+        .map(|kh| (kh, None))
+        .chain(
+            PRESENCE_KEYS
+                .iter()
+                .zip(&search.dup.presence)
+                .map(|kh| (kh, None)),
+        )
+        .chain(EVENT_KEYS.iter().zip(&search.dup.events).zip(lost_rows));
+    for ((key, hist), lost) in hists {
         out.clear();
         out.bytes(b"duphist ").bytes(key.as_bytes());
         for ((name, labels), row) in DIM_NAMES.iter().zip(BUCKET_NAMES).zip(hist) {
             out.byte(b' ').bytes(name.as_bytes()).byte(b'=');
             for (i, n) in row[..labels.len()].iter().enumerate() {
+                if i != 0 {
+                    out.byte(b',');
+                }
+                out.u64(*n);
+            }
+        }
+        if let Some(lost) = lost {
+            out.byte(b' ').bytes(LOST_NAME.as_bytes()).byte(b'=');
+            for (i, n) in lost.iter().enumerate() {
                 if i != 0 {
                     out.byte(b',');
                 }
@@ -1162,6 +1192,8 @@ mod tests {
             dup.count_store(StoreKind::New, at);
             dup.count_store(StoreKind::AlreadyThere(Writer::OtherWorker), at);
             dup.count_presence(PresenceKind::Entered, at);
+            dup.count(Event::TtMiss, at);
+            dup.count(Event::CutFirst, at);
             dup.dup_nodes = 40;
             let search = SearchCounts {
                 dup,
@@ -1180,7 +1212,7 @@ mod tests {
                 render_plain(&mut buf, search),
                 Some(
                     &b"info string stats nodes=100 st_new=2 st_there_other=1 pr_enter=1 \
-                       dup_nodes=40 sp_searches=1 sp_workers=2 sp_behind=1 sp_stopped=1 \
+                       tt_miss=1 cut_first=1 dup_nodes=40 sp_searches=1 sp_workers=2 sp_behind=1 sp_stopped=1 \
                        sp_moves=1"[..]
                 )
             );
@@ -1189,7 +1221,12 @@ mod tests {
         #[test]
         fn the_widest_line_fits_the_buffer() {
             let mut dup = DupCounts::ZERO;
-            for hist in dup.stores.iter_mut().chain(dup.presence.iter_mut()) {
+            for hist in dup
+                .stores
+                .iter_mut()
+                .chain(dup.presence.iter_mut())
+                .chain(dup.events.iter_mut())
+            {
                 hist[0][0] = u64::MAX;
             }
             dup.dup_nodes = u64::MAX;
@@ -1277,8 +1314,17 @@ mod tests {
         fn the_histogram_lines_carry_every_outcome_and_the_spread() {
             #[cfg(feature = "verbose3")]
             {
+                use yorkie_search::dupstats::Overwrite;
                 let mut dup = DupCounts::ZERO;
                 dup.count_store(StoreKind::New, Where::new(4, 2, false, true, 1));
+                dup.count_overwrite(
+                    Overwrite::Shallower {
+                        by: Event::OwShallowOther,
+                        lost: 2,
+                    },
+                    Where::new(7, 9, true, false, 0),
+                );
+                dup.count(Event::TtCut, Where::new(3, 1, false, false, 5));
                 let search = SearchCounts {
                     dup,
                     ..SearchCounts::default()
@@ -1289,15 +1335,40 @@ mod tests {
                     Ok(())
                 })
                 .expect("collected");
-                assert_eq!(lines.len(), 1 + STORE_KEYS.len() + PRESENCE_KEYS.len() + 1);
+                assert_eq!(
+                    lines.len(),
+                    1 + STORE_KEYS.len() + PRESENCE_KEYS.len() + EVENT_KEYS.len() + 1
+                );
                 assert_eq!(
                     lines[0],
                     "duphist buckets depth=1-2,3-5,6-9,10+ ply=0-3,4-7,8-11,12-19,20+ \
-                     type=pv,cut,all move=none,1,2-4,5+"
+                     type=pv,cut,all move=none,1,2-4,5+ lost=1,2,3,4+"
                 );
                 assert_eq!(
                     lines[1],
                     "duphist st_new depth=0,1,0,0 ply=1,0,0,0,0 type=0,1,0 move=0,1,0,0"
+                );
+                let line = |key: &str| {
+                    let lead = format!("duphist {key} ");
+                    lines
+                        .iter()
+                        .find(|l| l.starts_with(&lead))
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                assert_eq!(
+                    line("ow_shallow_other"),
+                    "duphist ow_shallow_other depth=0,0,1,0 ply=0,0,1,0,0 type=1,0,0 \
+                     move=1,0,0,0 lost=0,1,0,0"
+                );
+                assert_eq!(
+                    line("ow_shallow_self"),
+                    "duphist ow_shallow_self depth=0,0,0,0 ply=0,0,0,0,0 type=0,0,0 \
+                     move=0,0,0,0 lost=0,0,0,0"
+                );
+                assert_eq!(
+                    line("tt_cut"),
+                    "duphist tt_cut depth=0,1,0,0 ply=1,0,0,0,0 type=0,0,1 move=0,0,0,1"
                 );
                 assert_eq!(lines[lines.len() - 1], "duphist spread behind=0,0,0,0");
             }
