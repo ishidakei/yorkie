@@ -845,9 +845,16 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
         // excludes the clear itself.
         let start = Instant::now();
         crate::stats::clear_bench_counts();
+        #[cfg(feature = "dupstats")]
+        crate::stats::start_bench_timelines();
+        // Each searched position's index in the list, with its workers'
+        // timelines.
+        #[cfg(feature = "dupstats")]
+        let mut timelines = Vec::new();
         let mut total_nodes: u64 = 0;
         let mut positions: u64 = 0;
-        for fen in &config.fens {
+        #[cfg_attr(not(feature = "dupstats"), expect(unused_variables))]
+        for (index, fen) in config.fens.iter().enumerate() {
             match parse_sfen(fen) {
                 Ok(p) => self.engine.set_search_position(p),
                 Err(e) => {
@@ -866,7 +873,11 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
                 }
             }
             positions += 1;
-            total_nodes += match self.engine.bench_run_one(config.limits.clone()) {
+            total_nodes += match self.engine.bench_run_one(
+                config.limits.clone(),
+                #[cfg(feature = "dupstats")]
+                config.stop_first,
+            ) {
                 Some(nodes) => nodes,
                 // A position with no network loaded resigns and contributes no
                 // nodes, exactly as a `go` would.
@@ -875,7 +886,11 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
                     0
                 }
             };
+            #[cfg(feature = "dupstats")]
+            timelines.push((index as u64, crate::stats::take_bench_timelines()));
         }
+        #[cfg(feature = "dupstats")]
+        crate::stats::stop_bench_timelines();
 
         // `+1` mirrors the reference's divide-by-zero guard.
         //
@@ -910,6 +925,17 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
         // totals, one line per count.
         #[cfg(feature = "dupstats")]
         crate::stats::histogram_lines(&counts, |body| self.out.info_string(body))?;
+        // When each worker of each position's search finished each iteration.
+        #[cfg(feature = "dupstats")]
+        for (index, workers) in &timelines {
+            for timeline in workers {
+                for it in timeline.iterations() {
+                    crate::stats::iteration_line(*index, timeline.worker, it, |body| {
+                        self.out.info_string(body)
+                    })?;
+                }
+            }
+        }
         Ok(())
     }
 

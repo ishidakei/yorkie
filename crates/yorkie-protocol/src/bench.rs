@@ -8,8 +8,14 @@
 //! [`BenchConfig`]; the command handler consumes it.
 //!
 //! ```text
-//! bench [ttSizeMB] [threads] [limit] [default|current|<fenFile>] [limitType]
+//! bench [ttSizeMB] [threads] [limit] [default|current|<fenFile>] [limitType] [stop]
 //! ```
+//!
+//! `stop` is read by a `dupstats` build only, and is `main` (the default) or
+//! `first`. A search ends when its main worker finishes; a helper that finishes
+//! first waits for it. Under `first` it ends when any worker finishes, and that
+//! worker's result is the reply. A build without `dupstats` ignores the
+//! argument, as it ignores every token past `limitType`.
 //!
 //! The reference's defaults are `ttSize=1024`, `threads=1`, `limit=15000`,
 //! `fenFile=default`, `limitType=movetime` — its *code*, not the stale comment
@@ -52,6 +58,8 @@ const DEFAULT_THREADS: &[u8] = b"1";
 const DEFAULT_LIMIT: &[u8] = b"15000";
 const DEFAULT_FEN_SOURCE: &[u8] = b"default";
 const DEFAULT_LIMIT_TYPE: &[u8] = b"movetime";
+#[cfg(feature = "dupstats")]
+const DEFAULT_STOP: &[u8] = b"main";
 
 /// A `bench` argument-parse failure, surfaced as an `info string` so a garbage
 /// argument fails loudly without panicking.
@@ -73,6 +81,9 @@ pub enum BenchParseError<'a> {
         errno: Option<i32>,
     },
     NoPositions(&'a [u8]),
+    /// A `stop` argument other than `main` or `first`.
+    #[cfg(feature = "dupstats")]
+    UnsupportedStop(&'a [u8]),
 }
 
 impl BenchParseError<'_> {
@@ -110,6 +121,12 @@ impl BenchParseError<'_> {
             Self::NoPositions(path) => {
                 out.bytes(b"no positions in file `").bytes(path).bytes(b"`");
             }
+            #[cfg(feature = "dupstats")]
+            Self::UnsupportedStop(token) => {
+                out.bytes(b"unsupported stop `")
+                    .bytes(token)
+                    .bytes(b"` (supported: main, first)");
+            }
         }
     }
 }
@@ -125,6 +142,10 @@ pub struct BenchConfig {
     pub limits: GoParams,
     /// The positions to search, as SFENs (each parsed by the caller).
     pub fens: Vec<Vec<u8>>,
+    /// Whether each search ends at the first worker to finish (`first`) rather
+    /// than at the main one (`main`).
+    #[cfg(feature = "dupstats")]
+    pub stop_first: bool,
 }
 
 /// Parse the `bench` argument tokens into a [`BenchConfig`], filling missing
@@ -147,6 +168,12 @@ pub fn parse_bench<'a>(
     let limit_arg = arg(2, DEFAULT_LIMIT);
     let fen_source = arg(3, DEFAULT_FEN_SOURCE);
     let limit_type = arg(4, DEFAULT_LIMIT_TYPE);
+    #[cfg(feature = "dupstats")]
+    let stop_first = match arg(5, DEFAULT_STOP) {
+        b"main" => false,
+        b"first" => true,
+        other => return Err(BenchParseError::UnsupportedStop(other)),
+    };
 
     // Parsed for its shape and then dropped: nothing can resize the table, but
     // a garbage argument still has to fail loudly rather than shift the
@@ -194,6 +221,8 @@ pub fn parse_bench<'a>(
         threads,
         limits,
         fens,
+        #[cfg(feature = "dupstats")]
+        stop_first,
     })
 }
 
@@ -291,6 +320,23 @@ mod tests {
         assert!(
             message.contains("perft"),
             "message names the type: {message}"
+        );
+    }
+
+    #[cfg(feature = "dupstats")]
+    #[test]
+    fn the_stop_argument_is_main_by_default_or_first() {
+        let main: [&[u8]; 5] = [b"16", b"2", b"5", b"default", b"depth"];
+        assert!(!parse_bench(&main, b"x").expect("parse").stop_first);
+        let first: [&[u8]; 6] = [b"16", b"2", b"5", b"default", b"depth", b"first"];
+        assert!(parse_bench(&first, b"x").expect("parse").stop_first);
+        let named: [&[u8]; 6] = [b"16", b"2", b"5", b"default", b"depth", b"main"];
+        assert!(!parse_bench(&named, b"x").expect("parse").stop_first);
+        let bad: [&[u8]; 6] = [b"16", b"2", b"5", b"default", b"depth", b"last"];
+        let err = parse_bench(&bad, b"x").expect_err("not a stop rule");
+        assert_eq!(
+            message(&err),
+            "unsupported stop `last` (supported: main, first)"
         );
     }
 

@@ -1,6 +1,7 @@
 //! The duplication statistics of a `dupstats` build, from the outside: what one
-//! worker and two workers count over the depth-5 search fixtures, and what is
-//! left in the statistics-only tables once a search has ended.
+//! worker and two workers count over the depth-5 search fixtures, what is left
+//! in the statistics-only tables once a search has ended, and the record each
+//! worker keeps of when it finished each root iteration.
 //!
 //! With one worker the counts must not change the search — the fixtures' node
 //! counts and best moves are the plain build's — and nothing can be another
@@ -17,6 +18,7 @@ use serde::Deserialize;
 use yorkie_search::dupstats::{
     DupCounts, PresenceKind, StoreKind, Writer, path_len, presence_occupancy,
 };
+use yorkie_search::timeline::{Iteration, RootEntry};
 use yorkie_search::{QSearch, SearchControl, TallySlot, WorkerResult, generate_root_moves};
 mod text_str;
 
@@ -95,6 +97,32 @@ fn stores(dup: &DupCounts) -> u64 {
     StoreKind::ALL.iter().map(|k| dup.stores_of(*k)).sum()
 }
 
+/// Check the timeline of a worker that completed `completed` iterations and,
+/// when `stopped`, was stopped inside the next one: one completed record per
+/// depth from 1, then the stopped one marked not completed, at times that never
+/// go back and node counts that only grow, the last at the worker's own count.
+fn check_timeline(r: &WorkerResult, completed: i32, stopped: bool, what: &str) {
+    let its: Vec<&Iteration> = r.timeline.iterations().collect();
+    let want = completed as usize + usize::from(stopped);
+    assert_eq!(its.len(), want, "{what}: {its:?}");
+    for (i, it) in its.iter().enumerate() {
+        assert_eq!(it.depth, i as i32 + 1, "{what}: {it:?}");
+        assert_eq!(it.completed, it.depth <= completed, "{what}: {it:?}");
+        assert!(it.best.is_some(), "{what}: {it:?}");
+        assert!(
+            it.first_move_nodes + it.other_move_nodes <= it.nodes,
+            "{what}: {it:?}"
+        );
+    }
+    for pair in its.windows(2) {
+        assert!(pair[0].micros <= pair[1].micros, "{what}: {pair:?}");
+        assert!(pair[0].nodes < pair[1].nodes, "{what}: {pair:?}");
+    }
+    if let Some(last) = its.last() {
+        assert_eq!(last.nodes, r.nodes, "{what}: the last record is the end");
+    }
+}
+
 /// One worker, as the fixed-depth search runs: the fixtures come out exactly
 /// as the plain build's, and no count is another worker's.
 #[cfg_attr(miri, ignore)]
@@ -102,6 +130,7 @@ fn stores(dup: &DupCounts) -> u64 {
 fn one_worker_matches_the_fixtures_and_sees_no_other_worker() {
     let Some(owned) = network() else { return };
     let net = owned.network();
+    let mut first_move_nodes = 0;
     for name in FIXTURES {
         let fixture = load_fixture(name);
         TranspositionTable::shared().clear();
@@ -129,9 +158,17 @@ fn one_worker_matches_the_fixtures_and_sees_no_other_worker() {
         );
         assert_eq!(other_worker_counts(&result.dup), [0; 6], "{name}");
         assert_eq!(result.stopped_on, None, "{name}: ran to its depth");
+        check_timeline(&result, fixture.depth, false, name);
+        for it in result.timeline.iterations() {
+            assert_ne!(it.root_entry, RootEntry::OtherWorker, "{name}: {it:?}");
+            first_move_nodes += it.first_move_nodes;
+        }
         assert_eq!(presence_occupancy(), 0, "{name}");
         assert_eq!(path_len(), 0, "{name}");
     }
+    // A root answered without a move loop (a mate found before it) splits
+    // nothing, but the fixtures between them search their root moves.
+    assert!(first_move_nodes > 0);
 }
 
 static SLOTS: [TallySlot; 2] = [TallySlot::new(), TallySlot::new()];
@@ -177,7 +214,10 @@ fn two_workers_finish_the_fixtures_and_find_each_others_work() {
         for r in &results {
             assert_eq!(r.completed_depth, fixture.depth, "{name}");
             total.add(&r.dup);
+            check_timeline(r, fixture.depth, false, name);
         }
+        assert_eq!(results[0].timeline.worker, 0, "{name}");
+        assert_eq!(results[1].timeline.worker, 1, "{name}");
         assert_eq!(presence_occupancy(), 0, "{name}");
     }
     let other: u64 = other_worker_counts(&total)[..2].iter().sum();
@@ -209,6 +249,7 @@ fn a_search_stopped_by_time_leaves_the_tables_empty() {
     for r in &results {
         assert!(r.completed_depth < 64);
         assert!(r.stopped_on.is_some(), "stopped inside an iteration");
+        check_timeline(r, r.completed_depth, true, "stopped by time");
     }
     assert_eq!(presence_occupancy(), 0);
 }

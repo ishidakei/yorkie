@@ -27,6 +27,8 @@
 
 #[cfg(feature = "dupstats")]
 use std::sync::Mutex;
+#[cfg(all(feature = "dupstats", feature = "verbose3"))]
+use std::sync::PoisonError;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use yorkie_search::WorkerResult;
@@ -36,6 +38,8 @@ use yorkie_search::defer::DeferCounts;
 use yorkie_search::dupstats::{DupCounts, PRESENCE_KEYS, PresenceKind, STORE_KEYS, StoreKind};
 #[cfg(lazy_smp_spread)]
 use yorkie_search::spread::SpreadCounts;
+#[cfg(all(feature = "dupstats", feature = "verbose3"))]
+use yorkie_search::timeline::{Iteration, Timeline};
 use yorkie_state::TextWriter;
 #[cfg(feature = "verbose3")]
 use yorkie_storage::ValueMarks;
@@ -436,6 +440,108 @@ pub(crate) fn add_spread(results: &[WorkerResult]) {
     INTERVAL.add_spread(&spread);
     #[cfg(feature = "verbose3")]
     BENCH_RUN.add_spread(&spread);
+}
+
+/// The timelines of every worker of every search of the `bench` run in
+/// progress, in the order the searches ended; `None` while no run is.
+#[cfg(all(feature = "dupstats", feature = "verbose3"))]
+static BENCH_TIMELINES: Mutex<Option<Vec<Box<Timeline>>>> = Mutex::new(None);
+
+/// Keep the timelines of the workers of one finished search, `results` holding
+/// every one of them, when a `bench` run is in progress.
+#[cfg(all(feature = "dupstats", feature = "verbose3"))]
+pub(crate) fn add_timelines(results: &[WorkerResult]) {
+    let mut held = BENCH_TIMELINES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(kept) = held.as_mut() {
+        kept.extend(results.iter().map(|r| r.timeline.clone()));
+    }
+}
+
+/// Start keeping the timelines of a `bench` run's searches.
+#[cfg(all(feature = "dupstats", feature = "verbose3"))]
+pub(crate) fn start_bench_timelines() {
+    *BENCH_TIMELINES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(Vec::new());
+}
+
+/// The timelines kept since the run started or since the last take.
+#[cfg(all(feature = "dupstats", feature = "verbose3"))]
+pub(crate) fn take_bench_timelines() -> Vec<Box<Timeline>> {
+    BENCH_TIMELINES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_mut()
+        .map(std::mem::take)
+        .unwrap_or_default()
+}
+
+/// Stop keeping timelines: the `bench` run is over.
+#[cfg(all(feature = "dupstats", feature = "verbose3"))]
+pub(crate) fn stop_bench_timelines() {
+    *BENCH_TIMELINES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = None;
+}
+
+/// The widest `iter` line body: the lead, every key and a 20-digit value for
+/// each, a move and a root-entry word.
+#[cfg(all(feature = "dupstats", feature = "verbose3"))]
+const ITER_LINE: usize = 512;
+
+/// Hand `emit` the body of the `iter` line of iteration `it` of worker `worker`
+/// in the search of position `position` (its index in the run's list): what
+/// follows `info string `.
+///
+/// `iter pos=<p> worker=<w> depth=<d> done=<0|1> us=<µs> nodes=<n> fl=<n>
+/// fh=<n> move=<usi> value=<v> changed=<0|1> first=<n> rest=<n>
+/// root=<none|self|other|prev|unknown>`
+#[cfg(all(feature = "dupstats", feature = "verbose3"))]
+pub(crate) fn iteration_line<E>(
+    position: u64,
+    worker: u8,
+    it: &Iteration,
+    emit: impl FnOnce(&[u8]) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut bytes = [0u8; ITER_LINE];
+    let mut out = TextWriter::new(&mut bytes);
+    out.bytes(b"iter pos=")
+        .u64(position)
+        .bytes(b" worker=")
+        .u64(u64::from(worker))
+        .bytes(b" depth=")
+        .i64(i64::from(it.depth))
+        .bytes(b" done=")
+        .u64(u64::from(it.completed))
+        .bytes(b" us=")
+        .u64(it.micros)
+        .bytes(b" nodes=")
+        .u64(it.nodes)
+        .bytes(b" fl=")
+        .u64(u64::from(it.fail_lows))
+        .bytes(b" fh=")
+        .u64(u64::from(it.fail_highs))
+        .bytes(b" move=");
+    match it.best {
+        Some(mv) => yorkie_state::write_usi_move(mv, &mut out),
+        None => {
+            out.bytes(b"none");
+        }
+    }
+    out.bytes(b" value=")
+        .i64(i64::from(it.value))
+        .bytes(b" changed=")
+        .u64(u64::from(it.best_changed))
+        .bytes(b" first=")
+        .u64(it.first_move_nodes)
+        .bytes(b" rest=")
+        .u64(it.other_move_nodes)
+        .bytes(b" root=")
+        .bytes(it.root_entry.key().as_bytes());
+    debug_assert!(!out.overflowed(), "the widest line fits ITER_LINE");
+    emit(out.as_bytes())
 }
 
 /// Read the interval's tally and reset it to zero, so what is returned covers
@@ -1136,6 +1242,7 @@ mod tests {
                 eval_tt_hits: 0,
                 dup: Box::new(DupCounts::ZERO),
                 stopped_on: on.map(|i| moves[i].mv),
+                timeline: Box::default(),
                 #[cfg(lazy_smp_spread)]
                 spread: SpreadCounts::default(),
                 #[cfg(lazy_smp_defer)]

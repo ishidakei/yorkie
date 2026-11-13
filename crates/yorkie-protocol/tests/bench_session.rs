@@ -276,3 +276,157 @@ fn threads_two_bench_completes_and_reports() {
     );
     // No node-count assertion: multi-thread node totals vary run to run.
 }
+
+/// One `info string iter` line of a `dupstats` bench, its fields by name.
+#[cfg(feature = "dupstats")]
+#[derive(Debug)]
+struct IterLine {
+    pos: u64,
+    worker: u64,
+    depth: u64,
+    done: bool,
+    us: u64,
+    nodes: u64,
+}
+
+/// Every `iter` line of `out`, in the order written.
+#[cfg(feature = "dupstats")]
+fn iter_lines(out: &str) -> Vec<IterLine> {
+    out.lines()
+        .filter_map(|l| l.strip_prefix("info string iter "))
+        .map(|body| {
+            let field = |key: &str| -> &str {
+                body.split(' ')
+                    .find_map(|item| item.strip_prefix(key)?.strip_prefix('='))
+                    .unwrap_or_else(|| panic!("no {key}= in {body:?}"))
+            };
+            let num = |key: &str| -> u64 { field(key).parse().expect("an integer") };
+            for key in ["fl", "fh", "first", "rest", "value"] {
+                field(key).parse::<i64>().expect("an integer");
+            }
+            assert!(
+                ["none", "self", "other", "prev", "unknown"].contains(&field("root")),
+                "{body:?}"
+            );
+            assert!(!field("move").is_empty(), "{body:?}");
+            assert!(["0", "1"].contains(&field("changed")), "{body:?}");
+            IterLine {
+                pos: num("pos"),
+                worker: num("worker"),
+                depth: num("depth"),
+                done: field("done") == "1",
+                us: num("us"),
+                nodes: num("nodes"),
+            }
+        })
+        .collect()
+}
+
+/// The lines of one worker in one position's search hold every depth it
+/// completed, from 1 and in order, then at most the one it was stopped
+/// inside, marked not done — at times that never go back and node counts that
+/// only grow. Returns the deepest completed depth, and whether the worker was
+/// stopped inside the next one.
+#[cfg(feature = "dupstats")]
+fn check_worker_lines(lines: &[&IterLine]) -> (u64, bool) {
+    let completed = lines.iter().filter(|l| l.done).count() as u64;
+    for (i, l) in lines.iter().enumerate() {
+        assert_eq!(l.depth, i as u64 + 1, "{lines:?}");
+        assert_eq!(l.done, l.depth <= completed, "{lines:?}");
+    }
+    assert!(lines.len() as u64 <= completed + 1, "{lines:?}");
+    for pair in lines.windows(2) {
+        assert!(pair[0].us <= pair[1].us, "{pair:?}");
+        assert!(pair[0].nodes < pair[1].nodes, "{pair:?}");
+    }
+    (completed, lines.len() as u64 > completed)
+}
+
+/// The deepest completed depth of each worker of position `pos`'s search, and
+/// whether it was stopped inside the next one.
+#[cfg(feature = "dupstats")]
+fn completed_by_worker(lines: &[IterLine], pos: u64, workers: u64) -> Vec<(u64, bool)> {
+    (0..workers)
+        .map(|w| {
+            let mine: Vec<&IterLine> = lines
+                .iter()
+                .filter(|l| l.pos == pos && l.worker == w)
+                .collect();
+            check_worker_lines(&mine)
+        })
+        .collect()
+}
+
+/// At one thread a `dupstats` bench writes one `iter` line per completed depth
+/// of every position, all of them the main worker's, after the histograms: up
+/// to the bench depth, or — under a config whose node limit ends the search
+/// first — up to the depth that limit stopped it inside.
+#[cfg(feature = "dupstats")]
+#[cfg_attr(miri, ignore)]
+#[test]
+fn one_thread_writes_one_iteration_line_per_completed_depth() {
+    let _session = common::serial_session();
+    let out = bench_session("bench 16 1 4 default depth");
+    let lines = iter_lines(&out);
+    assert!(lines.iter().all(|l| l.worker == 0), "{lines:?}");
+    for pos in 0..4 {
+        let [(completed, stopped)] = completed_by_worker(&lines, pos, 1)[..] else {
+            unreachable!("one worker");
+        };
+        assert!(stopped || completed == 4, "position {pos}:\n{out}");
+    }
+    let all: Vec<&str> = out.lines().collect();
+    let last_hist = all
+        .iter()
+        .rposition(|l| l.starts_with("info string duphist "))
+        .expect("histograms");
+    let first_iter = all
+        .iter()
+        .position(|l| l.starts_with("info string iter "))
+        .expect("iteration lines");
+    assert!(
+        last_hist < first_iter,
+        "the iterations follow the histograms"
+    );
+}
+
+/// At two threads every completed depth of every worker has a line, a worker
+/// stopped inside an iteration has that one marked not done, and the main
+/// worker reaches the bench depth in every position's search it was not
+/// stopped in by a node limit.
+#[cfg(feature = "dupstats")]
+#[cfg_attr(miri, ignore)]
+#[test]
+fn two_threads_write_every_workers_iterations() {
+    let _session = common::serial_session();
+    let out = bench_session("bench 16 2 5 default depth");
+    let lines = iter_lines(&out);
+    for pos in 0..4 {
+        let (main_completed, main_stopped) = completed_by_worker(&lines, pos, 2)[0];
+        assert!(
+            main_stopped || main_completed == 5,
+            "position {pos}:\n{out}"
+        );
+    }
+}
+
+/// Stopping at the first worker: in every position's search some worker
+/// reached the bench depth, and the others' lines end where they were stopped
+/// — unless a node limit stopped every worker first.
+#[cfg(feature = "dupstats")]
+#[cfg_attr(miri, ignore)]
+#[test]
+fn stopping_at_the_first_worker_ends_on_a_worker_at_the_depth() {
+    let _session = common::serial_session();
+    let out = bench_session("bench 16 2 5 default depth first");
+    assert_eq!(bench_summary_positions(&out), 4, "in:\n{out}");
+    let lines = iter_lines(&out);
+    for pos in 0..4 {
+        let workers = completed_by_worker(&lines, pos, 2);
+        let finished = workers.iter().filter(|&&(d, stopped)| d == 5 && !stopped);
+        assert!(
+            finished.count() >= 1 || workers.iter().all(|&(_, stopped)| stopped),
+            "position {pos}: {workers:?}\n{out}"
+        );
+    }
+}

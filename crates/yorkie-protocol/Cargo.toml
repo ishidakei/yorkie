@@ -94,8 +94,10 @@ serde_json = "~1.0"
 # `dupstats` is the Search-layer measuring feature that counts how parallel
 # search workers repeat each other's work. It implies `verbose1`: this crate sums
 # the workers' counts into the per-reply statistics line, and with `verbose3`
-# the `bench` command also writes their full histograms after its summary. Off
-# by default; a build with it searches more slowly than one without.
+# the `bench` command also writes their full histograms after its summary,
+# then one line per worker and root iteration saying when it finished, and
+# reads a sixth argument that ends each search at the first worker to finish.
+# Off by default; a build with it searches more slowly than one without.
 #
 # `lazy-smp-spread` compiles in the parallel workers' move-order spread (the
 # Search layer's `spread` module) and the three counts this crate writes for it

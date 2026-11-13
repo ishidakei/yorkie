@@ -552,6 +552,12 @@ static HELPER_TIDS: [AtomicI32; POOL_CAPACITY - 1] =
 /// coordinator ending its helpers and by a search that stopped itself.
 static PONDER_STOP: AtomicBool = AtomicBool::new(false);
 
+/// The latch a `bench` run asked to stop at the first worker hands every worker
+/// of each of its searches; no other search is handed one.
+#[cfg(all(feature = "dupstats", feature = "verbose3"))]
+static FIRST_FINISH: yorkie_search::timeline::FirstFinish =
+    yorkie_search::timeline::FirstFinish::new();
+
 /// Raised by the coordinator while it is thinking ahead, so the command that
 /// ends that search knows to join the coordinator rather than leave it running.
 static PONDERING: AtomicBool = AtomicBool::new(false);
@@ -2313,6 +2319,8 @@ impl<P: EngineSink> Engine<P> {
             #[cfg(feature = "verbose2")]
             pv_config,
             sink,
+            #[cfg(all(feature = "dupstats", feature = "verbose3"))]
+            stop_first: false,
         })
     }
 
@@ -2322,12 +2330,22 @@ impl<P: EngineSink> Engine<P> {
     /// Only the driving is synchronous — a measurement run needs each position's
     /// node total before moving on. `None` means no network is loaded, which is
     /// the caller's to answer, exactly as for [`Self::go`].
+    ///
+    /// `stop_first`, in a `dupstats` build, ends each search when the first of
+    /// its workers finishes rather than when the main one does, and reports
+    /// that worker's result.
     #[cfg(feature = "verbose3")]
-    pub fn bench_run_one(&mut self, params: GoParams) -> Option<u64> {
+    pub fn bench_run_one(
+        &mut self,
+        params: GoParams,
+        #[cfg(feature = "dupstats")] stop_first: bool,
+    ) -> Option<u64> {
         // The measurement command is `verbose3`, so the PV interval it disables
         // always exists. A measurement position is answered and left: a search
         // that outlived it would be measured into the next one.
         let job = self.prepare_coordinator_job(params, Instant::now(), 0, false, true)?;
+        #[cfg(feature = "dupstats")]
+        let job = CoordinatorJob { stop_first, ..job };
         let node = self.worker_plan.system_node(0);
         let outcome = with_eval_network!(node, |net| run_coordinated(net, job));
         // Return the session state the job borrowed (the async path reclaims
@@ -2646,6 +2664,14 @@ struct HelperJob {
     /// How wide the helper reads its root: single-line for a `go`, the
     /// configured width for the search that thinks past the reply.
     root_width: RootWidth,
+    /// When the search started, the clock the helper times its iterations
+    /// from.
+    #[cfg(feature = "dupstats")]
+    search_start: Instant,
+    /// Whether the search ends at the first worker to finish ([`FIRST_FINISH`]),
+    /// which only a `bench` run asks for.
+    #[cfg(all(feature = "dupstats", feature = "verbose3"))]
+    first_finish: bool,
 }
 
 /// The state of one helper's coordination slot. The coordinator drives
@@ -2942,6 +2968,12 @@ fn helper_loop<N: NetworkParams>(
             #[cfg(feature = "verbose2")]
             qs.set_multi_pv(job.multi_pv);
             qs.set_root_width(job.root_width);
+            #[cfg(feature = "dupstats")]
+            qs.set_search_start(job.search_start);
+            #[cfg(all(feature = "dupstats", feature = "verbose3"))]
+            if job.first_finish {
+                qs.set_first_finish(&FIRST_FINISH);
+            }
             // A ceiling below the search's own maximum has two sources, `go
             // depth N` and the `DepthLimit` key, and both need `verbose2`.
             #[cfg(feature = "verbose2")]
@@ -3624,6 +3656,10 @@ impl PonderJob {
                     #[cfg(feature = "verbose2")]
                     multi_pv: self.multi_pv,
                     root_width: PONDER_ROOT_WIDTH,
+                    #[cfg(feature = "dupstats")]
+                    search_start: started,
+                    #[cfg(all(feature = "dupstats", feature = "verbose3"))]
+                    first_finish: false,
                 }
             };
         }
@@ -3660,6 +3696,8 @@ impl PonderJob {
         // opponent picks the move at its root, so it reads several of them to
         // full depth rather than one.
         qs.set_root_width(PONDER_ROOT_WIDTH);
+        #[cfg(feature = "dupstats")]
+        qs.set_search_start(started);
         // No PV sink: the main worker of this search prints nothing either.
         // The reply this search follows is already out, so what each of its
         // workers did counts towards the next one.
@@ -3782,6 +3820,10 @@ struct CoordinatorJob<P: EngineSink> {
     /// Where this search's progress and reply go: a handle to the session's own
     /// output, cloned for the thread that will emit through it.
     sink: P,
+    /// Whether the search ends at the first worker to finish rather than at the
+    /// main worker, and reports that worker's result. Only `bench` sets it.
+    #[cfg(all(feature = "dupstats", feature = "verbose3"))]
+    stop_first: bool,
 }
 
 /// The Lazy-SMP coordinator — the reference main worker's `start_searching`,
@@ -3852,6 +3894,8 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
         #[cfg(feature = "verbose2")]
         pv_config,
         sink,
+        #[cfg(all(feature = "dupstats", feature = "verbose3"))]
+        stop_first,
     } = job;
     #[cfg(feature = "verbose2")]
     let multi_pv = multi_pv.max(1);
@@ -3986,6 +4030,15 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
         }
     }
 
+    // One clock for every worker of this search, and a fresh latch when it ends
+    // at the first worker to finish.
+    #[cfg(feature = "dupstats")]
+    let search_start = Instant::now();
+    #[cfg(all(feature = "dupstats", feature = "verbose3"))]
+    if stop_first {
+        FIRST_FINISH.reset();
+    }
+
     // Dispatch a job to every helper (helper h → worker h + 1).
     macro_rules! go_job {
         ($h:expr) => {
@@ -4008,6 +4061,10 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
                 #[cfg(feature = "verbose2")]
                 multi_pv,
                 root_width: RootWidth::SINGLE_LINE,
+                #[cfg(feature = "dupstats")]
+                search_start,
+                #[cfg(all(feature = "dupstats", feature = "verbose3"))]
+                first_finish: stop_first,
             }
         };
     }
@@ -4038,6 +4095,12 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     qs.set_multi_pv(multi_pv);
     #[cfg(feature = "verbose2")]
     qs.set_pv_output(pv_config, Box::new(sink.pv_output()));
+    #[cfg(feature = "dupstats")]
+    qs.set_search_start(search_start);
+    #[cfg(all(feature = "dupstats", feature = "verbose3"))]
+    if stop_first {
+        qs.set_first_finish(&FIRST_FINISH);
+    }
     // As in the helper loop: without `verbose2` no `go` carries a ceiling below
     // the search's own maximum, because neither source of one exists.
     #[cfg(not(feature = "verbose2"))]
@@ -4075,6 +4138,8 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     crate::stats::add_search(&results);
     #[cfg(feature = "dupstats")]
     crate::stats::add_spread(&results);
+    #[cfg(all(feature = "dupstats", feature = "verbose3"))]
+    crate::stats::add_timelines(&results);
 
     // Aggregated node count for the `info` line and for `bench` — every worker's
     // exact final count (the reference `threads.nodes_searched()`). Both readers
@@ -4088,6 +4153,11 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     // early exit only a `verbose2` build has.
     #[cfg_attr(not(feature = "verbose2"), allow(unused_labels))]
     let chosen = 'vote: {
+        // A search that ended at its first worker to finish reports that one.
+        #[cfg(all(feature = "dupstats", feature = "verbose3"))]
+        if stop_first && let Some(w) = FIRST_FINISH.winner().filter(|&w| w < results.len()) {
+            break 'vote w;
+        }
         #[cfg(feature = "verbose2")]
         if !use_voting {
             break 'vote 0;
@@ -5322,6 +5392,10 @@ mod tests {
                 #[cfg(feature = "verbose2")]
                 multi_pv: 1,
                 root_width: RootWidth::SINGLE_LINE,
+                #[cfg(feature = "dupstats")]
+                search_start: Instant::now(),
+                #[cfg(all(feature = "dupstats", feature = "verbose3"))]
+                first_finish: false,
             }
         }
 

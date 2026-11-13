@@ -625,6 +625,19 @@ pub struct QSearch<N: NetworkParams> {
     /// it. Zero on the single-worker path.
     #[cfg(feature = "dupstats")]
     dup_worker: u8,
+    /// When this worker finished each root iteration of the search. Reported,
+    /// never read by the search.
+    #[cfg(feature = "dupstats")]
+    timeline: Box<crate::timeline::Timeline>,
+    /// When the search this worker belongs to started, the clock every worker
+    /// of it reads its iterations against; `None` starts it when the worker
+    /// starts.
+    #[cfg(feature = "dupstats")]
+    search_start: Option<Instant>,
+    /// The latch that ends a measurement search at the first worker to
+    /// finish; `None` for every other search.
+    #[cfg(all(feature = "dupstats", feature = "verbose3"))]
+    first_finish: Option<&'static crate::timeline::FirstFinish>,
     /// This worker's move-order spread: its duplicate count and the moves each
     /// ply has pulled out of its order without searching them yet.
     #[cfg(lazy_smp_spread)]
@@ -957,6 +970,10 @@ pub struct WorkerResult {
     /// `None` when its last iteration ran to its end.
     #[cfg(feature = "dupstats")]
     pub stopped_on: Option<Move>,
+    /// When this worker finished each root iteration, and the one it was
+    /// stopped inside. Boxed for the same reason as `dup`.
+    #[cfg(feature = "dupstats")]
+    pub timeline: Box<crate::timeline::Timeline>,
     /// What this worker's move-order spread counted, for the per-reply
     /// statistics line.
     #[cfg(all(lazy_smp_spread, feature = "verbose1"))]
@@ -1151,6 +1168,12 @@ impl<N: NetworkParams> QSearch<N> {
             dup: crate::dupstats::DupCounts::ZERO,
             #[cfg(feature = "dupstats")]
             dup_worker: 0,
+            #[cfg(feature = "dupstats")]
+            timeline: Box::default(),
+            #[cfg(feature = "dupstats")]
+            search_start: None,
+            #[cfg(all(feature = "dupstats", feature = "verbose3"))]
+            first_finish: None,
             #[cfg(lazy_smp_spread)]
             // Alone until a pool says otherwise (`set_best_move_tally`).
             spread: crate::spread::Spread::new(STACK_LEN, crate::config::LAZY_SMP_SPREAD, 1),
@@ -1860,6 +1883,32 @@ impl<N: NetworkParams> QSearch<N> {
         }
     }
 
+    /// The moment the search this worker belongs to started, which every
+    /// worker of it times its iterations from.
+    #[cfg(feature = "dupstats")]
+    pub fn set_search_start(&mut self, start: Instant) {
+        self.search_start = Some(start);
+    }
+
+    /// End the search when the first of its workers finishes, through `latch`,
+    /// which every worker of the search is handed.
+    #[cfg(all(feature = "dupstats", feature = "verbose3"))]
+    pub fn set_first_finish(&mut self, latch: &'static crate::timeline::FirstFinish) {
+        self.first_finish = Some(latch);
+    }
+
+    /// Who had stored the root of `pos` at `depth` or deeper, read before an
+    /// iteration to `depth` starts. The read changes nothing in the table.
+    #[cfg(feature = "dupstats")]
+    fn root_entry(&self, pos: &Position, depth: i32) -> crate::timeline::RootEntry {
+        let key = pos.key();
+        let tt = TranspositionTable::shared();
+        let (_, _, slot) = tt.locate(key, pos.side_to_move().index() as u8);
+        let found = tt.depth_at(slot, key);
+        let writer = found.and_then(|_| crate::dupstats::writer_of(key));
+        crate::timeline::RootEntry::of(found, depth, writer, self.dup_writer_id())
+    }
+
     /// Who this worker is, as the duplication statistics' writer table records
     /// a store.
     #[cfg(feature = "dupstats")]
@@ -2489,6 +2538,8 @@ impl<N: NetworkParams> QSearch<N> {
         {
             self.dup = crate::dupstats::DupCounts::ZERO;
             crate::dupstats::clear_path();
+            let start = self.search_start.unwrap_or_else(Instant::now);
+            self.timeline.reset(self.dup_worker, start);
         }
         #[cfg(lazy_smp_spread)]
         self.spread.reset();
@@ -2604,6 +2655,12 @@ impl<N: NetworkParams> QSearch<N> {
                 search_again_counter += 1;
             }
 
+            #[cfg(feature = "dupstats")]
+            {
+                let entry = self.root_entry(root_pos, root_depth);
+                self.timeline.begin(root_depth, entry);
+            }
+
             // The aspiration seed for the next iteration; all
             // `-VALUE_INFINITE` on the first.
             for rm in root_moves.iter_mut() {
@@ -2668,8 +2725,14 @@ impl<N: NetworkParams> QSearch<N> {
             // The iteration is incomplete, so discard it and keep the last
             // completed ordering.
             if self.stopped {
+                #[cfg(feature = "dupstats")]
+                self.timeline
+                    .end(false, self.nodes, root_moves[0].mv, root_moves[0].score);
                 break;
             }
+            #[cfg(feature = "dupstats")]
+            self.timeline
+                .end(true, self.nodes, root_moves[0].mv, root_moves[0].score);
 
             // End of a completed iteration (the reference's `if
             // (!threads.stop)` block).
@@ -2818,6 +2881,17 @@ impl<N: NetworkParams> QSearch<N> {
             iter_idx = (iter_idx + 1) & 3;
         }
 
+        // A worker that ran its deepening to its end, in a search that ends at
+        // the first worker to finish: the first one stops the others.
+        #[cfg(all(feature = "dupstats", feature = "verbose3"))]
+        if !self.stopped
+            && let Some(latch) = self.first_finish
+            && latch.finish(usize::from(self.dup_worker))
+            && let Some(stop) = self.control.stop
+        {
+            stop.store(true, Ordering::Relaxed);
+        }
+
         // Only an abort during iteration 1 leaves `completed_best` empty, and
         // then `root_moves[0]` — the best-so-far after the partial iteration's
         // sort — is still a legal move. It is taken out of the list rather than
@@ -2852,6 +2926,8 @@ impl<N: NetworkParams> QSearch<N> {
             } else {
                 None
             },
+            #[cfg(feature = "dupstats")]
+            timeline: self.timeline.clone(),
             #[cfg(all(lazy_smp_spread, feature = "verbose1"))]
             spread: self.spread.counts(),
             #[cfg(all(lazy_smp_defer, feature = "verbose1"))]
@@ -2953,10 +3029,14 @@ impl<N: NetworkParams> QSearch<N> {
                 beta = alpha;
                 alpha = (best_value - delta).max(-VALUE_INFINITE);
                 failed_high_cnt = 0;
+                #[cfg(feature = "dupstats")]
+                self.timeline.fail_low();
             } else if best_value >= beta {
                 alpha = (beta - delta).max(alpha);
                 beta = (best_value + delta).min(VALUE_INFINITE);
                 failed_high_cnt += 1;
+                #[cfg(feature = "dupstats")]
+                self.timeline.fail_high();
             } else {
                 break;
             }
@@ -4501,6 +4581,12 @@ impl<N: NetworkParams> QSearch<N> {
             #[cfg(all(lazy_smp_defer, feature = "verbose1"))]
             if self.tt_cut_ply == ply + 1 && self.defer.draining(s) {
                 self.defer.note_tt_cut();
+            }
+
+            #[cfg(feature = "dupstats")]
+            if root_node {
+                self.timeline
+                    .root_move(move_count == 1, self.nodes - node_count);
             }
 
             // A stop that fired inside this move's subtree makes the returned

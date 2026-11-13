@@ -62,8 +62,11 @@ yorkie-eval = { path = "../yorkie-eval", features = ["source-network"] }
 # search workers repeat each other's work (the `dupstats` module), using two
 # statistics-only tables beside the transposition table. It changes no search
 # decision, but the tables cost memory traffic, so a build with it is slower
-# than one without and its timings are not comparable with theirs. It implies
-# `verbose1`, whose statistics line carries its totals. Off by default.
+# than one without and its timings are not comparable with theirs. It also
+# keeps each worker's record of when it finished each root iteration (the
+# `timeline` module), and with `verbose3` the latch a measurement uses to end a
+# search at its first worker to finish. It implies `verbose1`, whose statistics
+# line carries its totals. Off by default.
 #
 # `lazy-smp-spread` compiles in the move-order spread of the `spread` module
 # without turning it on. The config key `lazy_smp_spread` compiles the same code

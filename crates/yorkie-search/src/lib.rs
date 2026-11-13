@@ -39,6 +39,9 @@ pub mod spread;
 #[cfg(test)]
 mod text_str;
 pub mod timeman;
+// When each worker finished each root iteration: only a build that measures it.
+#[cfg(feature = "dupstats")]
+pub mod timeline;
 pub mod update;
 
 pub use book::{BookConfig, BookHit, BookProbeResult, Prng, YorkieProbe, probe_book};
