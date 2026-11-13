@@ -2104,13 +2104,14 @@ impl<N: NetworkParams> QSearch<N> {
                     && let Some(mate_move) = pos.mate_1ply()
                 {
                     best_value = self.mate_for(us, ply + 1);
-                    // The stored value is the raw root-relative
-                    // `mate_in(ply+1)`, deliberately not `value_to_tt`-converted.
+                    // The returned value counts plies from the root; the
+                    // stored one counts them from this position, so a probe
+                    // at any other ply reads back the same mate in one.
                     let tt_pv = self.stack[Self::si(ply)].tt_pv;
                     self.tt_store(
                         tt_slot,
                         pos_key,
-                        best_value,
+                        value_to_tt(best_value, ply),
                         tt_pv,
                         Bound::Exact,
                         DEPTH_QS,
@@ -3321,6 +3322,23 @@ impl<N: NetworkParams> QSearch<N> {
         cut_node: bool,
         pv_node: bool,
     ) -> Value {
+        self.run_search_at(pos, 0, alpha, beta, depth, cut_node, pv_node)
+    }
+
+    /// [`Self::run_search`] with the node placed at `ply`: the values it
+    /// returns count from a root `ply` plies above it, the ones it stores
+    /// count from the node itself.
+    #[expect(clippy::too_many_arguments)]
+    fn run_search_at(
+        &mut self,
+        pos: &mut Position,
+        ply: i32,
+        alpha: Value,
+        beta: Value,
+        depth: i32,
+        cut_node: bool,
+        pv_node: bool,
+    ) -> Value {
         self.nodes = 0;
         self.sel_depth = 0;
         self.set_root_side(pos.side_to_move());
@@ -3340,7 +3358,7 @@ impl<N: NetworkParams> QSearch<N> {
         self.seed_accumulator(pos);
         self.lend_picker_scratch(|this, scratch| {
             this.search(
-                pos, 0, alpha, beta, depth, cut_node, pv_node, None, None, scratch,
+                pos, ply, alpha, beta, depth, cut_node, pv_node, None, None, scratch,
             )
         })
     }
@@ -3601,10 +3619,12 @@ impl<N: NetworkParams> QSearch<N> {
                 tt_hit,
                 dup_at,
             );
+            // Returned root-relative, stored position-relative, as every
+            // decisive value in the table is.
             self.tt_store(
                 tt_slot,
                 pos_key,
-                best_value,
+                value_to_tt(best_value, ply),
                 ttpv,
                 Bound::Exact,
                 (MAX_PLY - 1).min(depth + 6),
@@ -5434,9 +5454,109 @@ mod tests {
         assert!(found);
         assert_eq!(data.bound, Bound::Exact);
         assert_eq!(data.depth, DEPTH_QS);
-        assert_eq!(data.value, want, "raw mate score, not value_to_tt'd");
+        assert_eq!(
+            data.value, want,
+            "at ply 0 the stored value is the returned one"
+        );
         assert_eq!(data.eval, VALUE_NONE, "unadjustedStaticEval is still NONE");
         assert_eq!(data.move16, move16_of(p.mate_1ply()));
+    }
+
+    /// The entry a one-ply mate leaves behind holds "mate in one from here",
+    /// `VALUE_MATE - 1`, and a qsearch probe of it at any ply reads back
+    /// `mate_in(ply + 1)`. The engine plays the side that is mated, so the
+    /// distance is kept under `FLATTEN` too.
+    fn assert_one_ply_mate_entry(table: &TranspositionTable, p: &Position) {
+        let (found, data) = probe_root(table, p);
+        assert!(found);
+        assert_eq!(data.bound, Bound::Exact);
+        assert_eq!(data.value, VALUE_MATE - 1, "position-relative mate in one");
+
+        let net = zero_net();
+        for probe_ply in [2, 7] {
+            assert_eq!(value_from_tt(data.value, probe_ply), mate_in(probe_ply + 1));
+            let mut q = QSearch::new(net.network());
+            q.set_root_side(p.side_to_move().flip());
+            q.pv_node = false;
+            q.set_read_tt(true);
+            let v = q.qsearch_at(&mut p.clone(), probe_ply, -1, 0);
+            assert_eq!(v, mate_in(probe_ply + 1), "probed at ply {probe_ply}");
+            assert_eq!(q.nodes, 0, "the probe is answered by the table");
+        }
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn qsearch_one_ply_mate_above_the_root_is_stored_position_relative() {
+        let p = pos(MATE_IN_1);
+        let net = zero_net();
+        let table = fresh_tt();
+        let mut q = QSearch::new(net.network());
+        q.set_root_side(p.side_to_move().flip());
+        q.pv_node = false;
+        q.set_read_tt(true);
+        let v = q.qsearch_at(&mut p.clone(), 4, -1, 0);
+        assert_eq!(v, mate_in(5), "the returned value counts from the root");
+        assert_eq!(probe_root(&table, &p).1.depth, DEPTH_QS);
+        assert_one_ply_mate_entry(&table, &p);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn search_one_ply_mate_above_the_root_is_stored_position_relative() {
+        let p = pos(MATE_IN_1);
+        let net = zero_net();
+        let table = fresh_tt();
+        let mut q = QSearch::new(net.network());
+        // The root is taken to be the opponent's, so under `FLATTEN` the mate
+        // is scored against the engine and keeps its distance.
+        q.set_thinking_ahead(true);
+        let v = q.run_search_at(&mut p.clone(), 4, -1, 0, 1, false, false);
+        assert_eq!(v, mate_in(5), "the returned value counts from the root");
+        assert_eq!(q.nodes, 0, "the mate is found before any do_move");
+        assert_eq!(probe_root(&table, &p).1.depth, 7);
+        assert_one_ply_mate_entry(&table, &p);
+    }
+
+    /// White to move with one legal move, K9a-8a, after which black mates with
+    /// G*8b.
+    const ONE_MOVE_TO_MATE: &str = "k8/9/1G7/9/9/9/9/9/8K w G 1";
+    /// The position after that move.
+    const MATED_NEXT: &str = "1k7/9/1G7/9/9/9/9/9/8K b G 2";
+
+    /// The mate-in-one node is first met four plies below a root and stored
+    /// there; a later search meets it two plies below the root, takes its value
+    /// from the table, and reports the mate at its true distance from that root.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_one_ply_mate_met_at_another_ply_keeps_its_distance() {
+        let parent = pos(ONE_MOVE_TO_MATE);
+        assert_eq!(legal_moves(&parent).len(), 1, "the parent has one move");
+        assert!(parent.mate_1ply().is_none());
+        let child = pos(MATED_NEXT);
+        assert!(child.mate_1ply().is_some());
+        let mut reached = parent.clone();
+        reached.do_move(legal_moves(&parent)[0]);
+        assert_eq!(
+            reached.key(),
+            child.key(),
+            "the one move reaches the mate node"
+        );
+
+        let net = zero_net();
+        let _tt = fresh_tt();
+        let mut first = QSearch::new(net.network());
+        first.set_thinking_ahead(true);
+        assert_eq!(
+            first.run_search_at(&mut child.clone(), 4, -1, 0, 1, false, false),
+            mate_in(5)
+        );
+
+        // A window the null move and the static prunings leave alone, so the
+        // single move is searched and the child answers from the table.
+        let mut second = QSearch::new(net.network());
+        let v = second.run_search_at(&mut parent.clone(), 1, 100, 101, 2, false, false);
+        assert_eq!(v, mated_in(3), "white is mated two plies below the parent");
     }
 
     /// The search after the engine's own move has the opponent to move at its
