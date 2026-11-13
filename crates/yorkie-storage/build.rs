@@ -1,10 +1,12 @@
 //! Compile the engine's settings into the storage layer.
 //!
-//! The storage layer needs two settings. `usi_hash` is the size of the
+//! The storage layer needs three settings. `usi_hash` is the size of the
 //! transposition table; the table is a `static`, so its cluster count is an
 //! array length — a value that has to exist before the crate is compiled, not
 //! one a caller can hand over. `flatten_winning_mate` decides where the table's
 //! miss sentinel sits, above every score the search can store.
+//! `tt_replace_depth_margin` is the depth margin of the table's replacement
+//! rule.
 //!
 //! The schema, parser, code generator and path resolution are shared verbatim
 //! with the protocol crate's build script, so the two builds cannot read the

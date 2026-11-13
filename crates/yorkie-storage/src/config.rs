@@ -4,10 +4,12 @@
 //! the engine is built from, and included verbatim below. Nothing here is
 //! hand-written, and no value can change at run time.
 //!
-//! The storage layer reads two keys: `usi_hash`, the transposition table's
-//! size, which is an array length here and so has to be a constant; and
+//! The storage layer reads three keys: `usi_hash`, the transposition table's
+//! size, which is an array length here and so has to be a constant;
 //! `flatten_winning_mate`, which moves the table's miss sentinel up past the
-//! flat mate value that setting introduces. The rest are allowed-but-unused
+//! flat mate value that setting introduces; and `tt_replace_depth_margin`, how
+//! much shallower a store may be and still overwrite an entry of the same
+//! position. The rest are allowed-but-unused
 //! rather than filtered out, so this file cannot drift from the protocol crate's
 //! copy.
 

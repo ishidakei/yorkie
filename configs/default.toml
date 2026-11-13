@@ -418,6 +418,19 @@ lazy_smp_spread = false
 # all.
 lazy_smp_defer = false
 
+# How much shallower, in plies, a search result may be than the
+# transposition-table entry it lands on and still overwrite it, when the entry
+# holds the same position, was written by the current search and the result is
+# not exact. A result on the principal variation counts two plies deeper for
+# this comparison. `4` is the reference engine's rule: a result up to three
+# plies shallower replaces the entry. `0` keeps the entry unless the result is
+# deeper. An exact result, an entry of another position and an entry from an
+# earlier search are overwritten whatever this says, and a stored best move is
+# kept when the result carries none. The accepted range is 0 to 8. Any value
+# other than `4` departs from the reference and changes the node counts of a
+# one-thread search as well.
+tt_replace_depth_margin = 4
+
 # ---------------------------------------------------------------------------
 # Time management
 # ---------------------------------------------------------------------------

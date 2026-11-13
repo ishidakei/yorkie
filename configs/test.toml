@@ -113,6 +113,7 @@ ponder_root_margin = 500
 ponder_credit = 0
 lazy_smp_spread = false
 lazy_smp_defer = false
+tt_replace_depth_margin = 4
 
 # ---------------------------------------------------------------------------
 # Time management

@@ -157,6 +157,11 @@ pub const VALUE_NONE: Value = if crate::config::FLATTEN_WINNING_MATE {
     32002
 };
 
+/// How much shallower a non-exact store may be than a same-position entry of
+/// the current generation and still overwrite it, before the PV bonus: the
+/// `tt_replace_depth_margin` setting. The reference's rule is 4.
+pub const REPLACE_DEPTH_MARGIN: Depth = crate::config::TT_REPLACE_DEPTH_MARGIN as Depth;
+
 // The `genBound8` bit layout: `generation (5) | bound (2) << 5 | pv (1) << 7`.
 const GENERATION_BITS: u8 = 5;
 const GENERATION_MASK: u8 = (1 << GENERATION_BITS) - 1;
@@ -567,10 +572,51 @@ impl Cluster {
     /// field then differed. A store that only rewrites the move leaves it
     /// alone. The table is shared, so the count lives with the caller rather
     /// than in here.
+    ///
+    /// The margin of the third condition is [`REPLACE_DEPTH_MARGIN`].
     #[inline]
     #[expect(clippy::too_many_arguments)]
     fn save(
         &self,
+        slot: usize,
+        k: TteKey,
+        v: Value,
+        pv: bool,
+        b: Bound,
+        d: Depth,
+        m: Option<NonZeroU16>,
+        ev: Value,
+        curr_generation: u8,
+        #[cfg(feature = "verbose3")] marks: ValueMarks,
+        #[cfg(feature = "verbose1")] updates: &mut u64,
+    ) {
+        self.save_with_margin(
+            REPLACE_DEPTH_MARGIN,
+            slot,
+            k,
+            v,
+            pv,
+            b,
+            d,
+            m,
+            ev,
+            curr_generation,
+            #[cfg(feature = "verbose3")]
+            marks,
+            #[cfg(feature = "verbose1")]
+            updates,
+        );
+    }
+
+    /// [`Self::save`] with the depth margin of the third condition as an
+    /// argument, so the tests can exercise the rule at margins other than the
+    /// build's. Always inlined, so the build's margin folds into the
+    /// comparison as a constant.
+    #[inline(always)]
+    #[expect(clippy::too_many_arguments)]
+    fn save_with_margin(
+        &self,
+        margin: Depth,
         slot: usize,
         k: TteKey,
         v: Value,
@@ -605,10 +651,10 @@ impl Cluster {
         }
 
         // The depth comparison is in `i32` to match the reference's `int`
-        // promotion: `depth8 - 4` may be negative.
+        // promotion: `depth8 - margin` may be negative.
         if b == Bound::Exact
             || !key_matches(old_key, k)
-            || d - DEPTH_NONE + 2 * pv as Depth > old_depth8 as Depth - 4
+            || d - DEPTH_NONE + 2 * pv as Depth > old_depth8 as Depth - margin
             || relative_age(old_gen_bound8, curr_generation) != 0
         {
             debug_assert!(d > DEPTH_NONE);
@@ -1333,10 +1379,11 @@ mod save_tests {
         }
     }
 
-    fn save(cluster: &Cluster, s: Store) {
+    fn save<const MARGIN: Depth>(cluster: &Cluster, s: Store) {
         #[cfg(feature = "verbose1")]
         let mut updates = 0;
-        cluster.save(
+        cluster.save_with_margin(
+            MARGIN,
             0,
             s.k,
             s.v,
@@ -1357,7 +1404,7 @@ mod save_tests {
     /// written whenever the store carries one or the entry holds another
     /// position, and every payload field whenever the replacement condition
     /// holds.
-    fn save_unconditionally(cluster: &Cluster, s: Store) {
+    fn save_unconditionally<const MARGIN: Depth>(cluster: &Cluster, s: Store) {
         #[cfg(all(feature = "verbose3", feature = "tt-entry16"))]
         let k = s.k | (s.marks.bits() as TteKey) << MARK_SHIFT;
         #[cfg(not(all(feature = "verbose3", feature = "tt-entry16")))]
@@ -1371,7 +1418,7 @@ mod save_tests {
         }
         if s.b == Bound::Exact
             || !key_matches(old_key, k)
-            || s.d - DEPTH_NONE + 2 * s.pv as Depth > old_depth8 as Depth - 4
+            || s.d - DEPTH_NONE + 2 * s.pv as Depth > old_depth8 as Depth - MARGIN
             || relative_age(old_gen_bound8, s.generation) != 0
         {
             entry.key.store(k, REL);
@@ -1414,20 +1461,100 @@ mod save_tests {
     }
 
     /// Store `first` and then `second` into two empty clusters, one through
-    /// [`Cluster::save`] and one through [`save_unconditionally`], checking
-    /// after each store that the two hold the same. Returns the first cluster
-    /// and its contents from before `second`.
-    fn check(first: Store, second: Store) -> (Cluster, Contents) {
+    /// [`Cluster::save`] and one through [`save_unconditionally`], both with
+    /// depth margin `MARGIN`, checking after each store that the two hold the
+    /// same. Returns the first cluster and its contents from before `second`.
+    fn check_at<const MARGIN: Depth>(first: Store, second: Store) -> (Cluster, Contents) {
         let skipping = Cluster::empty();
         let unconditional = Cluster::empty();
-        save(&skipping, first);
-        save_unconditionally(&unconditional, first);
+        save::<MARGIN>(&skipping, first);
+        save_unconditionally::<MARGIN>(&unconditional, first);
         assert_eq!(contents(&skipping), contents(&unconditional));
         let before = contents(&skipping);
-        save(&skipping, second);
-        save_unconditionally(&unconditional, second);
+        save::<MARGIN>(&skipping, second);
+        save_unconditionally::<MARGIN>(&unconditional, second);
         assert_eq!(contents(&skipping), contents(&unconditional));
         (skipping, before)
+    }
+
+    /// [`check_at`] with the reference's margin, whatever the config sets.
+    fn check(first: Store, second: Store) -> (Cluster, Contents) {
+        check_at::<4>(first, second)
+    }
+
+    /// Whether `second`, stored over [`base`] with margin `MARGIN`, replaced
+    /// the payload. The store carries a value the base does not, so a replaced
+    /// payload always differs.
+    fn overwrites<const MARGIN: Depth>(second: Store) -> bool {
+        let (cluster, _) = check_at::<MARGIN>(base(), Store { v: 200, ..second });
+        let data = cluster.read(0);
+        assert_eq!(data.move16, NonZeroU16::new(second.m));
+        if data.value == 200 {
+            assert_eq!(data.depth, second.d);
+            assert_eq!(data.is_pv, second.pv);
+            true
+        } else {
+            assert_eq!(data.depth, base().d);
+            assert_eq!(data.value, base().v);
+            false
+        }
+    }
+
+    /// The outcome of a same-position, same-generation, non-exact store over
+    /// an entry of depth 10, for each margin, at depths 7, 9, 10 and 11
+    /// (old depth − 3, − 1, equal, + 1), without and with the PV bonus.
+    #[test]
+    fn the_depth_margin_decides_a_shallower_same_position_store() {
+        fn outcomes<const MARGIN: Depth>(pv: bool) -> [bool; 4] {
+            [7, 9, 10, 11].map(|d| overwrites::<MARGIN>(Store { d, pv, ..base() }))
+        }
+        assert_eq!(outcomes::<0>(false), [false, false, false, true]);
+        assert_eq!(outcomes::<0>(true), [false, true, true, true]);
+        assert_eq!(outcomes::<2>(false), [false, true, true, true]);
+        assert_eq!(outcomes::<2>(true), [true, true, true, true]);
+        assert_eq!(outcomes::<4>(false), [true, true, true, true]);
+        assert_eq!(outcomes::<4>(true), [true, true, true, true]);
+    }
+
+    /// An exact store, a store over an earlier generation's entry and a store
+    /// over another position's entry replace it at every margin, however
+    /// shallow.
+    #[test]
+    fn exact_older_generation_and_other_position_stores_overwrite_at_every_margin() {
+        fn all<const MARGIN: Depth>() {
+            let shallow = Store { d: 1, ..base() };
+            assert!(overwrites::<MARGIN>(Store {
+                b: Bound::Exact,
+                ..shallow
+            }));
+            assert!(overwrites::<MARGIN>(Store {
+                generation: 1,
+                ..shallow
+            }));
+            let (cluster, _) = check_at::<MARGIN>(
+                base(),
+                Store {
+                    k: other(),
+                    ..shallow
+                },
+            );
+            assert!(key_matches(cluster.entry[0].key.load(REL), other()));
+            assert_eq!(cluster.read(0).depth, 1);
+        }
+        all::<0>();
+        all::<2>();
+        all::<4>();
+        all::<8>();
+    }
+
+    /// A shallower store without a move keeps the entry's move at margin 0,
+    /// whether or not it replaces the payload.
+    #[test]
+    fn margin_zero_keeps_the_positions_move() {
+        for d in [7, 11] {
+            let (cluster, _) = check_at::<0>(base(), Store { d, m: 0, ..base() });
+            assert_eq!(cluster.read(0).move16, NonZeroU16::new(7), "depth {d}");
+        }
     }
 
     /// Depth 1 is stored as 4, which does not beat 13 − 4 in the same
@@ -1575,7 +1702,8 @@ mod store_count_tests {
         generation: u8,
     ) -> u64 {
         let mut updates = 0;
-        cluster.save(
+        cluster.save_with_margin(
+            4,
             0,
             k,
             0,

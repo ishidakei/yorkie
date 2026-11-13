@@ -500,6 +500,12 @@ const SCHEMA: &[Spec] = &[
         "lazy_smp_defer",
         "(none: a parallel worker puts off a move another worker is searching)",
     ),
+    int(
+        "tt_replace_depth_margin",
+        "(none: how much shallower a store may be and still overwrite a same-position entry)",
+        0,
+        8,
+    ),
     // --- Time management.
     int("network_delay", "NetworkDelay", 0, 10_000),
     int("network_delay2", "NetworkDelay2", 0, 10_000),
