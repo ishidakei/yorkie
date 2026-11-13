@@ -1,5 +1,48 @@
 # Changelog
 
+## 3.3.0
+
+The play config now consults the `.ybb`
+book at every ply and matches its
+entries by board alone, scores a draw
+-240 for black and +240 for white, and
+ends a game at move 512. A second book
+format, the yorkie book, is probed ahead
+of the `.ybb` book with the whole game
+path: `yorkie_book_files` lists weighted
+files, one drawn at each `usinewgame`
+and named on an `info string`, and
+`yorkie_book_path_skip_moves` leaves a
+server's opening preamble out of the
+path. New build-time keys:
+`flatten_winning_mate` and `quick_draw`
+(both on in the play config),
+`ponder_root_moves` and
+`ponder_root_margin` (the ponder search
+reads its root moves to full depth),
+`ponder_credit` (pondered time counts
+against the next search),
+`low_priority_worker` (the last worker
+at nice 19 beside the engine's other
+threads, which are now pinned to the
+lowest-numbered CPU),
+`tt_replace_depth_margin`, and
+`lazy_smp_spread` and `lazy_smp_defer`
+(off by default). `cpu_assignment`
+accepts `"none"` to pin nothing. A
+one-ply mate is stored in the table
+relative to its position. `verbose1`'s
+statistics line adds `evals` and
+`eval_tt_hits`, and a `verbose3` bench
+ends with one. New measuring features:
+`tune` (search parameters set from
+`YORKIE_TUNE`) and `dupstats` (how
+parallel workers duplicate each other's
+work). The evaluation's accumulator
+updates write each child directly and
+run column by column, raising search
+throughput on unchanged node counts.
+
 ## 3.2.0
 
 Settings are compiled in from a TOML
