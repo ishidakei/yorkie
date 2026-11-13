@@ -42,6 +42,7 @@ cpu_assignment = "0"
 # takes nothing from any ledger and leaves the machine's CPUs to whatever is
 # playing on it.
 cpu_ledger = ""
+low_priority_worker = false
 numa_nodes = "auto"
 # TEST VALUE: the play config says `true`. A test drives one search at a time
 # and reads the transcript it produced; a search that outlives its `bestmove`

@@ -536,6 +536,81 @@ fn pin_current_thread(cpu: CpuIndex) {
 #[cfg(not(target_os = "linux"))]
 fn pin_current_thread(_cpu: CpuIndex) {}
 
+/// The nice value [`lower_current_thread_priority`] sets: the lowest priority
+/// of the kernel's fair scheduling class.
+///
+/// Lowest, but still fair. A thread at nice 19 gets a small weight against
+/// every nice-0 thread on its CPU, so whatever else runs there takes the CPU
+/// first, and the thread itself is still given a share by the scheduler — it
+/// is never parked indefinitely, which is what `SCHED_IDLE` would allow.
+pub const LOWEST_NICE: i32 = 19;
+
+/// A kernel thread id: what `gettid` returns, and what the per-thread
+/// scheduling calls name a thread by.
+pub type ThreadId = i32;
+
+/// The calling thread's kernel thread id; 0 off Linux.
+pub fn current_thread_id() -> ThreadId {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `gettid` takes nothing and cannot fail.
+        unsafe { libc::gettid() }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
+/// Lower the calling thread, and no other, to nice [`LOWEST_NICE`].
+///
+/// On Linux a nice value belongs to a thread, not to its process, so naming the
+/// thread's own id leaves every other thread of the process where it was.
+/// Lowering a priority needs no privilege; `Err` carries the `errno` of a
+/// refusal all the same (a seccomp filter can produce one), and the caller
+/// decides what to say about it. Off Linux nothing is changed and the result is
+/// `Err(0)`.
+pub fn lower_current_thread_priority() -> Result<(), i32> {
+    #[cfg(target_os = "linux")]
+    {
+        let tid = current_thread_id();
+        // SAFETY: plain syscall wrapper on the calling thread's own id.
+        let status =
+            unsafe { libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, LOWEST_NICE) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(0)
+    }
+}
+
+/// The nice value of thread `tid`, or `None` when the kernel will not say (no
+/// such thread, or not Linux).
+pub fn thread_nice(tid: ThreadId) -> Option<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        // `getpriority` may legitimately return -1, so `errno` is what tells
+        // a failure apart, and it has to be cleared first.
+        // SAFETY: `__errno_location` points at this thread's `errno`, and
+        // `getpriority` only reads the named thread's priority.
+        unsafe {
+            *libc::__errno_location() = 0;
+            let nice = libc::getpriority(libc::PRIO_PROCESS, tid as libc::id_t);
+            (*libc::__errno_location() == 0).then_some(nice)
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = tid;
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,6 +627,40 @@ mod tests {
         let mut out = Vec::new();
         err.write_message(|fragment| out.extend_from_slice(fragment));
         String::from_utf8(out).expect("a message is ASCII")
+    }
+
+    // -- per-thread priority ----------------------------------------------
+
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn lowering_a_thread_leaves_its_siblings_alone() {
+        let caller = current_thread_id();
+        let before = thread_nice(caller).expect("the calling thread has a nice value");
+        let (tid, lowered) =
+            std::thread::spawn(|| (current_thread_id(), lower_current_thread_priority()))
+                .join()
+                .expect("the thread runs");
+        assert_eq!(lowered, Ok(()), "lowering needs no privilege");
+        assert_ne!(tid, caller);
+        assert_eq!(
+            thread_nice(caller),
+            Some(before),
+            "the spawning thread keeps its priority"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_lowered_thread_reads_back_the_lowest_nice() {
+        let nice = std::thread::spawn(|| {
+            lower_current_thread_priority().expect("lowering needs no privilege");
+            thread_nice(current_thread_id())
+        })
+        .join()
+        .expect("the thread runs");
+        assert_eq!(nice, Some(LOWEST_NICE));
     }
 
     // -- shortened-list parsing -------------------------------------------

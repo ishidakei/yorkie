@@ -34,6 +34,7 @@ cpu_assignment = "none"
 # DIFFERENCE: ".yorkie-cpu-ledger" in default.toml. A build that pins nothing
 # takes nothing from a ledger.
 cpu_ledger = ""
+low_priority_worker = false
 numa_nodes = "auto"
 
 # DIFFERENCE: true in default.toml. A search that runs on the opponent's time

@@ -103,8 +103,16 @@ serde_json = "~1.0"
 # when the config's `lazy_smp_spread` is true and the build has more than one
 # worker. The config key alone compiles the same code in; the feature is how
 # the tests reach it under a config that leaves the key off. Off by default.
+#
+# `low-priority-worker` compiles in what the config key `low_priority_worker`
+# turns on — one worker at the lowest scheduling priority, collected by a search
+# for a bounded time only, and the CPU-line annotation that names it — without
+# turning it on: with the key off, no worker is lowered. The key alone compiles
+# the same code in; the feature is how the tests reach it under a config that
+# leaves the key off. Off by default.
 [features]
 lazy-smp-spread = ["yorkie-search/lazy-smp-spread"]
+low-priority-worker = []
 verbose1 = ["yorkie-search/verbose1", "yorkie-storage/verbose1"]
 verbose2 = ["verbose1", "yorkie-search/verbose2"]
 verbose3 = ["verbose2", "yorkie-search/verbose3", "yorkie-storage/verbose3"]

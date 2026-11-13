@@ -75,6 +75,13 @@ impl Settings {
         crate::config::WORKER_CPUS
     }
 
+    /// The worker that runs at low priority, sharing its CPU with the engine's
+    /// non-search threads: the last one, when `low_priority_worker` is on.
+    #[cfg(low_priority_worker)]
+    pub(crate) fn low_priority_worker(&self) -> Option<usize> {
+        crate::config::LOW_PRIORITY_WORKER.then(|| self.threads() - 1)
+    }
+
     /// The system NUMA node of each worker's CPU, aligned with
     /// [`Self::worker_cpus`].
     pub(crate) fn worker_system_nodes(&self) -> &'static [usize] {

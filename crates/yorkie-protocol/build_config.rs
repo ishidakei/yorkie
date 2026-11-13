@@ -153,6 +153,9 @@ struct AssignmentRequest<'a> {
     ledger: &'a str,
     /// The `threads` value: how many CPUs the assignment must cover.
     threads: i64,
+    /// The `low_priority_worker` value: whether the last worker runs at low
+    /// priority on the CPU the machine's non-search threads share.
+    low_priority: bool,
 }
 
 /// The worker → CPU assignment a build resolved.
@@ -363,6 +366,10 @@ const SCHEMA: &[Spec] = &[
     text(
         "cpu_ledger",
         "(none: the file recording which CPUs earlier builds on the same machine took)",
+    ),
+    boolean(
+        "low_priority_worker",
+        "(none: the last worker runs at low priority on the CPU the non-search threads share)",
     ),
     node_count(
         "numa_nodes",
@@ -792,7 +799,10 @@ struct Generated {
 /// code reshapes data structures cannot be folded away behind a constant, and a
 /// build with the switch off has to be exactly the build without the code.
 #[allow(dead_code)]
-const CFG_SWITCHES: &[(&str, &str)] = &[("lazy_smp_spread", "lazy_smp_spread")];
+const CFG_SWITCHES: &[(&str, &str)] = &[
+    ("lazy_smp_spread", "lazy_smp_spread"),
+    ("low_priority_worker", "low_priority_worker"),
+];
 
 /// Type-check and range-check every schema key against the parsed file, reject
 /// anything left over, and render the generated module.
@@ -1011,10 +1021,24 @@ fn generate(
                         ),
                     ));
                 };
+                let Some(Value::Bool(low_priority)) =
+                    entries.get("low_priority_worker").map(|e| &e.value)
+                else {
+                    return Err(at(
+                        label,
+                        entry.line,
+                        &format!(
+                            "`{}` places the worker `low_priority_worker` lowers, which this \
+                             config does not give as a boolean",
+                            spec.key
+                        ),
+                    ));
+                };
                 let resolved = resolve(&AssignmentRequest {
                     spec: spec_value,
                     ledger,
                     threads: *threads,
+                    low_priority: *low_priority,
                 })
                 .map_err(|e| at(label, entry.line, &e))?;
                 format!(

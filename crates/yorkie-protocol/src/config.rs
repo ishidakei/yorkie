@@ -54,6 +54,10 @@ const _: () = assert!(
      and an unpinned build names none"
 );
 const _: () = assert!(
+    !LOW_PRIORITY_WORKER || THREADS >= 2,
+    "the low-priority worker is the last one and never the main worker, so it needs two"
+);
+const _: () = assert!(
     WORKER_SYSTEM_NODES.len() == THREADS as usize,
     "the worker node table is indexed by worker id"
 );

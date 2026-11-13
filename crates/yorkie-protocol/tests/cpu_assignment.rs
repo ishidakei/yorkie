@@ -47,6 +47,15 @@ fn request<'a>(spec: &'a str, ledger: &'a str, threads: i64) -> AssignmentReques
         spec,
         ledger,
         threads,
+        low_priority: false,
+    }
+}
+
+/// [`request`] with `low_priority_worker = true`.
+fn low_priority_request<'a>(spec: &'a str, threads: i64) -> AssignmentRequest<'a> {
+    AssignmentRequest {
+        low_priority: true,
+        ..request(spec, "", threads)
     }
 }
 
@@ -515,4 +524,131 @@ fn concurrent_builds_do_not_take_the_same_cpu() {
         "eight single-worker builds fill the machine exactly once"
     );
     let _ = std::fs::remove_file(&path);
+}
+
+// --- The low-priority worker -----------------------------------------------
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn auto_gives_the_low_priority_worker_the_lowest_online_cpu_and_picks_round_it() {
+    let m = two_node_machine();
+    let path = ledger_path("low-auto");
+    let cpus = take_cpus(
+        &low_priority_request("auto", 4),
+        &m,
+        &path,
+        &identity("/build/a"),
+    )
+    .expect("a fresh ledger has every CPU free");
+    // Three full-priority workers round-robin over what CPU 0 leaves, then the
+    // low-priority worker, last, on CPU 0: never the main worker.
+    assert_eq!(cpus, vec![1, 2, 4, 0]);
+    let text = std::fs::read_to_string(&path).expect("the ledger was written");
+    let entries = parse_ledger(&text, "ledger").expect("parses");
+    assert_eq!(
+        entries[0].cpus,
+        vec![1, 2, 4, 0],
+        "the ledger records CPU 0 as taken"
+    );
+
+    // One worker per CPU: every CPU, CPU 0 last.
+    let whole = ledger_path("low-auto-whole");
+    assert_eq!(
+        take_cpus(
+            &low_priority_request("auto", 8),
+            &m,
+            &whole,
+            &identity("/build/a")
+        ),
+        Ok(vec![1, 2, 4, 6, 3, 5, 7, 0])
+    );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&whole);
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn auto_refuses_a_low_priority_worker_whose_cpu_another_build_holds() {
+    let m = two_node_machine();
+    let path = ledger_path("low-auto-held");
+    take_cpus(&request("auto", "", 1), &m, &path, &identity("/build/a")).expect("takes CPU 0");
+    let err = take_cpus(
+        &low_priority_request("auto", 2),
+        &m,
+        &path,
+        &identity("/build/b"),
+    )
+    .expect_err("CPU 0 is another build's");
+    assert!(err.contains("records CPU 0 as another build's"), "{err}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn an_explicit_list_puts_the_low_priority_worker_on_the_lowest_online_cpu() {
+    let m = two_node_machine();
+    let path = ledger_path("low-explicit");
+    // Listed first, CPU 0 would be the main worker's; it moves to the end.
+    assert_eq!(
+        take_cpus(
+            &low_priority_request("0-3", 4),
+            &m,
+            &path,
+            &identity("/build/a")
+        ),
+        Ok(vec![1, 2, 3, 0])
+    );
+    assert_eq!(
+        take_cpus(
+            &low_priority_request("5,0,4", 3),
+            &m,
+            &path,
+            &identity("/build/a")
+        ),
+        Ok(vec![5, 4, 0])
+    );
+    let err = take_cpus(
+        &low_priority_request("1-3", 3),
+        &m,
+        &path,
+        &identity("/build/a"),
+    )
+    .expect_err("the list leaves out the CPU the non-search threads share");
+    assert!(err.contains("does not name it"), "{err}");
+    assert!(!path.exists(), "an explicit list touches no ledger");
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_low_priority_worker_needs_a_second_worker() {
+    let m = two_node_machine();
+    for spec in ["auto", "0", "none"] {
+        let path = ledger_path("low-one");
+        let err = take_cpus(
+            &low_priority_request(spec, 1),
+            &m,
+            &path,
+            &identity("/build/a"),
+        )
+        .expect_err("the only worker is the main one");
+        assert!(err.contains("at least 2"), "{spec}: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn none_pins_no_low_priority_worker_either() {
+    let m = two_node_machine();
+    let path = ledger_path("low-none");
+    assert_eq!(
+        take_cpus(
+            &low_priority_request("none", 4),
+            &m,
+            &path,
+            &identity("/build/a")
+        ),
+        Ok(Vec::new())
+    );
+    assert!(!path.exists());
 }

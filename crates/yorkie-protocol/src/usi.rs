@@ -529,6 +529,10 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
     /// a session — a `setoption` value spelling a path in a Windows code page is
     /// read like any other line — and no line costs an allocation.
     pub fn run(mut self) -> io::Result<()> {
+        // This thread reads every command; with a low-priority worker it runs on
+        // that worker's CPU, the one CPU a worker shares.
+        #[cfg(low_priority_worker)]
+        self.engine.pin_to_shared_cpu();
         let mut line = vec![0u8; MAX_LINE_BYTES];
         loop {
             let filled = match read_command_line(&mut self.reader, &mut line)? {

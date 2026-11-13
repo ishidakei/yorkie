@@ -120,7 +120,8 @@ fn active_gates() -> Vec<&'static str> {
 }
 
 /// Set the `cfg` of every [`CFG_SWITCHES`] entry the config turns on, or whose
-/// same-named Cargo feature (`lazy_smp_spread` ↔ `lazy-smp-spread`) this build
+/// same-named Cargo feature (`lazy_smp_spread` ↔ `lazy-smp-spread`,
+/// `low_priority_worker` ↔ `low-priority-worker`) this build
 /// carries. The feature compiles a switch's code in without the config turning
 /// it on, which is how the tests reach code no test config enables.
 fn emit_switch_cfgs(on: &[&str]) {

@@ -33,8 +33,43 @@ struct Machine {
     layout: yorkie_numa::NumaLayout,
 }
 
+impl Machine {
+    /// The CPU the machine's non-search work is kept on: its lowest-numbered
+    /// online CPU.
+    ///
+    /// This is the one place the rule is written down. A build with
+    /// `low_priority_worker = true` puts its low-priority worker here, so that
+    /// worker is the only one sharing a CPU with anything; a host that keeps
+    /// its other processes off the workers' CPUs keeps them on this one.
+    fn shared_cpu(&self) -> CpuIndex {
+        self.online.first().copied().unwrap_or(0)
+    }
+}
+
 /// The `cpu_assignment` value that pins no worker.
 const UNPINNED: &str = "none";
+
+/// Move the machine's [shared CPU](Machine::shared_cpu) to the end of an
+/// explicit list, so the last worker — the low-priority one, never the main
+/// worker — is the one pinned to it.
+///
+/// The list has to name that CPU: the low-priority worker exists to give way to
+/// whatever else runs there, and lowering a worker on any other CPU would slow
+/// the search down for nothing.
+fn shared_cpu_last(cpus: &mut Vec<CpuIndex>, machine: &Machine) -> Result<(), String> {
+    let shared = machine.shared_cpu();
+    let Some(at) = cpus.iter().position(|&c| c == shared) else {
+        return Err(format!(
+            "`low_priority_worker` = true puts the low-priority worker on CPU {shared}, the \
+             machine's lowest online CPU and the one its non-search threads share, and \
+             `cpu_assignment` does not name it — add CPU {shared} to the list, or set \
+             `low_priority_worker` = false"
+        ));
+    };
+    let cpu = cpus.remove(at);
+    cpus.push(cpu);
+    Ok(())
+}
 
 /// Which build a ledger line belongs to.
 ///
@@ -262,11 +297,22 @@ fn take_cpus(
         ));
     }
 
+    if request.low_priority && threads < 2 {
+        return Err(format!(
+            "`low_priority_worker` = true lowers the last worker and never the main one, so it \
+             needs `threads` of at least 2; this config has {threads}"
+        ));
+    }
+
     if request.spec == UNPINNED {
         return Ok(Vec::new());
     }
     if request.spec != "auto" {
-        return explicit_cpus(request.spec, machine, threads);
+        let mut cpus = explicit_cpus(request.spec, machine, threads)?;
+        if request.low_priority {
+            shared_cpu_last(&mut cpus, machine)?;
+        }
+        return Ok(cpus);
     }
 
     let label = ledger_path.display().to_string();
@@ -292,14 +338,35 @@ fn take_cpus(
         .flat_map(|(_, e)| e.cpus.iter().copied())
         .collect();
 
-    let cpus = round_robin_cpus(&machine.domains, &taken, threads).map_err(|free| {
+    // The low-priority worker's CPU is fixed rather than picked: it is the one
+    // the machine's other work shares, so the pick for the full-priority
+    // workers goes round it and that worker comes last.
+    let shared = request.low_priority.then(|| machine.shared_cpu());
+    let mut excluded = taken;
+    if let Some(cpu) = shared {
+        if excluded.contains(&cpu) {
+            return Err(format!(
+                "`low_priority_worker` = true puts the low-priority worker on CPU {cpu}, the \
+                 machine's lowest online CPU and the one its non-search threads share, and \
+                 `{label}` records CPU {cpu} as another build's. Delete that build's line, or \
+                 set `low_priority_worker` = false"
+            ));
+        }
+        excluded.insert(cpu);
+    }
+    let picked = threads - usize::from(shared.is_some());
+    let mut cpus = round_robin_cpus(&machine.domains, &excluded, picked).map_err(|free| {
         format!(
-            "`cpu_assignment` = \"auto\" needs {threads} free CPU(s) and `{label}` leaves \
+            "`cpu_assignment` = \"auto\" needs {picked} free CPU(s){} and `{label}` leaves \
              {free}: {} short. Delete the lines of the builds that no longer run, or the \
              whole file to start the allocation over",
-            threads - free
+            shared.map_or(String::new(), |cpu| format!(
+                " besides CPU {cpu}, the low-priority worker's"
+            )),
+            picked - free
         )
     })?;
+    cpus.extend(shared);
 
     let entry = LedgerEntry {
         cpus: cpus.clone(),
@@ -370,7 +437,9 @@ pub const WORKERS_PINNED: bool = {pinned};
 /// `{shape}`.
 ///
 /// Chosen when this binary was built, so nothing at run time decides where a
-/// worker runs. Worker 0 is the search coordinator.
+/// worker runs. Worker 0 is the search coordinator. With
+/// `low_priority_worker` on, the last entry is the machine's lowest online
+/// CPU, which its non-search threads share with the low-priority worker.
 pub const WORKER_CPUS: &[usize] = &[{cpus}];
 
 /// The system NUMA node of each worker's CPU, one per worker, indexed like

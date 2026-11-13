@@ -23,12 +23,17 @@ use std::io;
 use std::num::NonZeroU64;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
+#[cfg(low_priority_worker)]
+use std::sync::TryLockError;
+#[cfg(low_priority_worker)]
+use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-// The only wait this engine ever does is the one that holds a `go infinite`
-// reply, and that clause arrives with `verbose2`.
-#[cfg(feature = "verbose2")]
+// The engine waits on a clock in two places: the hold of a `go infinite` reply,
+// a clause that arrives with `verbose2`, and the bounded wait for a
+// low-priority worker.
+#[cfg(any(feature = "verbose2", low_priority_worker))]
 use std::time::Duration;
 use std::time::Instant;
 
@@ -454,10 +459,92 @@ const _: () = assert!(POOL_CAPACITY >= 1);
 // reaches at a constant address rather than through a handle it was given.
 // Every `go` clears them ([`arm_search`]) before its search starts, and nothing
 // races that reset: every `go` joins the previous coordinator first, and a
-// joined coordinator has already collected every helper it dispatched.
+// joined coordinator has already collected every full-priority helper it
+// dispatched. The low-priority helper may still be finishing the last search
+// then; it polls [`LOW_STOP`], which that reset leaves raised.
 
-/// The one stop flag every worker of a search polls.
+/// The one stop flag every worker of a search polls, but the low-priority one.
 static STOP: AtomicBool = AtomicBool::new(false);
+
+/// The stop flag of the low-priority helper (`low_priority_worker`).
+///
+/// It is the coordinator's alone to raise and lower. The coordinator raises it
+/// as soon as its own search returns, which is when it raises [`STOP`] for the
+/// rest, and lowers it only when it hands that helper a new job — which it
+/// does only once the helper has handed back the last one. A helper the
+/// scheduler kept off its CPU past the end of a search therefore still sees the
+/// flag raised when it runs again, however many searches have started since,
+/// and does not carry on with a search nobody will collect.
+#[cfg(low_priority_worker)]
+static LOW_STOP: AtomicBool = AtomicBool::new(false);
+
+/// How long a coordinator waits, from the end of its own search, for the
+/// low-priority helper's result. A result that has not arrived by then is left
+/// out of this search's vote, and the reply goes out without it.
+///
+/// A helper that is on its CPU sees its stop flag within microseconds, so this
+/// is spent only when something else holds that CPU; it is the most that
+/// worker can add to the time a `bestmove` takes.
+#[cfg(low_priority_worker)]
+const LATE_HELPER_WAIT: Duration = Duration::from_millis(5);
+
+/// How often a coordinator looks at the low-priority helper's slot while it
+/// waits for it. It polls rather than blocks, so that a helper descheduled
+/// while it holds its slot's lock cannot hold the coordinator with it.
+#[cfg(low_priority_worker)]
+const LATE_HELPER_POLL: Duration = Duration::from_micros(100);
+
+/// What the low-priority helper made of lowering its own priority: still
+/// [`LOWERING_PENDING`], [`LOWERED`], or the `errno` of the refusal (`-1` when
+/// the platform has no per-thread priority).
+#[cfg(low_priority_worker)]
+static LOW_PRIORITY_OUTCOME: AtomicI32 = AtomicI32::new(LOWERING_PENDING);
+#[cfg(low_priority_worker)]
+const LOWERING_PENDING: i32 = i32::MIN;
+#[cfg(low_priority_worker)]
+const LOWERED: i32 = 0;
+
+/// Lower the calling helper thread to the lowest priority and publish the
+/// outcome in [`LOW_PRIORITY_OUTCOME`]. Run first thing in the helper, so the
+/// outcome is published whatever its CPU pin does after.
+#[cfg(low_priority_worker)]
+fn lower_this_helper() {
+    let outcome = match yorkie_numa::lower_current_thread_priority() {
+        Ok(()) => LOWERED,
+        Err(errno) if errno > 0 => errno,
+        Err(_) => -1,
+    };
+    LOW_PRIORITY_OUTCOME.store(outcome, Ordering::Release);
+}
+
+/// Why the low-priority helper of the live pool runs at normal priority after
+/// all — the `errno` of the refusal, `-1` for a platform without per-thread
+/// priorities — or `None` when it was lowered or there is none.
+#[cfg(low_priority_worker)]
+fn low_priority_refusal() -> Option<i32> {
+    match LOW_PRIORITY_OUTCOME.load(Ordering::Acquire) {
+        LOWERING_PENDING | LOWERED => None,
+        refusal => Some(refusal),
+    }
+}
+
+/// Append to the `workers on CPUs` / `workers unpinned` line which worker gives
+/// way to the rest of the machine: by the CPU it shares with the non-search
+/// threads, or by its number in a build that pins nothing. Nothing without one.
+#[cfg(low_priority_worker)]
+fn write_low_priority_suffix(plan: &WorkerPlan, out: &mut TextWriter<'_>) {
+    if let Some(cpu) = plan.low_priority_cpu() {
+        out.bytes(b", low priority on CPU ").u64(cpu as u64);
+    } else if let Some(worker) = plan.low_priority_worker() {
+        out.bytes(b", low priority on worker ").u64(worker as u64);
+    }
+}
+
+/// Each helper's kernel thread id, written as it starts, so a test can ask the
+/// kernel what priority a given worker runs at.
+#[cfg(all(test, low_priority_worker))]
+static HELPER_TIDS: [AtomicI32; POOL_CAPACITY - 1] =
+    [const { AtomicI32::new(0) }; POOL_CAPACITY - 1];
 
 /// The stop flag of the thinking-ahead search a coordinator runs once it has
 /// replied, which is a different search and so takes a flag of its own:
@@ -898,6 +985,10 @@ pub struct Engine<P: EngineSink> {
     /// [`Self::set_startup_affinity`] so a test can present a confined process
     /// without confining the test process itself.
     startup_affinity: BTreeSet<usize>,
+    /// Whether this session has already said that its low-priority worker
+    /// could not be lowered.
+    #[cfg(low_priority_worker)]
+    low_priority_refusal_reported: bool,
 }
 
 impl<P: EngineSink> Engine<P> {
@@ -926,6 +1017,8 @@ impl<P: EngineSink> Engine<P> {
             settings.worker_system_nodes(),
             threads,
         );
+        #[cfg(low_priority_worker)]
+        let worker_plan = worker_plan.with_low_priority(settings.low_priority_worker());
         // Build the per-node shared correction / pawn tables: the helpers are
         // handed theirs as the pool spawns them, and the coordinator (worker 0)
         // gets its node's set here.
@@ -988,6 +1081,28 @@ impl<P: EngineSink> Engine<P> {
             eval_root: network_file::executable_directory(),
             sysfs_root: PathBuf::from(SYSFS_ROOT),
             startup_affinity: yorkie_numa::startup_affinity().clone(),
+            #[cfg(low_priority_worker)]
+            low_priority_refusal_reported: false,
+        }
+    }
+
+    /// Pin the calling thread — the session's command reader — to the CPU the
+    /// low-priority worker runs on, so the engine's own non-search threads take
+    /// their time from that worker and from no other. The threads it starts
+    /// later inherit the pin: the keep-alive timer of a readiness handshake
+    /// keeps it, and the workers each pin themselves to their own CPU.
+    ///
+    /// Nothing happens without a low-priority worker, in a build that pins no
+    /// worker (there is no CPU to share then), or when this process may not run
+    /// on that CPU, which the readiness check reports instead. Called once the
+    /// engine has recorded the process's startup affinity, which the pin
+    /// narrows for this thread.
+    #[cfg(low_priority_worker)]
+    pub fn pin_to_shared_cpu(&self) {
+        if let Some(cpu) = self.worker_plan.low_priority_cpu()
+            && self.startup_affinity.contains(&cpu)
+        {
+            yorkie_numa::pin_current_thread_to_cpu(cpu);
         }
     }
 
@@ -1198,6 +1313,12 @@ impl<P: EngineSink> Engine<P> {
             self.settings.worker_system_nodes(),
             requested,
         );
+        #[cfg(low_priority_worker)]
+        {
+            self.worker_plan = self
+                .worker_plan
+                .with_low_priority(self.settings.low_priority_worker());
+        }
         // Rebuild the per-node shared correction / pawn tables from the fresh
         // assignment, so every pool rebuild resets them. The coordinator's own
         // game-scoped per-worker tables persist, so only its shared handle is
@@ -1457,6 +1578,27 @@ impl<P: EngineSink> Engine<P> {
             } else {
                 out.bytes(b"workers unpinned");
             }
+            #[cfg(low_priority_worker)]
+            write_low_priority_suffix(&self.worker_plan, &mut out);
+            self.sink.notice(out.as_bytes())?;
+        }
+        // A worker that was to give way and could not is said once a session,
+        // and the engine plays on with it at normal priority.
+        #[cfg(low_priority_worker)]
+        if self.worker_plan.low_priority_worker().is_some()
+            && !self.low_priority_refusal_reported
+            && let Some(refusal) = low_priority_refusal()
+        {
+            self.low_priority_refusal_reported = true;
+            let mut bytes = [0u8; NOTICE_BYTES];
+            let mut out = TextWriter::new(&mut bytes);
+            out.bytes(b"low-priority worker not lowered (");
+            if refusal > 0 {
+                out.bytes(b"errno ").u64(refusal as u64);
+            } else {
+                out.bytes(b"no per-thread priority on this platform");
+            }
+            out.bytes(b"); it runs at normal priority");
             self.sink.notice(out.as_bytes())?;
         }
         // The machine is the one the binary was built for, so the workers'
@@ -1682,6 +1824,10 @@ impl<P: EngineSink> Engine<P> {
         // `search_clear`). Clearing the table also resets its generation; the next
         // `go` bumps it again via `run_root`.
         self.finish_search_join();
+        // A low-priority helper the last search replied without may still be
+        // finishing: wait for it, since nothing here is on a clock.
+        #[cfg(low_priority_worker)]
+        self.pool.settle();
         self.pos.reset_startpos();
         // The join above left this thread as the only one touching the table,
         // so the clear races nothing.
@@ -2048,7 +2194,7 @@ impl<P: EngineSink> Engine<P> {
         // while a coordinator runs (every resize path calls
         // `finish_search_join` first), so these are the live helpers' for this
         // whole `go`.
-        let helper_slots = self.pool.helper_slots();
+        let helpers = self.pool.helpers();
 
         // The shared table is a `static`, so nothing is handed over for it; the
         // main histories are still lent take-and-return and reclaimed on join.
@@ -2092,7 +2238,7 @@ impl<P: EngineSink> Engine<P> {
         // flags are the session's own, cleared by `arm_search` like the rest.
         let ponder = PonderJob {
             enabled: ponder_after_reply,
-            helper_slots,
+            helpers,
             #[cfg(feature = "verbose2")]
             node_slots,
             bmc_slots,
@@ -2127,7 +2273,7 @@ impl<P: EngineSink> Engine<P> {
             #[cfg(feature = "verbose2")]
             node_slots,
             bmc_slots,
-            helper_slots,
+            helpers,
             worker_plan,
             book,
             yorkie,
@@ -2529,10 +2675,98 @@ impl HelperSlot {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The slot's lock if it is free right now, without waiting for it: the
+    /// helper holds it only for a moment, but a helper the scheduler takes off
+    /// its CPU in that moment holds it until it runs again.
+    #[cfg(low_priority_worker)]
+    fn try_lock(&self) -> Option<MutexGuard<'_, SlotState>> {
+        match self.state.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
+
     /// Post a search job to a parked helper and wake it.
     fn assign(&self, job: HelperJob) {
         *self.lock() = SlotState::Assigned(Box::new(job));
         self.cv.notify_all();
+    }
+
+    /// Post the job `job` builds if the helper is free to take one now, without
+    /// waiting for it, and say whether it was posted.
+    ///
+    /// A helper is free when it is parked, or finished with a job whose result
+    /// nobody collected — a search that has already replied without it, whose
+    /// result is dropped here. A helper still searching, or whose slot is
+    /// locked, is left out of the search this job is for, and `job` is not
+    /// called.
+    #[cfg(low_priority_worker)]
+    fn try_assign(&self, job: impl FnOnce() -> HelperJob) -> bool {
+        let Some(mut st) = self.try_lock() else {
+            return false;
+        };
+        if !matches!(&*st, SlotState::Parked | SlotState::Finished(_)) {
+            return false;
+        }
+        *st = SlotState::Assigned(Box::new(job()));
+        drop(st);
+        self.cv.notify_all();
+        true
+    }
+
+    /// Take the helper's result if it arrives by `deadline`, and return the slot
+    /// to `Parked`; `None` if it does not.
+    ///
+    /// A late helper's slot is left as it is, to be settled by whoever next
+    /// needs it ([`Self::try_assign`], [`Self::settle`]). The one exception is a
+    /// job the helper never picked up, which is taken back at the deadline, so
+    /// that it does not start a search that has already ended.
+    #[cfg(low_priority_worker)]
+    fn collect_by(&self, deadline: Instant) -> Option<WorkerResult> {
+        loop {
+            let now = Instant::now();
+            if let Some(mut st) = self.try_lock() {
+                match &*st {
+                    SlotState::Finished(_) => {
+                        let SlotState::Finished(r) = std::mem::replace(&mut *st, SlotState::Parked)
+                        else {
+                            unreachable!("the slot was just seen Finished");
+                        };
+                        return Some(r);
+                    }
+                    SlotState::Assigned(_) if now >= deadline => {
+                        *st = SlotState::Parked;
+                        return None;
+                    }
+                    _ => {}
+                }
+            }
+            if now >= deadline {
+                return None;
+            }
+            std::thread::sleep(LATE_HELPER_POLL.min(deadline - now));
+        }
+    }
+
+    /// Wait for as long as it takes until the helper is searching nothing, drop
+    /// whatever result it left, and leave the slot `Parked` (or `Exit`, if it
+    /// is already that).
+    ///
+    /// What a new game's table clear and a pool teardown need: no helper still
+    /// running. Only the low-priority helper can be running here, finishing a
+    /// search that already replied, with its stop flag raised.
+    #[cfg(low_priority_worker)]
+    fn settle(&self) {
+        let mut st = self.lock();
+        loop {
+            match &*st {
+                SlotState::Running => st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner()),
+                SlotState::Exit => return,
+                _ => break,
+            }
+        }
+        *st = SlotState::Parked;
     }
 
     /// Block until the helper has finished, then take its result and return the
@@ -2548,6 +2782,69 @@ impl HelperSlot {
         match std::mem::replace(&mut *st, SlotState::Parked) {
             SlotState::Finished(r) => r,
             _ => unreachable!("slot must be Finished after the wait loop"),
+        }
+    }
+}
+
+/// The helpers one search dispatches to: the live pool's slots, and which of
+/// them, if any, is the low-priority helper (`low_priority_worker`).
+///
+/// The low-priority helper is the one worker a search does not wait for. It is
+/// handed a job only when it has handed back the last one, it stops on
+/// `LOW_STOP` rather than on the search's own flag, and its result is
+/// collected for at most `LATE_HELPER_WAIT`. Every other helper is waited for
+/// as it always is: each runs alone on its own CPU at normal priority, and sees
+/// the stop within microseconds.
+///
+/// Without `low_priority_worker` (the config key, or the Cargo feature of the
+/// same name) none of that is compiled in: the searches dispatch to and wait
+/// for every slot alike, in loops of their own.
+#[derive(Clone, Copy)]
+struct Helpers {
+    slots: &'static [HelperSlot],
+    /// The index into [`Self::slots`] of the low-priority helper.
+    #[cfg(low_priority_worker)]
+    low: Option<usize>,
+}
+
+#[cfg(low_priority_worker)]
+impl Helpers {
+    /// Hand every helper the job `job(h)` builds for helper `h` (worker
+    /// `h + 1`), and say whether the low-priority helper took one: it is left
+    /// out of this search while it is still finishing an earlier one.
+    fn dispatch(&self, mut job: impl FnMut(usize) -> HelperJob) -> bool {
+        let mut low_dispatched = false;
+        for (h, slot) in self.slots.iter().enumerate() {
+            if Some(h) == self.low {
+                low_dispatched = slot.try_assign(|| {
+                    LOW_STOP.store(false, Ordering::Relaxed);
+                    HelperJob {
+                        stop: &LOW_STOP,
+                        ..job(h)
+                    }
+                });
+            } else {
+                slot.assign(job(h));
+            }
+        }
+        low_dispatched
+    }
+
+    /// Collect every helper's result into `take`, in worker order.
+    ///
+    /// The caller has already raised the stop flag the helpers poll. Each
+    /// full-priority helper is waited for until it finishes. The low-priority
+    /// one has its own flag raised here and is collected only if it was
+    /// dispatched and finishes within [`LATE_HELPER_WAIT`] of this call.
+    fn collect(&self, low_dispatched: bool, mut take: impl FnMut(WorkerResult)) {
+        LOW_STOP.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + LATE_HELPER_WAIT;
+        for (h, slot) in self.slots.iter().enumerate() {
+            if Some(h) != self.low {
+                take(slot.collect());
+            } else if low_dispatched && let Some(result) = slot.collect_by(deadline) {
+                take(result);
+            }
         }
     }
 }
@@ -2647,6 +2944,9 @@ struct ThreadPool {
     /// The live helpers (`size − 1`), parked on the first that many slots of
     /// [`HELPER_SLOTS`].
     helpers: usize,
+    /// The slot of the helper that runs at low priority, if the plan has one.
+    #[cfg(low_priority_worker)]
+    low: Option<usize>,
     /// The helper threads, joined on resize / teardown.
     handles: Vec<JoinHandle<()>>,
 }
@@ -2668,6 +2968,8 @@ impl ThreadPool {
     fn with_binding(size: usize, plan: WorkerPlan, shared: &[Arc<SharedHistories>]) -> Self {
         let mut pool = ThreadPool {
             helpers: 0,
+            #[cfg(low_priority_worker)]
+            low: None,
             handles: Vec::new(),
         };
         pool.set_with_binding(size, plan, shared);
@@ -2704,11 +3006,28 @@ impl ThreadPool {
             size <= POOL_CAPACITY,
             "a pool of {size} workers is past this build's {POOL_CAPACITY}"
         );
+        #[cfg(low_priority_worker)]
+        let low = plan.low_priority_worker().filter(|&w| w < size);
+        #[cfg(low_priority_worker)]
+        if low.is_some() {
+            LOW_PRIORITY_OUTCOME.store(LOWERING_PENDING, Ordering::Relaxed);
+        }
         for (worker_id, slot) in (1..size).zip(&HELPER_SLOTS) {
             // The slot is left `Exit` by the pool that used it last.
             *slot.lock() = SlotState::Parked;
             let shared = shared.get(worker_id).map(Arc::clone);
+            #[cfg(low_priority_worker)]
+            let lowered = low == Some(worker_id);
             self.handles.push(std::thread::spawn(move || {
+                #[cfg(low_priority_worker)]
+                {
+                    #[cfg(test)]
+                    HELPER_TIDS[worker_id - 1]
+                        .store(yorkie_numa::current_thread_id(), Ordering::Release);
+                    if lowered {
+                        lower_this_helper();
+                    }
+                }
                 let node = plan.system_node(worker_id);
                 pin_worker(&plan, worker_id);
                 // The one place this helper's node becomes the network type its
@@ -2717,14 +3036,47 @@ impl ThreadPool {
             }));
         }
         self.helpers = size - 1;
+        #[cfg(low_priority_worker)]
+        {
+            self.low = low.map(|w| w - 1);
+            // The pool is built between games, never on a clock, so it is ready
+            // only once the readiness handshake can say how the lowering went.
+            while low.is_some() && LOW_PRIORITY_OUTCOME.load(Ordering::Acquire) == LOWERING_PENDING
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// The helpers a search dispatches to.
+    fn helpers(&self) -> Helpers {
+        Helpers {
+            slots: self.helper_slots(),
+            #[cfg(low_priority_worker)]
+            low: self.low,
+        }
+    }
+
+    /// Wait until no helper is still finishing a search that has already
+    /// replied — which only the low-priority helper can be — so the caller is
+    /// alone with the shared table. Off any clock: a new game and a teardown
+    /// are the callers.
+    #[cfg(low_priority_worker)]
+    fn settle(&self) {
+        for slot in self.helper_slots() {
+            slot.settle();
+        }
     }
 
     /// Ask every helper to exit and join it, leaving only the main slot.
-    /// Idempotent. Every helper must be parked first (guaranteed by the
-    /// `finish_search_join` every caller runs before a resize / teardown), so the
-    /// `Exit` is never overwritten by a late `Finished` write.
+    /// Idempotent. Every full-priority helper is parked first (guaranteed by
+    /// the `finish_search_join` every caller runs before a resize / teardown),
+    /// and the low-priority one is waited for, so the `Exit` is never
+    /// overwritten by a late `Finished` write.
     fn shutdown(&mut self) {
         for slot in self.helper_slots() {
+            #[cfg(low_priority_worker)]
+            slot.settle();
             *slot.lock() = SlotState::Exit;
             slot.cv.notify_all();
         }
@@ -2732,6 +3084,10 @@ impl ThreadPool {
             let _ = handle.join();
         }
         self.helpers = 0;
+        #[cfg(low_priority_worker)]
+        {
+            self.low = None;
+        }
     }
 
     /// The configured pool size: the main-worker slot plus the live helpers.
@@ -2773,6 +3129,10 @@ struct WorkerPlan {
     system_nodes: &'static [NumaIndex],
     /// The workers the plan covers, at least one.
     workers: usize,
+    /// The worker that runs at low priority on the CPU the engine's non-search
+    /// threads share (`low_priority_worker`), if any.
+    #[cfg(low_priority_worker)]
+    low_priority: Option<usize>,
 }
 
 impl WorkerPlan {
@@ -2789,7 +3149,35 @@ impl WorkerPlan {
             cpus,
             system_nodes,
             workers: requested.max(1),
+            #[cfg(low_priority_worker)]
+            low_priority: None,
         }
+    }
+
+    /// The same plan with worker `worker` at low priority. Never the main
+    /// worker (worker 0), which keeps the clock and decides when the search
+    /// stops.
+    #[cfg(low_priority_worker)]
+    fn with_low_priority(self, worker: Option<usize>) -> Self {
+        debug_assert_ne!(worker, Some(0), "the main worker is never lowered");
+        WorkerPlan {
+            low_priority: worker.filter(|&w| w != 0),
+            ..self
+        }
+    }
+
+    /// The worker that runs at low priority, if the plan has one and covers
+    /// it.
+    #[cfg(low_priority_worker)]
+    fn low_priority_worker(&self) -> Option<usize> {
+        self.low_priority.filter(|&w| w < self.workers)
+    }
+
+    /// The CPU the low-priority worker shares with the engine's non-search
+    /// threads; `None` without one, or in a build that pins nothing.
+    #[cfg(low_priority_worker)]
+    fn low_priority_cpu(&self) -> Option<usize> {
+        self.low_priority_worker().and_then(|w| self.cpu(w))
     }
 
     /// A plan over the CPUs this process is actually allowed on, all of them on
@@ -3078,8 +3466,8 @@ struct PonderJob {
     /// Whether this `go` is thought past at all: the `ponder` setting, and a
     /// request that was a move in a game ([`is_a_game_move`]).
     enabled: bool,
-    /// The helper slots, dispatched to again for this search.
-    helper_slots: &'static [HelperSlot],
+    /// The helpers, dispatched to again for this search.
+    helpers: Helpers,
     /// The per-worker node counters, published to as in any other search. What
     /// they hold has already been read by the reply this search follows.
     #[cfg(feature = "verbose2")]
@@ -3188,28 +3576,36 @@ impl PonderJob {
         TranspositionTable::shared().new_search();
         let entering_king = EnteringKingConfig::new(&root);
 
-        for (h, slot) in self.helper_slots.iter().enumerate() {
-            slot.assign(HelperJob {
-                pos: root.clone(),
-                root_moves: root_moves.clone(),
-                #[cfg(feature = "verbose2")]
-                limit_depth: SEARCH_MAX_DEPTH,
-                stop: &PONDER_STOP,
-                thinking_ahead: true,
-                #[cfg(feature = "verbose2")]
-                node_slots: self.node_slots,
-                bmc_slots: self.bmc_slots,
-                index: h + 1,
-                entering_king,
-                #[cfg(feature = "verbose2")]
-                mate_mode: false,
-                #[cfg(feature = "random")]
-                random_seed: self.random_seed,
-                #[cfg(feature = "verbose2")]
-                multi_pv: self.multi_pv,
-                root_width: PONDER_ROOT_WIDTH,
-            });
+        macro_rules! ponder_job {
+            ($h:expr) => {
+                HelperJob {
+                    pos: root.clone(),
+                    root_moves: root_moves.clone(),
+                    #[cfg(feature = "verbose2")]
+                    limit_depth: SEARCH_MAX_DEPTH,
+                    stop: &PONDER_STOP,
+                    thinking_ahead: true,
+                    #[cfg(feature = "verbose2")]
+                    node_slots: self.node_slots,
+                    bmc_slots: self.bmc_slots,
+                    index: $h + 1,
+                    entering_king,
+                    #[cfg(feature = "verbose2")]
+                    mate_mode: false,
+                    #[cfg(feature = "random")]
+                    random_seed: self.random_seed,
+                    #[cfg(feature = "verbose2")]
+                    multi_pv: self.multi_pv,
+                    root_width: PONDER_ROOT_WIDTH,
+                }
+            };
         }
+        #[cfg(not(low_priority_worker))]
+        for (h, slot) in self.helpers.slots.iter().enumerate() {
+            slot.assign(ponder_job!(h));
+        }
+        #[cfg(low_priority_worker)]
+        let low_dispatched = self.helpers.dispatch(|h| ponder_job!(h));
 
         let mut qs = QSearch::with_histories(net, histories);
         // No clock and no ceiling: the stop flag is the whole of this search's
@@ -3247,14 +3643,24 @@ impl PonderJob {
 
         // Whatever ended this search ends the helpers with it, and each is
         // collected before the thread returns — a slot left holding a result
-        // belongs to no search.
+        // belongs to no search. The one exception is a low-priority helper
+        // that does not finish in time, which the next command must not wait
+        // for: it is left to be settled by the next search that needs it.
         PONDER_STOP.store(true, Ordering::Relaxed);
-        for slot in self.helper_slots {
+        #[cfg(not(low_priority_worker))]
+        for slot in self.helpers.slots {
             #[cfg(feature = "verbose1")]
             crate::stats::add_search([&slot.collect()]);
             #[cfg(not(feature = "verbose1"))]
             slot.collect();
         }
+        #[cfg(low_priority_worker)]
+        self.helpers.collect(low_dispatched, |result| {
+            #[cfg(feature = "verbose1")]
+            crate::stats::add_search([&result]);
+            #[cfg(not(feature = "verbose1"))]
+            let _ = result;
+        });
         // The marker goes out before the flag is lowered, so a session that
         // reads "no longer thinking ahead" has already been told it stopped.
         #[cfg(feature = "verbose1")]
@@ -3306,8 +3712,8 @@ struct CoordinatorJob<P: EngineSink> {
     /// zeroed on the same terms: each worker bumps its own slot at the root and
     /// the main worker folds them all each iteration.
     bmc_slots: &'static [TallySlot],
-    /// The persistent helper slots to dispatch to, one per helper.
-    helper_slots: &'static [HelperSlot],
+    /// The persistent helpers to dispatch to.
+    helpers: Helpers,
     /// The active worker plan: the coordinator pins itself to worker 0's CPU and
     /// prefers that CPU's node for memory at the start of this `go`.
     worker_plan: WorkerPlan,
@@ -3400,7 +3806,7 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
         #[cfg(feature = "verbose2")]
         node_slots,
         bmc_slots,
-        helper_slots,
+        helpers,
         worker_plan,
         book,
         yorkie,
@@ -3553,29 +3959,37 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
         }
     }
 
-    // Dispatch a job to every helper (index h in `helper_slots` → worker h + 1).
-    for (h, slot) in helper_slots.iter().enumerate() {
-        slot.assign(HelperJob {
-            pos: pos.clone(),
-            root_moves: root_moves.clone(),
-            #[cfg(feature = "verbose2")]
-            limit_depth: depth,
-            stop: &STOP,
-            thinking_ahead: false,
-            #[cfg(feature = "verbose2")]
-            node_slots,
-            bmc_slots,
-            index: h + 1,
-            entering_king,
-            #[cfg(feature = "verbose2")]
-            mate_mode,
-            #[cfg(feature = "random")]
-            random_seed,
-            #[cfg(feature = "verbose2")]
-            multi_pv,
-            root_width: RootWidth::SINGLE_LINE,
-        });
+    // Dispatch a job to every helper (helper h → worker h + 1).
+    macro_rules! go_job {
+        ($h:expr) => {
+            HelperJob {
+                pos: pos.clone(),
+                root_moves: root_moves.clone(),
+                #[cfg(feature = "verbose2")]
+                limit_depth: depth,
+                stop: &STOP,
+                thinking_ahead: false,
+                #[cfg(feature = "verbose2")]
+                node_slots,
+                bmc_slots,
+                index: $h + 1,
+                entering_king,
+                #[cfg(feature = "verbose2")]
+                mate_mode,
+                #[cfg(feature = "random")]
+                random_seed,
+                #[cfg(feature = "verbose2")]
+                multi_pv,
+                root_width: RootWidth::SINGLE_LINE,
+            }
+        };
     }
+    #[cfg(not(low_priority_worker))]
+    for (h, slot) in helpers.slots.iter().enumerate() {
+        slot.assign(go_job!(h));
+    }
+    #[cfg(low_priority_worker)]
+    let low_dispatched = helpers.dispatch(|h| go_job!(h));
 
     // The main worker is the only one given a PV sink, and only a `verbose2`
     // build has one to give. `MultiPV` rides on the same feature for a different
@@ -3611,6 +4025,9 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
 
     // Signal the helpers the search is over, then wait for and collect each one.
     // They observe the shared stop at their next checkpoint and finish promptly.
+    // A low-priority helper is waited for only briefly: when the scheduler is
+    // holding it back, the reply goes out without its result, which then takes
+    // no part in the vote below.
     STOP.store(true, Ordering::Relaxed);
     let VoteBuffers {
         mut results,
@@ -3620,9 +4037,12 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
     // is about to be filled again.
     results.clear();
     results.push(main_result);
-    for slot in helper_slots {
+    #[cfg(not(low_priority_worker))]
+    for slot in helpers.slots {
         results.push(slot.collect());
     }
+    #[cfg(low_priority_worker)]
+    helpers.collect(low_dispatched, |result| results.push(result));
     // Every worker's counts go to the interval the reply below ends.
     #[cfg(feature = "verbose1")]
     crate::stats::add_search(&results);
@@ -4813,5 +5233,254 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The low-priority worker: its priority, and the stop path that must not
+    /// wait for it.
+    #[cfg(low_priority_worker)]
+    mod low_priority {
+        use super::*;
+
+        use std::sync::mpsc;
+
+        /// Scheduling noise a timing assertion allows on top of the bound it
+        /// checks: the test machine runs other tests beside this one.
+        const SLACK: Duration = Duration::from_millis(50);
+
+        /// A pool of `size` workers over this process's own CPUs, its last
+        /// worker at low priority, with every helper's thread id cleared first.
+        fn pool_with_low_priority_last(size: usize) -> ThreadPool {
+            for tid in &HELPER_TIDS[..size - 1] {
+                tid.store(0, Ordering::Relaxed);
+            }
+            let plan = WorkerPlan::of_allowed_cpus(size).with_low_priority(Some(size - 1));
+            ThreadPool::with_binding(size, plan, &[])
+        }
+
+        /// Helper `h`'s kernel thread id, once the thread has written it.
+        fn helper_tid(h: usize) -> yorkie_numa::ThreadId {
+            loop {
+                let tid = HELPER_TIDS[h].load(Ordering::Acquire);
+                if tid != 0 {
+                    return tid;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        fn own_nice() -> i32 {
+            yorkie_numa::thread_nice(yorkie_numa::current_thread_id())
+                .expect("the kernel reports this thread's priority")
+        }
+
+        /// A job for helper 1 of a two-worker search that no helper will run.
+        fn idle_job() -> HelperJob {
+            let pos = Position::startpos();
+            HelperJob {
+                entering_king: EnteringKingConfig::new(&pos),
+                pos,
+                root_moves: Vec::new(),
+                #[cfg(feature = "verbose2")]
+                limit_depth: SEARCH_MAX_DEPTH,
+                stop: &STOP,
+                thinking_ahead: false,
+                #[cfg(feature = "verbose2")]
+                node_slots: node_tally(2),
+                bmc_slots: bmc_tally(2),
+                index: 1,
+                #[cfg(feature = "verbose2")]
+                mate_mode: false,
+                #[cfg(feature = "random")]
+                random_seed: 0,
+                #[cfg(feature = "verbose2")]
+                multi_pv: 1,
+                root_width: RootWidth::SINGLE_LINE,
+            }
+        }
+
+        /// The first helper slot, seen as the low-priority helper of a
+        /// two-worker search. No pool is live while a test holds the session.
+        fn lone_low_helper() -> Helpers {
+            Helpers {
+                slots: &HELPER_SLOTS[..1],
+                low: Some(0),
+            }
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn the_second_of_two_workers_runs_at_the_lowest_priority() {
+            let _session = serial_session();
+            let own = own_nice();
+            let pool = pool_with_low_priority_last(2);
+            assert_eq!(
+                yorkie_numa::thread_nice(helper_tid(0)),
+                Some(yorkie_numa::LOWEST_NICE),
+                "worker 1 reads back the lowered priority"
+            );
+            assert_eq!(low_priority_refusal(), None, "the lowering was not refused");
+            // The main worker is the per-`go` coordinator: a thread the command
+            // thread spawns, which pins itself and lowers nothing.
+            let plan = WorkerPlan::of_allowed_cpus(2).with_low_priority(Some(1));
+            let main = std::thread::spawn(move || {
+                pin_worker(&plan, 0);
+                own_nice()
+            })
+            .join()
+            .expect("the main worker's thread runs");
+            assert_eq!(main, own, "the main worker keeps the session's priority");
+            assert_eq!(own_nice(), own, "the command thread keeps its priority");
+            drop(pool);
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn only_the_last_worker_is_lowered() {
+            let _session = serial_session();
+            let own = own_nice();
+            let pool = pool_with_low_priority_last(3);
+            assert_eq!(yorkie_numa::thread_nice(helper_tid(0)), Some(own));
+            assert_eq!(
+                yorkie_numa::thread_nice(helper_tid(1)),
+                Some(yorkie_numa::LOWEST_NICE)
+            );
+            assert_eq!(pool.helpers().low, Some(1), "the last helper's slot");
+            drop(pool);
+        }
+
+        #[test]
+        fn a_plan_never_lowers_the_main_worker() {
+            let plan = WorkerPlan::of(&[0, 1, 2], &[0, 0, 0], 3);
+            assert_eq!(
+                plan.with_low_priority(Some(2)).low_priority_worker(),
+                Some(2)
+            );
+            assert_eq!(plan.with_low_priority(None).low_priority_worker(), None);
+            // A worker the plan does not cover has nothing to lower.
+            let two = WorkerPlan::of(&[0, 1, 2], &[0, 0, 0], 2);
+            assert_eq!(two.with_low_priority(Some(2)).low_priority_worker(), None);
+        }
+
+        #[test]
+        fn the_cpu_line_names_the_low_priority_worker() {
+            let rendered = |plan: &WorkerPlan| {
+                let mut bytes = [0u8; NOTICE_BYTES];
+                let mut out = TextWriter::new(&mut bytes);
+                write_low_priority_suffix(plan, &mut out);
+                out.as_bytes().to_vec()
+            };
+            let pinned = WorkerPlan::of(&[1, 2, 0], &[0, 0, 0], 3);
+            assert_eq!(
+                rendered(&pinned.with_low_priority(Some(2))),
+                b", low priority on CPU 0"
+            );
+            let unpinned = WorkerPlan::of(&[], &[0, 0, 0], 3);
+            assert_eq!(
+                rendered(&unpinned.with_low_priority(Some(2))),
+                b", low priority on worker 2"
+            );
+            assert_eq!(rendered(&pinned), b"", "nothing without one");
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn a_helper_still_searching_does_not_hold_the_reply() {
+            let _session = serial_session();
+            let slot = &HELPER_SLOTS[0];
+            // Dispatched, and then kept off its CPU: it never finishes.
+            *slot.lock() = SlotState::Running;
+            LOW_STOP.store(false, Ordering::Relaxed);
+            let start = Instant::now();
+            let mut taken = 0;
+            lone_low_helper().collect(true, |_| taken += 1);
+            let waited = start.elapsed();
+            assert_eq!(taken, 0, "the reply goes out without its result");
+            assert!(waited >= LATE_HELPER_WAIT, "waited {waited:?}");
+            assert!(waited < LATE_HELPER_WAIT + SLACK, "waited {waited:?}");
+            assert!(LOW_STOP.load(Ordering::Relaxed), "it is told to stop");
+            assert!(matches!(*slot.lock(), SlotState::Running));
+            // The next search neither waits for it nor hands it a job.
+            assert!(!lone_low_helper().dispatch(|_| unreachable!("no job is built")));
+            assert!(LOW_STOP.load(Ordering::Relaxed), "its flag stays raised");
+            *slot.lock() = SlotState::Parked;
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn a_helper_holding_its_lock_does_not_hold_the_reply() {
+            let _session = serial_session();
+            let slot = &HELPER_SLOTS[0];
+            *slot.lock() = SlotState::Running;
+            // A helper descheduled inside its slot's critical section.
+            let (held_tx, held_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                let _guard = slot.lock();
+                held_tx.send(()).expect("the test waits for this");
+                let _ = release_rx.recv();
+            });
+            held_rx.recv().expect("the holder takes the lock");
+            let start = Instant::now();
+            assert!(slot.collect_by(start + LATE_HELPER_WAIT).is_none());
+            let waited = start.elapsed();
+            assert!(waited < LATE_HELPER_WAIT + SLACK, "waited {waited:?}");
+            assert!(
+                !slot.try_assign(|| unreachable!("no job is built")),
+                "dispatch does not wait on the lock either"
+            );
+            release_tx.send(()).expect("the holder waits for this");
+            holder.join().expect("the holder runs");
+            *slot.lock() = SlotState::Parked;
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn a_job_the_helper_never_picked_up_is_taken_back() {
+            let _session = serial_session();
+            let slot = &HELPER_SLOTS[0];
+            *slot.lock() = SlotState::Parked;
+            LOW_STOP.store(true, Ordering::Relaxed);
+            // No thread parks on the slot, so nothing picks the job up.
+            assert!(lone_low_helper().dispatch(|_| idle_job()));
+            assert!(
+                !LOW_STOP.load(Ordering::Relaxed),
+                "a dispatched helper may search"
+            );
+            match &*slot.lock() {
+                SlotState::Assigned(job) => {
+                    assert!(std::ptr::eq(job.stop, &LOW_STOP), "it polls its own flag");
+                }
+                _ => panic!("the job is posted"),
+            }
+            let start = Instant::now();
+            let mut taken = 0;
+            lone_low_helper().collect(true, |_| taken += 1);
+            assert!(start.elapsed() < LATE_HELPER_WAIT + SLACK);
+            assert_eq!(taken, 0);
+            assert!(
+                matches!(*slot.lock(), SlotState::Parked),
+                "the job is taken back, so it never starts a search that has ended"
+            );
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn a_new_game_waits_for_a_late_helper() {
+            let _session = serial_session();
+            let slot = &HELPER_SLOTS[0];
+            *slot.lock() = SlotState::Running;
+            let finisher = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                // What the helper's loop does once its search returns, less
+                // the result.
+                *slot.lock() = SlotState::Parked;
+                slot.cv.notify_all();
+            });
+            let start = Instant::now();
+            slot.settle();
+            assert!(start.elapsed() >= Duration::from_millis(20));
+            assert!(matches!(*slot.lock(), SlotState::Parked));
+            finisher.join().expect("the finisher runs");
+        }
     }
 }

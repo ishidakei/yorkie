@@ -28,6 +28,7 @@ fv_scale = 16
 # nothing of the process's affinity and nothing is placed on a NUMA node.
 cpu_assignment = "none"
 cpu_ledger = ""
+low_priority_worker = false
 numa_nodes = "auto"
 ponder = false
 

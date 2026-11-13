@@ -94,6 +94,23 @@ cpu_assignment = "auto"
 # Deleting the file hands every CPU back and starts the allocation over.
 cpu_ledger = ".yorkie-cpu-ledger"
 
+# Run one worker — the last — at the lowest scheduling priority (nice 19), on
+# the machine's lowest-numbered online CPU, where the engine's own non-search
+# threads (the USI reader and the keep-alive timer) are pinned too. Everything
+# else that has to run on the machine then takes its time from that one
+# worker rather than from a worker at random, so a build can have one worker
+# per CPU (`threads` equal to the CPU count) without stalling the host.
+#
+# Never the main worker, so `threads` must be at least 2. Under `"auto"` the
+# other workers are picked round that CPU and the ledger must not give it to
+# another build; an explicit list must name it. Under `"none"` nothing is
+# pinned and the last worker is simply lowered.
+#
+# `bestmove` never waits on a worker that the scheduler is holding back: the
+# search collects it for at most a few milliseconds after the stop, and a
+# result that has not arrived by then is left out of the vote.
+low_priority_worker = false
+
 # How many NUMA nodes the machine this binary is built on has to have.
 #
 # The layout itself — the node count and each node's CPUs — is read off the
