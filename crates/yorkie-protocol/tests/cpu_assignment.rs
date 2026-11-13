@@ -446,13 +446,27 @@ fn none_generates_no_cpu_and_one_node_per_worker() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_pinned_assignment_says_it_is_pinned() {
-    let items = render_cpu_assignment(&[3, 1], &[0, 0]);
+    let items = render_cpu_assignment(&[3, 1], &[0, 0], Some(0));
     assert!(
         items.contains("pub const WORKERS_PINNED: bool = true;"),
         "{items}"
     );
     assert!(
         items.contains("pub const WORKER_CPUS: &[usize] = &[3, 1];"),
+        "{items}"
+    );
+    assert!(
+        items.contains("pub const SHARED_CPU: Option<usize> = Some(0);"),
+        "the non-search threads' CPU is named even when no worker is on it: {items}"
+    );
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn an_unpinned_assignment_names_no_shared_cpu() {
+    let items = render_cpu_assignment(&[], &[0], None);
+    assert!(
+        items.contains("pub const SHARED_CPU: Option<usize> = None;"),
         "{items}"
     );
 }

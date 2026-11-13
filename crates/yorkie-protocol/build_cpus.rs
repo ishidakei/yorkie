@@ -418,7 +418,11 @@ impl Drop for LedgerLock {
 ///
 /// An unpinned build has no CPUs to name, so `cpus` is empty while
 /// `system_nodes` still holds one node per worker.
-fn render_cpu_assignment(cpus: &[CpuIndex], system_nodes: &[NumaIndex]) -> String {
+fn render_cpu_assignment(
+    cpus: &[CpuIndex],
+    system_nodes: &[NumaIndex],
+    shared: Option<CpuIndex>,
+) -> String {
     let list = |v: &[usize]| {
         v.iter()
             .map(usize::to_string)
@@ -442,6 +446,11 @@ pub const WORKERS_PINNED: bool = {pinned};
 /// CPU, which its non-search threads share with the low-priority worker.
 pub const WORKER_CPUS: &[usize] = &[{cpus}];
 
+/// The CPU the engine's own non-search threads (the USI reader and the threads
+/// it starts) are pinned to: the building machine's lowest online CPU, the one
+/// a host keeps its other work on. `None` in a build that pins no worker.
+pub const SHARED_CPU: Option<usize> = {shared};
+
 /// The system NUMA node of each worker's CPU, one per worker, indexed like
 /// [`WORKER_CPUS`].
 ///
@@ -461,6 +470,7 @@ pub const WORKER_SYSTEM_NODES: &[usize] = &[{nodes}];
             format_cpu_list(sorted)
         },
         cpus = list(cpus),
+        shared = shared.map_or_else(|| "None".to_string(), |c| format!("Some({c})")),
         nodes = list(system_nodes),
         regions = render_eval_regions(system_nodes),
     )
@@ -566,6 +576,10 @@ fn resolve_cpu_assignment(
             .collect()
     };
     Ok(ResolvedAssignment {
-        items: render_cpu_assignment(&cpus, &system_nodes),
+        items: render_cpu_assignment(
+            &cpus,
+            &system_nodes,
+            (request.spec != UNPINNED).then(|| machine.shared_cpu()),
+        ),
     })
 }

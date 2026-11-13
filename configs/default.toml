@@ -79,6 +79,12 @@ fv_scale = 16
 # binary runs wherever whatever started it allows — which is what lets many
 # processes of one binary share a machine, each confined to its own CPU with
 # `taskset`. Pinning never changes what the search computes, only where it runs.
+#
+# Under `"auto"` or a list, the engine's own non-search threads (the USI reader
+# and the threads it starts, such as the keep-alive timer) are pinned too: to
+# the machine's lowest-numbered online CPU, the one a host keeps its other work
+# on. They stay off every worker's CPU unless a worker is given that CPU as
+# well.
 cpu_assignment = "auto"
 
 # The file recording which CPUs each build on the same machine took: one build per
@@ -96,7 +102,7 @@ cpu_ledger = ".yorkie-cpu-ledger"
 
 # Run one worker — the last — at the lowest scheduling priority (nice 19), on
 # the machine's lowest-numbered online CPU, where the engine's own non-search
-# threads (the USI reader and the keep-alive timer) are pinned too. Everything
+# threads (the USI reader and the keep-alive timer) are pinned. Everything
 # else that has to run on the machine then takes its time from that one
 # worker rather than from a worker at random, so a build can have one worker
 # per CPU (`threads` equal to the CPU count) without stalling the host.

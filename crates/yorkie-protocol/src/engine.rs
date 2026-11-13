@@ -1087,22 +1087,43 @@ impl<P: EngineSink> Engine<P> {
     }
 
     /// Pin the calling thread — the session's command reader — to the CPU the
-    /// low-priority worker runs on, so the engine's own non-search threads take
-    /// their time from that worker and from no other. The threads it starts
-    /// later inherit the pin: the keep-alive timer of a readiness handshake
-    /// keeps it, and the workers each pin themselves to their own CPU.
+    /// host keeps its non-search work on (the building machine's lowest online
+    /// CPU), so the engine's own non-search threads stay off every other
+    /// worker's CPU. The threads it starts later inherit the pin: the
+    /// keep-alive timer of a readiness handshake keeps it, and the workers each
+    /// pin themselves to their own CPU. With a low-priority worker this is that
+    /// worker's CPU, so those threads take their time from it and from no other.
     ///
-    /// Nothing happens without a low-priority worker, in a build that pins no
-    /// worker (there is no CPU to share then), or when this process may not run
-    /// on that CPU, which the readiness check reports instead. Called once the
-    /// engine has recorded the process's startup affinity, which the pin
-    /// narrows for this thread.
-    #[cfg(low_priority_worker)]
+    /// The pin is what keeps these threads where they belong even when the
+    /// process starts with a wide affinity. A launcher has to hand the engine
+    /// every CPU a worker pins itself to (the readiness check refuses less), so
+    /// a bridge confined to the shared CPU cannot pass its own mask down.
+    ///
+    /// Nothing happens in a build that pins no worker (there is no CPU to share
+    /// then), or when this process may not run on that CPU, which the
+    /// readiness check reports instead. Called once the engine has recorded the
+    /// process's startup affinity, which the pin narrows for this thread. A
+    /// thread's CPU affinity leaves its memory policy alone, so where the
+    /// table and the per-node copies are placed does not change.
     pub fn pin_to_shared_cpu(&self) {
-        if let Some(cpu) = self.worker_plan.low_priority_cpu()
+        if let Some(cpu) = self.shared_cpu()
             && self.startup_affinity.contains(&cpu)
         {
             yorkie_numa::pin_current_thread_to_cpu(cpu);
+        }
+    }
+
+    /// The CPU [`Self::pin_to_shared_cpu`] pins to: the low-priority worker's
+    /// when the plan has one, and otherwise the build's shared CPU.
+    fn shared_cpu(&self) -> Option<usize> {
+        #[cfg(low_priority_worker)]
+        if let Some(cpu) = self.worker_plan.low_priority_cpu() {
+            return Some(cpu);
+        }
+        if self.worker_plan.pinned() {
+            crate::config::SHARED_CPU
+        } else {
+            None
         }
     }
 

@@ -529,9 +529,8 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
     /// a session — a `setoption` value spelling a path in a Windows code page is
     /// read like any other line — and no line costs an allocation.
     pub fn run(mut self) -> io::Result<()> {
-        // This thread reads every command; with a low-priority worker it runs on
-        // that worker's CPU, the one CPU a worker shares.
-        #[cfg(low_priority_worker)]
+        // This thread reads every command; it runs on the CPU the host keeps
+        // its non-search work on, which a low-priority worker shares.
         self.engine.pin_to_shared_cpu();
         let mut line = vec![0u8; MAX_LINE_BYTES];
         loop {
