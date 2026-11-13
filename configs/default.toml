@@ -403,6 +403,21 @@ ponder_credit = 100
 # it is compiled in. With `threads = 1` it has no effect at all.
 lazy_smp_spread = false
 
+# Put off a move another parallel worker is searching right now. The workers
+# share a small table, apart from the transposition table, of the
+# (position, move) pairs some worker is in the middle of searching at a
+# remaining depth of 3 or more. At such a node, every move after the first one
+# the node searches is looked up first: if another worker is on it, it goes to a
+# list of put-off moves and the node goes on with its next move; otherwise the
+# worker enters the pair, searches the move and removes the pair again. Once the
+# node's other moves are done, and unless one of them cut the node off, the
+# put-off moves are searched in their order without looking them up, by when the
+# other worker's result is usually in the transposition table. Combined with
+# `lazy_smp_spread`, the spread chooses the next move and this test applies to
+# it. Off, nothing of it is compiled in. With `threads = 1` it has no effect at
+# all.
+lazy_smp_defer = false
+
 # ---------------------------------------------------------------------------
 # Time management
 # ---------------------------------------------------------------------------

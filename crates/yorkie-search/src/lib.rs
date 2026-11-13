@@ -14,6 +14,10 @@ use yorkie_state::{Move, Position};
 
 pub mod book;
 mod config;
+// Parallel workers putting off a move another worker is searching: only a
+// build that asks for it, through the config or the feature.
+#[cfg(lazy_smp_defer)]
+pub mod defer;
 // How parallel workers repeat each other's work: only a build that measures it.
 #[cfg(feature = "dupstats")]
 pub mod dupstats;

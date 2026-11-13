@@ -109,6 +109,7 @@ ponder_root_moves = 1
 ponder_root_margin = 500
 ponder_credit = 0
 lazy_smp_spread = false
+lazy_smp_defer = false
 
 # ---------------------------------------------------------------------------
 # Time management

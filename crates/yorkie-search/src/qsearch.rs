@@ -629,6 +629,15 @@ pub struct QSearch<N: NetworkParams> {
     /// ply has pulled out of its order without searching them yet.
     #[cfg(lazy_smp_spread)]
     spread: crate::spread::Spread<Move>,
+    /// Whether this worker puts off a move another worker is searching, and
+    /// the moves each ply has put off.
+    #[cfg(lazy_smp_defer)]
+    defer: crate::defer::Defer<Move>,
+    /// The ply of the last node that returned the transposition table's value
+    /// without searching, so a node can tell whether a deferred move's child
+    /// did. Reported, never read by the search.
+    #[cfg(all(lazy_smp_defer, feature = "verbose1"))]
+    tt_cut_ply: i32,
     /// What the tests read off the nodes whose TT move went through a singular
     /// search.
     #[cfg(all(lazy_smp_spread, test))]
@@ -952,6 +961,10 @@ pub struct WorkerResult {
     /// statistics line.
     #[cfg(all(lazy_smp_spread, feature = "verbose1"))]
     pub spread: crate::spread::SpreadCounts,
+    /// What this worker counted about the moves it put off, for the per-reply
+    /// statistics line.
+    #[cfg(all(lazy_smp_defer, feature = "verbose1"))]
+    pub defer: crate::defer::DeferCounts,
     /// Whether this worker (only meaningful for the main worker) already
     /// emitted the last completed iteration's final PV during iterative
     /// deepening — the reference `uciPvSent` return of `iterative_deepening`.
@@ -1141,6 +1154,11 @@ impl<N: NetworkParams> QSearch<N> {
             #[cfg(lazy_smp_spread)]
             // Alone until a pool says otherwise (`set_best_move_tally`).
             spread: crate::spread::Spread::new(STACK_LEN, crate::config::LAZY_SMP_SPREAD, 1),
+            #[cfg(lazy_smp_defer)]
+            // Alone until a pool says otherwise (`set_best_move_tally`).
+            defer: crate::defer::Defer::new(STACK_LEN, crate::config::LAZY_SMP_DEFER, 1),
+            #[cfg(all(lazy_smp_defer, feature = "verbose1"))]
+            tt_cut_ply: -1,
             #[cfg(all(lazy_smp_spread, test))]
             singular_audit: SingularAudit::default(),
             sel_depth: 0,
@@ -1382,6 +1400,8 @@ impl<N: NetworkParams> QSearch<N> {
             self.spread.seed(index);
             self.spread.set_workers(slots.len());
         }
+        #[cfg(lazy_smp_defer)]
+        self.defer.set_workers(slots.len());
     }
 
     /// Turn this worker's move-order spread on or off, for a pool of `workers`.
@@ -1391,6 +1411,15 @@ impl<N: NetworkParams> QSearch<N> {
     #[cfg(lazy_smp_spread)]
     pub fn set_spread(&mut self, on: bool, workers: usize) {
         self.spread.set(on, workers);
+    }
+
+    /// Turn this worker's putting off of busy moves on or off, for a pool of
+    /// `workers`. A worker starts with the switch as the config's
+    /// `lazy_smp_defer` sets it, and alone; [`Self::set_best_move_tally`] tells
+    /// it the pool's size. One worker never puts a move off.
+    #[cfg(lazy_smp_defer)]
+    pub fn set_defer(&mut self, on: bool, workers: usize) {
+        self.defer.set(on, workers);
     }
 
     /// Install the raw `MultiPV` option value for this `go`. Every worker gets
@@ -2463,6 +2492,8 @@ impl<N: NetworkParams> QSearch<N> {
         }
         #[cfg(lazy_smp_spread)]
         self.spread.reset();
+        #[cfg(lazy_smp_defer)]
+        self.defer.reset();
         self.sel_depth = 0;
         self.last_iteration_pv.clear();
         // Fresh abort state for this `go`; the counter is seeded so the first
@@ -2823,6 +2854,8 @@ impl<N: NetworkParams> QSearch<N> {
             },
             #[cfg(all(lazy_smp_spread, feature = "verbose1"))]
             spread: self.spread.counts(),
+            #[cfg(all(lazy_smp_defer, feature = "verbose1"))]
+            defer: self.defer.counts(),
             #[cfg(feature = "verbose2")]
             uci_pv_sent,
             #[cfg(feature = "verbose2")]
@@ -3592,6 +3625,10 @@ impl<N: NetworkParams> QSearch<N> {
             {
                 self.marks = tt_data.marks;
             }
+            #[cfg(all(lazy_smp_defer, feature = "verbose1"))]
+            {
+                self.tt_cut_ply = ply;
+            }
             return tt_value;
         }
 
@@ -3973,7 +4010,7 @@ impl<N: NetworkParams> QSearch<N> {
         // The next move to search: the picker's, or, while this worker's spread
         // is shifting, one from a little further down the picker's order.
         #[cfg(not(lazy_smp_spread))]
-        macro_rules! next_move {
+        macro_rules! picked_move {
             ($this:expr) => {
                 mp.next_move(pos, &$this.histories)
             };
@@ -3981,12 +4018,37 @@ impl<N: NetworkParams> QSearch<N> {
         #[cfg(lazy_smp_spread)]
         self.spread.begin_node(s);
         #[cfg(lazy_smp_spread)]
-        macro_rules! next_move {
+        macro_rules! picked_move {
             ($this:expr) => {
                 $this.spread.pick(s, move_count == 0, || {
                     mp.next_move(pos, &$this.histories)
                         .map(|mv| (mv, mp.in_quiet_stage()))
                 })
+            };
+        }
+        // The picked move, unless another worker is searching it: then it is
+        // put off until the node's other moves are done.
+        #[cfg(not(lazy_smp_defer))]
+        macro_rules! next_move {
+            ($this:expr) => {
+                picked_move!($this)
+            };
+        }
+        #[cfg(lazy_smp_defer)]
+        self.defer.begin_node(s);
+        #[cfg(lazy_smp_defer)]
+        macro_rules! next_move {
+            ($this:expr) => {
+                $this.defer.next(
+                    s,
+                    depth,
+                    move_count == 0,
+                    || picked_move!($this),
+                    |mv: Move| {
+                        crate::defer::BusyTable::shared()
+                            .probe(crate::defer::word(pos_key, mv.move16()))
+                    },
+                )
             };
         }
 
@@ -4146,6 +4208,8 @@ impl<N: NetworkParams> QSearch<N> {
                 // may cut off with some of its own still there.
                 #[cfg(lazy_smp_spread)]
                 let held = self.spread.hold(s);
+                #[cfg(lazy_smp_defer)]
+                let held_deferred = self.defer.hold(s);
                 let s_value = self.search(
                     pos,
                     ply,
@@ -4165,6 +4229,8 @@ impl<N: NetworkParams> QSearch<N> {
                 self.stack[s].excluded_move = None;
                 #[cfg(lazy_smp_spread)]
                 self.spread.restore(s, held);
+                #[cfg(lazy_smp_defer)]
+                self.defer.restore(s, held_deferred);
                 #[cfg(all(lazy_smp_spread, test))]
                 {
                     audit_singular = true;
@@ -4209,6 +4275,25 @@ impl<N: NetworkParams> QSearch<N> {
                 } else if cut_node {
                     extension = -2;
                 }
+            }
+
+            // Every move after the node's first is entered as this worker's,
+            // for the others to put off while it searches it; the entry spans
+            // every search of the move below, re-searches included.
+            #[cfg(lazy_smp_defer)]
+            let busy_word = (self.defer.active()
+                && move_count > 1
+                && depth >= crate::defer::MIN_DEPTH)
+                .then(|| {
+                    let word = crate::defer::word(pos_key, mv.move16());
+                    crate::defer::BusyTable::shared().enter(word);
+                    #[cfg(feature = "verbose1")]
+                    self.defer.note_entry();
+                    word
+                });
+            #[cfg(all(lazy_smp_defer, feature = "verbose1"))]
+            {
+                self.tt_cut_ply = -1;
             }
 
             // Step 16. Make the move. The accumulator delta must be taken
@@ -4403,6 +4488,20 @@ impl<N: NetworkParams> QSearch<N> {
             // Step 19. Undo move.
             pos.undo_move(mv, undo);
             self.pop_accumulator();
+
+            // Cleared before the stop check below, so a stopped search leaves
+            // no entry behind.
+            #[cfg(lazy_smp_defer)]
+            if let Some(word) = busy_word {
+                crate::defer::BusyTable::shared().clear(word);
+            }
+            // The only nodes at `ply + 1` since the mark was reset are this
+            // move's child, searched once or more, and a node that returns on
+            // its table entry has searched nothing below it.
+            #[cfg(all(lazy_smp_defer, feature = "verbose1"))]
+            if self.tt_cut_ply == ply + 1 && self.defer.draining(s) {
+                self.defer.note_tt_cut();
+            }
 
             // A stop that fired inside this move's subtree makes the returned
             // value untrustworthy, so bail out without updating the best move,

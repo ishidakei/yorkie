@@ -11,7 +11,9 @@
 //! `tt_update`, `eval_dup`, `evals` and `eval_tt_hits`, what the searches of
 //! that interval did on every thread (see [`SearchCounts`]). A build with the
 //! workers' move-order spread compiled in follows them with `spread_dups`,
-//! `spread_shifts` and `spread_peak`. A `verbose3` build adds three more: the
+//! `spread_shifts` and `spread_peak`, and one with the workers' putting off of
+//! busy moves compiled in with `defer_moves`, `defer_tt_cuts` and
+//! `defer_entries`. A `verbose3` build adds three more: the
 //! value marks of the score the reply rests on.
 //!
 //! A `verbose3` build's `bench` also writes one line after its summary, in the
@@ -28,6 +30,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use yorkie_search::WorkerResult;
+#[cfg(lazy_smp_defer)]
+use yorkie_search::defer::DeferCounts;
 #[cfg(feature = "dupstats")]
 use yorkie_search::dupstats::{DupCounts, PRESENCE_KEYS, PresenceKind, STORE_KEYS, StoreKind};
 #[cfg(lazy_smp_spread)]
@@ -132,13 +136,27 @@ const SPREAD_ITEMS_MAX: usize =
 #[cfg(not(lazy_smp_spread))]
 const SPREAD_ITEMS_MAX: usize = 0;
 
+/// The items of the workers' putting off of busy moves, in the order they are
+/// written, each with the space that separates it from what comes before.
+#[cfg(lazy_smp_defer)]
+const DEFER_KEYS: [&[u8]; 3] = [b" defer_moves=", b" defer_tt_cuts=", b" defer_entries="];
+
+/// The putting-off items at their widest: every key with a 20-digit value.
+#[cfg(lazy_smp_defer)]
+const DEFER_ITEMS_MAX: usize =
+    DEFER_KEYS[0].len() + DEFER_KEYS[1].len() + DEFER_KEYS[2].len() + 3 * U64_DIGITS;
+
+/// A build without the putting off of busy moves writes none of its items.
+#[cfg(not(lazy_smp_defer))]
+const DEFER_ITEMS_MAX: usize = 0;
+
 /// The longest line [`render`] can produce.
 #[cfg(not(feature = "dupstats"))]
-const MAX_LINE: usize = LINE_MAX + SPREAD_ITEMS_MAX;
+const MAX_LINE: usize = LINE_MAX + SPREAD_ITEMS_MAX + DEFER_ITEMS_MAX;
 
 /// The longest line [`render`] can produce, the duplication items included.
 #[cfg(feature = "dupstats")]
-const MAX_LINE: usize = LINE_MAX + SPREAD_ITEMS_MAX + DUP_ITEMS_MAX;
+const MAX_LINE: usize = LINE_MAX + SPREAD_ITEMS_MAX + DEFER_ITEMS_MAX + DUP_ITEMS_MAX;
 
 /// What the searches of one interval did, summed over every thread that
 /// searched in it.
@@ -174,6 +192,10 @@ pub(crate) struct SearchCounts {
     /// picks summed over every worker, the peak the highest any worker reached.
     #[cfg(lazy_smp_spread)]
     pub(crate) smp: SpreadCounts,
+    /// What the workers counted about the moves they put off, summed over
+    /// every worker.
+    #[cfg(lazy_smp_defer)]
+    pub(crate) defer: DeferCounts,
 }
 
 /// How the workers of the searches of an interval were spread when each search
@@ -266,6 +288,12 @@ struct Tally {
     /// The highest of the workers' peaks, not a sum.
     #[cfg(lazy_smp_spread)]
     spread_peak: AtomicU64,
+    #[cfg(lazy_smp_defer)]
+    defer_moves: AtomicU64,
+    #[cfg(lazy_smp_defer)]
+    defer_tt_cuts: AtomicU64,
+    #[cfg(lazy_smp_defer)]
+    defer_entries: AtomicU64,
     /// Too many counts for one atomic each, and added once per worker per
     /// search, so a lock costs nothing that matters.
     #[cfg(feature = "dupstats")]
@@ -286,6 +314,12 @@ impl Tally {
             spread_shifts: AtomicU64::new(0),
             #[cfg(lazy_smp_spread)]
             spread_peak: AtomicU64::new(0),
+            #[cfg(lazy_smp_defer)]
+            defer_moves: AtomicU64::new(0),
+            #[cfg(lazy_smp_defer)]
+            defer_tt_cuts: AtomicU64::new(0),
+            #[cfg(lazy_smp_defer)]
+            defer_entries: AtomicU64::new(0),
             #[cfg(feature = "dupstats")]
             dup: Mutex::new(DupTally {
                 dup: DupCounts::ZERO,
@@ -314,6 +348,15 @@ impl Tally {
             self.spread_shifts
                 .fetch_add(r.spread.shifts, Ordering::Relaxed);
             self.spread_peak.fetch_max(r.spread.peak, Ordering::Relaxed);
+        }
+        #[cfg(lazy_smp_defer)]
+        {
+            self.defer_moves
+                .fetch_add(r.defer.deferred, Ordering::Relaxed);
+            self.defer_tt_cuts
+                .fetch_add(r.defer.tt_cuts, Ordering::Relaxed);
+            self.defer_entries
+                .fetch_add(r.defer.entries, Ordering::Relaxed);
         }
         #[cfg(feature = "dupstats")]
         self.dup_tally().dup.add(&r.dup);
@@ -349,6 +392,12 @@ impl Tally {
                 dups: self.spread_dups.swap(0, Ordering::Relaxed),
                 shifts: self.spread_shifts.swap(0, Ordering::Relaxed),
                 peak: self.spread_peak.swap(0, Ordering::Relaxed),
+            },
+            #[cfg(lazy_smp_defer)]
+            defer: DeferCounts {
+                deferred: self.defer_moves.swap(0, Ordering::Relaxed),
+                tt_cuts: self.defer_tt_cuts.swap(0, Ordering::Relaxed),
+                entries: self.defer_entries.swap(0, Ordering::Relaxed),
             },
             #[cfg(feature = "dupstats")]
             dup,
@@ -467,6 +516,17 @@ pub(crate) fn render(
             .iter()
             .zip([search.smp.dups, search.smp.shifts, search.smp.peak])
     {
+        if value != 0 {
+            out.bytes(key).u64(value);
+            carried = true;
+        }
+    }
+    #[cfg(lazy_smp_defer)]
+    for (key, value) in DEFER_KEYS.iter().zip([
+        search.defer.deferred,
+        search.defer.tt_cuts,
+        search.defer.entries,
+    ]) {
         if value != 0 {
             out.bytes(key).u64(value);
             carried = true;
@@ -626,6 +686,12 @@ mod tests {
                 shifts: value,
                 peak: value,
             },
+            #[cfg(lazy_smp_defer)]
+            defer: DeferCounts {
+                deferred: value,
+                tt_cuts: value,
+                entries: value,
+            },
             #[cfg(feature = "dupstats")]
             dup: DupCounts::ZERO,
             #[cfg(feature = "dupstats")]
@@ -710,7 +776,12 @@ mod tests {
         assert_eq!(counted(&mut buf, 0, evaluated(0, 0)), None);
     }
 
-    #[cfg(not(any(feature = "verbose3", feature = "dupstats", lazy_smp_spread)))]
+    #[cfg(not(any(
+        feature = "verbose3",
+        feature = "dupstats",
+        lazy_smp_spread,
+        lazy_smp_defer
+    )))]
     #[test]
     fn the_widest_line_fits_the_buffer() {
         let mut buf = StatsBuf::new();
@@ -836,7 +907,7 @@ mod tests {
             );
         }
 
-        #[cfg(not(any(feature = "dupstats", lazy_smp_spread)))]
+        #[cfg(not(any(feature = "dupstats", lazy_smp_spread, lazy_smp_defer)))]
         #[test]
         fn the_widest_line_fits_the_buffer() {
             let mut buf = StatsBuf::new();
@@ -892,6 +963,62 @@ mod tests {
             }
             assert_eq!(tally.take().smp, spread(7, 6, 2).smp);
             assert_eq!(tally.take().smp, SpreadCounts::default());
+        }
+
+        #[cfg(not(any(feature = "verbose3", feature = "dupstats")))]
+        #[test]
+        fn the_widest_line_fits_the_buffer() {
+            let mut buf = StatsBuf::new();
+            let line =
+                counted(&mut buf, u64::MAX, all(u64::MAX)).expect("a non-zero count is reported");
+            assert_eq!(line.len(), MAX_LINE);
+        }
+    }
+
+    /// The items a build with the putting off of busy moves adds.
+    #[cfg(lazy_smp_defer)]
+    mod busy_move_defer {
+        use super::*;
+
+        fn defer(deferred: u64, tt_cuts: u64, entries: u64) -> SearchCounts {
+            SearchCounts {
+                defer: DeferCounts {
+                    deferred,
+                    tt_cuts,
+                    entries,
+                },
+                ..search(100, 0, 0)
+            }
+        }
+
+        /// The three items follow the counted ones, and a zero one is omitted.
+        #[test]
+        fn the_items_follow_the_counted_ones() {
+            let mut buf = StatsBuf::new();
+            assert_eq!(
+                counted(&mut buf, 0, defer(12, 3, 40)),
+                Some(
+                    &b"info string stats nodes=100 defer_moves=12 defer_tt_cuts=3 defer_entries=40"
+                        [..]
+                )
+            );
+            assert_eq!(
+                counted(&mut buf, 0, defer(0, 0, 7)),
+                Some(&b"info string stats nodes=100 defer_entries=7"[..])
+            );
+        }
+
+        /// The tally sums every worker's counts.
+        #[test]
+        fn the_tally_sums_the_counts() {
+            let tally = Tally::new();
+            for (deferred, tt_cuts, entries) in [(3, 1, 9), (4, 0, 2)] {
+                tally.defer_moves.fetch_add(deferred, Ordering::Relaxed);
+                tally.defer_tt_cuts.fetch_add(tt_cuts, Ordering::Relaxed);
+                tally.defer_entries.fetch_add(entries, Ordering::Relaxed);
+            }
+            assert_eq!(tally.take().defer, defer(7, 1, 11).defer);
+            assert_eq!(tally.take().defer, DeferCounts::default());
         }
 
         #[cfg(not(any(feature = "verbose3", feature = "dupstats")))]
@@ -1011,6 +1138,8 @@ mod tests {
                 stopped_on: on.map(|i| moves[i].mv),
                 #[cfg(lazy_smp_spread)]
                 spread: SpreadCounts::default(),
+                #[cfg(lazy_smp_defer)]
+                defer: DeferCounts::default(),
                 #[cfg(feature = "verbose2")]
                 uci_pv_sent: false,
                 #[cfg(feature = "verbose2")]

@@ -2653,6 +2653,12 @@ struct HelperJob {
 /// thread drives `Assigned → Running → Finished`. The pool sets `Exit` (only
 /// ever over `Parked`, since every teardown path first joins the coordinator,
 /// which returns every helper to `Parked`).
+///
+/// `Finished` holds the result inline: a slot is written once per helper per
+/// search, and boxing the result would put a heap allocation on that path in
+/// every build. Only a build carrying the most per-worker counts makes the
+/// variant large enough for the lint, so it is allowed rather than expected.
+#[cfg_attr(lazy_smp_defer, allow(clippy::large_enum_variant))]
 enum SlotState {
     /// Idle, waiting for a job.
     Parked,

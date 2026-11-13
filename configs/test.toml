@@ -112,6 +112,7 @@ ponder_root_margin = 500
 # budgets its time from its own clock alone.
 ponder_credit = 0
 lazy_smp_spread = false
+lazy_smp_defer = false
 
 # ---------------------------------------------------------------------------
 # Time management

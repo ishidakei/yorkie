@@ -104,6 +104,14 @@ serde_json = "~1.0"
 # worker. The config key alone compiles the same code in; the feature is how
 # the tests reach it under a config that leaves the key off. Off by default.
 #
+# `lazy-smp-defer` compiles in the parallel workers' put-off of a move another
+# worker is searching (the Search layer's `defer` module) and the three counts
+# this crate writes for it on the statistics line, without turning it on: a
+# worker puts moves off only when the config's `lazy_smp_defer` is true and the
+# build has more than one worker. The config key alone compiles the same code
+# in; the feature is how the tests reach it under a config that leaves the key
+# off. Off by default.
+#
 # `low-priority-worker` compiles in what the config key `low_priority_worker`
 # turns on — one worker at the lowest scheduling priority, collected by a search
 # for a bounded time only, and the CPU-line annotation that names it — without
@@ -111,6 +119,7 @@ serde_json = "~1.0"
 # the same code in; the feature is how the tests reach it under a config that
 # leaves the key off. Off by default.
 [features]
+lazy-smp-defer = ["yorkie-search/lazy-smp-defer"]
 lazy-smp-spread = ["yorkie-search/lazy-smp-spread"]
 low-priority-worker = []
 verbose1 = ["yorkie-search/verbose1", "yorkie-storage/verbose1"]

@@ -12,9 +12,11 @@
 //! because a build script cannot depend on a member of the workspace it is
 //! building.
 //!
-//! One switch reshapes the search rather than setting a value in it: with
+//! Two switches reshape the search rather than setting a value in it: with
 //! `lazy_smp_spread` on, this script sets the `cfg` of the same name, behind
-//! which the workers' move-order spread is compiled; off, none of it exists.
+//! which the workers' move-order spread is compiled, and with `lazy_smp_defer`
+//! on, the one behind which a worker puts off a move another worker is
+//! searching; off, none of it exists.
 //!
 //! The generated module carries every schema key it can render on its own, not
 //! just the ones read here: the generator renders the schema as a whole, and

@@ -496,6 +496,10 @@ const SCHEMA: &[Spec] = &[
         "lazy_smp_spread",
         "(none: a parallel worker that keeps meeting other workers' results shifts its move order)",
     ),
+    boolean(
+        "lazy_smp_defer",
+        "(none: a parallel worker puts off a move another worker is searching)",
+    ),
     // --- Time management.
     int("network_delay", "NetworkDelay", 0, 10_000),
     int("network_delay2", "NetworkDelay2", 0, 10_000),
@@ -801,6 +805,7 @@ struct Generated {
 #[allow(dead_code)]
 const CFG_SWITCHES: &[(&str, &str)] = &[
     ("lazy_smp_spread", "lazy_smp_spread"),
+    ("lazy_smp_defer", "lazy_smp_defer"),
     ("low_priority_worker", "low_priority_worker"),
 ];
 
