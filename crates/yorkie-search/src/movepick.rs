@@ -1770,6 +1770,75 @@ mod tests {
         );
     }
 
+    /// A king step next to the enemy king is pseudo-legal and illegal, and it
+    /// stays in the quiet buffer until it is yielded. A king gives no direct
+    /// check (the king's check squares are empty, as in the reference), so it
+    /// gets no check term: it stays below the partial-sort limit and does not
+    /// take a slot in the sorted prefix. Were it scored as a check, its slot
+    /// would displace 3d2c behind 5f5e in the unsorted tail.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn illegal_king_step_next_to_the_enemy_king_gets_no_check_term() {
+        let p = pos("6n1l/2+S2b3/2lp4p/1np3G2/3P1pR2/1N1kS3P/1P3KL+r1/1p1G5/2g1G4 b L5Pb2sn5p 23");
+        assert!(!p.in_check());
+        let us = p.side_to_move();
+        let depth = 3;
+        let ply = 22;
+        let limit = -3560 * depth;
+
+        let mut raw_ext: Vec<ExtMove> = Vec::new();
+        p.generate_quiets::<GENERATE_ALL_LEGAL_MOVES, _>(&mut raw_ext);
+        let raw: Vec<Move> = raw_ext.into_iter().map(|e| e.mv).collect();
+        let find = |usi: &str| {
+            *raw.iter()
+                .find(|&&m| format_usi_move(m) == usi)
+                .unwrap_or_else(|| panic!("{usi} is generated"))
+        };
+        let king_step = find("4g5g");
+        let king_sibling = find("4g4h");
+        assert!(!p.is_legal(king_step), "4g5g steps next to the enemy king");
+        assert!(p.is_legal(king_sibling));
+
+        // Every quiet below the sort limit, except the direct checks (which the
+        // check term lifts over it) and four moves bumped over it. That makes
+        // eight sorted quiets; a ninth, the king step, would displace 3d2c.
+        let mut h = WorkerHistories::new();
+        h.main.fill(-3000);
+        for usi in ["6e6d", "8f9d", "3e1e", "3d2d"] {
+            h.main.update(us, find(usi), 4000);
+        }
+        let check_squares = p.check_squares();
+        let score = |m: Move| score_quiet(&p, m, ply, &h, SENTINEL_PLANES, &check_squares);
+
+        assert!(!check_squares.gives_direct_check(king_step));
+        assert!(!p.gives_direct_check(king_step));
+        assert_eq!(
+            score(king_step),
+            score(king_sibling),
+            "the illegal king step scores as its legal sibling: no check term",
+        );
+        assert!(score(king_step) < limit);
+        let sorted: Vec<String> = raw
+            .iter()
+            .filter(|&&m| score(m) >= limit)
+            .map(|&m| format_usi_move(m))
+            .collect();
+        assert_eq!(
+            sorted,
+            [
+                "6e6d", "8f9d", "5f6g", "3e1e", "3d2d", "6h5g", "6h6g", "L*6g"
+            ],
+        );
+
+        let mut sc = scratch();
+        let emitted = collect_usi(main_picker(&p, None, depth, ply, &mut sc), &p, &h);
+        let at = |usi: &str| emitted.iter().position(|s| s == usi).unwrap();
+        assert!(
+            at("3d2c") < at("5f5e"),
+            "the reference yields 3d2c before 5f5e here: {emitted:?}",
+        );
+    }
+
     //   The single-buffer production picker must yield an IDENTICAL sequence to
     //   the multi-Vec twin — a second, independent picker kept for this test —
     //   in every state.

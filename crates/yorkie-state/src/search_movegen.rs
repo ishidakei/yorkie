@@ -821,10 +821,12 @@ impl Position {
         // king attacks exactly the squares from which a side-to-move `pt` piece
         // checks that king (attack reverse-symmetry).
         //
-        // The KING slot holds the actual king ring where the reference has a
-        // hard `0`. A king move is never a legal check, so the two agree in real
-        // search, but the ring also matches the scratch-scan oracle on the
-        // pseudo-legal king steps the generators emit next to the enemy king.
+        // The KING slot stays empty, as in the reference: a king never gives a
+        // direct check. A legal king move cannot stand next to the enemy king,
+        // but the generators emit pseudo-legal king steps that do, and the move
+        // picker scores them before legality is tested; a ring here would give
+        // such an illegal step the quiet score's check term and reorder the
+        // partially sorted buffer away from the reference's.
         let occ = board.occupied();
         let mut check_squares = [Bitboard::EMPTY; CHECK_PATTERN_COUNT];
         if let Some(eks) = enemy_king {
@@ -851,7 +853,6 @@ impl Position {
                 bishop | king_ring;
             check_squares[check_pattern(Piece::promoted(PieceKind::Rook, enemy).unwrap())] =
                 rook | king_ring;
-            check_squares[check_pattern(Piece::new(PieceKind::King, enemy))] = king_ring;
         }
 
         // `slider_blockers(c)` returns `(blockersForKing[c], pinners[~c])`, so
@@ -1675,19 +1676,27 @@ impl Position {
 #[cfg(test)]
 impl Position {
     /// Apply `m` to a scratch board and test the enemy king against the full
-    /// attacker scan.
+    /// attacker scan. A moved king is left out of the attackers: under the
+    /// reference's rule a king gives no direct check, which only matters for
+    /// the pseudo-legal (and illegal) king steps next to the enemy king.
     pub(crate) fn gives_check_reference(&self, m: Move) -> bool {
         let mover = self.side_to_move();
         let mut board = *self.board();
         apply_to_board(&mut board, m, mover);
         match try_find_king(&board, mover.flip()) {
-            Some(king_sq) => is_attacked_by(&board, king_sq, mover),
+            Some(king_sq) => {
+                let mut attackers = crate::movegen::attackers_bb(&board, king_sq, mover);
+                if m.moved_piece_after().kind == PieceKind::King {
+                    attackers &= !Bitboard::from_square(m.to_sq());
+                }
+                !attackers.is_empty()
+            }
             None => false,
         }
     }
 
     /// Does a piece of the moved type, standing on `to`, attack the enemy king
-    /// under the pre-move occupancy?
+    /// under the pre-move occupancy? Never for a king, by the reference's rule.
     pub(crate) fn gives_direct_check_reference(&self, m: Move) -> bool {
         let board = self.board();
         let stm = self.side_to_move();
@@ -1695,6 +1704,9 @@ impl Position {
             return false;
         };
         let piece = m.moved_piece_after();
+        if piece.kind == PieceKind::King {
+            return false;
+        }
         let to = m.to_sq();
         let dr_sign = dr_sign_for(piece.color);
         let (steps, slides) = movement(piece);
@@ -2323,6 +2335,31 @@ mod tests {
             "a discovered check is not a direct check"
         );
         assert!(p.gives_check(discover));
+    }
+
+    #[test]
+    fn a_king_gives_no_direct_check_but_can_discover_one() {
+        // Black king 5c blocks the black rook 5i from the white king 5a.
+        let p = pos("4k4/9/4K4/9/9/9/9/9/4R4 b - 1");
+        let king = Piece::new(PieceKind::King, Color::Black);
+        let next_to_king = Move::make(Square::new(4, 2).unwrap(), Square::new(4, 1).unwrap(), king);
+        assert_eq!(format_usi_move(next_to_king), "5c5b");
+        assert!(!p.is_legal(next_to_king), "5b is next to the white king");
+        assert!(!p.gives_direct_check(next_to_king));
+        assert!(!p.check_squares().gives_direct_check(next_to_king));
+        assert!(!p.gives_check(next_to_king));
+        assert!(!p.gives_direct_check_reference(next_to_king));
+        assert!(!p.gives_check_reference(next_to_king));
+
+        let discover = Move::make(Square::new(4, 2).unwrap(), Square::new(3, 2).unwrap(), king);
+        assert_eq!(format_usi_move(discover), "5c4c");
+        assert!(p.is_legal(discover));
+        assert!(!p.gives_direct_check(discover));
+        assert!(
+            p.gives_check(discover),
+            "stepping off the file uncovers the rook"
+        );
+        assert!(p.gives_check_reference(discover));
     }
 
     #[test]
