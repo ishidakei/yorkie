@@ -1,7 +1,6 @@
 pub mod bitboard;
 pub mod board;
 pub mod color;
-mod config;
 pub mod hand;
 pub mod key;
 #[cfg(test)]

@@ -115,7 +115,7 @@ pub enum RepetitionState {
     Win,
     /// Perpetual check delivered by the side to move, which therefore loses.
     Lose,
-    /// Ordinary (non-perpetual-check) fourfold-style repetition.
+    /// Ordinary (non-perpetual-check) repetition.
     Draw,
     /// Same board, side to move holds the strictly superior hand.
     Superior,
@@ -195,25 +195,16 @@ pub(crate) struct StateInfo {
     /// The run, counted in twos, of consecutive checking moves by each colour
     /// ending at this state.
     pub continuous_check: [u16; Color::COUNT],
-    /// Signed ply distance to the previous occurrence of this position, `0` if
-    /// none. Negative once `repetition_times` reaches the forced fourfold.
-    pub repetition: i32,
-    pub repetition_times: i32,
-    pub repetition_type: RepetitionState,
 }
 
-// Forty-eight bytes, seven of them padding. `do_move` pushes one of these per
-// ply and `undo_move` pops it, so the padding is real, and the look-back that
-// writes `repetition` never reaches past [`MAX_REPETITION_PLY`] — a byte would
-// hold the distance and take the record to forty.
-//
-// It stays at forty-eight because forty measured slower: the record is written
-// whole at every node and its `hands` are compared whole at every look-back
-// step, and only a multiple of sixteen puts every record of the run on the
-// sixteen-byte boundary those whole-record moves want. On a single-thread,
-// nodes-fixed bench the narrow record cost about 2.6% of the search's
-// throughput, which is more than the seven bytes are worth.
-const _: () = assert!(size_of::<StateInfo>() == 48);
+// Thirty-two bytes, none of them padding. The record is written whole at every
+// node and its `hands` are compared whole at every look-back step, and a size
+// that is a multiple of sixteen puts every record of the run on the
+// sixteen-byte boundary those whole-record moves want: a forty-byte record
+// measured about 2.6% slower on a single-thread, nodes-fixed bench than a
+// forty-eight-byte one, so a record that outgrows thirty-two bytes is padded
+// to forty-eight rather than left at forty.
+const _: () = assert!(size_of::<StateInfo>() == 32);
 const _: () = assert!(size_of::<StateInfo>().is_multiple_of(16));
 
 #[derive(Debug, Clone)]
@@ -259,10 +250,10 @@ pub struct Position {
 
 // One position per worker, so this size is not paid per node — what it pins is
 // which of its parts share a line. The board and the check info are both
-// sixteen-byte-aligned and between them take 880 of the 1056 bytes; the keys,
+// sixteen-byte-aligned and between them take 880 of the 1040 bytes; the keys,
 // the hands, the side to move and the two stacks' handles follow them, and the
 // fifteen bytes past those are the alignment the board imposes.
-const _: () = assert!(size_of::<Position>() == 1056);
+const _: () = assert!(size_of::<Position>() == 1040);
 const _: () = assert!(align_of::<Position>() == align_of::<Board>());
 
 /// Structural equality over the primary state alone. The keys are a derived
@@ -657,16 +648,7 @@ impl Position {
             board_key: self.board_key,
             plies_from_null: prev.plies_from_null + 1,
             continuous_check,
-            // Filled in by `store_current_repetition` below; left at zero under
-            // `quick_draw`, whose check reads no stored verdict.
-            repetition: 0,
-            repetition_times: 0,
-            repetition_type: RepetitionState::None,
         });
-
-        if !crate::config::QUICK_DRAW {
-            self.store_current_repetition();
-        }
 
         undo
     }
@@ -680,20 +662,6 @@ impl Position {
             board_key: self.board_key,
             plies_from_null: 0,
             continuous_check: [0; Color::COUNT],
-            repetition: 0,
-            repetition_times: 0,
-            repetition_type: RepetitionState::None,
-        }
-    }
-
-    /// Compute the repetition info for the current state and store it into that
-    /// `StateInfo`. Must run after the `do_move` push.
-    fn store_current_repetition(&mut self) {
-        let (repetition, repetition_times, repetition_type) = self.compute_repetition();
-        if let Some(top) = self.history.last_mut() {
-            top.repetition = repetition;
-            top.repetition_times = repetition_times;
-            top.repetition_type = repetition_type;
         }
     }
 
@@ -787,11 +755,6 @@ impl Position {
             // `st->pliesFromNull = 0`.
             plies_from_null: 0,
             continuous_check,
-            // `st->repetition = st->repetition_times = 0`; a state reached
-            // directly by a null move is never itself a repetition.
-            repetition: 0,
-            repetition_times: 0,
-            repetition_type: RepetitionState::None,
         });
     }
 
@@ -869,106 +832,23 @@ impl Position {
             .map_or(0, |s| s.continuous_check[color.index()] as i32)
     }
 
-    /// Compute the repetition triple for the current position, walking the
-    /// `StateInfo` chain back `min(16, plies_from_null)` plies in steps of two.
+    /// Classify the current position as a repetition from the search's
+    /// viewpoint (`Position::is_repetition`): walk back
+    /// `min(16, plies_from_null)` plies in steps of two and classify the
+    /// nearest earlier occurrence, wherever it lies relative to the search root
+    /// — in the search or in the game played before it.
     ///
-    /// It reads the *stored* `repetition_times` / `repetition_type` of the
-    /// nearest prior occurrence, so the chain it builds on must already carry
-    /// them — every state reached through `do_move` does.
-    fn compute_repetition(&self) -> (i32, i32, RepetitionState) {
+    /// A position's second occurrence within that window is already the
+    /// verdict, scored as the game scores its fourth: a draw, a loss for the
+    /// side giving perpetual check, or a win or loss when the side to move's
+    /// hand has strictly gained or lost pieces since. The verdict does not
+    /// depend on how often the position occurred before, and a cycle that is
+    /// perpetual check from one occurrence to the next is a perpetual-check
+    /// verdict even if an earlier cycle was not. This is a search rule only:
+    /// the game itself ends in a repetition at the fourth occurrence alone.
+    pub fn is_repetition(&self) -> RepetitionState {
         let end = MAX_REPETITION_PLY.min(self.current_plies_from_null());
         // A repetition needs at least a four-ply cycle to return.
-        if end < 4 {
-            return (0, 0, RepetitionState::None);
-        }
-
-        let stm = self.side_to_move;
-        let cc_stm = self.current_continuous_check(stm);
-        let cc_opp = self.current_continuous_check(stm.flip());
-
-        let mut i = 4i32;
-        while i <= end {
-            if let Some(prev) = self.state_back(i as usize) {
-                // No board copy is stored, so a `board_key` hit is trusted
-                // directly and the stored hands then decide draw vs
-                // superior/inferior. This inherits the reference's accepted
-                // hash-collision risk.
-                if prev.board_key == self.board_key {
-                    if prev.hands == self.hands {
-                        let times = prev.repetition_times + 1;
-                        // Negative marks the forced fourfold.
-                        let repetition = if times >= 3 { -i } else { i };
-                        let mut typ = if i <= cc_stm {
-                            RepetitionState::Lose
-                        } else if i <= cc_opp {
-                            RepetitionState::Win
-                        } else {
-                            RepetitionState::Draw
-                        };
-                        // A cycle that was perpetual check only part of the way
-                        // is an ordinary draw.
-                        if prev.repetition_times != 0 && typ != prev.repetition_type {
-                            typ = RepetitionState::Draw;
-                        }
-                        return (repetition, times, typ);
-                    }
-                    // Superior / inferior is decided on the side to move's hand
-                    // alone: by piece conservation the opponent's hand moves
-                    // oppositely.
-                    let cur_hand = &self.hands[stm.index()];
-                    let prev_hand = &prev.hands[stm.index()];
-                    if hand_is_equal_or_superior(cur_hand, prev_hand) {
-                        return (i, 0, RepetitionState::Superior);
-                    }
-                    if hand_is_equal_or_superior(prev_hand, cur_hand) {
-                        return (i, 0, RepetitionState::Inferior);
-                    }
-                    // Neither dominates: a coincidental board match, keep going.
-                }
-            }
-            i += 2;
-        }
-
-        (0, 0, RepetitionState::None)
-    }
-
-    /// Classify the current position as a repetition from the search's
-    /// viewpoint at search distance `ply` from the root
-    /// (`Position::is_repetition`).
-    ///
-    /// The `repetition < ply` gate reports a twofold or threefold only when the
-    /// earlier occurrence lies after the search root, while a forced fourfold —
-    /// carrying a negative `repetition` — always passes, so it is seen even when
-    /// it sits entirely in the game history before the root.
-    ///
-    /// Under `quick_draw` the verdict is `quick_repetition`'s instead, which
-    /// counts the second occurrence within 16 plies, and `ply` is not read.
-    pub fn is_repetition(&self, ply: u16) -> RepetitionState {
-        if crate::config::QUICK_DRAW {
-            return self.quick_repetition();
-        }
-        self.stored_repetition(ply)
-    }
-
-    /// The verdict without `quick_draw`: the stored repetition fields of the
-    /// current state, behind the `repetition < ply` gate.
-    fn stored_repetition(&self, ply: u16) -> RepetitionState {
-        match self.history.last() {
-            Some(s) if s.repetition != 0 && s.repetition < ply as i32 => s.repetition_type,
-            _ => RepetitionState::None,
-        }
-    }
-
-    /// The repetition verdict that counts a position's second occurrence: walk
-    /// back `min(16, plies_from_null)` plies in steps of two and classify the
-    /// nearest earlier occurrence, wherever it lies relative to the search root.
-    ///
-    /// Nothing is read from the stored repetition fields, so the verdict does
-    /// not depend on how often the position occurred before, and a cycle that
-    /// is perpetual check from one occurrence to the next is a perpetual-check
-    /// verdict even if an earlier cycle was not.
-    pub(crate) fn quick_repetition(&self) -> RepetitionState {
-        let end = MAX_REPETITION_PLY.min(self.current_plies_from_null());
         if end < 4 {
             return RepetitionState::None;
         }
@@ -979,6 +859,9 @@ impl Position {
 
         let mut i = 4i32;
         while i <= end {
+            // No board copy is stored, so a `board_key` hit is trusted directly
+            // and the stored hands then decide draw vs superior/inferior. This
+            // inherits the reference's accepted hash-collision risk.
             if let Some(prev) = self.state_back(i as usize)
                 && prev.board_key == self.board_key
             {
@@ -991,6 +874,10 @@ impl Position {
                         RepetitionState::Draw
                     };
                 }
+                // Superior / inferior is decided on the side to move's hand
+                // alone: by piece conservation the opponent's hand moves
+                // oppositely. Neither dominating is a coincidental board match,
+                // and the walk goes on.
                 let cur_hand = &self.hands[stm.index()];
                 let prev_hand = &prev.hands[stm.index()];
                 if hand_is_equal_or_superior(cur_hand, prev_hand) {
@@ -1801,7 +1688,7 @@ mod tests {
 
     /// Build a `StateInfo` whose `board_key` is computed the way the
     /// incremental path would, so hand-assembled histories agree with
-    /// `Position::board_key`. `assemble` fills in the repetition fields.
+    /// `Position::board_key`.
     fn make_state(
         board: Board,
         hands: [Hand; Color::COUNT],
@@ -1820,9 +1707,6 @@ mod tests {
             board_key: scratch.board_key(),
             plies_from_null: 0,
             continuous_check: [0; Color::COUNT],
-            repetition: 0,
-            repetition_times: 0,
-            repetition_type: RepetitionState::None,
         }
     }
 
@@ -1839,7 +1723,7 @@ mod tests {
                 crate::move_::parse_usi_move(usi.as_bytes(), &pos).expect("fixture move parses");
             pos.do_move(m);
             let depth = idx + 1;
-            let rep = pos.is_repetition(16);
+            let rep = pos.is_repetition();
             if depth < 4 {
                 assert_eq!(
                     rep,
@@ -1908,7 +1792,7 @@ mod tests {
     #[test]
     fn is_repetition_lose_when_side_to_move_is_perpetual_checker() {
         assert_eq!(
-            perpetual_check_by_side_to_move().is_repetition(16),
+            perpetual_check_by_side_to_move().is_repetition(),
             RepetitionState::Lose,
             "the perpetually-checking side to move must be classified LOSE",
         );
@@ -1917,7 +1801,7 @@ mod tests {
     #[test]
     fn is_repetition_win_when_opponent_is_perpetual_checker() {
         assert_eq!(
-            perpetual_check_by_opponent().is_repetition(16),
+            perpetual_check_by_opponent().is_repetition(),
             RepetitionState::Win,
             "the checked side to move must be classified WIN",
         );
@@ -1972,7 +1856,6 @@ mod tests {
             s.plies_from_null = idx as i32 + 1;
         }
         p.root = Some(root);
-        p.store_current_repetition();
         p
     }
 
@@ -1988,7 +1871,7 @@ mod tests {
             &[filler.clone(), filler.clone(), filler, current],
             root,
         );
-        assert_eq!(p.is_repetition(16), RepetitionState::Superior);
+        assert_eq!(p.is_repetition(), RepetitionState::Superior);
     }
 
     #[test]
@@ -2002,22 +1885,13 @@ mod tests {
             &[filler.clone(), filler.clone(), filler, current],
             root,
         );
-        assert_eq!(p.is_repetition(16), RepetitionState::Inferior);
-    }
-
-    /// `do_move`, then the repetition fields recorded for the current state
-    /// whatever `quick_draw` says, so a test of the stored-field rule runs in
-    /// every build. Recording them again where `do_move` already did is a no-op:
-    /// the computation reads only earlier states.
-    fn do_move_storing_repetition(p: &mut Position, m: Move) {
-        p.do_move(m);
-        p.store_current_repetition();
+        assert_eq!(p.is_repetition(), RepetitionState::Inferior);
     }
 
     #[test]
-    fn is_repetition_gated_by_search_ply() {
+    fn is_repetition_finds_a_six_ply_cycle_only_when_it_closes() {
         // Both kings walk a triangle and return to the root only after six
-        // plies, so `repetition == 6` and the gate turns on `ply > 6`.
+        // plies; no earlier position recurs.
         let mut p = Position::empty();
         let bk = Piece::new(PieceKind::King, Color::Black);
         let wk = Piece::new(PieceKind::King, Color::White);
@@ -2036,74 +1910,18 @@ mod tests {
             (Square::new(0, 1).unwrap(), Square::new(0, 0).unwrap()),
         ];
         for i in 0..3 {
-            do_move_storing_repetition(&mut p, Move::make(bmoves[i].0, bmoves[i].1, bk));
-            do_move_storing_repetition(&mut p, Move::make(wmoves[i].0, wmoves[i].1, wk));
-        }
-
-        assert_eq!(
-            p.stored_repetition(6),
-            RepetitionState::None,
-            "a recurrence reaching the root (repetition == ply) is not an immediate draw",
-        );
-        assert_eq!(
-            p.stored_repetition(7),
-            RepetitionState::Draw,
-            "with the root strictly inside the search window the recurrence is a draw",
-        );
-        assert_eq!(p.stored_repetition(16), RepetitionState::Draw);
-    }
-
-    #[test]
-    fn is_repetition_forced_fourfold_is_seen_across_the_search_root() {
-        // Three four-ply king shuffles, so the root occurs a fourth time.
-        let mut p = setup_king_shuffle_pos();
-        let cycle = shuffle_cycle();
-        for _ in 0..3 {
-            for m in cycle {
-                do_move_storing_repetition(&mut p, m);
+            p.do_move(Move::make(bmoves[i].0, bmoves[i].1, bk));
+            assert_eq!(p.is_repetition(), RepetitionState::None);
+            p.do_move(Move::make(wmoves[i].0, wmoves[i].1, wk));
+            if i < 2 {
+                assert_eq!(p.is_repetition(), RepetitionState::None);
             }
         }
 
-        let top = p.history.last().expect("history is non-empty");
         assert_eq!(
-            top.repetition_times, 3,
-            "the fourth occurrence chains repetition_times to 3",
-        );
-        assert!(
-            top.repetition < 0,
-            "a forced fourfold marks repetition negative (got {})",
-            top.repetition,
-        );
-
-        // `ply == 1` places the entire cycle before the search root.
-        assert_eq!(
-            p.stored_repetition(1),
+            p.is_repetition(),
             RepetitionState::Draw,
-            "a forced fourfold is reported regardless of the search ply",
-        );
-    }
-
-    #[test]
-    fn is_repetition_two_fold_before_root_is_not_reported() {
-        // One four-ply cycle, so the root recurs once at a positive distance.
-        // Only the fourfold path crosses the search root.
-        let mut p = setup_king_shuffle_pos();
-        for m in shuffle_cycle() {
-            do_move_storing_repetition(&mut p, m);
-        }
-        let top = p.history.last().expect("history is non-empty");
-        assert_eq!(top.repetition, 4, "second occurrence: positive distance");
-        assert_eq!(top.repetition_times, 1);
-
-        assert_eq!(
-            p.stored_repetition(4),
-            RepetitionState::None,
-            "a two-fold reaching the root (ply == distance) is not an immediate draw",
-        );
-        assert_eq!(
-            p.stored_repetition(5),
-            RepetitionState::Draw,
-            "with the earlier occurrence strictly after the root it is a draw",
+            "the root's second occurrence, six plies on, is a draw",
         );
     }
 
@@ -2115,7 +1933,7 @@ mod tests {
             p.do_move(m);
         }
         assert_eq!(
-            p.is_repetition(16),
+            p.is_repetition(),
             RepetitionState::Draw,
             "the closed four-ply cycle is an ordinary draw",
         );
@@ -2130,7 +1948,7 @@ mod tests {
             "a null move resets plies_from_null",
         );
         assert_eq!(
-            p.is_repetition(16),
+            p.is_repetition(),
             RepetitionState::None,
             "plies_from_null == 0 blocks detection across the null move",
         );
@@ -2139,74 +1957,31 @@ mod tests {
             p.do_move(m);
         }
         assert_eq!(
-            p.is_repetition(16),
+            p.is_repetition(),
             RepetitionState::Draw,
             "four real plies past the null restore detection",
         );
     }
 
     #[test]
-    fn quick_repetition_reports_the_second_occurrence_without_a_ply_gate() {
+    fn is_repetition_reports_every_occurrence_from_the_second_on() {
         let mut p = setup_king_shuffle_pos();
         for m in shuffle_cycle() {
-            do_move_storing_repetition(&mut p, m);
+            p.do_move(m);
         }
-        // The stored-field check gates this twofold on the search ply; the
-        // quick one takes no ply, so an occurrence at or before the root counts
-        // too.
-        assert_eq!(p.stored_repetition(4), RepetitionState::None);
-        assert_eq!(p.quick_repetition(), RepetitionState::Draw);
+        // The earlier occurrence is the root itself.
+        assert_eq!(p.is_repetition(), RepetitionState::Draw);
 
         // A further occurrence is classified the same way, from the nearest
         // earlier one alone.
         for m in shuffle_cycle() {
             p.do_move(m);
         }
-        assert_eq!(p.quick_repetition(), RepetitionState::Draw);
+        assert_eq!(p.is_repetition(), RepetitionState::Draw);
     }
 
     #[test]
-    fn quick_repetition_classifies_perpetual_check_on_the_second_occurrence() {
-        assert_eq!(
-            perpetual_check_by_side_to_move().quick_repetition(),
-            RepetitionState::Lose,
-        );
-        assert_eq!(
-            perpetual_check_by_opponent().quick_repetition(),
-            RepetitionState::Win,
-        );
-    }
-
-    #[test]
-    fn quick_repetition_classifies_superior_and_inferior_hands() {
-        let filler = superiority_state(9, 9);
-        let superior = assemble(
-            superiority_board(),
-            &[
-                filler.clone(),
-                filler.clone(),
-                filler.clone(),
-                superiority_state(1, 0),
-            ],
-            superiority_state(0, 1),
-        );
-        assert_eq!(superior.quick_repetition(), RepetitionState::Superior);
-
-        let inferior = assemble(
-            superiority_board(),
-            &[
-                filler.clone(),
-                filler.clone(),
-                filler,
-                superiority_state(0, 1),
-            ],
-            superiority_state(1, 0),
-        );
-        assert_eq!(inferior.quick_repetition(), RepetitionState::Inferior);
-    }
-
-    #[test]
-    fn quick_repetition_looks_back_at_most_sixteen_plies() {
+    fn is_repetition_looks_back_at_most_sixteen_plies() {
         // The fillers stand on a different board, so the only earlier
         // occurrence is the root, `len` plies back.
         let mut other = superiority_board();
@@ -2222,8 +1997,8 @@ mod tests {
             assemble(superiority_board(), &states, superiority_state(0, 0))
         };
 
-        assert_eq!(with_root_back(16).quick_repetition(), RepetitionState::Draw);
-        assert_eq!(with_root_back(18).quick_repetition(), RepetitionState::None);
+        assert_eq!(with_root_back(16).is_repetition(), RepetitionState::Draw);
+        assert_eq!(with_root_back(18).is_repetition(), RepetitionState::None);
     }
 
     #[cfg_attr(miri, ignore)]
@@ -2276,7 +2051,7 @@ mod tests {
             let m =
                 crate::move_::parse_usi_move(usi.as_bytes(), &pos).expect("fixture move parses");
             let u = pos.do_move(m);
-            forward.push(pos.is_repetition(16));
+            forward.push(pos.is_repetition());
             stack.push((m, u));
         }
 
@@ -2289,7 +2064,7 @@ mod tests {
                 RepetitionState::None
             };
             assert_eq!(
-                pos.is_repetition(16),
+                pos.is_repetition(),
                 expected,
                 "is_repetition mismatch after unwinding to depth {depth}",
             );

@@ -322,20 +322,6 @@ max_moves_to_draw = 512
 # about a mate is whether it is forced, not how short it is.
 flatten_winning_mate = true
 
-# Inside the search, treat a position as repeated the second time it appears
-# among the last 16 plies, instead of only at its fourth occurrence (the game's
-# sennichite rule). The repeated position is scored as the game would score its
-# fourth occurrence: a draw, a loss for the side giving perpetual check, or a
-# win or loss when one side's hand has strictly gained or lost pieces since the
-# earlier occurrence. The lookback may reach into the game played before the
-# position the search starts from. This is a search shortcut only: the game
-# still ends in a repetition draw at the fourth occurrence alone.
-#
-# On here, so the tournament binary plays with it: a line that returns to a
-# recent position is cut there, which spends the search on lines that make
-# progress.
-quick_draw = true
-
 # PV-output throttle in milliseconds, `0` meaning never suppress
 # (`PvInterval`).
 pv_interval = 300

@@ -78,7 +78,6 @@ depth_limit = 0
 nodes_limit = 0
 max_moves_to_draw = 512
 flatten_winning_mate = true
-quick_draw = true
 
 # DIFFERENCE: 300 in default.toml. A match build prints no search `info`
 # line, so this changes nothing in a game. A build of this config carrying the

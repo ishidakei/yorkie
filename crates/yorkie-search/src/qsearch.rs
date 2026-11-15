@@ -2114,7 +2114,7 @@ impl<N: NetworkParams> QSearch<N> {
 
         // Step 2. Immediate draw / max ply.
         let us = pos.side_to_move();
-        let draw_type = pos.is_repetition(ply as u16);
+        let draw_type = pos.is_repetition();
         if draw_type != RepetitionState::None {
             // The judgement read the move history, so the value is path
             // dependent by construction — this is where the mark originates.
@@ -3265,7 +3265,7 @@ impl<N: NetworkParams> QSearch<N> {
         let mut applied: Vec<(Move, yorkie_state::Undo)> = Vec::new();
         let mut ply = 0usize;
         while ply < MAX_PLY as usize {
-            if ply >= 1 && pos.is_repetition(ply as u16) != RepetitionState::None {
+            if ply >= 1 && pos.is_repetition() != RepetitionState::None {
                 break;
             }
             let m = if ply < root_pv.len() {
@@ -3590,7 +3590,7 @@ impl<N: NetworkParams> QSearch<N> {
         // The root never draws or mate-distance-prunes.
         if !root_node {
             // Step 2. Immediate draw / max ply.
-            let draw_type = pos.is_repetition(ply as u16);
+            let draw_type = pos.is_repetition();
             if draw_type != RepetitionState::None {
                 // The judgement read the move history, so the value is path
                 // dependent by construction — this is where the mark
@@ -5989,9 +5989,8 @@ mod tests {
         let net = zero_net();
         let _tt = fresh_tt();
         // Shuffling both kings gives a period-4 cycle, so the position after
-        // six plies repeats the one after two — an earlier occurrence strictly
-        // *after* the search root, which the reference scores as an ordinary
-        // draw. A two-fold landing *on* the root would not be scored.
+        // six plies repeats the one after two: its second occurrence, which is
+        // scored as an ordinary draw.
         let mut p = pos(TWO_KINGS);
         let bk = Piece::new(PieceKind::King, Color::Black);
         let wk = Piece::new(PieceKind::King, Color::White);
@@ -6010,20 +6009,9 @@ mod tests {
         p.do_move(step((4, 8), (3, 8), bk));
         p.do_move(step((4, 0), (3, 0), wk));
         assert_eq!(
-            p.is_repetition(6),
+            p.is_repetition(),
             RepetitionState::Draw,
-            "a repetition strictly after the search root is an ordinary draw"
-        );
-        // Only the stored-field check gates on the ply; the quick check scores
-        // an occurrence at or before the root too.
-        assert_eq!(
-            p.is_repetition(4),
-            if crate::config::QUICK_DRAW {
-                RepetitionState::Draw
-            } else {
-                RepetitionState::None
-            },
-            "the same repetition reaching to the root (ply == distance)"
+            "a position's second occurrence is an ordinary draw"
         );
 
         let mut q = QSearch::new(net.network());
@@ -6139,7 +6127,7 @@ mod tests {
             let net = zero_net();
             let _tt = fresh_tt();
             let mut p = shuffled_two_kings();
-            assert_eq!(p.is_repetition(6), RepetitionState::Draw);
+            assert_eq!(p.is_repetition(), RepetitionState::Draw);
 
             let mut q = QSearch::new(net.network());
             q.root_us = p.side_to_move();
@@ -6156,15 +6144,13 @@ mod tests {
                 "the repetition draw is a path-dependent value and nothing else"
             );
 
-            // The same position, reached at a ply the judgement does not apply
-            // to: an ordinary node, and an unmarked value. Only the stored-field
-            // check has such a ply; the quick check applies at every ply.
-            if !crate::config::QUICK_DRAW {
-                assert_eq!(p.is_repetition(4), RepetitionState::None);
-                q.nodes = 0;
-                q.qsearch_at(&mut p, 4, -1, 0);
-                assert_eq!(q.marks, ValueMarks::NONE);
-            }
+            // The same board before the shuffle, where nothing has recurred: an
+            // ordinary node, and an unmarked value.
+            let mut fresh = pos(TWO_KINGS);
+            assert_eq!(fresh.is_repetition(), RepetitionState::None);
+            q.nodes = 0;
+            q.qsearch_at(&mut fresh, 4, -1, 0);
+            assert_eq!(q.marks, ValueMarks::NONE);
         }
 
         /// The move limit is a rule of the tournament, so the draw it forces is

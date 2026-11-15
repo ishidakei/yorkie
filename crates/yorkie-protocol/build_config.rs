@@ -455,10 +455,6 @@ const SCHEMA: &[Spec] = &[
         "flatten_winning_mate",
         "(none: score every forced mate the engine delivers with one flat value)",
     ),
-    boolean(
-        "quick_draw",
-        "(none: score a position's second occurrence within 16 plies as a repetition)",
-    ),
     int("pv_interval", "PvInterval", 0, 100_000_000),
     boolean("consideration_mode", "ConsiderationMode"),
     boolean("output_fail_lh_pv", "OutputFailLHPV"),
