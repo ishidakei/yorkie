@@ -528,7 +528,7 @@ pub fn last_reply_searched(out: &str, line: Line<'_>) -> bool {
         let pos = startpos_after(line);
         let side = pos.side_to_move().index() as u8;
         return yorkie_storage::TranspositionTable::shared()
-            .probe(pos.key(), side)
+            .probe(pos.key(), side, |m16| pos.to_move(m16).is_some())
             .0;
     }
     let mut lines: Vec<&str> = out.lines().collect();

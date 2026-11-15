@@ -100,6 +100,11 @@ fn key_mid(hi: u64, mid: u64, frag: u16) -> u64 {
     (hi << CLUSTER_SHIFT) | (mid << 16) | frag as u64
 }
 
+/// The probe predicate of a caller for which every stored move rebuilds.
+fn any(_: NonZeroU16) -> bool {
+    true
+}
+
 /// Probe `k` and store through the returned writer, at the table's current
 /// generation, leaving the entry unmarked.
 #[expect(clippy::too_many_arguments)]
@@ -115,7 +120,7 @@ fn store(
     eval: i32,
 ) {
     let generation = tt.generation();
-    let (_, _, w) = tt.probe(k, side);
+    let (_, _, w) = tt.probe(k, side, any);
     w.write(
         k,
         value,
@@ -141,7 +146,7 @@ fn store_probe_round_trip_every_field() {
     let side = 0;
 
     // Miss on an empty table.
-    let (found, data, w) = tt.probe(k, side);
+    let (found, data, w) = tt.probe(k, side, any);
     assert!(!found);
     assert_eq!(data, miss_sentinel());
     w.write(
@@ -160,7 +165,7 @@ fn store_probe_round_trip_every_field() {
     );
 
     // Hit: every field survives the round trip.
-    let (found, data, _) = tt.probe(k, side);
+    let (found, data, _) = tt.probe(k, side, any);
     assert!(found);
     assert_eq!(data.value, -321);
     assert_eq!(data.eval, -654);
@@ -185,7 +190,7 @@ fn every_bound_and_pv_combination_round_trips() {
             let frag = 0x100 + (i as u16) * 2 + pv as u16;
             let k = key(7, frag);
             store(&tt, k, side, 10 + i as i32, pv, bound, 5, frag, -10);
-            let (found, data, _) = tt.probe(k, side);
+            let (found, data, _) = tt.probe(k, side, any);
             assert!(found, "bound={bound:?} pv={pv} should be found");
             assert_eq!(data.bound, bound);
             assert_eq!(data.is_pv, pv);
@@ -204,16 +209,16 @@ fn miss_on_wrong_key() {
     store(&tt, stored, side, 100, false, Bound::Exact, 8, 0x0111, 100);
 
     // Same cluster, different fragment → miss.
-    let (found, data, _) = tt.probe(key(42, 0xBEE0), side);
+    let (found, data, _) = tt.probe(key(42, 0xBEE0), side, any);
     assert!(!found);
     assert_eq!(data, miss_sentinel());
 
     // Different cluster entirely → miss.
-    let (found, _, _) = tt.probe(key(99, 0xBEEF), side);
+    let (found, _, _) = tt.probe(key(99, 0xBEEF), side, any);
     assert!(!found);
 
     // Same key but opposite side lands in a different cluster → miss.
-    let (found, _, _) = tt.probe(stored, 1);
+    let (found, _, _) = tt.probe(stored, 1, any);
     assert!(!found);
 }
 
@@ -238,21 +243,24 @@ fn replacement_evicts_lowest_priority_entry() {
     store(&tt, key(hi, 3), side, 0, false, Bound::Lower, 20, 3, 0);
 
     // All three present before the eviction.
-    assert!(tt.probe(key(hi, 1), side).0);
-    assert!(tt.probe(key(hi, 2), side).0);
-    assert!(tt.probe(key(hi, 3), side).0);
+    assert!(tt.probe(key(hi, 1), side, any).0);
+    assert!(tt.probe(key(hi, 2), side, any).0);
+    assert!(tt.probe(key(hi, 3), side, any).0);
 
     // Miss on frag 4 → writer targets the evicted slot; write frag 4 there.
     store(&tt, key(hi, 4), side, 0, false, Bound::Lower, 1, 4, 0);
 
     // frag 2 (depth 5) was the least valuable and is gone; frags 1, 3, 4 remain.
     assert!(
-        !tt.probe(key(hi, 2), side).0,
+        !tt.probe(key(hi, 2), side, any).0,
         "frag 2 should have been evicted"
     );
-    assert!(tt.probe(key(hi, 1), side).0, "frag 1 should survive");
-    assert!(tt.probe(key(hi, 3), side).0, "frag 3 should survive");
-    assert!(tt.probe(key(hi, 4), side).0, "frag 4 should now be present");
+    assert!(tt.probe(key(hi, 1), side, any).0, "frag 1 should survive");
+    assert!(tt.probe(key(hi, 3), side, any).0, "frag 3 should survive");
+    assert!(
+        tt.probe(key(hi, 4), side, any).0,
+        "frag 4 should now be present"
+    );
 }
 
 /// The `tt-entry16` counterpart: the same replacement scan over a **2**-entry
@@ -276,19 +284,19 @@ fn replacement_evicts_lowest_priority_entry() {
     store(&tt, key(hi, 16), side, 0, false, Bound::Lower, 5, 2, 0);
 
     // Both present before the eviction.
-    assert!(tt.probe(key(hi, 8), side).0);
-    assert!(tt.probe(key(hi, 16), side).0);
+    assert!(tt.probe(key(hi, 8), side, any).0);
+    assert!(tt.probe(key(hi, 16), side, any).0);
 
     // Miss on frag 24 → writer targets the evicted slot; write frag 24 there.
     store(&tt, key(hi, 24), side, 0, false, Bound::Lower, 1, 3, 0);
 
     assert!(
-        !tt.probe(key(hi, 16), side).0,
+        !tt.probe(key(hi, 16), side, any).0,
         "frag 16 (depth 5) should have been evicted"
     );
-    assert!(tt.probe(key(hi, 8), side).0, "frag 8 should survive");
+    assert!(tt.probe(key(hi, 8), side, any).0, "frag 8 should survive");
     assert!(
-        tt.probe(key(hi, 24), side).0,
+        tt.probe(key(hi, 24), side, any).0,
         "frag 24 should now be present"
     );
 }
@@ -324,21 +332,24 @@ fn generation_aging_lowers_replacement_priority() {
     store(&tt, key(hi, 3), side, 0, false, Bound::Lower, 8, 3, 0);
 
     // Sanity: all three occupy the cluster.
-    assert!(tt.probe(key(hi, 1), side).0);
-    assert!(tt.probe(key(hi, 2), side).0);
-    assert!(tt.probe(key(hi, 3), side).0);
+    assert!(tt.probe(key(hi, 1), side, any).0);
+    assert!(tt.probe(key(hi, 2), side, any).0);
+    assert!(tt.probe(key(hi, 3), side, any).0);
 
     // Miss → evicts the aged, deep entry P (frag 1).
     store(&tt, key(hi, 4), side, 0, false, Bound::Lower, 1, 4, 3);
     assert!(
-        !tt.probe(key(hi, 1), side).0,
+        !tt.probe(key(hi, 1), side, any).0,
         "aged deep entry P should be evicted"
     );
     assert!(
-        tt.probe(key(hi, 2), side).0,
+        tt.probe(key(hi, 2), side, any).0,
         "fresh shallow entry Q should survive"
     );
-    assert!(tt.probe(key(hi, 3), side).0, "fresh entry R should survive");
+    assert!(
+        tt.probe(key(hi, 3), side, any).0,
+        "fresh entry R should survive"
+    );
 }
 
 /// The `tt-entry16` counterpart: the same generation arithmetic over a
@@ -370,21 +381,21 @@ fn generation_aging_lowers_replacement_priority() {
     store(&tt, key(hi, 16), side, 0, false, Bound::Lower, 3, 2, 0);
 
     // Sanity: both occupy the cluster.
-    assert!(tt.probe(key(hi, 8), side).0);
-    assert!(tt.probe(key(hi, 16), side).0);
+    assert!(tt.probe(key(hi, 8), side, any).0);
+    assert!(tt.probe(key(hi, 16), side, any).0);
 
     // Miss → evicts the aged, deep entry P (frag 8), not the shallow fresh Q.
     store(&tt, key(hi, 24), side, 0, false, Bound::Lower, 1, 3, 3);
     assert!(
-        !tt.probe(key(hi, 8), side).0,
+        !tt.probe(key(hi, 8), side, any).0,
         "aged deep entry P should be evicted"
     );
     assert!(
-        tt.probe(key(hi, 16), side).0,
+        tt.probe(key(hi, 16), side, any).0,
         "fresh shallow entry Q should survive"
     );
     assert!(
-        tt.probe(key(hi, 24), side).0,
+        tt.probe(key(hi, 24), side, any).0,
         "frag 24 should now be present"
     );
 }
@@ -409,7 +420,7 @@ fn a_cluster_holds_exactly_cluster_size_positions() {
     for i in 1..=CLUSTER_ENTRIES as u16 {
         let f = frag(i);
         assert!(
-            tt.probe(key(hi, f), side).0,
+            tt.probe(key(hi, f), side, any).0,
             "a full cluster must retain all {CLUSTER_ENTRIES} of its entries (frag {f} missing)"
         );
     }
@@ -428,9 +439,12 @@ fn a_cluster_holds_exactly_cluster_size_positions() {
         extra,
         0,
     );
-    assert!(tt.probe(key(hi, extra), side).0, "the new entry is present");
+    assert!(
+        tt.probe(key(hi, extra), side, any).0,
+        "the new entry is present"
+    );
     let survivors = (1..=CLUSTER_ENTRIES as u16)
-        .filter(|&i| tt.probe(key(hi, frag(i)), side).0)
+        .filter(|&i| tt.probe(key(hi, frag(i)), side, any).0)
         .count();
     assert_eq!(
         survivors,
@@ -453,7 +467,7 @@ fn save_preserves_move_when_new_move_absent() {
     // Same key, mv = 0, deeper: refreshes value, keeps move.
     store(&tt, k, side, 2, false, Bound::Lower, 12, 0, 2);
 
-    let (found, data, _) = tt.probe(k, side);
+    let (found, data, _) = tt.probe(k, side, any);
     assert!(found);
     assert_eq!(
         data.move16,
@@ -462,6 +476,160 @@ fn save_preserves_move_when_new_move_absent() {
     );
     assert_eq!(data.value, 2, "value refreshed");
     assert_eq!(data.depth, 12, "depth refreshed");
+}
+
+/// Probe `k` through `fits` and store a lower bound through the writer the
+/// probe returned, whether it hit or missed.
+#[cfg(not(feature = "tt-entry16"))]
+fn store_through(
+    tt: &TranspositionTable,
+    k: u64,
+    side: u8,
+    fits: impl Fn(NonZeroU16) -> bool,
+    value: i32,
+    depth: i32,
+    mv: u16,
+) {
+    let generation = tt.generation();
+    let (_, _, w) = tt.probe(k, side, fits);
+    w.write(
+        k,
+        value,
+        false,
+        Bound::Lower,
+        depth,
+        NonZeroU16::new(mv),
+        value,
+        generation,
+        #[cfg(feature = "verbose3")]
+        ValueMarks::NONE,
+        #[cfg(feature = "verbose1")]
+        &mut 0,
+    );
+}
+
+/// A key match whose move the probing position cannot rebuild is a miss, in
+/// either layout.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_match_whose_move_does_not_fit_is_a_miss() {
+    let tt = fresh_tt();
+    let side = 1;
+    let k = key(500, 0x4321);
+    store(&tt, k, side, 77, false, Bound::Exact, 9, 0x0111, 70);
+
+    let (found, data, _) = tt.probe(k, side, |m| m.get() != 0x0111);
+    assert!(!found);
+    assert_eq!(data, miss_sentinel());
+
+    let (found, data, _) = tt.probe(k, side, |m| m.get() == 0x0111);
+    assert!(found);
+    assert_eq!(data.value, 77);
+}
+
+/// Two positions in one cluster under one 16-bit tag: what the default
+/// layout's probe makes of the collision. A `tt-entry16` build tells them
+/// apart by the whole key, so the collision does not arise there.
+#[cfg(not(feature = "tt-entry16"))]
+mod tag_collisions {
+    use super::*;
+
+    const HI: u64 = 600;
+    const TAG: u16 = 0x2468;
+    const SIDE: u8 = 0;
+    const A_MOVE: u16 = 0x0111;
+    const B_MOVE: u16 = 0x0222;
+
+    /// Position A, the entry already stored.
+    fn a() -> u64 {
+        key_mid(HI, 1, TAG)
+    }
+    /// Position B, probing: same cluster, same tag, another key.
+    fn b() -> u64 {
+        key_mid(HI, 2, TAG)
+    }
+    /// B's predicate: A's move does not rebuild in B, anything else does.
+    fn b_fits(m: NonZeroU16) -> bool {
+        m.get() != A_MOVE
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn the_probe_skips_the_first_match_and_finds_the_second() {
+        let tt = fresh_tt();
+        store(&tt, a(), SIDE, 100, false, Bound::Lower, 10, A_MOVE, 100);
+
+        // B misses past A's entry and stores beside it.
+        let (found, _, _) = tt.probe(b(), SIDE, b_fits);
+        assert!(!found, "A's entry must not answer B's probe");
+        store_through(&tt, b(), SIDE, b_fits, 200, 6, B_MOVE);
+
+        let (found, data, _) = tt.probe(b(), SIDE, b_fits);
+        assert!(found, "B's own entry, second in the cluster, is found");
+        assert_eq!(data.value, 200);
+        assert_eq!(data.move16, NonZeroU16::new(B_MOVE));
+
+        // A, with a predicate that rejects B's move, still reads its own.
+        let (found, data, _) = tt.probe(a(), SIDE, |m| m.get() != B_MOVE);
+        assert!(found);
+        assert_eq!(data.value, 100);
+    }
+
+    /// With the cluster full, the miss's writer is the entry the replacement
+    /// rule picks over all three, the skipped match among them. Here A's
+    /// entry is the shallowest, so B's store replaces it.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_miss_past_a_shallow_match_replaces_that_match() {
+        let tt = fresh_tt();
+        store(&tt, a(), SIDE, 100, false, Bound::Lower, 2, A_MOVE, 100);
+        store(&tt, key(HI, 1), SIDE, 1, false, Bound::Lower, 10, 1, 0);
+        store(&tt, key(HI, 3), SIDE, 3, false, Bound::Lower, 20, 3, 0);
+
+        store_through(&tt, b(), SIDE, b_fits, 200, 1, B_MOVE);
+
+        let (found, data, _) = tt.probe(a(), SIDE, any);
+        assert!(found);
+        assert_eq!(data.value, 200, "B's store went into A's slot");
+        assert!(tt.probe(key(HI, 1), SIDE, any).0);
+        assert!(tt.probe(key(HI, 3), SIDE, any).0);
+    }
+
+    /// Here A's entry is the deepest, so B's store replaces the shallowest of
+    /// the other two and A's survives.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_miss_past_a_deep_match_replaces_the_shallowest_other() {
+        let tt = fresh_tt();
+        store(&tt, a(), SIDE, 100, false, Bound::Lower, 20, A_MOVE, 100);
+        store(&tt, key(HI, 1), SIDE, 1, false, Bound::Lower, 5, 1, 0);
+        store(&tt, key(HI, 3), SIDE, 3, false, Bound::Lower, 10, 3, 0);
+
+        store_through(&tt, b(), SIDE, b_fits, 200, 1, B_MOVE);
+
+        assert!(!tt.probe(key(HI, 1), SIDE, any).0, "the depth-5 entry went");
+        assert!(tt.probe(key(HI, 3), SIDE, any).0);
+        let (found, data, _) = tt.probe(a(), SIDE, |m| m.get() == A_MOVE);
+        assert!(found);
+        assert_eq!(data.value, 100, "A's entry survives");
+        let (found, data, _) = tt.probe(b(), SIDE, b_fits);
+        assert!(found);
+        assert_eq!(data.value, 200);
+    }
+
+    /// An entry with no move gives nothing to test, so it answers B's probe
+    /// as before, whatever the predicate.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_match_without_a_move_is_a_hit() {
+        let tt = fresh_tt();
+        store(&tt, a(), SIDE, 100, false, Bound::Lower, 10, 0, 100);
+
+        let (found, data, _) = tt.probe(b(), SIDE, |_| false);
+        assert!(found);
+        assert_eq!(data.value, 100);
+        assert_eq!(data.move16, None);
+    }
 }
 
 /// The table's size and placement, as a caller outside the crate sees them:
@@ -495,11 +663,11 @@ fn clear_zeroes_entries_and_generation() {
     tt.new_search();
     let k = key(11, 0x22);
     store(&tt, k, 0, 5, false, Bound::Exact, 9, 0x22, 5);
-    assert!(tt.probe(k, 0).0);
+    assert!(tt.probe(k, 0, any).0);
 
     tt.clear();
     assert_eq!(tt.generation(), 0, "clear resets generation");
-    assert!(!tt.probe(k, 0).0, "clear empties every entry");
+    assert!(!tt.probe(k, 0, any).0, "clear empties every entry");
 }
 
 #[cfg_attr(miri, ignore)]
@@ -546,7 +714,7 @@ fn determinism_identical_sequences_yield_identical_tables() {
         let read = (1..=6u16)
             .map(|f| {
                 let (k, side) = entry(f);
-                let (found, data, _) = tt.probe(k, side);
+                let (found, data, _) = tt.probe(k, side, any);
                 (found, data)
             })
             .collect();
@@ -567,7 +735,7 @@ fn a_cleared_table_reads_back_all_misses() {
             // A nonzero fragment cannot match a zeroed entry's `key == 0`, so
             // the probe takes the true miss path.
             let k = key(hi, (hi as u16).wrapping_mul(7) | 8);
-            let (found, data, _) = tt.probe(k, side);
+            let (found, data, _) = tt.probe(k, side, any);
             assert!(!found, "cleared table entry occupied at hi={hi}");
             assert_eq!(data, miss_sentinel());
         }
@@ -584,10 +752,13 @@ fn many_clear_and_store_cycles_preserve_semantics() {
         tt.clear();
         let k = key(i, i as u16);
         store(&tt, k, 0, 3, false, Bound::Exact, 5, i as u16, 3);
-        assert!(tt.probe(k, 0).0);
+        assert!(tt.probe(k, 0, any).0);
         if i > 0 {
             let previous = key(i - 1, (i - 1) as u16);
-            assert!(!tt.probe(previous, 0).0, "the clear emptied the last game");
+            assert!(
+                !tt.probe(previous, 0, any).0,
+                "the clear emptied the last game"
+            );
         }
     }
 }
@@ -696,11 +867,19 @@ mod wide_key_identity {
         assert_eq!(a as u16, b as u16, "the pair shares its low 16 bits");
 
         store(&tt, a, side, 111, false, Bound::Exact, 9, 0x11, 111);
-        assert!(!tt.probe(b, side).0, "b must not read a's entry");
+        assert!(!tt.probe(b, side, any).0, "b must not read a's entry");
 
         store(&tt, b, side, 222, false, Bound::Exact, 9, 0x22, 222);
-        assert_eq!(tt.probe(a, side).1.value, 111, "a keeps its own payload");
-        assert_eq!(tt.probe(b, side).1.value, 222, "b keeps its own payload");
+        assert_eq!(
+            tt.probe(a, side, any).1.value,
+            111,
+            "a keeps its own payload"
+        );
+        assert_eq!(
+            tt.probe(b, side, any).1.value,
+            222,
+            "b keeps its own payload"
+        );
     }
 
     /// Keys sharing their low 16 bits **and** their cluster, differing only in
@@ -719,19 +898,19 @@ mod wide_key_identity {
 
         store(&tt, a, side, 111, false, Bound::Exact, 9, 0x11, 111);
         assert!(
-            !tt.probe(b, side).0,
+            !tt.probe(b, side, any).0,
             "a 64-bit key must not be matched by a sibling that differs above bit 16"
         );
 
         store(&tt, b, side, 222, true, Bound::Lower, 12, 0x22, 222);
 
-        let (found_a, data_a, _) = tt.probe(a, side);
+        let (found_a, data_a, _) = tt.probe(a, side, any);
         assert!(found_a, "a survives — b took the cluster's other entry");
         assert_eq!(data_a.value, 111);
         assert_eq!(data_a.move16, NonZeroU16::new(0x11));
         assert_eq!(data_a.depth, 9);
 
-        let (found_b, data_b, _) = tt.probe(b, side);
+        let (found_b, data_b, _) = tt.probe(b, side, any);
         assert!(found_b);
         assert_eq!(data_b.value, 222);
         assert_eq!(data_b.move16, NonZeroU16::new(0x22));
@@ -758,7 +937,7 @@ mod wide_key_identity {
 
             store(&tt, base, side, 5, false, Bound::Exact, 9, 0x33, 5);
             assert!(
-                !tt.probe(sibling, side).0,
+                !tt.probe(sibling, side, any).0,
                 "key bit {bit} must take part in the identity check"
             );
         }
@@ -785,11 +964,19 @@ mod narrow_key_identity {
         assert_eq!(a as u16, b as u16, "the pair shares its low 16 bits");
 
         store(&tt, a, side, 111, false, Bound::Exact, 9, 0x11, 111);
-        assert!(!tt.probe(b, side).0, "b must not read a's entry");
+        assert!(!tt.probe(b, side, any).0, "b must not read a's entry");
 
         store(&tt, b, side, 222, false, Bound::Exact, 9, 0x22, 222);
-        assert_eq!(tt.probe(a, side).1.value, 111, "a keeps its own payload");
-        assert_eq!(tt.probe(b, side).1.value, 222, "b keeps its own payload");
+        assert_eq!(
+            tt.probe(a, side, any).1.value,
+            111,
+            "a keeps its own payload"
+        );
+        assert_eq!(
+            tt.probe(b, side, any).1.value,
+            222,
+            "b keeps its own payload"
+        );
     }
 
     /// Keys sharing their cluster and their low 16 bits **do** alias here —
@@ -806,13 +993,13 @@ mod narrow_key_identity {
 
         store(&tt, a, side, 111, false, Bound::Exact, 9, 0x11, 111);
 
-        let (found_b, data_b, _) = tt.probe(b, side);
+        let (found_b, data_b, _) = tt.probe(b, side, any);
         assert!(found_b, "a 16-bit key cannot tell b from a");
         assert_eq!(data_b.value, 111, "b reads a's payload");
 
         // Writing through b lands in the same entry, so a now reads b's data.
         store(&tt, b, side, 222, true, Bound::Lower, 12, 0x22, 222);
-        let (found_a, data_a, _) = tt.probe(a, side);
+        let (found_a, data_a, _) = tt.probe(a, side, any);
         assert!(found_a);
         assert_eq!(data_a.value, 222, "the two share one entry");
         assert_eq!(data_a.move16, NonZeroU16::new(0x22));
@@ -866,7 +1053,7 @@ mod value_marks {
         marks: ValueMarks,
     ) {
         let generation = tt.generation();
-        let (_, _, w) = tt.probe(k, side);
+        let (_, _, w) = tt.probe(k, side, any);
         w.write(
             k,
             value,
@@ -910,7 +1097,7 @@ mod value_marks {
             },
         ] {
             store_marked(&tt, k, side, 10, false, Bound::Exact, 8, 0x11, 0, marks);
-            assert_eq!(tt.probe(k, side).1.marks, marks);
+            assert_eq!(tt.probe(k, side, any).1.marks, marks);
         }
     }
 
@@ -922,7 +1109,7 @@ mod value_marks {
         let k = key(64, 0x0102);
 
         store_marked(&tt, k, side, 10, false, Bound::Exact, 8, 0x11, 0, ALL);
-        assert_eq!(tt.probe(k, side).1.marks, ALL);
+        assert_eq!(tt.probe(k, side, any).1.marks, ALL);
 
         // The same slot, rewritten unmarked: the marks follow the payload
         // rather than accumulating.
@@ -938,7 +1125,7 @@ mod value_marks {
             0,
             ValueMarks::NONE,
         );
-        let (found, data, _) = tt.probe(k, side);
+        let (found, data, _) = tt.probe(k, side, any);
         assert!(found);
         assert_eq!(data.value, 20);
         assert_eq!(data.marks, ValueMarks::NONE);
@@ -963,7 +1150,7 @@ mod value_marks {
             0,
             ALL,
         );
-        let (found, data, _) = tt.probe(key(70, 0x0020), side);
+        let (found, data, _) = tt.probe(key(70, 0x0020), side, any);
         assert!(!found);
         assert_eq!(data, miss_sentinel());
     }
@@ -997,7 +1184,7 @@ mod value_marks {
             );
         }
         for (i, &k) in family.iter().enumerate() {
-            let (found, data, _) = tt.probe(k, side);
+            let (found, data, _) = tt.probe(k, side, any);
             assert!(found, "entry {i} must still be there");
             assert_eq!(data.value, i as i32);
             assert_eq!(data.marks, expected(i), "entry {i} carries its own marks");
@@ -1022,7 +1209,7 @@ mod value_marks {
             } else {
                 expected(i)
             };
-            assert_eq!(tt.probe(k, side).1.marks, want, "entry {i}");
+            assert_eq!(tt.probe(k, side, any).1.marks, want, "entry {i}");
         }
     }
 
@@ -1050,7 +1237,7 @@ mod value_marks {
             ValueMarks::NONE,
         );
 
-        let (found, data, _) = tt.probe(k, side);
+        let (found, data, _) = tt.probe(k, side, any);
         assert!(found);
         assert_eq!(data.value, 10, "the declined write kept the deep entry");
         assert_eq!(data.marks, ALL, "and with it the marks");
@@ -1072,13 +1259,13 @@ mod value_marks {
         }
         tt.clear();
         for &k in &family {
-            let (found, data, _) = tt.probe(k, side);
+            let (found, data, _) = tt.probe(k, side, any);
             assert!(!found, "clear empties every entry");
             assert_eq!(data, miss_sentinel());
         }
 
         for (i, &k) in family.iter().enumerate() {
-            let (found, data, _) = tt.probe(0, side);
+            let (found, data, _) = tt.probe(0, side, any);
             assert!(!found);
             assert_eq!(data.marks, ValueMarks::NONE, "entry {i} kept its marks");
             store_marked(
@@ -1117,7 +1304,7 @@ mod value_marks {
 
             for marks in [ValueMarks::NONE, PATH_DEP, ALL] {
                 store_marked(&tt, k, side, 11, false, Bound::Exact, 8, 0x11, 0, marks);
-                let (found, data, _) = tt.probe(k, side);
+                let (found, data, _) = tt.probe(k, side, any);
                 assert!(found, "the marks are not part of the identity");
                 assert_eq!(data.value, 11);
                 assert_eq!(data.marks, marks, "key bit {} is a mark", 63 - bit);
@@ -1158,12 +1345,12 @@ mod value_marks {
                 ValueMarks::NONE,
             );
 
-            let (found_base, data_base, _) = tt.probe(base, side);
+            let (found_base, data_base, _) = tt.probe(base, side, any);
             assert!(found_base, "{pattern:#b}: the base key keeps its entry");
             assert_eq!(data_base.value, 11);
             assert_eq!(data_base.marks, ALL);
 
-            let (found_other, data_other, _) = tt.probe(other, side);
+            let (found_other, data_other, _) = tt.probe(other, side, any);
             assert!(found_other, "{pattern:#b}: the sibling keeps its own");
             assert_eq!(data_other.value, 22);
             assert_eq!(data_other.marks, ValueMarks::NONE);

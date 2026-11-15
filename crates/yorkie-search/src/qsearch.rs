@@ -1922,7 +1922,9 @@ impl<N: NetworkParams> QSearch<N> {
     fn root_entry(&self, pos: &Position, depth: i32) -> crate::timeline::RootEntry {
         let key = pos.key();
         let tt = TranspositionTable::shared();
-        let (_, _, slot) = tt.locate(key, pos.side_to_move().index() as u8);
+        let (_, _, slot) = tt.locate(key, pos.side_to_move().index() as u8, |m16| {
+            pos.to_move(m16).is_some()
+        });
         let found = tt.depth_at(slot, key);
         let writer = found.and_then(|_| crate::dupstats::writer_of(key));
         crate::timeline::RootEntry::of(found, depth, writer, self.dup_writer_id())
@@ -2146,7 +2148,8 @@ impl<N: NetworkParams> QSearch<N> {
         let side = us.index() as u8;
         // Capture the entry location once (like the reference's Step-3
         // `ttWriter`); every write below targets this exact slot.
-        let (found, tt_data, tt_slot) = TranspositionTable::shared().locate(pos_key, side);
+        let (found, tt_data, tt_slot) =
+            TranspositionTable::shared().locate(pos_key, side, |m16| pos.to_move(m16).is_some());
         let tt_hit = found && self.reads_tt();
         // Widened O(1), without legal-move generation; the MovePicker's TT
         // stage re-validates with `pseudo_legal` + `is_legal`.
@@ -3270,7 +3273,8 @@ impl<N: NetworkParams> QSearch<N> {
             } else {
                 let key = pos.key();
                 let side = pos.side_to_move().index() as u8;
-                let (found, data, _writer) = TranspositionTable::shared().probe(key, side);
+                let (found, data, _writer) =
+                    TranspositionTable::shared().probe(key, side, |m16| pos.to_move(m16).is_some());
                 if !found {
                     break;
                 }
@@ -3666,7 +3670,8 @@ impl<N: NetworkParams> QSearch<N> {
         let side = us.index() as u8;
         // Capture the entry location once (the reference's Step-4 `ttWriter`);
         // every write in this node targets this slot, not a re-probe.
-        let (tt_hit, tt_data, tt_slot) = TranspositionTable::shared().locate(pos_key, side);
+        let (tt_hit, tt_data, tt_slot) =
+            TranspositionTable::shared().locate(pos_key, side, |m16| pos.to_move(m16).is_some());
         self.stack[s].tt_hit = tt_hit;
         // At the root the current PV line's move is treated as the TT move
         // regardless of what the probe returned; the rest of `tt_data` is still
@@ -5087,7 +5092,7 @@ mod tests {
         let key = p.key();
         let side = p.side_to_move().index() as u8;
         let generation = table.generation();
-        let (_f, _d, w) = table.probe(key, side);
+        let (_f, _d, w) = table.probe(key, side, |m16| p.to_move(m16).is_some());
         w.write(
             key,
             value,
@@ -5105,7 +5110,9 @@ mod tests {
     }
 
     fn probe_root(table: &TranspositionTable, p: &Position) -> (bool, TTData) {
-        let (f, d, _w) = table.probe(p.key(), p.side_to_move().index() as u8);
+        let (f, d, _w) = table.probe(p.key(), p.side_to_move().index() as u8, |m16| {
+            p.to_move(m16).is_some()
+        });
         (f, d)
     }
 
@@ -6073,7 +6080,7 @@ mod tests {
             let key = p.key();
             let side = p.side_to_move().index() as u8;
             let generation = table.generation();
-            let (_f, _d, w) = table.probe(key, side);
+            let (_f, _d, w) = table.probe(key, side, |m16| p.to_move(m16).is_some());
             w.write(
                 key, value, false, bound, DEPTH_QS, None, 0, generation, marks, &mut 0,
             );
@@ -6342,6 +6349,62 @@ mod tests {
             q.run(&mut p.clone(), 399, 400, false, false)
         };
         assert_eq!(without_tt.value, 0, "ReadTT=false ignores the entry");
+    }
+
+    /// A stored move that does not rebuild in `p`: a board move of another
+    /// position whose origin square is empty in `p`.
+    fn foreign_move16(p: &Position) -> NonZeroU16 {
+        let m = legal_moves(&pos(THREE_CAPTURES))
+            .into_iter()
+            .find(|m| !m.is_drop() && p.board().get(m.from_sq()).is_none())
+            .expect("a board move from a square empty in `p`");
+        let m16 = move16_of(Some(m)).expect("a storable move");
+        assert!(p.to_move(m16).is_none(), "the move must not rebuild in `p`");
+        m16
+    }
+
+    /// An entry whose move does not rebuild in the position is what another
+    /// position colliding on the same tag leaves: the probe skips it, so
+    /// qsearch evaluates instead of cutting on its value. The same entry with
+    /// no move still cuts.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn qsearch_evaluates_past_an_entry_whose_move_does_not_fit() {
+        let net = zero_net();
+        let table = fresh_tt();
+        let p = pos(TWO_KINGS);
+        let run = |mv: Option<NonZeroU16>| {
+            table.clear();
+            prewrite(&table, &p, 500, false, Bound::Lower, DEPTH_QS, mv, 0);
+            let mut q = QSearch::new(net.network());
+            q.run(&mut p.clone(), 399, 400, false, true).value
+        };
+        assert_eq!(run(None), 500, "an entry with no move is a hit");
+        assert_eq!(run(Some(foreign_move16(&p))), 0, "the stand pat, not 500");
+    }
+
+    /// [`qsearch_evaluates_past_an_entry_whose_move_does_not_fit`] for the
+    /// main search's step-5 cutoff.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn search_evaluates_past_an_entry_whose_move_does_not_fit() {
+        let net = zero_net();
+        let table = fresh_tt();
+        let p = pos(TWO_KINGS);
+        let run = |mv: Option<NonZeroU16>| {
+            table.clear();
+            prewrite(&table, &p, 500, false, Bound::Lower, 10, mv, 0);
+            let mut q = QSearch::new(net.network());
+            let v = q.run_search(&mut p.clone(), 399, 400, 3, true, false);
+            (v, q.nodes)
+        };
+        assert_eq!(run(None), (500, 0), "an entry with no move is a hit");
+        let (v, nodes) = run(Some(foreign_move16(&p)));
+        assert_ne!(v, 500, "the colliding entry's value is not taken");
+        assert!(nodes > 0, "the node is searched");
+        let (found, data) = probe_root(&table, &p);
+        assert!(found, "the node stores its own entry over the skipped one");
+        assert_ne!(data.value, 500);
     }
 
     #[cfg_attr(miri, ignore)]

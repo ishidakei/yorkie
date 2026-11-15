@@ -37,6 +37,10 @@
 //! in primitives: the position key is a `u64`, the side to move a `u8`, and the
 //! best move its low-16-bit fragment. Widening that fragment back to a full
 //! move, and validating it against the actual position, belongs to the caller.
+//! The one place a probe needs that answer — whether a key match's stored move
+//! rebuilds in the probing position at all, which decides whether the match
+//! counts — it asks the caller through a predicate rather than learning what a
+//! position is.
 //!
 //! # One table, sized before the binary exists
 //!
@@ -1069,30 +1073,24 @@ impl TranspositionTable {
     /// entry on a hit and the least-valuable entry to replace on a miss. By
     /// default `found` may be a 16-bit key collision; under `tt-entry16` the
     /// 64-bit match makes it exact.
-    pub fn probe(&self, key: u64, side_to_move: u8) -> (bool, TTData, TTWriter<'_>) {
-        let ci = cluster_index(key, side_to_move);
-        let k = tte_key(key);
-        let generation = GENERATION8.load(REL);
-        let cluster = &self.clusters[ci];
-
-        if let Some(i) = (0..CLUSTER_SIZE).find(|&i| key_matches(cluster.entry[i].key.load(REL), k))
-        {
-            let found = cluster.entry[i].is_occupied();
-            let data = cluster.read(i);
-            return (found, data, TTWriter::new(cluster, i));
-        }
-
-        // Miss: pick the least-valuable entry to replace.
-        let mut replace = 0;
-        for i in 1..CLUSTER_SIZE {
-            if cluster.entry[replace].replace_priority(generation)
-                > cluster.entry[i].replace_priority(generation)
-            {
-                replace = i;
-            }
-        }
-
-        (false, TTData::none(), TTWriter::new(cluster, replace))
+    ///
+    /// `fits` says whether a stored move rebuilds as a move in the probing
+    /// position. A key match whose move does not is another position's entry:
+    /// the scan skips it and goes on, as the reference does, and when nothing
+    /// else matches the probe is a miss. An entry with no move is not tested.
+    #[inline]
+    pub fn probe(
+        &self,
+        key: u64,
+        side_to_move: u8,
+        fits: impl Fn(NonZeroU16) -> bool,
+    ) -> (bool, TTData, TTWriter<'_>) {
+        let (found, data, slot) = self.locate(key, side_to_move, fits);
+        (
+            found,
+            data,
+            TTWriter::new(&self.clusters[slot.cluster], slot.entry),
+        )
     }
 
     /// Like [`Self::probe`] but returns the chosen entry's location rather than
@@ -1101,16 +1099,31 @@ impl TranspositionTable {
     /// physical entry through [`Self::write_at`]. Re-probing at write time
     /// would re-run the replacement selection against a cluster the children
     /// have since churned, and could land on a different slot.
-    pub fn locate(&self, key: u64, side_to_move: u8) -> (bool, TTData, TtSlot) {
+    ///
+    /// `fits` is [`Self::probe`]'s. On a miss the slot is the replacement
+    /// victim chosen over the whole cluster, a skipped key match included, so
+    /// the store that follows lands where the reference's does.
+    #[inline]
+    pub fn locate(
+        &self,
+        key: u64,
+        side_to_move: u8,
+        fits: impl Fn(NonZeroU16) -> bool,
+    ) -> (bool, TTData, TtSlot) {
         let ci = cluster_index(key, side_to_move);
         let k = tte_key(key);
         let generation = GENERATION8.load(REL);
         let cluster = &self.clusters[ci];
 
-        if let Some(i) = (0..CLUSTER_SIZE).find(|&i| key_matches(cluster.entry[i].key.load(REL), k))
-        {
-            let found = cluster.entry[i].is_occupied();
+        for i in 0..CLUSTER_SIZE {
+            if !key_matches(cluster.entry[i].key.load(REL), k) {
+                continue;
+            }
             let data = cluster.read(i);
+            if data.move16.is_some_and(|m| !fits(m)) {
+                continue;
+            }
+            let found = cluster.entry[i].is_occupied();
             return (
                 found,
                 data,
