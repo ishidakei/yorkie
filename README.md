@@ -72,7 +72,7 @@ strip --strip-debug target/release/yorkie
 | ビルド | 読むもの・出すもの |
 | --- | --- |
 | feature なし | 対局で使うコマンドと、対局で使う出力だけ。探索出力は `bestmove` のみ |
-| `verbose1` | ＋受け付けられない入力（認識できないコマンド、不正な `position`、対局では使わない `go` の指定）や定跡ファイルの異常を `info string` で報告する。入力への対処自体はどのビルドでも変わらず、報告するかどうかだけが変わる。あわせて、探索を終える `bestmove` の直前に 1 応答ぶんの統計行を出力し（後述）、`ponder` 設定が有効なビルドでは `bestmove` のあとに始まる探索の開始と終了を `info string ponder start` / `info string ponder stop` で報告する |
+| `verbose1` | ＋受け付けられない入力（認識できないコマンド、不正な `position`、対局では使わない `go` の指定）や定跡ファイルの異常を `info string` で報告する。入力への対処自体はどのビルドでも変わらず、報告するかどうかだけが変わる。あわせて、探索を終える `bestmove` の直前に 1 応答ぶんの統計行を出力し（後述）、`ponder` 設定が有効なビルドでは `bestmove` のあとに始まる探索の開始と終了を `info string ponder start` / `info string ponder stop` で報告する。定跡から指す手では `bestmove` の前に、どちらの定跡から指したかを `info string book: yorkie`（yorkie 定跡）または `info string book: ybb`（`.ybb` 定跡）で知らせる |
 | `verbose2` | ＋探索の経過と結果を伝える `info` 行（反復深化ごとの PV、`bestmove` 直前の最終 PV、定跡ヒット時の multipv ブロック）を出力し、対局では使わない `go` の指定（`depth` / `nodes` / `movetime` / `infinite` / `mate` / `rtime`）を受け付ける。候補手順を複数本探す `multi_pv` 設定が効くのもこの feature から（これのないビルドには 2 本目を伝える出力がないため、ルート探索は 1 本だけ）。GUI の検討モードに必要な feature |
 | `verbose3` | ＋`bench` を受け付け、1 応答ぶんの統計行に評価値の印（`pathdep` / `declrule` / `movelimit`、後述）を加える |
 

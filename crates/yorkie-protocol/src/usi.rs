@@ -499,6 +499,13 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
         self
     }
 
+    /// Read the `.ybb` book at `path` instead of the configured one — see
+    /// [`Engine::set_book_file`].
+    pub fn with_book_file(mut self, path: PathBuf) -> Self {
+        self.engine.set_book_file(path);
+        self
+    }
+
     /// Override how many leading moves of the `position` command the yorkie
     /// book's game path leaves out — see
     /// [`Engine::set_yorkie_book_path_skip_moves`].

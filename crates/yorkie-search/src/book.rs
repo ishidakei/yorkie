@@ -268,6 +268,32 @@ pub struct BookHit {
     /// One info line per surviving candidate, best-first.
     #[cfg(feature = "verbose2")]
     pub info_lines: Vec<BookInfoLine>,
+    /// Which of the two books answered. The reply's `info string book:` line
+    /// is its only reader, so a build that prints no diagnostic carries none.
+    #[cfg(feature = "verbose1")]
+    pub source: BookSource,
+}
+
+/// The book a hit came from: the yorkie book, probed first, or the `.ybb`
+/// priority list behind it.
+#[cfg(feature = "verbose1")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BookSource {
+    /// The yorkie book.
+    Yorkie,
+    /// A `.ybb` book.
+    Ybb,
+}
+
+#[cfg(feature = "verbose1")]
+impl BookSource {
+    /// The word the `info string book: <word>` line names this book by.
+    pub fn name(self) -> &'static [u8] {
+        match self {
+            Self::Yorkie => b"yorkie",
+            Self::Ybb => b"ybb",
+        }
+    }
 }
 
 /// One thing a probe has to say about what it found — the illegal-entry,
@@ -556,6 +582,8 @@ pub fn probe_book(
         value: best.value,
         #[cfg(feature = "verbose2")]
         info_lines,
+        #[cfg(feature = "verbose1")]
+        source: BookSource::Ybb,
     });
     result
 }
@@ -643,6 +671,8 @@ fn probe_yorkie(
         value,
         #[cfg(feature = "verbose2")]
         info_lines,
+        #[cfg(feature = "verbose1")]
+        source: BookSource::Yorkie,
     })
 }
 

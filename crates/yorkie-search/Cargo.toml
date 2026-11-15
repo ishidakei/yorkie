@@ -31,7 +31,8 @@ yorkie-eval = { path = "../yorkie-eval", features = ["source-network"] }
 # crate without that feature rather than merely unused:
 #
 #   - `verbose1` — the book probe's diagnostic message bodies, which the Protocol
-#     layer turns into `info string` lines, and each worker's counts of the
+#     layer turns into `info string` lines, the book a hit came from, which it
+#     names in one, and each worker's counts of the
 #     transposition-table stores that wrote an entry and of the static-eval
 #     stores that found the position's eval already there, which the per-reply
 #     statistics line reports.

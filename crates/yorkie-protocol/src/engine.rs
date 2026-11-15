@@ -876,6 +876,9 @@ pub struct Engine<P: EngineSink> {
     /// last book load — the Multiple Book priority list, not a single name.
     /// [`Self::ready`] reloads only when this changes — the reference's reload-skip.
     book_signature: Option<(Vec<PathBuf>, bool, bool)>,
+    /// The `.ybb` file [`Self::reload_book`] reads instead of the configured
+    /// `<book_dir>/<book_file>`, set through [`Self::set_book_file`].
+    book_file_override: Option<PathBuf>,
     /// The yorkie books this session reads, in the config's order; empty when
     /// the yorkie book is disabled. Resolved once, at construction, the way
     /// [`book_path`] resolves the `.ybb` name.
@@ -1056,6 +1059,7 @@ impl<P: EngineSink> Engine<P> {
             yorkie_books: None,
             yorkie_choice: 0,
             yorkie_path_skip,
+            book_file_override: None,
             yorkie_prng: Prng::new(book_seed ^ YORKIE_DRAW_SEED_MIX),
             pos: Position::startpos(),
             eval: None,
@@ -1165,6 +1169,16 @@ impl<P: EngineSink> Engine<P> {
                 weight,
             })
             .collect();
+    }
+
+    /// Read the `.ybb` book at `path` in place of the configured
+    /// `<book_dir>/<book_file>`, `no_book` included; every other book setting
+    /// stays the config's.
+    ///
+    /// `book_file` is compiled in like every other setting, so a test that
+    /// drives a session against a `.ybb` book of its own names the file here.
+    pub fn set_book_file(&mut self, path: PathBuf) {
+        self.book_file_override = Some(path);
     }
 
     /// Override how many leading moves of the `position` command the yorkie
@@ -1382,7 +1396,10 @@ impl<P: EngineSink> Engine<P> {
         let book_dir = self.settings.book_dir();
         let on_the_fly = self.settings.book_on_the_fly();
         let ignore_book_ply = self.settings.ignore_book_ply();
-        let base = book_path(book_dir, book_file);
+        let base = self
+            .book_file_override
+            .clone()
+            .unwrap_or_else(|| book_path(book_dir, book_file));
 
         // Enumerate the priority series now: the resolved name list is half of
         // the reload-skip capture, so a numbered file appearing (or vanishing)
@@ -1398,7 +1415,7 @@ impl<P: EngineSink> Engine<P> {
 
         // `no_book` → bookless, silently. (`book_name_without_extension` yields
         // an empty stem for it, so `names` is just the base name anyway.)
-        if book_file == NO_BOOK {
+        if book_file == NO_BOOK && self.book_file_override.is_none() {
             return Ok(());
         }
 
@@ -3997,6 +4014,16 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
             }
         }
         if let Some(hit) = probed.hit {
+            // Which book answered, ahead of everything else the hit prints: the
+            // replies of the two books look alike otherwise, and a tournament
+            // build answers either with the move alone.
+            #[cfg(feature = "verbose1")]
+            {
+                let mut bytes = [0u8; BOOK_DIAGNOSTIC_BYTES];
+                let mut out = TextWriter::new(&mut bytes);
+                out.bytes(b"book: ").bytes(hit.source.name());
+                sink.diagnostic(out.as_bytes());
+            }
             // `tm.elapsed_time()` at the moment the book answered, floored at 1
             // — the `time` the reply's `info` lines carry.
             #[cfg(feature = "verbose2")]

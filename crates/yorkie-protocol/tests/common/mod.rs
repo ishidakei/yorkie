@@ -288,6 +288,44 @@ pub fn drive_with_yorkie_books(input: &str, book_seed: u64, books: &[(&Path, u32
     output.text()
 }
 
+/// Like [`drive_with_yorkie_books`], with the session also reading the `.ybb`
+/// book at `ybb` in place of the one the config names.
+pub fn drive_with_books(
+    input: &str,
+    book_seed: u64,
+    ybb: &Path,
+    yorkie_books: &[(&Path, u32)],
+) -> String {
+    let output = Transcript::default();
+    driver(input.as_bytes(), output.clone(), Some(book_seed))
+        .with_book_file(ybb.to_path_buf())
+        .with_yorkie_books(
+            yorkie_books
+                .iter()
+                .map(|&(path, weight)| (path.to_path_buf(), weight))
+                .collect(),
+        )
+        .run()
+        .expect("driver run");
+    output.text()
+}
+
+/// The book each `bestmove` of the session `out` was played from, by the
+/// `info string book:` line before it: `Some("yorkie")`, `Some("ybb")`, or
+/// `None` for a reply that names no book.
+pub fn reply_books(out: &str) -> Vec<Option<&str>> {
+    let mut books = Vec::new();
+    let mut pending = None;
+    for line in out.lines() {
+        if let Some(book) = line.strip_prefix("info string book: ") {
+            pending = Some(book);
+        } else if line.starts_with("bestmove ") {
+            books.push(pending.take());
+        }
+    }
+    books
+}
+
 /// Like [`drive_with_yorkie_book`], with the yorkie book's game path leaving
 /// out the first `skip_moves` moves of each `position` command rather than the
 /// count the config names.
