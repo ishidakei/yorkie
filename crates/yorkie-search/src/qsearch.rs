@@ -6014,10 +6014,16 @@ mod tests {
             RepetitionState::Draw,
             "a repetition strictly after the search root is an ordinary draw"
         );
+        // Only the stored-field check gates on the ply; the quick check scores
+        // an occurrence at or before the root too.
         assert_eq!(
             p.is_repetition(4),
-            RepetitionState::None,
-            "the same repetition reaching to the root (ply == distance) is not a draw"
+            if crate::config::QUICK_DRAW {
+                RepetitionState::Draw
+            } else {
+                RepetitionState::None
+            },
+            "the same repetition reaching to the root (ply == distance)"
         );
 
         let mut q = QSearch::new(net.network());
@@ -6134,7 +6140,6 @@ mod tests {
             let _tt = fresh_tt();
             let mut p = shuffled_two_kings();
             assert_eq!(p.is_repetition(6), RepetitionState::Draw);
-            assert_eq!(p.is_repetition(4), RepetitionState::None);
 
             let mut q = QSearch::new(net.network());
             q.root_us = p.side_to_move();
@@ -6152,10 +6157,14 @@ mod tests {
             );
 
             // The same position, reached at a ply the judgement does not apply
-            // to: an ordinary node, and an unmarked value.
-            q.nodes = 0;
-            q.qsearch_at(&mut p, 4, -1, 0);
-            assert_eq!(q.marks, ValueMarks::NONE);
+            // to: an ordinary node, and an unmarked value. Only the stored-field
+            // check has such a ply; the quick check applies at every ply.
+            if !crate::config::QUICK_DRAW {
+                assert_eq!(p.is_repetition(4), RepetitionState::None);
+                q.nodes = 0;
+                q.qsearch_at(&mut p, 4, -1, 0);
+                assert_eq!(q.marks, ValueMarks::NONE);
+            }
         }
 
         /// The move limit is a rule of the tournament, so the draw it forces is

@@ -947,6 +947,12 @@ impl Position {
         if crate::config::QUICK_DRAW {
             return self.quick_repetition();
         }
+        self.stored_repetition(ply)
+    }
+
+    /// The verdict without `quick_draw`: the stored repetition fields of the
+    /// current state, behind the `repetition < ply` gate.
+    fn stored_repetition(&self, ply: u16) -> RepetitionState {
         match self.history.last() {
             Some(s) if s.repetition != 0 && s.repetition < ply as i32 => s.repetition_type,
             _ => RepetitionState::None,
@@ -1999,6 +2005,15 @@ mod tests {
         assert_eq!(p.is_repetition(16), RepetitionState::Inferior);
     }
 
+    /// `do_move`, then the repetition fields recorded for the current state
+    /// whatever `quick_draw` says, so a test of the stored-field rule runs in
+    /// every build. Recording them again where `do_move` already did is a no-op:
+    /// the computation reads only earlier states.
+    fn do_move_storing_repetition(p: &mut Position, m: Move) {
+        p.do_move(m);
+        p.store_current_repetition();
+    }
+
     #[test]
     fn is_repetition_gated_by_search_ply() {
         // Both kings walk a triangle and return to the root only after six
@@ -2021,21 +2036,21 @@ mod tests {
             (Square::new(0, 1).unwrap(), Square::new(0, 0).unwrap()),
         ];
         for i in 0..3 {
-            p.do_move(Move::make(bmoves[i].0, bmoves[i].1, bk));
-            p.do_move(Move::make(wmoves[i].0, wmoves[i].1, wk));
+            do_move_storing_repetition(&mut p, Move::make(bmoves[i].0, bmoves[i].1, bk));
+            do_move_storing_repetition(&mut p, Move::make(wmoves[i].0, wmoves[i].1, wk));
         }
 
         assert_eq!(
-            p.is_repetition(6),
+            p.stored_repetition(6),
             RepetitionState::None,
             "a recurrence reaching the root (repetition == ply) is not an immediate draw",
         );
         assert_eq!(
-            p.is_repetition(7),
+            p.stored_repetition(7),
             RepetitionState::Draw,
             "with the root strictly inside the search window the recurrence is a draw",
         );
-        assert_eq!(p.is_repetition(16), RepetitionState::Draw);
+        assert_eq!(p.stored_repetition(16), RepetitionState::Draw);
     }
 
     #[test]
@@ -2045,7 +2060,7 @@ mod tests {
         let cycle = shuffle_cycle();
         for _ in 0..3 {
             for m in cycle {
-                p.do_move(m);
+                do_move_storing_repetition(&mut p, m);
             }
         }
 
@@ -2062,7 +2077,7 @@ mod tests {
 
         // `ply == 1` places the entire cycle before the search root.
         assert_eq!(
-            p.is_repetition(1),
+            p.stored_repetition(1),
             RepetitionState::Draw,
             "a forced fourfold is reported regardless of the search ply",
         );
@@ -2074,19 +2089,19 @@ mod tests {
         // Only the fourfold path crosses the search root.
         let mut p = setup_king_shuffle_pos();
         for m in shuffle_cycle() {
-            p.do_move(m);
+            do_move_storing_repetition(&mut p, m);
         }
         let top = p.history.last().expect("history is non-empty");
         assert_eq!(top.repetition, 4, "second occurrence: positive distance");
         assert_eq!(top.repetition_times, 1);
 
         assert_eq!(
-            p.is_repetition(4),
+            p.stored_repetition(4),
             RepetitionState::None,
             "a two-fold reaching the root (ply == distance) is not an immediate draw",
         );
         assert_eq!(
-            p.is_repetition(5),
+            p.stored_repetition(5),
             RepetitionState::Draw,
             "with the earlier occurrence strictly after the root it is a draw",
         );
@@ -2134,11 +2149,12 @@ mod tests {
     fn quick_repetition_reports_the_second_occurrence_without_a_ply_gate() {
         let mut p = setup_king_shuffle_pos();
         for m in shuffle_cycle() {
-            p.do_move(m);
+            do_move_storing_repetition(&mut p, m);
         }
-        // The default check gates this twofold on the search ply; the quick one
-        // takes no ply, so an occurrence at or before the root counts too.
-        assert_eq!(p.is_repetition(4), RepetitionState::None);
+        // The stored-field check gates this twofold on the search ply; the
+        // quick one takes no ply, so an occurrence at or before the root counts
+        // too.
+        assert_eq!(p.stored_repetition(4), RepetitionState::None);
         assert_eq!(p.quick_repetition(), RepetitionState::Draw);
 
         // A further occurrence is classified the same way, from the nearest
