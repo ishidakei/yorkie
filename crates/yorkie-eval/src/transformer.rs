@@ -387,7 +387,7 @@ mod tests {
         );
 
         const SLOTS: usize = 4;
-        let stack: Vec<Accumulator> = (0..SLOTS).map(|_| Accumulator::new()).collect();
+        let stack: Vec<Accumulator> = Vec::from_fn(SLOTS, |_| Accumulator::new());
         let row = |slot: &Accumulator, color| slot.perspective(color).as_ptr().addr();
 
         for slot in &stack {

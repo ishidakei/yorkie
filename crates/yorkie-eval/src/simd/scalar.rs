@@ -304,7 +304,7 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn weights(&mut self, columns: usize) -> Box<[i16]> {
-            (0..columns * HIDDEN_SIZE).map(|_| self.next()).collect()
+            Vec::from_fn(columns * HIDDEN_SIZE, |_| self.next()).into_boxed_slice()
         }
     }
 

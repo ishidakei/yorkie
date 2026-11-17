@@ -1213,14 +1213,12 @@ impl<N: NetworkParams> QSearch<N> {
             // PV update never grows the buffer on the hot path. Built as a
             // `Vec` (each cell distinct — `SearchStackCell` is not `Copy`) then
             // converted to the boxed array without a stack copy.
-            stack: (0..STACK_LEN)
-                .map(|_| {
-                    let mut cell = SearchStackCell::default();
-                    cell.pv.reserve_exact(MAX_PLY as usize + 1);
-                    cell
-                })
-                .collect::<Vec<_>>()
-                .try_into()
+            stack: Vec::from_fn(STACK_LEN, |_| {
+                let mut cell = SearchStackCell::default();
+                cell.pv.reserve_exact(MAX_PLY as usize + 1);
+                cell
+            })
+            .try_into()
                 .map_err(|_| ())
                 .expect("STACK_LEN cells collected"),
             // One accumulator slot per reachable do/undo depth (bounded by
@@ -1228,9 +1226,7 @@ impl<N: NetworkParams> QSearch<N> {
             // the slots individually. A boxed fixed-size array keeps the large
             // slots on the heap (no stack copy) with a compile-time length, and
             // is the whole stack's one allocation: a slot's rows are part of it.
-            acc_stack: (0..ACC_LEN)
-                .map(|_| Accumulator::new())
-                .collect::<Vec<_>>()
+            acc_stack: Vec::from_fn(ACC_LEN, |_| Accumulator::new())
                 .try_into()
                 .map_err(|_| ())
                 .expect("ACC_LEN slots collected"),
@@ -1239,9 +1235,7 @@ impl<N: NetworkParams> QSearch<N> {
             // One block for the whole set: the buffers carry their storage
             // inline, so this is the only allocation any of them costs.
             picker_scratch: Some(
-                (0..PICKER_SCRATCH_LEN)
-                    .map(|_| PickerScratch::new())
-                    .collect::<Vec<_>>()
+                Vec::from_fn(PICKER_SCRATCH_LEN, |_| PickerScratch::new())
                     .try_into()
                     .map_err(|_| ())
                     .expect("PICKER_SCRATCH_LEN buffers collected"),

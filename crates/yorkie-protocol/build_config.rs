@@ -1231,8 +1231,5 @@ fn config_name(path: &Path) -> String {
 /// when it lives inside the repository, so the generated file does not bake an
 /// absolute build-machine path into an otherwise reproducible artefact.
 fn display_source(repo_root: &Path, path: &Path) -> String {
-    path.strip_prefix(repo_root)
-        .unwrap_or(path)
-        .display()
-        .to_string()
+    path.trim_prefix(repo_root).display().to_string()
 }

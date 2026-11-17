@@ -364,11 +364,7 @@ fn targets_host_cpu() -> bool {
     };
     flags
         .split('\u{1f}')
-        .filter_map(|flag| {
-            flag.strip_prefix("-C")
-                .unwrap_or(flag)
-                .strip_prefix("target-cpu=")
-        })
+        .filter_map(|flag| flag.trim_prefix("-C").strip_prefix("target-cpu="))
         .next_back()
         .is_some_and(|cpu| cpu == "native")
 }

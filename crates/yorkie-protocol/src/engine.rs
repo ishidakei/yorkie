@@ -4353,9 +4353,7 @@ mod tests {
     fn a_pinned_seed_draws_a_fixed_sequence() {
         let choices = weighted(&[70, 30]);
         let mut prng = Prng::new(TEST_DRAW_SEED ^ YORKIE_DRAW_SEED_MIX);
-        let drawn: Vec<usize> = (0..16)
-            .map(|_| draw_weighted(&choices, &mut prng))
-            .collect();
+        let drawn = Vec::from_fn(16, |_| draw_weighted(&choices, &mut prng));
         assert_eq!(
             drawn,
             [0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0],
