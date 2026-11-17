@@ -298,7 +298,7 @@ fn affine_padded32_avx512_vnni(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aligned::Aligned64;
+    use crate::aligned;
     use crate::types::{
         FC_1_INPUT_DIMS, FC_2_INPUT_DIMS, LAYER_STACKS, NetStack, NetworkParams, OwnedNetwork,
     };
@@ -385,12 +385,9 @@ mod tests {
         require_vnni!();
         let (in_dims, padded_in, out_dims, seed) = (1536usize, 1536usize, 16usize, 41u32);
         // 64-byte aligned so the unaligned 512-bit loads never split a line.
-        let weights: Aligned64<i8> = seeded_weights(out_dims * padded_in, seed)
-            .iter()
-            .copied()
-            .collect();
+        let weights = aligned::copy_of(&seeded_weights(out_dims * padded_in, seed));
         let biases = seeded_biases(out_dims, seed);
-        let input: Aligned64<u8> = seeded_input(padded_in, seed).iter().copied().collect();
+        let input = aligned::copy_of(&seeded_input(padded_in, seed));
 
         let mut avx = vec![0i32; out_dims].into_boxed_slice();
         // SAFETY: guarded by `require_vnni!`; in_dims is a multiple of 64.
@@ -403,10 +400,7 @@ mod tests {
     }
 
     fn affine_padded32_parity(out_dims: usize, in_dims: usize, seed: u32) {
-        let weights: Aligned64<i8> = seeded_weights(out_dims * 32, seed)
-            .iter()
-            .copied()
-            .collect();
+        let weights = aligned::copy_of(&seeded_weights(out_dims * 32, seed));
         let biases = seeded_biases(out_dims, seed);
 
         // Real inputs in [0, in_dims); padding lanes are zero (as in the fused chain).
