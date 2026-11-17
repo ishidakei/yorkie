@@ -232,11 +232,8 @@ mod tests {
                 }
                 for piece in pieces {
                     let code = piece_code(piece);
-                    for s in 0..Square::COUNT {
-                        assert_ne!(
-                            ZOBRIST.psq[code][s], 0,
-                            "psq[{code}][{s}] ({piece:?}) is zero"
-                        );
+                    for (s, &value) in ZOBRIST.psq[code].iter().enumerate() {
+                        assert_ne!(value, 0, "psq[{code}][{s}] ({piece:?}) is zero");
                     }
                 }
                 if kind != PieceKind::King {

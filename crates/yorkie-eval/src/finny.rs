@@ -230,8 +230,7 @@ mod tests {
 
         let mut previous: Option<usize> = None;
         for perspective in [Color::Black, Color::White] {
-            for bucket in 0..Square::COUNT {
-                let entry = &cache.entries[perspective.index()][bucket];
+            for (bucket, entry) in cache.entries[perspective.index()].iter().enumerate() {
                 assert!(!entry.initialized);
                 assert!(entry.accumulation == ZEROED, "entry is not zeroed");
                 assert!(entry.active.is_empty());
