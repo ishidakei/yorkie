@@ -35,6 +35,10 @@
 //! Each count is kept as a small histogram over four dimensions of the node it
 //! was taken at ([`Where`]); the overwrites also by the depth they lost.
 //!
+//! Apart from those, every worker keeps a [`NodeHist`]: all of its nodes, by
+//! ply, by remaining depth and by node type, one bucket per ply and per depth —
+//! where a worker's work went, rather than where it repeated someone else's.
+//!
 //! Nothing here is read by the search: its decisions, node counts and best
 //! moves are those of a build without the feature. The side tables do cost
 //! memory traffic, so the build is slower, and its timings are not comparable
@@ -553,6 +557,98 @@ impl DupCounts {
 }
 
 impl Default for DupCounts {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
+/// How many ply buckets a [`NodeHist`] has: one per ply from 0, the last one
+/// holding that ply and every deeper one.
+pub const NODE_PLY_BUCKETS: usize = 128;
+/// How many remaining-depth buckets a [`NodeHist`] has: bucket 0 for a
+/// quiescence node (no remaining depth), then one per depth from 1, the last
+/// one holding that depth and every greater one.
+pub const NODE_DEPTH_BUCKETS: usize = 64;
+/// The node-type buckets of a [`NodeHist`], as the histogram output writes them:
+/// the main search's three node types, then the quiescence search.
+pub const NODE_TYPE_NAMES: [&str; 4] = ["pv", "cut", "all", "qs"];
+
+/// The type of the node a move is made from, for a [`NodeHist`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeKind {
+    /// A principal-variation node of the main search.
+    Pv,
+    /// An expected cut node of the main search.
+    Cut,
+    /// An expected all node of the main search.
+    All,
+    /// A node of the quiescence search.
+    Quiescence,
+}
+
+impl NodeKind {
+    /// The main-search type of a node `pv_node` / `cut_node` describe.
+    pub const fn of(pv_node: bool, cut_node: bool) -> Self {
+        if pv_node {
+            NodeKind::Pv
+        } else if cut_node {
+            NodeKind::Cut
+        } else {
+            NodeKind::All
+        }
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Where one worker's nodes are: every node it counted — every move it made in
+/// the search, the count its `nodes` reports — by the ply of the position the
+/// move leads to, and by the remaining depth and the type of the node the move
+/// is made from. Each of the three rows sums to the worker's node count.
+///
+/// The rows are fine-grained (one bucket per ply and per depth) where the
+/// [`Hist`] dimensions are coarse: they are read to tell whether extra nodes sit
+/// beyond the root depth's reach or at ordinary plies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeHist {
+    /// By the ply of the position each move leads to: never 0, the root being
+    /// reached by no move.
+    pub ply: [u64; NODE_PLY_BUCKETS],
+    /// By the remaining depth of the node each move is made from; bucket 0 is
+    /// the quiescence search.
+    pub depth: [u64; NODE_DEPTH_BUCKETS],
+    /// By the type of that node, in [`NODE_TYPE_NAMES`] order.
+    pub node_type: [u64; NODE_TYPE_NAMES.len()],
+}
+
+impl NodeHist {
+    /// No node counted.
+    pub const ZERO: Self = Self {
+        ply: [0; NODE_PLY_BUCKETS],
+        depth: [0; NODE_DEPTH_BUCKETS],
+        node_type: [0; NODE_TYPE_NAMES.len()],
+    };
+
+    /// Count one move made from a node of remaining depth `depth` (anything
+    /// below 1 for a quiescence node) and type `kind`, leading to a position at
+    /// `ply` from the root.
+    pub fn count(&mut self, ply: i32, depth: i32, kind: NodeKind) {
+        let ply = ply.clamp(0, NODE_PLY_BUCKETS as i32 - 1) as usize;
+        let depth = depth.clamp(0, NODE_DEPTH_BUCKETS as i32 - 1) as usize;
+        self.ply[ply] += 1;
+        self.depth[depth] += 1;
+        self.node_type[kind.index()] += 1;
+    }
+
+    /// The nodes counted.
+    pub fn total(&self) -> u64 {
+        self.ply.iter().sum()
+    }
+}
+
+impl Default for NodeHist {
     fn default() -> Self {
         Self::ZERO
     }
@@ -1089,6 +1185,26 @@ mod tests {
         assert_eq!(total, 130);
         drop(outer);
         assert_eq!(path_len(), 0);
+    }
+
+    #[test]
+    fn a_counted_node_falls_in_one_bucket_of_each_row_and_the_ends_hold_the_rest() {
+        let mut hist = NodeHist::ZERO;
+        hist.count(1, 18, NodeKind::of(true, false));
+        hist.count(40, 0, NodeKind::Quiescence);
+        hist.count(40, -3, NodeKind::Quiescence);
+        hist.count(500, 200, NodeKind::of(false, true));
+        hist.count(7, 5, NodeKind::of(false, false));
+        assert_eq!(hist.total(), 5);
+        assert_eq!(hist.depth.iter().sum::<u64>(), 5);
+        assert_eq!(hist.node_type.iter().sum::<u64>(), 5);
+        assert_eq!(hist.ply[1], 1);
+        assert_eq!(hist.ply[40], 2);
+        assert_eq!(hist.ply[NODE_PLY_BUCKETS - 1], 1);
+        assert_eq!(hist.depth[0], 2);
+        assert_eq!(hist.depth[18], 1);
+        assert_eq!(hist.depth[NODE_DEPTH_BUCKETS - 1], 1);
+        assert_eq!(hist.node_type, [1, 1, 1, 2]);
     }
 
     #[test]

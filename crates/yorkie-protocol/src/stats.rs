@@ -18,7 +18,10 @@
 //!
 //! A `verbose3` build's `bench` also writes one line after its summary, in the
 //! same format, carrying the search counts summed over every position of the
-//! run (see [`take_bench_counts`]).
+//! run (see [`take_bench_counts`]). A `dupstats` build's `bench` follows it with
+//! the same counts for each position on its own, and with where each worker's
+//! nodes were in each position's search (see [`take_position_counts`] and
+//! [`node_hist_line`]).
 //!
 //! What the line reports is the interval it ends, so composing it must not
 //! disturb what it measures. It is rendered into a stack buffer sized for the
@@ -38,6 +41,8 @@ use yorkie_search::defer::DeferCounts;
 use yorkie_search::dupstats::{
     DupCounts, EVENT_KEYS, Event, PRESENCE_KEYS, PresenceKind, STORE_KEYS, StoreKind,
 };
+#[cfg(all(feature = "dupstats", feature = "verbose3"))]
+use yorkie_search::dupstats::{NODE_TYPE_NAMES, NodeHist};
 #[cfg(lazy_smp_spread)]
 use yorkie_search::spread::SpreadCounts;
 #[cfg(all(feature = "dupstats", feature = "verbose3"))]
@@ -427,12 +432,19 @@ static INTERVAL: Tally = Tally::new();
 #[cfg(feature = "verbose3")]
 static BENCH_RUN: Tally = Tally::new();
 
+/// The tally of the position a `bench` run is searching: the run's tally, taken
+/// after each position.
+#[cfg(all(feature = "dupstats", feature = "verbose3"))]
+static BENCH_POSITION: Tally = Tally::new();
+
 /// Add the counts of finished workers to the interval's tally.
 pub(crate) fn add_search<'a>(results: impl IntoIterator<Item = &'a WorkerResult>) {
     for r in results {
         INTERVAL.add(r);
         #[cfg(feature = "verbose3")]
         BENCH_RUN.add(r);
+        #[cfg(all(feature = "dupstats", feature = "verbose3"))]
+        BENCH_POSITION.add(r);
     }
 }
 
@@ -444,22 +456,37 @@ pub(crate) fn add_spread(results: &[WorkerResult]) {
     INTERVAL.add_spread(&spread);
     #[cfg(feature = "verbose3")]
     BENCH_RUN.add_spread(&spread);
+    #[cfg(all(feature = "dupstats", feature = "verbose3"))]
+    BENCH_POSITION.add_spread(&spread);
 }
 
-/// The timelines of every worker of every search of the `bench` run in
-/// progress, in the order the searches ended; `None` while no run is.
+/// What a `bench` run keeps of one worker of one search: when it finished each
+/// iteration, and where its nodes were.
 #[cfg(all(feature = "dupstats", feature = "verbose3"))]
-static BENCH_TIMELINES: Mutex<Option<Vec<Box<Timeline>>>> = Mutex::new(None);
+pub(crate) struct BenchWorker {
+    pub(crate) timeline: Box<Timeline>,
+    pub(crate) node_hist: Box<NodeHist>,
+}
 
-/// Keep the timelines of the workers of one finished search, `results` holding
-/// every one of them, when a `bench` run is in progress.
+/// The timelines and node histograms of every worker of every search of the
+/// `bench` run in progress, in the order the searches ended; `None` while no
+/// run is.
+#[cfg(all(feature = "dupstats", feature = "verbose3"))]
+static BENCH_TIMELINES: Mutex<Option<Vec<BenchWorker>>> = Mutex::new(None);
+
+/// Keep the timelines and node histograms of the workers of one finished
+/// search, `results` holding every one of them, when a `bench` run is in
+/// progress.
 #[cfg(all(feature = "dupstats", feature = "verbose3"))]
 pub(crate) fn add_timelines(results: &[WorkerResult]) {
     let mut held = BENCH_TIMELINES
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     if let Some(kept) = held.as_mut() {
-        kept.extend(results.iter().map(|r| r.timeline.clone()));
+        kept.extend(results.iter().map(|r| BenchWorker {
+            timeline: r.timeline.clone(),
+            node_hist: r.node_hist.clone(),
+        }));
     }
 }
 
@@ -471,9 +498,9 @@ pub(crate) fn start_bench_timelines() {
         .unwrap_or_else(PoisonError::into_inner) = Some(Vec::new());
 }
 
-/// The timelines kept since the run started or since the last take.
+/// The workers kept since the run started or since the last take.
 #[cfg(all(feature = "dupstats", feature = "verbose3"))]
-pub(crate) fn take_bench_timelines() -> Vec<Box<Timeline>> {
+pub(crate) fn take_bench_timelines() -> Vec<BenchWorker> {
     BENCH_TIMELINES
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -491,9 +518,10 @@ pub(crate) fn stop_bench_timelines() {
 }
 
 /// The widest `iter` line body: the lead, every key and a 20-digit value for
-/// each, a move and a root-entry word.
+/// each, a move and a root-entry word, and the root-move split's moves and
+/// values.
 #[cfg(all(feature = "dupstats", feature = "verbose3"))]
-const ITER_LINE: usize = 512;
+const ITER_LINE: usize = 1024;
 
 /// Hand `emit` the body of the `iter` line of iteration `it` of worker `worker`
 /// in the search of position `position` (its index in the run's list): what
@@ -501,7 +529,12 @@ const ITER_LINE: usize = 512;
 ///
 /// `iter pos=<p> worker=<w> depth=<d> done=<0|1> us=<µs> nodes=<n> fl=<n>
 /// fh=<n> move=<usi> value=<v> changed=<0|1> first=<n> rest=<n>
-/// root=<none|self|other|prev|unknown>`
+/// root=<none|self|other|prev|unknown> split=<usi>:<n>,… other=<n>`
+///
+/// `split` is the iteration's [`yorkie_search::timeline::RootSplit`]: each of
+/// the first root moves it searched with the nodes under it, in the order it
+/// first searched them (`none` when it searched none), and `other` the nodes
+/// under every root move past those.
 #[cfg(all(feature = "dupstats", feature = "verbose3"))]
 pub(crate) fn iteration_line<E>(
     position: u64,
@@ -543,7 +576,21 @@ pub(crate) fn iteration_line<E>(
         .bytes(b" rest=")
         .u64(it.other_move_nodes)
         .bytes(b" root=")
-        .bytes(it.root_entry.key().as_bytes());
+        .bytes(it.root_entry.key().as_bytes())
+        .bytes(b" split=");
+    let mut named = 0;
+    for (mv, nodes) in it.split.named() {
+        if named != 0 {
+            out.byte(b',');
+        }
+        yorkie_state::write_usi_move(mv, &mut out);
+        out.byte(b':').u64(nodes);
+        named += 1;
+    }
+    if named == 0 {
+        out.bytes(b"none");
+    }
+    out.bytes(b" other=").u64(it.split.rest);
     debug_assert!(!out.overflowed(), "the widest line fits ITER_LINE");
     emit(out.as_bytes())
 }
@@ -570,6 +617,79 @@ pub(crate) fn take_bench_counts() -> SearchCounts {
 #[cfg(feature = "verbose3")]
 pub(crate) fn clear_bench_counts() {
     BENCH_RUN.clear();
+    #[cfg(feature = "dupstats")]
+    BENCH_POSITION.clear();
+}
+
+/// Read the tally of the `bench` run's searches since the previous take — one
+/// position's, when taken after each — and reset it to zero.
+#[cfg(all(feature = "dupstats", feature = "verbose3"))]
+pub(crate) fn take_position_counts() -> SearchCounts {
+    BENCH_POSITION.take()
+}
+
+/// The items of a line [`render`] composed: what follows its prefix, starting
+/// with the space before the first item.
+#[cfg(all(feature = "dupstats", feature = "verbose3"))]
+pub(crate) fn line_items(line: &[u8]) -> &[u8] {
+    line.strip_prefix(PREFIX).unwrap_or(line)
+}
+
+/// The widest `nodehist` line body: the lead, three keys and their 20-digit
+/// values, then every bucket of the three rows as a 20-digit value and a comma.
+#[cfg(all(feature = "dupstats", feature = "verbose3"))]
+const NODE_HIST_LINE: usize = 64
+    + 4 * U64_DIGITS
+    + (yorkie_search::dupstats::NODE_PLY_BUCKETS
+        + yorkie_search::dupstats::NODE_DEPTH_BUCKETS
+        + NODE_TYPE_NAMES.len())
+        * (U64_DIGITS + 1);
+
+/// Hand `emit` the body of the `nodehist` line of worker `worker` in the search
+/// of position `position`: what follows `info string `.
+///
+/// `nodehist pos=<p> worker=<w> nodes=<n> ply=<n>,… depth=<n>,…
+/// type=<pv>,<cut>,<all>,<qs>`
+///
+/// `ply` has one value per ply from 0, `depth` one per remaining depth from 0
+/// (0 is the quiescence search); each list stops at its last non-zero bucket,
+/// and the last bucket of [`NodeHist`] holds every deeper one.
+#[cfg(all(feature = "dupstats", feature = "verbose3"))]
+pub(crate) fn node_hist_line<E>(
+    position: u64,
+    worker: u8,
+    hist: &NodeHist,
+    emit: impl FnOnce(&[u8]) -> Result<(), E>,
+) -> Result<(), E> {
+    fn row(out: &mut TextWriter<'_>, name: &[u8], values: &[u64]) {
+        let len = values.iter().rposition(|&n| n != 0).map_or(1, |i| i + 1);
+        out.byte(b' ').bytes(name).byte(b'=');
+        for (i, n) in values[..len].iter().enumerate() {
+            if i != 0 {
+                out.byte(b',');
+            }
+            out.u64(*n);
+        }
+    }
+    let mut bytes = [0u8; NODE_HIST_LINE];
+    let mut out = TextWriter::new(&mut bytes);
+    out.bytes(b"nodehist pos=")
+        .u64(position)
+        .bytes(b" worker=")
+        .u64(u64::from(worker))
+        .bytes(b" nodes=")
+        .u64(hist.total());
+    row(&mut out, b"ply", &hist.ply);
+    row(&mut out, b"depth", &hist.depth);
+    out.bytes(b" type=");
+    for (i, n) in hist.node_type.iter().enumerate() {
+        if i != 0 {
+            out.byte(b',');
+        }
+        out.u64(*n);
+    }
+    debug_assert!(!out.overflowed(), "the widest line fits NODE_HIST_LINE");
+    emit(out.as_bytes())
 }
 
 /// The stack buffer a line is composed in.
@@ -1280,6 +1400,7 @@ mod tests {
                 dup: Box::new(DupCounts::ZERO),
                 stopped_on: on.map(|i| moves[i].mv),
                 timeline: Box::default(),
+                node_hist: Box::default(),
                 #[cfg(lazy_smp_spread)]
                 spread: SpreadCounts::default(),
                 #[cfg(lazy_smp_defer)]

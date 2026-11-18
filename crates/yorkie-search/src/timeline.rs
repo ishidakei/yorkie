@@ -6,8 +6,9 @@
 //! the time since the search started — one clock for every worker of a search,
 //! read once per iteration — the worker's own node count at that moment, how
 //! often the iteration was searched again at the root, the best move it ended
-//! on, how its nodes split between the first root move and the rest, and
-//! whether the transposition table already held the root deep enough when the
+//! on, how its nodes split between the first root move and the rest — and
+//! over the first [`ROOT_SPLIT`] distinct root moves it searched, move by move —
+//! and whether the transposition table already held the root deep enough when the
 //! iteration started, and who had written it there.
 //!
 //! The records live in a fixed array indexed by depth, which the worker owns
@@ -31,6 +32,58 @@ use crate::dupstats::WriterId;
 /// How many depths a timeline has room for: every depth a root iteration can
 /// reach.
 pub const DEPTHS: usize = 256;
+
+/// How many distinct root moves an iteration's [`RootSplit`] names; the nodes
+/// of any further one are summed in [`RootSplit::rest`].
+pub const ROOT_SPLIT: usize = 8;
+
+/// An iteration's nodes, root move by root move: the first [`ROOT_SPLIT`]
+/// distinct root moves the iteration searched, in the order it first searched
+/// each, with the nodes under every search of it (an aspiration re-search
+/// searches a move again), and the nodes under every other root move together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootSplit {
+    /// The moves, in the order first searched; `None` past the last one.
+    pub moves: [Option<Move>; ROOT_SPLIT],
+    /// The nodes under each of [`Self::moves`].
+    pub nodes: [u64; ROOT_SPLIT],
+    /// The nodes under every root move past the first [`ROOT_SPLIT`].
+    pub rest: u64,
+}
+
+impl RootSplit {
+    const EMPTY: Self = Self {
+        moves: [None; ROOT_SPLIT],
+        nodes: [0; ROOT_SPLIT],
+        rest: 0,
+    };
+
+    fn add(&mut self, mv: Move, nodes: u64) {
+        for (slot, n) in self.moves.iter_mut().zip(&mut self.nodes) {
+            match slot {
+                Some(m) if *m == mv => {
+                    *n += nodes;
+                    return;
+                }
+                Some(_) => {}
+                None => {
+                    *slot = Some(mv);
+                    *n = nodes;
+                    return;
+                }
+            }
+        }
+        self.rest += nodes;
+    }
+
+    /// The named moves with their nodes, in the order first searched.
+    pub fn named(&self) -> impl Iterator<Item = (Move, u64)> + '_ {
+        self.moves
+            .iter()
+            .zip(&self.nodes)
+            .map_while(|(m, n)| m.map(|m| (m, *n)))
+    }
+}
 
 /// Who had stored the root at the iteration's depth or deeper when the
 /// iteration started.
@@ -107,6 +160,8 @@ pub struct Iteration {
     pub first_move_nodes: u64,
     /// Nodes searched under every other root move.
     pub other_move_nodes: u64,
+    /// The same nodes, root move by root move.
+    pub split: RootSplit,
     /// Who had stored the root at this depth or deeper when it started.
     pub root_entry: RootEntry,
 }
@@ -124,6 +179,7 @@ impl Iteration {
         best_changed: false,
         first_move_nodes: 0,
         other_move_nodes: 0,
+        split: RootSplit::EMPTY,
         root_entry: RootEntry::Absent,
     };
 }
@@ -184,9 +240,10 @@ impl Timeline {
         self.current.fail_highs += 1;
     }
 
-    /// A root move was searched, under which `nodes` nodes were; `first` when
-    /// it was the first move of its root search.
-    pub fn root_move(&mut self, first: bool, nodes: u64) {
+    /// The root move `mv` was searched, under which `nodes` nodes were; `first`
+    /// when it was the first move of its root search.
+    pub fn root_move(&mut self, first: bool, mv: Move, nodes: u64) {
+        self.current.split.add(mv, nodes);
         if first {
             self.current.first_move_nodes += nodes;
         } else {
@@ -325,9 +382,9 @@ mod tests {
         let mut t = Timeline::new();
         t.reset(2, Instant::now());
         t.begin(1, RootEntry::Absent);
-        t.root_move(true, 10);
-        t.root_move(false, 5);
-        t.root_move(false, 7);
+        t.root_move(true, mv(7), 10);
+        t.root_move(false, mv(8), 5);
+        t.root_move(false, mv(9), 7);
         t.end(true, 30, mv(100), 40);
         t.begin(2, RootEntry::ThisWorker);
         t.fail_low();
@@ -348,6 +405,11 @@ mod tests {
             ),
             (1, 10, 12)
         );
+        assert_eq!(
+            its[0].split.named().collect::<Vec<_>>(),
+            vec![(mv(7), 10), (mv(8), 5), (mv(9), 7)]
+        );
+        assert_eq!(its[1].split.named().count(), 0);
         assert!(!its[0].best_changed, "the first has nothing to differ from");
         assert_eq!((its[1].fail_lows, its[1].fail_highs), (1, 2));
         assert!(its[1].best_changed);
@@ -358,6 +420,30 @@ mod tests {
 
         t.reset(0, Instant::now());
         assert_eq!(t.iterations().count(), 0);
+    }
+
+    #[test]
+    fn a_root_move_searched_again_adds_to_its_own_slot_and_the_ninth_goes_to_the_rest() {
+        let mut t = Timeline::new();
+        t.begin(5, RootEntry::Absent);
+        t.root_move(true, mv(1), 100);
+        t.root_move(false, mv(2), 3);
+        // An aspiration re-search: the first move again.
+        t.root_move(true, mv(1), 50);
+        for n in 3..=ROOT_SPLIT as u32 + 2 {
+            t.root_move(false, mv(n), 1);
+        }
+        t.end(true, 200, mv(1), 0);
+        let it = t.iterations().next().expect("one iteration");
+        let named: Vec<_> = it.split.named().collect();
+        assert_eq!(named.len(), ROOT_SPLIT);
+        assert_eq!(named[0], (mv(1), 150));
+        assert_eq!(named[1], (mv(2), 3));
+        assert_eq!(it.split.rest, 2);
+        assert_eq!(
+            named.iter().map(|(_, n)| n).sum::<u64>() + it.split.rest,
+            it.first_move_nodes + it.other_move_nodes
+        );
     }
 
     /// One stub worker: how many ticks each of its iterations takes.

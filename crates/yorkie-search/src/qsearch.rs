@@ -629,6 +629,10 @@ pub struct QSearch<N: NetworkParams> {
     /// never read by the search.
     #[cfg(feature = "dupstats")]
     timeline: Box<crate::timeline::Timeline>,
+    /// Where this worker's nodes are, since the search started. Reported, never
+    /// read by the search.
+    #[cfg(feature = "dupstats")]
+    node_hist: Box<crate::dupstats::NodeHist>,
     /// When the search this worker belongs to started, the clock every worker
     /// of it reads its iterations against; `None` starts it when the worker
     /// starts.
@@ -993,6 +997,10 @@ pub struct WorkerResult {
     /// stopped inside. Boxed for the same reason as `dup`.
     #[cfg(feature = "dupstats")]
     pub timeline: Box<crate::timeline::Timeline>,
+    /// Where this worker's nodes are: by ply, remaining depth and node type.
+    /// Boxed for the same reason as `dup`.
+    #[cfg(feature = "dupstats")]
+    pub node_hist: Box<crate::dupstats::NodeHist>,
     /// What this worker's move-order spread counted, for the per-reply
     /// statistics line.
     #[cfg(all(lazy_smp_spread, feature = "verbose1"))]
@@ -1189,6 +1197,8 @@ impl<N: NetworkParams> QSearch<N> {
             dup_worker: 0,
             #[cfg(feature = "dupstats")]
             timeline: Box::default(),
+            #[cfg(feature = "dupstats")]
+            node_hist: Box::default(),
             #[cfg(feature = "dupstats")]
             search_start: None,
             #[cfg(all(feature = "dupstats", feature = "verbose3"))]
@@ -2327,6 +2337,9 @@ impl<N: NetworkParams> QSearch<N> {
             // from the pre-move position.
             let acc_delta = MoveDelta::from_move(pos, mv);
             self.nodes += 1; // the search's sole node-count increment
+            #[cfg(feature = "dupstats")]
+            self.node_hist
+                .count(ply + 1, 0, crate::dupstats::NodeKind::Quiescence);
             let undo = pos.do_move_with_check(mv, gives_check);
             // The reference sets these inside `do_move`, for every move,
             // qsearch's included. A deeper node reads the
@@ -2572,6 +2585,7 @@ impl<N: NetworkParams> QSearch<N> {
             crate::dupstats::clear_path();
             let start = self.search_start.unwrap_or_else(Instant::now);
             self.timeline.reset(self.dup_worker, start);
+            *self.node_hist = crate::dupstats::NodeHist::ZERO;
         }
         #[cfg(lazy_smp_spread)]
         self.spread.reset();
@@ -2960,6 +2974,8 @@ impl<N: NetworkParams> QSearch<N> {
             },
             #[cfg(feature = "dupstats")]
             timeline: self.timeline.clone(),
+            #[cfg(feature = "dupstats")]
+            node_hist: self.node_hist.clone(),
             #[cfg(all(lazy_smp_spread, feature = "verbose1"))]
             spread: self.spread.counts(),
             #[cfg(all(lazy_smp_defer, feature = "verbose1"))]
@@ -4072,6 +4088,12 @@ impl<N: NetworkParams> QSearch<N> {
                     }
                     let acc_delta = MoveDelta::from_move(pos, mv);
                     self.nodes += 1;
+                    #[cfg(feature = "dupstats")]
+                    self.node_hist.count(
+                        ply + 1,
+                        depth,
+                        crate::dupstats::NodeKind::of(pv_node, cut_node),
+                    );
                     let undo = pos.do_move(mv);
                     let moved = mv.moved_piece_after();
                     self.stack[s].current_move = Some(mv);
@@ -4468,6 +4490,12 @@ impl<N: NetworkParams> QSearch<N> {
             // from the pre-move position.
             let acc_delta = MoveDelta::from_move(pos, mv);
             self.nodes += 1;
+            #[cfg(feature = "dupstats")]
+            self.node_hist.count(
+                ply + 1,
+                depth,
+                crate::dupstats::NodeKind::of(pv_node, cut_node),
+            );
             let undo = pos.do_move_with_check(mv, gives_check);
             self.stack[s].current_move = Some(mv);
             self.stack[s].cont_hist =
@@ -4674,7 +4702,7 @@ impl<N: NetworkParams> QSearch<N> {
             #[cfg(feature = "dupstats")]
             if root_node {
                 self.timeline
-                    .root_move(move_count == 1, self.nodes - node_count);
+                    .root_move(move_count == 1, mv, self.nodes - node_count);
             }
 
             // A stop that fired inside this move's subtree makes the returned

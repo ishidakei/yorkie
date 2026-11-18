@@ -17,6 +17,11 @@
 //! worker's result is the reply. A build without `dupstats` ignores the
 //! argument, as it ignores every token past `limitType`.
 //!
+//! A `dupstats` build also takes `default:<i>` as the position source: the
+//! default list's position `<i>` (from 0) alone, so that one run measures one
+//! position. Its measurement lines name it by `<i>`, its index in the default
+//! list.
+//!
 //! The reference's defaults are `ttSize=1024`, `threads=1`, `limit=15000`,
 //! `fenFile=default`, `limitType=movetime` — its *code*, not the stale comment
 //! example beside it, is the ground truth. This port mirrors them exactly.
@@ -81,6 +86,9 @@ pub enum BenchParseError<'a> {
         errno: Option<i32>,
     },
     NoPositions(&'a [u8]),
+    /// A `default:<i>` source whose `<i>` is not an index of the default list.
+    #[cfg(feature = "dupstats")]
+    NoSuchDefault(&'a [u8]),
     /// A `stop` argument other than `main` or `first`.
     #[cfg(feature = "dupstats")]
     UnsupportedStop(&'a [u8]),
@@ -122,6 +130,14 @@ impl BenchParseError<'_> {
                 out.bytes(b"no positions in file `").bytes(path).bytes(b"`");
             }
             #[cfg(feature = "dupstats")]
+            Self::NoSuchDefault(token) => {
+                out.bytes(b"no default position `")
+                    .bytes(token)
+                    .bytes(b"` (the default list has ")
+                    .u64(BENCH_DEFAULT_POSITIONS.len() as u64)
+                    .bytes(b", from 0)");
+            }
+            #[cfg(feature = "dupstats")]
             Self::UnsupportedStop(token) => {
                 out.bytes(b"unsupported stop `")
                     .bytes(token)
@@ -146,6 +162,11 @@ pub struct BenchConfig {
     /// than at the main one (`main`).
     #[cfg(feature = "dupstats")]
     pub stop_first: bool,
+    /// The index the measurement lines give the first of [`Self::fens`]: the
+    /// default list's index of the position a `default:<i>` source names, 0
+    /// for every other source.
+    #[cfg(feature = "dupstats")]
+    pub first_index: u64,
 }
 
 /// Parse the `bench` argument tokens into a [`BenchConfig`], filling missing
@@ -193,7 +214,21 @@ pub fn parse_bench<'a>(
         other => return Err(BenchParseError::UnsupportedLimitType(other)),
     }
 
+    #[cfg(feature = "dupstats")]
+    let mut first_index = 0;
     let fens = match fen_source {
+        #[cfg(feature = "dupstats")]
+        one if one.starts_with(b"default:") => {
+            let index = &one[b"default:".len()..];
+            let sfen = atoi_u64(index)
+                .and_then(|i| usize::try_from(i).ok())
+                .and_then(|i| BENCH_DEFAULT_POSITIONS.get(i).map(|sfen| (i, sfen)));
+            let Some((i, sfen)) = sfen else {
+                return Err(BenchParseError::NoSuchDefault(index));
+            };
+            first_index = i as u64;
+            vec![sfen.to_vec()]
+        }
         b"default" => BENCH_DEFAULT_POSITIONS
             .iter()
             .map(|sfen| sfen.to_vec())
@@ -223,6 +258,8 @@ pub fn parse_bench<'a>(
         fens,
         #[cfg(feature = "dupstats")]
         stop_first,
+        #[cfg(feature = "dupstats")]
+        first_index,
     })
 }
 
@@ -338,6 +375,31 @@ mod tests {
             message(&err),
             "unsupported stop `last` (supported: main, first)"
         );
+    }
+
+    #[cfg(feature = "dupstats")]
+    #[test]
+    fn a_default_index_names_one_position_of_the_default_list() {
+        for (i, sfen) in BENCH_DEFAULT_POSITIONS.iter().enumerate() {
+            let source = format!("default:{i}");
+            let tokens: [&[u8]; 5] = [b"16", b"2", b"5", source.as_bytes(), b"depth"];
+            let cfg = parse_bench(&tokens, b"x").expect("parse");
+            assert_eq!(cfg.fens, vec![sfen.to_vec()]);
+            assert_eq!(cfg.first_index, i as u64);
+        }
+        let whole: [&[u8]; 5] = [b"16", b"2", b"5", b"default", b"depth"];
+        assert_eq!(parse_bench(&whole, b"x").expect("parse").first_index, 0);
+        for bad in [&b"default:4"[..], b"default:", b"default:x", b"default:-1"] {
+            let tokens: [&[u8]; 5] = [b"16", b"2", b"5", bad, b"depth"];
+            let err = parse_bench(&tokens, b"x").expect_err("no such position");
+            assert_eq!(
+                message(&err),
+                format!(
+                    "no default position `{}` (the default list has 4, from 0)",
+                    std::str::from_utf8(&bad[8..]).expect("ASCII")
+                )
+            );
+        }
     }
 
     #[cfg_attr(miri, ignore)]

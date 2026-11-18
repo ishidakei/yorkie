@@ -463,3 +463,98 @@ fn stopping_at_the_first_worker_ends_on_a_worker_at_the_depth() {
         );
     }
 }
+
+/// The `key=value` items of the line body `body`, by key.
+#[cfg(feature = "dupstats")]
+fn items(body: &str) -> std::collections::HashMap<&str, &str> {
+    body.split(' ')
+        .filter_map(|item| item.split_once('='))
+        .collect()
+}
+
+/// The sum of a comma-separated list of integers.
+#[cfg(feature = "dupstats")]
+fn list_sum(list: &str) -> u64 {
+    list.split(',')
+        .map(|v| v.parse::<u64>().expect("an integer"))
+        .sum()
+}
+
+/// A `dupstats` bench reports each position on its own after the iterations:
+/// one `posstats` line, the histograms behind it and one `nodehist` line per
+/// worker, whose nodes add up to the position's, and the positions' to the
+/// run's. `default:<i>` runs the default list's position `<i>` alone, and the
+/// lines name it by that index.
+#[cfg(feature = "dupstats")]
+#[cfg_attr(miri, ignore)]
+#[test]
+fn every_position_is_reported_on_its_own_and_one_runs_alone_by_its_index() {
+    let _session = common::serial_session();
+    for (line, threads, want) in [
+        ("bench 16 1 4 default depth", 1, vec![0, 1, 2, 3]),
+        ("bench 16 2 4 default:3 depth", 2, vec![3]),
+    ] {
+        let out = bench_session(line);
+        let summary = out
+            .lines()
+            .find_map(|l| l.strip_prefix("info string bench: "))
+            .expect("a summary");
+        let total: u64 = items(summary)["nodes"].parse().expect("an integer");
+        let positions: Vec<(u64, u64)> = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("info string posstats "))
+            .map(|body| {
+                let it = items(body);
+                assert!(it["time_ms"].parse::<u64>().is_ok(), "{body}");
+                assert_eq!(it["nodes"], it["bench_nodes"], "{body}");
+                let pos = it["pos"].parse().expect("an integer");
+                (pos, it["bench_nodes"].parse().expect("an integer"))
+            })
+            .collect();
+        let indices: Vec<u64> = positions.iter().map(|(p, _)| *p).collect();
+        assert_eq!(indices, want, "{line}:\n{out}");
+        let sum: u64 = positions.iter().map(|(_, n)| n).sum();
+        assert_eq!(sum, total, "{line}");
+        for (pos, nodes) in &positions {
+            let workers: Vec<(u64, u64)> = out
+                .lines()
+                .filter_map(|l| l.strip_prefix("info string nodehist "))
+                .map(items)
+                .filter(|it| it["pos"] == pos.to_string())
+                .map(|it| {
+                    let n: u64 = it["nodes"].parse().expect("an integer");
+                    for row in ["ply", "depth", "type"] {
+                        assert_eq!(list_sum(it[row]), n, "{line}: the {row} row");
+                    }
+                    (it["worker"].parse().expect("an integer"), n)
+                })
+                .collect();
+            let ids: Vec<u64> = workers.iter().map(|(w, _)| *w).collect();
+            assert_eq!(ids, (0..threads).collect::<Vec<u64>>(), "{line}");
+            let sum: u64 = workers.iter().map(|(_, n)| n).sum();
+            assert_eq!(sum, *nodes, "{line}");
+            let lead = format!("info string pos={pos} duphist ");
+            assert!(out.lines().any(|l| l.starts_with(&lead)), "{line}: {lead}");
+        }
+        for body in out
+            .lines()
+            .filter_map(|l| l.strip_prefix("info string iter "))
+        {
+            let it = items(body);
+            let pos: u64 = it["pos"].parse().expect("an integer");
+            assert!(want.contains(&pos), "{body}");
+            let named: u64 = it["split"]
+                .split(',')
+                .filter(|s| *s != "none")
+                .map(|s| {
+                    let (_, n) = s.rsplit_once(':').expect("move:nodes");
+                    n.parse::<u64>().expect("an integer")
+                })
+                .sum();
+            let other: u64 = it["other"].parse().expect("an integer");
+            let first: u64 = it["first"].parse().expect("an integer");
+            let rest: u64 = it["rest"].parse().expect("an integer");
+            assert_eq!(named + other, first + rest, "{body}");
+        }
+    }
+}

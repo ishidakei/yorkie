@@ -172,7 +172,30 @@ fn check_timeline(r: &WorkerResult, completed: i32, stopped: bool, what: &str) {
             it.first_move_nodes + it.other_move_nodes <= it.nodes,
             "{what}: {it:?}"
         );
+        let split: u64 = it.split.named().map(|(_, n)| n).sum::<u64>() + it.split.rest;
+        assert_eq!(
+            split,
+            it.first_move_nodes + it.other_move_nodes,
+            "{what}: the root-move split covers the root moves' nodes: {it:?}"
+        );
     }
+    let hist = &r.node_hist;
+    assert_eq!(
+        hist.total(),
+        r.nodes,
+        "{what}: every node is in the ply row"
+    );
+    assert_eq!(hist.depth.iter().sum::<u64>(), r.nodes, "{what}: depth row");
+    assert_eq!(
+        hist.node_type.iter().sum::<u64>(),
+        r.nodes,
+        "{what}: type row"
+    );
+    assert_eq!(hist.ply[0], 0, "{what}: no move leads to the root");
+    assert_eq!(
+        hist.depth[0], hist.node_type[3],
+        "{what}: the quiescence nodes are depth 0 and type qs alike"
+    );
     for pair in its.windows(2) {
         assert!(pair[0].micros <= pair[1].micros, "{what}: {pair:?}");
         assert!(pair[0].nodes < pair[1].nodes, "{what}: {pair:?}");

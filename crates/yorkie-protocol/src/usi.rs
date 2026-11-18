@@ -855,9 +855,12 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
         #[cfg(feature = "dupstats")]
         crate::stats::start_bench_timelines();
         // Each searched position's index in the list, with its workers'
-        // timelines.
+        // timelines and node histograms.
         #[cfg(feature = "dupstats")]
         let mut timelines = Vec::new();
+        // Each searched position's index, time, nodes and search counts.
+        #[cfg(feature = "dupstats")]
+        let mut per_position = Vec::new();
         let mut total_nodes: u64 = 0;
         let mut positions: u64 = 0;
         #[cfg_attr(not(feature = "dupstats"), expect(unused_variables))]
@@ -880,6 +883,10 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
                 }
             }
             positions += 1;
+            #[cfg(feature = "dupstats")]
+            let position_start = Instant::now();
+            #[cfg(feature = "dupstats")]
+            let nodes_before = total_nodes;
             total_nodes += match self.engine.bench_run_one(
                 config.limits.clone(),
                 #[cfg(feature = "dupstats")]
@@ -894,7 +901,16 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
                 }
             };
             #[cfg(feature = "dupstats")]
-            timelines.push((index as u64, crate::stats::take_bench_timelines()));
+            {
+                let index = config.first_index + index as u64;
+                per_position.push((
+                    index,
+                    position_start.elapsed().as_millis() as u64,
+                    total_nodes - nodes_before,
+                    crate::stats::take_position_counts(),
+                ));
+                timelines.push((index, crate::stats::take_bench_timelines()));
+            }
         }
         #[cfg(feature = "dupstats")]
         crate::stats::stop_bench_timelines();
@@ -935,12 +951,44 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
         // When each worker of each position's search finished each iteration.
         #[cfg(feature = "dupstats")]
         for (index, workers) in &timelines {
-            for timeline in workers {
-                for it in timeline.iterations() {
-                    crate::stats::iteration_line(*index, timeline.worker, it, |body| {
+            for worker in workers {
+                for it in worker.timeline.iterations() {
+                    crate::stats::iteration_line(*index, worker.timeline.worker, it, |body| {
                         self.out.info_string(body)
                     })?;
                 }
+            }
+        }
+        // Each position on its own: its time, nodes and search counts, the
+        // histograms behind them, and where each worker's nodes were.
+        #[cfg(feature = "dupstats")]
+        for ((index, time_ms, nodes, counts), (_, workers)) in per_position.iter().zip(&timelines) {
+            let mut lead_bytes = [0u8; DIAG_BYTES];
+            let mut lead = TextWriter::new(&mut lead_bytes);
+            lead.bytes(b"pos=").u64(*index).byte(b' ');
+            let lead = lead.as_bytes();
+            let mut head_bytes = [0u8; DIAG_BYTES];
+            let mut head = TextWriter::new(&mut head_bytes);
+            head.bytes(b"posstats pos=")
+                .u64(*index)
+                .bytes(b" time_ms=")
+                .u64(*time_ms)
+                .bytes(b" bench_nodes=")
+                .u64(*nodes);
+            let mut buf = StatsBuf::new();
+            let items = crate::stats::render(&mut buf, 0, *counts, ValueMarks::NONE)
+                .map_or(&b""[..], crate::stats::line_items);
+            self.out.info_string_parts(&[head.as_bytes(), items])?;
+            crate::stats::histogram_lines(counts, |body| {
+                self.out.info_string_parts(&[lead, body])
+            })?;
+            for worker in workers {
+                crate::stats::node_hist_line(
+                    *index,
+                    worker.timeline.worker,
+                    &worker.node_hist,
+                    |body| self.out.info_string(body),
+                )?;
             }
         }
         Ok(())
