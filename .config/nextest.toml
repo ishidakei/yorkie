@@ -1,0 +1,21 @@
+# cargo-nextest reads this file for every `cargo nextest run` in the workspace.
+#
+# The test config (`configs/test.toml`) pins the engine's single search worker,
+# and the thread that reads its commands, to CPU 0. Every test that starts an
+# engine — a spawned `yorkie` process or an in-process session — therefore runs
+# its engine on that one CPU, however many CPUs the machine has, and nextest runs
+# as many tests at once as there are CPUs. With N of them on CPU 0 each gets
+# about 1/N of it: a `stop` that answers in well under a second on its own takes
+# about a quarter of a second more per test running beside it, eight seconds on
+# a 32-CPU machine.
+#
+# Most tests do not mind; they only take longer. The tests below assert a
+# wall-clock bound on the engine's own reply — a `bestmove` within its time
+# budget, a prompt answer to `stop`, a reply shortened by the time spent
+# thinking ahead — so they run alone: a test that requires every test thread
+# starts only once all others have finished, and nothing else starts until it
+# ends. The bounds stay what the tests state; only the neighbours go.
+
+[[profile.default.overrides]]
+filter = 'binary_id(yorkie::usi_time_management) | binary_id(yorkie-protocol::ponder_credit_session)'
+threads-required = "num-test-threads"
