@@ -15,8 +15,9 @@
 //! must hold under it. The crates that do not depend on this one keep the
 //! system allocator; none is on the allocation-hot path.
 //!
-//! [`crate::large_page`]'s `alloc_zeroed_large` requests an over-aligned, zeroed
-//! block through `std::alloc::alloc_zeroed`, and the
+//! [`crate::large_page`]'s [`LargePageAlloc`](crate::LargePageAlloc) requests
+//! an over-aligned, zeroed block through `Global.allocate_zeroed`, which
+//! reaches the installed allocator's `alloc_zeroed`, and the
 //! [`GlobalAlloc`](std::alloc::GlobalAlloc) contract requires the returned
 //! pointer to satisfy the requested alignment whichever allocator is installed.
 //! `global_allocator_honours_large_page_alignment` asserts it directly.

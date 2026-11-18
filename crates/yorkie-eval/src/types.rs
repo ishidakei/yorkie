@@ -21,7 +21,7 @@ use std::path::PathBuf;
 
 use yorkie_state::TextWriter;
 #[cfg(any(test, feature = "source-network"))]
-use yorkie_storage::LargePageArray;
+use yorkie_storage::LargePageAlloc;
 
 use crate::nnue_layout::{DATA_BYTES, SECTION_ALIGN, SPANS, Span, StackSpans};
 pub use crate::nnue_layout::{
@@ -226,7 +226,7 @@ unsafe fn array<'a, T>(base: *const u8, span: Span) -> &'a [T] {
 /// shipped ones and nothing else.
 #[cfg(any(test, feature = "source-network"))]
 pub struct OwnedNetwork {
-    bytes: LargePageArray<u8>,
+    bytes: Box<[u8], LargePageAlloc>,
 }
 
 #[cfg(any(test, feature = "source-network"))]
@@ -234,7 +234,7 @@ impl OwnedNetwork {
     /// A network of all-zero parameters.
     pub fn zeroed() -> Self {
         Self {
-            bytes: LargePageArray::<u8>::zeroed(DATA_BYTES),
+            bytes: LargePageAlloc::zeroed_slice::<u8>(DATA_BYTES),
         }
     }
 

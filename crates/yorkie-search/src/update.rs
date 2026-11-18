@@ -113,12 +113,14 @@ pub struct WorkerHistories {
     pub shared: Arc<SharedHistories>,
 }
 
-// Five large-page handles, the single gravity entry and the shared-table handle.
+// Five large-page boxes (one pointer each: the allocator is zero-sized and the
+// layout comes from the type), the single gravity entry and the shared-table
+// handle.
 // The six bytes past the entry are the bundle's own alignment and cannot be
 // reordered away: every other field is already eight bytes wide. The bundle is
 // per-worker and reached once per update, so its own line is never contended —
 // what a helper shares with its node is `shared`, whose entries are atomic.
-const _: () = assert!(size_of::<WorkerHistories>() == 136);
+const _: () = assert!(size_of::<WorkerHistories>() == 56);
 
 impl Default for WorkerHistories {
     fn default() -> Self {

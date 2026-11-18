@@ -10,8 +10,11 @@
 //! **An [`ArenaSlice`] is a raw-pointer view that neither owns nor
 //! borrow-checks against its arena.** The intended use is for one struct to own
 //! both the arena and the slices carved from it. That is sound because the
-//! bytes live on the heap behind a `NonNull`, so moving the owner copies the
-//! pointer and not the bytes, and because `ArenaSlice` has no `Drop` glue, so
+//! arena owns its block through a raw pointer, not through a `Box` or a
+//! reference: no uniqueness (`noalias`) assumption is attached to the block, so
+//! a view aliasing it violates none, and moving the owner copies the pointer,
+//! not the bytes, and leaves every view valid. The block is put back into a
+//! `Box` only in `Drop`, to free it. And `ArenaSlice` has no `Drop` glue, so
 //! field-drop order cannot produce a use-after-free. The owner must keep the
 //! arena alive as long as the views, and never hand out a `&mut` to the arena
 //! while a view aliases it — both of which follow from filling through
@@ -24,7 +27,7 @@ use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::slice;
 
-use crate::large_page::{LargePageArray, Zeroable, rounded_size};
+use crate::large_page::{LargePageAlloc, Zeroable, rounded_size};
 
 /// Alignment every carved sub-array starts on — the 64-byte cache line the
 /// AVX-512 NNUE kernels assume.
@@ -127,10 +130,12 @@ impl ArenaLayout {
 /// as a temporary `&mut [T]` for filling ([`slice_mut`](Self::slice_mut)) or as
 /// a detached [`ArenaSlice`] to store ([`view`](Self::view)).
 pub struct LargePageArena {
-    /// The single backing allocation. Its length is `total_bytes.max(1)`, so
-    /// even a zero-byte layout has a real, non-dangling base.
-    backing: LargePageArray<u8>,
-    /// The exact byte size the layout requested (`<= backing.len()`).
+    /// The single backing allocation, taken out of its `Box` at construction
+    /// so it carries the allocation's raw, write-capable provenance and no
+    /// uniqueness assumption. Its length is `total_bytes.max(1)`, so even a
+    /// zero-byte layout has a real, non-dangling base.
+    block: NonNull<[u8]>,
+    /// The exact byte size the layout requested (`<= block.len()`).
     total_bytes: usize,
 }
 
@@ -152,13 +157,26 @@ impl LargePageArena {
     /// Allocate a zeroed arena of exactly `total_bytes`, for when the layout
     /// total was recorded separately from the layout.
     pub fn with_capacity(total_bytes: usize) -> Self {
-        // At least one byte, so even the degenerate empty layout has a
-        // non-null, aligned base.
-        let backing = LargePageArray::<u8>::zeroed(total_bytes.max(1));
+        Self::over(Self::zeroed_backing(total_bytes), total_bytes)
+    }
+
+    /// A zeroed block for an arena of `total_bytes`: at least one byte, so even
+    /// the degenerate empty layout has a non-null, aligned base.
+    fn zeroed_backing(total_bytes: usize) -> Box<[u8], LargePageAlloc> {
+        LargePageAlloc::zeroed_slice::<u8>(total_bytes.max(1))
+    }
+
+    /// The arena over `backing`, which it owns from here on.
+    fn over(backing: Box<[u8], LargePageAlloc>, total_bytes: usize) -> Self {
+        let (block, LargePageAlloc) = Box::into_raw_with_allocator(backing);
         Self {
-            backing,
+            block: NonNull::new(block).expect("a box's base is non-null"),
             total_bytes,
         }
+    }
+
+    fn base(&self) -> NonNull<u8> {
+        self.block.cast()
     }
 
     /// The exact byte size the layout requested.
@@ -191,14 +209,10 @@ impl LargePageArena {
         // lies inside the backing `[u8]` as asserted above. The bytes were
         // zeroed at allocation and `T: Zeroable`, so they form `section.len`
         // valid `T`, and `&mut self` guarantees no other view is live. The base
-        // comes from `base_nonnull()`, so the pointer carries the allocation's
-        // raw, write-capable provenance rather than a reference reborrow.
+        // is the block pointer, so the pointer carries the allocation's raw,
+        // write-capable provenance rather than a reference reborrow.
         unsafe {
-            let p = self
-                .backing
-                .base_nonnull()
-                .byte_add(section.offset)
-                .cast::<T>();
+            let p = self.base().byte_add(section.offset).cast::<T>();
             slice::from_raw_parts_mut(p.as_ptr(), section.len)
         }
     }
@@ -222,14 +236,9 @@ impl LargePageArena {
         );
         // SAFETY: `offset` is in-bounds and 64-aligned and the base is non-null,
         // so `base + offset` is a non-null, `T`-aligned pointer into the arena.
-        // The base comes from `base_nonnull()`, so it carries the allocation's
-        // raw, write-capable provenance — the view may later write through it.
-        let ptr = unsafe {
-            self.backing
-                .base_nonnull()
-                .byte_add(section.offset)
-                .cast::<T>()
-        };
+        // The base is the block pointer, so it carries the allocation's raw,
+        // write-capable provenance — the view may later write through it.
+        let ptr = unsafe { self.base().byte_add(section.offset).cast::<T>() };
         ArenaSlice {
             ptr,
             len: section.len,
@@ -239,19 +248,38 @@ impl LargePageArena {
 
     /// The requested bytes of the backing allocation (for byte-equal cloning).
     pub fn as_bytes(&self) -> &[u8] {
-        &self.backing[..self.total_bytes]
+        // SAFETY: the block holds at least `total_bytes` bytes, zeroed at
+        // allocation and so initialised, and lives as long as `self`. Nothing
+        // writes it while the returned borrow lives: `slice_mut` needs
+        // `&mut self`, and the owner writes through no view while it reads the
+        // arena's bytes.
+        unsafe { slice::from_raw_parts(self.base().as_ptr(), self.total_bytes) }
     }
 
     /// A fresh arena of the same size with byte-identical contents in a
     /// distinct allocation.
     pub fn clone_backing(&self) -> Self {
-        let mut out = Self::with_capacity(self.total_bytes);
-        if self.total_bytes != 0 {
-            out.backing[..self.total_bytes].copy_from_slice(&self.backing[..self.total_bytes]);
-        }
-        out
+        let mut backing = Self::zeroed_backing(self.total_bytes);
+        backing[..self.total_bytes].copy_from_slice(self.as_bytes());
+        Self::over(backing, self.total_bytes)
     }
 }
+
+impl Drop for LargePageArena {
+    fn drop(&mut self) {
+        // SAFETY: `block` came out of `Box::into_raw_with_allocator` over a
+        // `LargePageAlloc` box in `over`, and is rebuilt exactly once, here.
+        drop(unsafe { Box::from_raw_in(self.block.as_ptr(), LargePageAlloc) });
+    }
+}
+
+// SAFETY: a `LargePageArena` owns its block, a plain `[u8]` that is `Send` and
+// `Sync`, as a `Box<[u8], LargePageAlloc>` would; every write through the block
+// pointer takes `&mut self` or goes through a view the owner keeps disjoint, so
+// the arena may move between and be shared by threads exactly as that `Box`
+// may.
+unsafe impl Send for LargePageArena {}
+unsafe impl Sync for LargePageArena {}
 
 /// A raw-pointer view into a [`LargePageArena`] sub-array, exposed as a `[T]`.
 /// It does not own the backing bytes: the arena it was carved from must outlive
@@ -365,6 +393,24 @@ mod tests {
         let view = arena.view(s);
         assert_eq!(view[0], -20);
         assert_eq!(view[63], 43);
+    }
+
+    /// Moving the arena by value retags its fields; under miri this pins that
+    /// the block is held through a raw pointer that carries no uniqueness, so
+    /// a view carved before the move still writes and the block still frees.
+    #[test]
+    fn a_view_survives_moving_its_arena() {
+        fn moved(arena: LargePageArena) -> LargePageArena {
+            arena
+        }
+        let mut layout = ArenaLayout::new();
+        let s = layout.reserve::<i32>(8);
+        let arena = LargePageArena::new(&layout);
+        let mut view = arena.view(s);
+        let arena = moved(arena);
+        view[3] = 7;
+        assert_eq!(arena.as_bytes()[3 * size_of::<i32>()], 7);
+        drop(arena);
     }
 
     #[test]

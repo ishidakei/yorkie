@@ -229,7 +229,7 @@ mod tests {
     use yorkie_state::{Move, Position};
 
     use crate::text_str::{format_usi_move, parse_sfen};
-    use yorkie_storage::LargePageArray;
+    use yorkie_storage::LargePageAlloc;
 
     // --- HalfKA_hm2 feature-plane geometry (mirrors yorkie-eval's features.rs).
     // A feature index is `E_KING_PERIOD * sq_k_code + p_adj`; board-piece
@@ -248,7 +248,7 @@ mod tests {
     /// `transformed[LANE_A] + transformed[LANE_B]`: biases are zero, so the
     /// accumulator is a pure sum of active feature columns, and only the fc_0
     /// shortcut row carries a non-zero weight.
-    fn net_with_ft(ft_weights: LargePageArray<i16>) -> OwnedNetwork {
+    fn net_with_ft(ft_weights: Box<[i16], LargePageAlloc>) -> OwnedNetwork {
         let mut b = OwnedNetwork::zeroed();
         b.ft_weights_mut().copy_from_slice(&ft_weights);
         let row = HIDDEN1_DIMS * FC_0_PADDED_INPUT_DIMS;
@@ -261,16 +261,16 @@ mod tests {
     }
 
     /// All-zero feature-transformer weights: every position evaluates to 0.
-    fn zeroed_ft() -> LargePageArray<i16> {
-        LargePageArray::zeroed(HIDDEN_SIZE * NUM_FEATURES)
+    fn zeroed_ft() -> Box<[i16], LargePageAlloc> {
+        LargePageAlloc::zeroed_slice(HIDDEN_SIZE * NUM_FEATURES)
     }
 
     /// Material-counting FT: the output is a strictly increasing function of
     /// the number of pieces on the board, so a capture lowers the child's eval
     /// and negating it makes captures the most attractive moves. `w` stays
     /// modest to keep the lanes under the ewm clamp.
-    fn material_ft(w: i16) -> LargePageArray<i16> {
-        let mut ft = LargePageArray::<i16>::zeroed(HIDDEN_SIZE * NUM_FEATURES);
+    fn material_ft(w: i16) -> Box<[i16], LargePageAlloc> {
+        let mut ft = LargePageAlloc::zeroed_slice::<i16>(HIDDEN_SIZE * NUM_FEATURES);
         for f in 0..NUM_FEATURES {
             if (BOARD_LO..BOARD_HI).contains(&(f % E_KING_PERIOD)) {
                 ft[f * HIDDEN_SIZE + LANE_A] = w;
@@ -283,8 +283,8 @@ mod tests {
     /// Feature-index-dependent FT, so evals vary richly across sibling
     /// positions and the argmax-equality tests have something to discriminate.
     /// Weights stay small enough to keep the lanes under the ewm clamp of 254.
-    fn patterned_ft() -> LargePageArray<i16> {
-        let mut ft = LargePageArray::<i16>::zeroed(HIDDEN_SIZE * NUM_FEATURES);
+    fn patterned_ft() -> Box<[i16], LargePageAlloc> {
+        let mut ft = LargePageAlloc::zeroed_slice::<i16>(HIDDEN_SIZE * NUM_FEATURES);
         for f in 0..NUM_FEATURES {
             ft[f * HIDDEN_SIZE + LANE_A] = (f % 4 + 1) as i16;
             ft[f * HIDDEN_SIZE + LANE_B] = (f % 5 + 1) as i16;

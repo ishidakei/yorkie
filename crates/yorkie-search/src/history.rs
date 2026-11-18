@@ -29,7 +29,7 @@
 use std::sync::atomic::{AtomicI16, Ordering};
 
 use yorkie_state::{Color, Move, Piece, Square};
-use yorkie_storage::{LargePageArray, LargePageBox, Zeroable};
+use yorkie_storage::{LargePageAlloc, Zeroable};
 
 /// Index of one plane of an `N`-plane continuation-style history table.
 ///
@@ -160,13 +160,13 @@ fn captured_code(p: Piece) -> usize {
 pub struct CapturePieceToHistory {
     /// The dimensions are part of the type, so an entry's address is one
     /// computation from the block's base and each index carries its own bound.
-    table: LargePageBox<[[[i16; CAPTURED_NB]; SQ_NB]; PIECE_NB]>,
+    table: Box<[[[i16; CAPTURED_NB]; SQ_NB]; PIECE_NB], LargePageAlloc>,
 }
 
 impl Default for CapturePieceToHistory {
     fn default() -> Self {
         Self {
-            table: LargePageBox::zeroed(),
+            table: LargePageAlloc::zeroed(),
         }
     }
 }
@@ -179,9 +179,9 @@ impl CapturePieceToHistory {
 
     /// The `(address, byte length)` of this table's large-page block — see
     /// [`WorkerHistories::backing_regions`](crate::WorkerHistories::backing_regions).
-    /// A [`LargePageBox`] always owns a block, so this is never `None`.
+    /// The table is not zero-sized, so it always owns a block.
     pub fn backing_region(&self) -> (usize, usize) {
-        self.table.backing_region()
+        LargePageAlloc::backing_region(&self.table).expect("a history table is not zero-sized")
     }
 
     /// Overwrite every entry with `v` — the reference's
@@ -243,13 +243,13 @@ fn move16(m: Move) -> usize {
 /// uses.
 pub struct ButterflyHistory {
     /// Layout `[us][move16]`, both dimensions compile-time.
-    table: LargePageBox<[[i16; 1 << 16]; Color::COUNT]>,
+    table: Box<[[i16; 1 << 16]; Color::COUNT], LargePageAlloc>,
 }
 
 impl Default for ButterflyHistory {
     fn default() -> Self {
         Self {
-            table: LargePageBox::zeroed(),
+            table: LargePageAlloc::zeroed(),
         }
     }
 }
@@ -262,9 +262,9 @@ impl ButterflyHistory {
 
     /// The `(address, byte length)` of this table's large-page block — see
     /// [`WorkerHistories::backing_regions`](crate::WorkerHistories::backing_regions).
-    /// A [`LargePageBox`] always owns a block, so this is never `None`.
+    /// The table is not zero-sized, so it always owns a block.
     pub fn backing_region(&self) -> (usize, usize) {
-        self.table.backing_region()
+        LargePageAlloc::backing_region(&self.table).expect("a history table is not zero-sized")
     }
 
     /// Overwrite every entry with `v` — the reference's `mainHistory.fill(v)`
@@ -343,13 +343,13 @@ impl PieceToHistory {
 /// through [`fill`](LowPlyHistory::fill) at the root.
 pub struct LowPlyHistory {
     /// Layout `[ply][move16]`, both dimensions compile-time.
-    table: LargePageBox<[[i16; 1 << 16]; LOW_PLY_HISTORY_SIZE]>,
+    table: Box<[[i16; 1 << 16]; LOW_PLY_HISTORY_SIZE], LargePageAlloc>,
 }
 
 impl Default for LowPlyHistory {
     fn default() -> Self {
         Self {
-            table: LargePageBox::zeroed(),
+            table: LargePageAlloc::zeroed(),
         }
     }
 }
@@ -362,9 +362,9 @@ impl LowPlyHistory {
 
     /// The `(address, byte length)` of this table's large-page block — see
     /// [`WorkerHistories::backing_regions`](crate::WorkerHistories::backing_regions).
-    /// A [`LargePageBox`] always owns a block, so this is never `None`.
+    /// The table is not zero-sized, so it always owns a block.
     pub fn backing_region(&self) -> (usize, usize) {
-        self.table.backing_region()
+        LargePageAlloc::backing_region(&self.table).expect("a history table is not zero-sized")
     }
 
     /// Overwrite every entry with `v` — the reference's `lowPlyHistory.fill(v)`
@@ -453,12 +453,12 @@ pub struct SharedHistories {
     thread_count: usize,
     /// Correction table: `thread_count * CORRHIST_BASE_SIZE` slots, each
     /// [`CORR_SLOT_LEN`] atomic `i16`. Layout `[slot][color][channel]`, flat.
-    correction: LargePageArray<AtomicI16>,
+    correction: Box<[AtomicI16], LargePageAlloc>,
     /// `correctionHistory.get_size() - 1` — the correction slot mask.
     corr_mask: usize,
     /// Pawn table: `thread_count * PAWN_HISTORY_BASE_SIZE` slots, each
     /// [`PAWN_SLOT_LEN`] atomic `i16`. Layout `[plane][pc][to]`, flat.
-    pawn: LargePageArray<AtomicI16>,
+    pawn: Box<[AtomicI16], LargePageAlloc>,
     /// `pawnHistory.get_size() - 1` — the pawn slot mask.
     pawn_mask: usize,
 }
@@ -478,9 +478,9 @@ impl SharedHistories {
         let pawn_slots = thread_count * PAWN_HISTORY_BASE_SIZE;
         let out = Self {
             thread_count,
-            correction: LargePageArray::zeroed(corr_slots * CORR_SLOT_LEN),
+            correction: LargePageAlloc::zeroed_slice(corr_slots * CORR_SLOT_LEN),
             corr_mask: corr_slots - 1,
-            pawn: LargePageArray::zeroed(pawn_slots * PAWN_SLOT_LEN),
+            pawn: LargePageAlloc::zeroed_slice(pawn_slots * PAWN_SLOT_LEN),
             pawn_mask: pawn_slots - 1,
         };
         // The correction fill of `0` is a no-op on the zeroed allocation, but is
@@ -596,15 +596,15 @@ impl SharedHistories {
 pub struct ContinuationCorrectionHistory {
     /// Layout: `[plane = outer_pc*SQ_NB + outer_to][inner_pc][inner_to]`. Every
     /// dimension is fixed so each access carries a compile-time length.
-    table: LargePageBox<[[[i16; SQ_NB]; PIECE_NB]; CONT_CORR_PLANES]>,
+    table: Box<[[[i16; SQ_NB]; PIECE_NB]; CONT_CORR_PLANES], LargePageAlloc>,
 }
 
 impl Default for ContinuationCorrectionHistory {
     fn default() -> Self {
         // Huge-page-backed, zero-initialised; the compile-time dimensions are
-        // preserved by [`LargePageBox`].
+        // preserved by the `Box`.
         Self {
-            table: LargePageBox::zeroed(),
+            table: LargePageAlloc::zeroed(),
         }
     }
 }
@@ -618,9 +618,9 @@ impl ContinuationCorrectionHistory {
 
     /// The `(address, byte length)` of this table's large-page block — see
     /// [`WorkerHistories::backing_regions`](crate::WorkerHistories::backing_regions).
-    /// A [`LargePageBox`] always owns a block, so this is never `None`.
+    /// The table is not zero-sized, so it always owns a block.
     pub fn backing_region(&self) -> (usize, usize) {
-        self.table.backing_region()
+        LargePageAlloc::backing_region(&self.table).expect("a history table is not zero-sized")
     }
 
     /// Overwrite every entry with `v` — the reference fills each continuation
@@ -660,13 +660,13 @@ pub struct ContinuationHistory {
     /// Layout: `[plane][inner_pc][inner_to]`, `plane` from [`Self::plane_index`].
     /// The planes are inline, so their length is part of the type and an entry's
     /// address is one computation from the block's base.
-    table: LargePageBox<[PieceToHistory; CONT_PLANES]>,
+    table: Box<[PieceToHistory; CONT_PLANES], LargePageAlloc>,
 }
 
 impl Default for ContinuationHistory {
     fn default() -> Self {
         Self {
-            table: LargePageBox::zeroed(),
+            table: LargePageAlloc::zeroed(),
         }
     }
 }
@@ -680,10 +680,10 @@ impl ContinuationHistory {
     /// The `(address, byte length)` of this table's large-page block — see
     /// [`WorkerHistories::backing_regions`](crate::WorkerHistories::backing_regions).
     /// This is the big one: ~54 MiB, more than three quarters of a worker's
-    /// private footprint. A [`LargePageBox`] always owns a block, so this is
-    /// never `None`.
+    /// private footprint. The table is not zero-sized, so it always owns a
+    /// block.
     pub fn backing_region(&self) -> (usize, usize) {
-        self.table.backing_region()
+        LargePageAlloc::backing_region(&self.table).expect("a history table is not zero-sized")
     }
 
     /// Overwrite every entry with `v` — the reference fills each continuation

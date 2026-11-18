@@ -28,7 +28,7 @@ pub mod yorkie_book;
 pub use allocator::{CountingAlloc, clear_alloc_count, take_alloc_count};
 pub use arena::{ARENA_SUB_ALIGN, ArenaLayout, ArenaSlice, LargePageArena, Section};
 pub use book::{Book, BookError, BookMove};
-pub use large_page::{LARGE_PAGE_ALIGN, LargePageArray, LargePageBox, Zeroable, advise_huge_pages};
+pub use large_page::{LARGE_PAGE_ALIGN, LargePageAlloc, Zeroable, advise_huge_pages};
 pub use mapped::map_file_onto;
 #[cfg(feature = "verbose3")]
 pub use tt::ValueMarks;

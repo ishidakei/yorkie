@@ -4,21 +4,19 @@
 //! The history tables and the loaded NNUE parameters allocate through here, so
 //! the huge-page policy lives in one place: base alignment
 //! [`LARGE_PAGE_ALIGN`], the byte size rounded **up** to a whole multiple of it,
-//! zero-initialised, and — on Linux — `MADV_HUGEPAGE`-hinted best-effort across
-//! the whole rounded region. [`advise_huge_pages`] is that last step on its own,
-//! for a region this module did not allocate: the transposition table's
-//! `static`, which the linker placed.
+//! and — on Linux — `MADV_HUGEPAGE`-hinted best-effort across the whole rounded
+//! region. [`advise_huge_pages`] is that last step on its own, for a region this
+//! module did not allocate: the transposition table's `static`, which the
+//! linker placed.
 //!
-//! [`LargePageArray<T>`] and [`LargePageBox<T>`] are the `Box<[T]>` and `Box<T>`
-//! analogues on top of it. Both construct their storage zeroed, so the element
-//! type must have a valid all-zero bit pattern — the [`Zeroable`] marker.
+//! [`LargePageAlloc`] is that policy as an [`Allocator`], so the blocks are
+//! plain `Box<[T], LargePageAlloc>` and `Box<T, LargePageAlloc>`.
+//! [`LargePageAlloc::zeroed_slice`] and [`LargePageAlloc::zeroed`] build them
+//! zero-initialised, so the element type must have a valid all-zero bit
+//! pattern — the [`Zeroable`] marker.
 
-use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
-use std::fmt;
-use std::mem::{align_of, size_of};
-use std::ops::{Deref, DerefMut};
-use std::ptr::{self, NonNull};
-use std::slice;
+use std::alloc::{AllocError, Allocator, Global, Layout, handle_alloc_error};
+use std::ptr::NonNull;
 
 /// Base alignment of a large-page allocation: a 2 MiB huge-page boundary on
 /// Linux so a `MADV_HUGEPAGE` hint can back the region with transparent huge
@@ -35,24 +33,21 @@ pub const LARGE_PAGE_ALIGN: usize = 4096;
 /// # Safety
 ///
 /// An all-zero byte pattern of `size_of::<Self>()` bytes must be a valid value
-/// of `Self`, and `Self` must need no drop glue: the containers below free the
-/// backing bytes directly and never run element destructors.
+/// of `Self`.
 pub unsafe trait Zeroable {}
 
-// SAFETY: `0` is a valid value of each of these integer types, and all are
-// trivially destructible.
+// SAFETY: `0` is a valid value of each of these integer types.
 unsafe impl Zeroable for i8 {}
 unsafe impl Zeroable for i16 {}
 unsafe impl Zeroable for i32 {}
 unsafe impl Zeroable for u8 {}
 
-// SAFETY: `AtomicI16` has the same layout as `i16`, its all-zero pattern is the
-// integer `0`, and it has no `Drop` glue.
+// SAFETY: `AtomicI16` has the same layout as `i16`, and its all-zero pattern is
+// the integer `0`.
 unsafe impl Zeroable for core::sync::atomic::AtomicI16 {}
 
 // SAFETY: an array is valid when every element is, and an all-zero array is an
-// array of all-zero (valid) elements; an array needs no drop glue when its
-// elements need none.
+// array of all-zero (valid) elements.
 unsafe impl<T: Zeroable, const N: usize> Zeroable for [T; N] {}
 
 /// Round `min_bytes` up to a whole multiple of [`LARGE_PAGE_ALIGN`].
@@ -60,38 +55,13 @@ pub(crate) const fn rounded_size(min_bytes: usize) -> usize {
     min_bytes.next_multiple_of(LARGE_PAGE_ALIGN)
 }
 
-/// Allocate a zeroed block of at least `min_bytes` under the module's
-/// huge-page policy. `min_bytes` must be non-zero. The returned [`Layout`] must
-/// be replayed to [`free_large`] to free the block.
-pub(crate) fn alloc_zeroed_large(min_bytes: usize) -> (NonNull<u8>, Layout) {
-    debug_assert!(min_bytes > 0, "large-page allocation must be non-empty");
-
-    let size = rounded_size(min_bytes);
-    let layout = Layout::from_size_align(size, LARGE_PAGE_ALIGN)
-        .expect("large-page allocation size/alignment is valid");
-
-    // SAFETY: `layout` has non-zero size, since `min_bytes >= 1` rounds up to
-    // at least `LARGE_PAGE_ALIGN`.
-    let raw = unsafe { alloc_zeroed(layout) };
-    let ptr = match NonNull::new(raw) {
-        Some(p) => p,
-        None => handle_alloc_error(layout),
-    };
-
-    // Best-effort, as the reference's is: a refused hint leaves the block
-    // exactly as it was.
-    advise_huge_pages(ptr.as_ptr().addr(), size);
-
-    (ptr, layout)
-}
-
 /// Ask the kernel to back the byte range `[addr, addr + len)` with transparent
 /// huge pages (`madvise(MADV_HUGEPAGE)`).
 ///
-/// The hint every block this module hands out carries, and the one a caller
-/// applies to a region it did not allocate here — the transposition table's
-/// `static`, whose address the linker fixed. `addr` must be page-aligned, which
-/// both of those are, being [`LARGE_PAGE_ALIGN`]-aligned.
+/// The hint every block [`LargePageAlloc`] hands out carries, and the one a
+/// caller applies to a region it did not allocate here — the transposition
+/// table's `static`, whose address the linker fixed. `addr` must be
+/// page-aligned, which both of those are, being [`LARGE_PAGE_ALIGN`]-aligned.
 ///
 /// Returns whether the kernel accepted it. `false` — off Linux, or where the
 /// kernel was built or configured without transparent huge pages — leaves the
@@ -121,218 +91,121 @@ pub fn advise_huge_pages(addr: usize, len: usize) -> bool {
     }
 }
 
-/// Free a block returned by [`alloc_zeroed_large`].
+/// An [`Allocator`] that hands out blocks under the huge-page policy: the
+/// request's alignment raised to [`LARGE_PAGE_ALIGN`], its size rounded up to a
+/// whole multiple of it, and the whole block `MADV_HUGEPAGE`-hinted. The
+/// memory itself comes from [`Global`], so a zeroed request reaches the global
+/// allocator's own zeroed path, which can hand out fresh OS pages without
+/// writing them.
 ///
-/// # Safety
-///
-/// `ptr` must have come from [`alloc_zeroed_large`] with exactly `layout`, and
-/// must not be freed more than once.
-pub(crate) unsafe fn free_large(ptr: NonNull<u8>, layout: Layout) {
-    // SAFETY: contract delegated to the caller (see the doc comment).
-    unsafe { dealloc(ptr.as_ptr(), layout) }
-}
+/// [`deallocate`](Allocator::deallocate) receives the caller's layout, not the
+/// block's, so it applies the same raise and round-up again before returning
+/// the block to [`Global`]. Both are pure functions of the layout, which is
+/// what makes the two agree; a caller that frees with any size the block fits
+/// (from its request up to the rounded length it was handed) lands on the same
+/// block layout, since the rounding of a whole multiple is itself.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LargePageAlloc;
 
-/// A large-page-backed, zero-initialised `[T]` — the analogue of `Box<[T]>`.
-/// The exposed slice covers exactly `len` elements; the round-up tail of the
-/// allocation is not part of it.
-pub struct LargePageArray<T: Zeroable> {
-    /// Base of the aligned allocation. Dangling (never dereferenced) when
-    /// `len == 0`; always [`LARGE_PAGE_ALIGN`]-aligned otherwise.
-    ptr: NonNull<T>,
-    /// Number of live elements the slice exposes.
-    len: usize,
-    /// Exact [`Layout`] the block was allocated with, replayed to [`free_large`]
-    /// on drop. Meaningless (zero-sized) when `len == 0`.
-    layout: Layout,
-}
-
-// SAFETY: `LargePageArray<T>` uniquely owns its heap block of `T`, freed once
-// in `Drop`, just like `Box<[T]>`, so it is `Send`/`Sync` exactly when `T` is.
-unsafe impl<T: Zeroable + Send> Send for LargePageArray<T> {}
-unsafe impl<T: Zeroable + Sync> Sync for LargePageArray<T> {}
-
-impl<T: Zeroable> LargePageArray<T> {
-    /// A zeroed array of `len` elements. `len == 0` allocates nothing.
-    pub fn zeroed(len: usize) -> Self {
-        debug_assert!(
-            size_of::<T>() > 0,
-            "LargePageArray element must not be a ZST"
-        );
-        debug_assert!(align_of::<T>() <= LARGE_PAGE_ALIGN);
-
-        if len == 0 {
-            return Self {
-                ptr: NonNull::dangling(),
-                len: 0,
-                // Zero-sized, correctly aligned; never handed to `free_large`.
-                layout: Layout::from_size_align(0, LARGE_PAGE_ALIGN)
-                    .expect("LARGE_PAGE_ALIGN is a valid power-of-two alignment"),
-            };
-        }
-
-        let bytes = len
-            .checked_mul(size_of::<T>())
-            .expect("LargePageArray byte size overflows usize");
-        let (raw, layout) = alloc_zeroed_large(bytes);
-        // `raw` is `LARGE_PAGE_ALIGN`-aligned, hence aligned for `T`.
-        Self {
-            ptr: raw.cast(),
-            len,
-            layout,
-        }
+impl LargePageAlloc {
+    /// The layout of the block that serves a `layout` request.
+    fn block_layout(layout: Layout) -> Result<Layout, AllocError> {
+        let raised = layout.align_to(LARGE_PAGE_ALIGN).map_err(|_| AllocError)?;
+        let size = raised
+            .size()
+            .checked_next_multiple_of(LARGE_PAGE_ALIGN)
+            .ok_or(AllocError)?;
+        Layout::from_size_align(size, raised.align()).map_err(|_| AllocError)
     }
 
-    /// The stored base pointer, carrying the allocation's original raw,
-    /// write-capable provenance rather than a reference reborrow.
+    /// Hint a block [`Global`] just handed out, and pass it on.
+    fn advised(block: Result<NonNull<[u8]>, AllocError>) -> Result<NonNull<[u8]>, AllocError> {
+        let block = block?;
+        if !block.is_empty() {
+            // Best-effort, as the reference's is: a refused hint leaves the
+            // block exactly as it was.
+            advise_huge_pages(block.as_ptr().addr(), block.len());
+        }
+        Ok(block)
+    }
+
+    /// A zeroed block for `layout`, aborting through [`handle_alloc_error`] if
+    /// the allocation fails.
+    fn zeroed_block(layout: Layout) -> NonNull<u8> {
+        Self.allocate_zeroed(layout)
+            .unwrap_or_else(|_| handle_alloc_error(layout))
+            .cast()
+    }
+
+    /// A zeroed `T`, its base on a [`LARGE_PAGE_ALIGN`] boundary.
     ///
-    /// `as_ptr` / `as_mut_ptr` resolve through `Deref` to the slice methods and
-    /// so stamp the pointer with a temporary reference's provenance, making a
-    /// later write through it undefined behaviour under Stacked or Tree
-    /// Borrows. An arena view that carves sub-array pointers must use this.
-    pub(crate) fn base_nonnull(&self) -> NonNull<T> {
-        self.ptr
+    /// The bytes are zero because the allocator returned them zeroed; nothing
+    /// writes them here, so no page is touched until the caller first writes
+    /// one.
+    pub fn zeroed<T: Zeroable>() -> Box<T, Self> {
+        let ptr = Self::zeroed_block(Layout::new::<T>()).cast::<T>();
+        // SAFETY: `ptr` was allocated by `LargePageAlloc` with
+        // `Layout::new::<T>()`, the layout a `Box<T>` frees with, so it is
+        // aligned for `T` and owned by nothing else. Its bytes are zero, which
+        // `T: Zeroable` makes a valid `T`.
+        unsafe { Box::from_non_null_in(ptr, Self) }
     }
 
-    /// The `(address, byte length)` of the backing block, or `None` when the
-    /// array is empty and so allocates nothing.
+    /// A zeroed `[T]` of `len` elements, its base on a [`LARGE_PAGE_ALIGN`]
+    /// boundary when `len * size_of::<T>()` is non-zero.
     ///
-    /// The length is the *rounded* allocation size, not `len * size_of::<T>()`,
-    /// so a NUMA placement call names the block whole and does not spill policy
-    /// onto a neighbouring allocation. The address is a `usize` because the
-    /// consumer hands it to the kernel as a range descriptor and never
-    /// dereferences it.
-    pub fn backing_region(&self) -> Option<(usize, usize)> {
-        (self.len != 0).then(|| (self.ptr.as_ptr().addr(), self.layout.size()))
+    /// The bytes are zero because the allocator returned them zeroed; nothing
+    /// writes them here, so no page is touched until the caller first writes
+    /// one.
+    pub fn zeroed_slice<T: Zeroable>(len: usize) -> Box<[T], Self> {
+        let layout = Layout::array::<T>(len).expect("large-page array byte size overflows");
+        let ptr = NonNull::slice_from_raw_parts(Self::zeroed_block(layout).cast::<T>(), len);
+        // SAFETY: `ptr` was allocated by `LargePageAlloc` with
+        // `Layout::array::<T>(len)`, the layout a `Box<[T]>` of `len` elements
+        // frees with, so it is aligned for `T` and owned by nothing else. Its
+        // `len` elements are all-zero bytes, which `T: Zeroable` makes valid.
+        unsafe { Box::from_non_null_in(ptr, Self) }
     }
 
-    /// Copy `src` into a fresh large-page-backed array of the same length.
-    pub fn from_slice(src: &[T]) -> Self
-    where
-        T: Copy,
-    {
-        let buf = Self::zeroed(src.len());
-        if !src.is_empty() {
-            // SAFETY: `buf` holds `src.len()` elements in one allocation,
-            // disjoint from `src`, and `T: Copy` makes a bytewise copy valid.
-            unsafe {
-                ptr::copy_nonoverlapping(src.as_ptr(), buf.ptr.as_ptr(), src.len());
-            }
-        }
-        buf
-    }
-}
-
-impl<T: Zeroable> Deref for LargePageArray<T> {
-    type Target = [T];
-
-    #[inline]
-    fn deref(&self) -> &[T] {
-        // SAFETY: for `len > 0`, `ptr` addresses `len` contiguous, zeroed `T`
-        // within one allocation. For `len == 0` this yields an empty slice, for
-        // which `from_raw_parts` accepts any aligned non-null pointer. The
-        // borrow is tied to `&self`, so no `&mut` can coexist.
-        unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    /// The `(address, byte length)` of the block behind `boxed`, or `None`
+    /// when the value is zero-sized and so occupies no block.
+    ///
+    /// The length is the *rounded* block size, not the value's size, so a NUMA
+    /// placement call names the block whole and does not spill policy onto a
+    /// neighbouring allocation. The address is a `usize` because the consumer
+    /// hands it to the kernel as a range descriptor and never dereferences it.
+    #[expect(
+        clippy::borrowed_box,
+        reason = "only a box from this allocator names a block it rounded"
+    )]
+    pub fn backing_region<T: ?Sized>(boxed: &Box<T, Self>) -> Option<(usize, usize)> {
+        let bytes = size_of_val::<T>(boxed);
+        (bytes != 0).then(|| (Box::as_ptr(boxed).addr(), rounded_size(bytes)))
     }
 }
 
-impl<T: Zeroable> DerefMut for LargePageArray<T> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut [T] {
-        // SAFETY: as `deref`, but `&mut self` guarantees exclusivity.
-        unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
-    }
-}
-
-impl<T: Zeroable + fmt::Debug> fmt::Debug for LargePageArray<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&**self, f)
-    }
-}
-
-impl<T: Zeroable> Drop for LargePageArray<T> {
-    fn drop(&mut self) {
-        if self.len != 0 {
-            // SAFETY: `ptr` came from `alloc_zeroed_large` with exactly
-            // `layout`, and is freed exactly once because `LargePageArray`
-            // uniquely owns the block. `T: Zeroable` needs no drop glue, so
-            // freeing the raw bytes is sufficient.
-            unsafe {
-                free_large(self.ptr.cast(), self.layout);
-            }
-        }
-    }
-}
-
-/// A large-page-backed, zero-initialised single `T` — the analogue of `Box<T>`.
-/// Keeps a fixed-shape array's compile-time dimensions, so its per-access index
-/// maths stay bounds-check-free.
-pub struct LargePageBox<T: Zeroable> {
-    /// Base of the aligned allocation, holding one initialised `T`.
-    ptr: NonNull<T>,
-    /// Exact [`Layout`] the block was allocated with, replayed to [`free_large`]
-    /// on drop.
-    layout: Layout,
-}
-
-// SAFETY: `LargePageBox<T>` uniquely owns one heap `T`, freed once in `Drop`,
-// just like `Box<T>`, so it is `Send`/`Sync` exactly when `T` is.
-unsafe impl<T: Zeroable + Send> Send for LargePageBox<T> {}
-unsafe impl<T: Zeroable + Sync> Sync for LargePageBox<T> {}
-
-impl<T: Zeroable> LargePageBox<T> {
-    /// A zeroed `T`, its base pointer on a [`LARGE_PAGE_ALIGN`] boundary.
-    pub fn zeroed() -> Self {
-        debug_assert!(size_of::<T>() > 0, "LargePageBox value must not be a ZST");
-        debug_assert!(align_of::<T>() <= LARGE_PAGE_ALIGN);
-
-        let (raw, layout) = alloc_zeroed_large(size_of::<T>());
-        Self {
-            ptr: raw.cast(),
-            layout,
-        }
+// SAFETY: every method forwards to `Global` with the layout replaced by
+// `block_layout`, a pure function of the caller's layout that maps every size
+// the returned block fits to the same block layout, so a block goes back to
+// `Global` with exactly the layout it was allocated with. `Global` upholds the
+// rest of the contract; the raised alignment and the longer block only
+// strengthen what the caller asked for, and the returned slice reports the
+// whole block. The huge-page hint neither reads nor writes the block.
+unsafe impl Allocator for LargePageAlloc {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        Self::advised(Global.allocate(Self::block_layout(layout)?))
     }
 
-    /// The `(address, byte length)` of the backing block, as
-    /// [`LargePageArray::backing_region`]. Always present, since a
-    /// [`LargePageBox`] holds one non-ZST `T`.
-    pub fn backing_region(&self) -> (usize, usize) {
-        (self.ptr.as_ptr().addr(), self.layout.size())
+    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        Self::advised(Global.allocate_zeroed(Self::block_layout(layout)?))
     }
-}
 
-impl<T: Zeroable> Deref for LargePageBox<T> {
-    type Target = T;
-
-    #[inline]
-    fn deref(&self) -> &T {
-        // SAFETY: `ptr` addresses one zeroed `T` within a live allocation, and
-        // the borrow is tied to `&self`, so no `&mut` can coexist.
-        unsafe { self.ptr.as_ref() }
-    }
-}
-
-impl<T: Zeroable> DerefMut for LargePageBox<T> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut T {
-        // SAFETY: as `deref`, but `&mut self` guarantees exclusivity.
-        unsafe { self.ptr.as_mut() }
-    }
-}
-
-impl<T: Zeroable + fmt::Debug> fmt::Debug for LargePageBox<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&**self, f)
-    }
-}
-
-impl<T: Zeroable> Drop for LargePageBox<T> {
-    fn drop(&mut self) {
-        // SAFETY: `ptr` came from `alloc_zeroed_large` with exactly `layout`,
-        // and is freed exactly once because `LargePageBox` uniquely owns the
-        // block. `T: Zeroable` needs no drop glue.
-        unsafe {
-            free_large(self.ptr.cast(), self.layout);
-        }
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        let block =
+            Self::block_layout(layout).expect("the layout was rounded when it was allocated");
+        // SAFETY: the caller guarantees `ptr` came from this allocator with a
+        // layout it fits, so `Global` allocated it with `block`.
+        unsafe { Global.deallocate(ptr, block) }
     }
 }
 
@@ -349,6 +222,55 @@ mod tests {
         assert_eq!(rounded_size(2 * LARGE_PAGE_ALIGN), 2 * LARGE_PAGE_ALIGN);
     }
 
+    #[test]
+    fn a_block_is_rounded_and_frees_with_any_layout_it_fits() {
+        // Under miri a free whose layout differs from the allocation's is
+        // reported, so this also pins that `deallocate` rounds as `allocate`
+        // did.
+        let request = Layout::from_size_align(7, 2).unwrap();
+        for free_size in [request.size(), LARGE_PAGE_ALIGN] {
+            let block = LargePageAlloc.allocate_zeroed(request).expect("allocation");
+            assert_eq!(
+                block.len(),
+                LARGE_PAGE_ALIGN,
+                "the block is the rounded size"
+            );
+            assert_eq!(block.as_ptr().addr() % LARGE_PAGE_ALIGN, 0);
+            let free = Layout::from_size_align(free_size, request.align()).unwrap();
+            // SAFETY: `block` came from `LargePageAlloc` for `request`, `free`
+            // has its alignment and a size the block fits, and it is freed
+            // once.
+            unsafe { LargePageAlloc.deallocate(block.cast(), free) };
+        }
+    }
+
+    #[test]
+    fn block_layout_matches_the_rounding_the_regions_report() {
+        for size in [
+            0,
+            1,
+            7,
+            LARGE_PAGE_ALIGN - 1,
+            LARGE_PAGE_ALIGN,
+            LARGE_PAGE_ALIGN + 1,
+        ] {
+            let block = LargePageAlloc::block_layout(Layout::from_size_align(size, 8).unwrap())
+                .expect("small layouts round");
+            assert_eq!(block.size(), rounded_size(size));
+            assert_eq!(block.align(), LARGE_PAGE_ALIGN);
+        }
+        let over = Layout::from_size_align(1, 2 * LARGE_PAGE_ALIGN).unwrap();
+        assert_eq!(
+            LargePageAlloc::block_layout(over).unwrap().align(),
+            2 * LARGE_PAGE_ALIGN,
+            "a stricter alignment than the policy's is kept",
+        );
+        assert!(
+            LargePageAlloc::block_layout(Layout::from_size_align(usize::MAX / 2, 1).unwrap())
+                .is_err()
+        );
+    }
+
     // Ignored under miri: the largest lengths run to millions of elements, and
     // walking them all takes minutes there. The small-length tests below cover
     // the same alignment and round-up logic.
@@ -358,7 +280,7 @@ mod tests {
         // A length that does not divide the alignment, and one spanning
         // several alignment units.
         for &len in &[1usize, 7, 4096, LARGE_PAGE_ALIGN / 2 + 3, LARGE_PAGE_ALIGN] {
-            let buf = LargePageArray::<i16>::zeroed(len);
+            let buf = LargePageAlloc::zeroed_slice::<i16>(len);
             assert_eq!(buf.len(), len);
             assert_eq!(
                 buf.as_ptr().addr() % LARGE_PAGE_ALIGN,
@@ -374,7 +296,7 @@ mod tests {
 
     #[test]
     fn empty_array_is_valid_and_aligned() {
-        let buf = LargePageArray::<i16>::zeroed(0);
+        let buf = LargePageAlloc::zeroed_slice::<i16>(0);
         assert_eq!(buf.len(), 0);
         assert!(buf.is_empty());
         assert_eq!(buf.as_ptr().addr() % align_of::<i16>(), 0);
@@ -382,7 +304,7 @@ mod tests {
 
     #[test]
     fn array_is_mutable_in_place() {
-        let mut buf = LargePageArray::<i32>::zeroed(64);
+        let mut buf = LargePageAlloc::zeroed_slice::<i32>(64);
         for (i, slot) in buf.iter_mut().enumerate() {
             *slot = i as i32;
         }
@@ -391,16 +313,8 @@ mod tests {
     }
 
     #[test]
-    fn from_slice_preserves_bytes_and_aligns() {
-        let src: Vec<i16> = (0..1000i32).map(|i| (i - 500) as i16).collect();
-        let buf = LargePageArray::<i16>::from_slice(&src);
-        assert_eq!(buf.as_ptr().addr() % LARGE_PAGE_ALIGN, 0);
-        assert_eq!(&*buf, &src[..]);
-    }
-
-    #[test]
     fn box_is_aligned_and_zeroed() {
-        let boxed = LargePageBox::<[[i16; 4]; 2]>::zeroed();
+        let boxed = LargePageAlloc::zeroed::<[[i16; 4]; 2]>();
         assert_eq!(
             std::ptr::from_ref(&*boxed).addr() % LARGE_PAGE_ALIGN,
             0,
@@ -413,23 +327,26 @@ mod tests {
     fn backing_region_names_the_whole_rounded_block() {
         // A length that does not fill a whole alignment unit, so the region
         // must report the rounded allocation rather than the element bytes.
-        let buf = LargePageArray::<i16>::zeroed(7);
-        let (addr, bytes) = buf
-            .backing_region()
-            .expect("a non-empty array owns a block");
+        let buf = LargePageAlloc::zeroed_slice::<i16>(7);
+        let (addr, bytes) =
+            LargePageAlloc::backing_region(&buf).expect("a non-empty array owns a block");
         assert_eq!(addr, buf.as_ptr().addr());
         assert_eq!(addr % LARGE_PAGE_ALIGN, 0, "base must be page-aligned");
         assert_eq!(bytes, rounded_size(7 * size_of::<i16>()));
         assert_eq!(bytes, LARGE_PAGE_ALIGN);
 
         // An empty array allocates nothing, so there is no region to place.
-        assert_eq!(LargePageArray::<i16>::zeroed(0).backing_region(), None);
+        assert_eq!(
+            LargePageAlloc::backing_region(&LargePageAlloc::zeroed_slice::<i16>(0)),
+            None
+        );
     }
 
     #[test]
     fn box_backing_region_names_the_whole_rounded_block() {
-        let boxed = LargePageBox::<[[i16; 4]; 2]>::zeroed();
-        let (addr, bytes) = boxed.backing_region();
+        let boxed = LargePageAlloc::zeroed::<[[i16; 4]; 2]>();
+        let (addr, bytes) =
+            LargePageAlloc::backing_region(&boxed).expect("a non-ZST box owns a block");
         assert_eq!(addr, std::ptr::from_ref(&*boxed).addr());
         assert_eq!(addr % LARGE_PAGE_ALIGN, 0, "base must be page-aligned");
         assert_eq!(bytes, rounded_size(size_of::<[[i16; 4]; 2]>()));
@@ -437,9 +354,43 @@ mod tests {
 
     #[test]
     fn box_is_mutable_and_keeps_fixed_dimensions() {
-        let mut boxed = LargePageBox::<[[i16; 4]; 2]>::zeroed();
+        let mut boxed = LargePageAlloc::zeroed::<[[i16; 4]; 2]>();
         boxed[1][3] = 42;
         assert_eq!(boxed[1][3], 42);
         assert_eq!(boxed[0][0], 0);
+    }
+
+    /// A zeroed block comes zeroed from the allocator, not filled by the
+    /// constructing thread: a fill would fault every page in on that thread
+    /// and fix which NUMA node it lands on before the block's user ever
+    /// touches it. `mincore` reports which of the block's pages are resident;
+    /// with mimalloc installed only the first [`LARGE_PAGE_ALIGN`] bytes are,
+    /// exactly as for a direct `std::alloc::alloc_zeroed` of the same layout.
+    ///
+    /// Linux only, and not under miri, which cannot call `mincore`.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn a_zeroed_block_is_not_touched_by_its_construction() {
+        const BYTES: usize = 64 * LARGE_PAGE_ALIGN;
+        let buf = LargePageAlloc::zeroed_slice::<u8>(BYTES);
+        let page = 4096;
+        let mut resident = vec![0u8; BYTES / page];
+        // SAFETY: the range is the block `buf` owns, page-aligned, and
+        // `resident` holds one byte per 4 KiB page of it; `mincore` only writes
+        // that vector.
+        let rc =
+            unsafe { libc::mincore(buf.as_ptr().cast_mut().cast(), BYTES, resident.as_mut_ptr()) };
+        assert_eq!(rc, 0, "mincore failed");
+        // The global allocator may write the block's first word itself, and a
+        // huge page then backs that whole first unit; a fill would show past
+        // it.
+        let past_first_unit = &resident[LARGE_PAGE_ALIGN / page..];
+        let touched = past_first_unit.iter().filter(|&&r| r & 1 != 0).count();
+        assert_eq!(
+            touched, 0,
+            "{touched} of the block's pages past its first {LARGE_PAGE_ALIGN} bytes are resident \
+             before the first write"
+        );
+        drop(buf);
     }
 }

@@ -99,7 +99,7 @@ fn page_size() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::large_page::{LARGE_PAGE_ALIGN, LargePageArray};
+    use crate::large_page::{LARGE_PAGE_ALIGN, LargePageAlloc};
 
     fn temp_file(tag: &str, bytes: &[u8]) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -122,7 +122,7 @@ mod tests {
 
         // A block this test owns, standing in for the region the engine's
         // network is declared at.
-        let target = LargePageArray::<u8>::zeroed(LARGE_PAGE_ALIGN);
+        let target = LargePageAlloc::zeroed_slice::<u8>(LARGE_PAGE_ALIGN);
         let addr = target.as_ptr().addr();
         // SAFETY: `target` is this test's own block, nothing else reads it, and
         // it is large-page aligned and long enough.
@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn a_file_shorter_than_the_range_is_refused() {
         let path = temp_file("short", &[0u8; 64]);
-        let target = LargePageArray::<u8>::zeroed(LARGE_PAGE_ALIGN);
+        let target = LargePageAlloc::zeroed_slice::<u8>(LARGE_PAGE_ALIGN);
         // SAFETY: `target` is this test's own block and long enough for the
         // range asked for; the call refuses before touching it.
         let err = unsafe { map_file_onto(target.as_ptr().addr(), 4096, &path, 0) }
