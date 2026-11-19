@@ -633,6 +633,11 @@ pub struct QSearch<N: NetworkParams> {
     /// read by the search.
     #[cfg(feature = "dupstats")]
     node_hist: Box<crate::dupstats::NodeHist>,
+    /// What this worker takes from the table and how its root searches went,
+    /// written to the record file when its search ends. Never read by the
+    /// search.
+    #[cfg(feature = "dupstats")]
+    channels: Box<crate::channels::Record>,
     /// When the search this worker belongs to started, the clock every worker
     /// of it reads its iterations against; `None` starts it when the worker
     /// starts.
@@ -1199,6 +1204,8 @@ impl<N: NetworkParams> QSearch<N> {
             timeline: Box::default(),
             #[cfg(feature = "dupstats")]
             node_hist: Box::default(),
+            #[cfg(feature = "dupstats")]
+            channels: Box::default(),
             #[cfg(feature = "dupstats")]
             search_start: None,
             #[cfg(all(feature = "dupstats", feature = "verbose3"))]
@@ -1945,6 +1952,40 @@ impl<N: NetworkParams> QSearch<N> {
         }
     }
 
+    /// Count the use of the entry the interior node of remaining depth
+    /// `depth` found its position `key` in (`hit`), and note the entry's move
+    /// for the comparison with a lone search. `cut` is whether the entry ends
+    /// the node.
+    #[cfg(feature = "dupstats")]
+    fn channel_use(
+        &mut self,
+        key: u64,
+        hit: bool,
+        data: &yorkie_storage::TTData,
+        depth: i32,
+        cut: bool,
+    ) {
+        let move16 = if hit {
+            data.move16.map_or(0, NonZeroU16::get)
+        } else {
+            0
+        };
+        self.channels
+            .tt
+            .note_move(self.root_depth, key, hit, move16);
+        if hit {
+            self.channels.tt.count(&crate::channels::Use {
+                iteration: self.root_depth,
+                depth,
+                stored_depth: data.depth,
+                bound: data.bound,
+                cut,
+                writer: crate::dupstats::writer_of(key),
+                me: self.dup_writer_id(),
+            });
+        }
+    }
+
     /// Enter the node in `at`, at remaining depth `depth`, whose position `key`
     /// names: push its path frame, take its place in the presence table when it
     /// is deep enough, and count what that found. The two holds are released
@@ -2154,6 +2195,8 @@ impl<N: NetworkParams> QSearch<N> {
         // `ttWriter`); every write below targets this exact slot.
         let (found, tt_data, tt_slot) =
             TranspositionTable::shared().locate(pos_key, side, |m16| pos.to_move(m16).is_some());
+        #[cfg(feature = "dupstats")]
+        let tt_data = crate::channels::mask_pv(tt_data);
         let tt_hit = found && self.reads_tt();
         // Widened O(1), without legal-move generation; the MovePicker's TT
         // stage re-validates with `pseudo_legal` + `is_legal`.
@@ -2169,6 +2212,10 @@ impl<N: NetworkParams> QSearch<N> {
         };
         let pv_hit = tt_hit && tt_data.is_pv;
 
+        #[cfg(feature = "dupstats")]
+        let tt_value_kept = tt_value;
+        #[cfg(feature = "dupstats")]
+        let tt_value = crate::channels::mask_cut_value(tt_value);
         if !pv_node
             && tt_data.depth >= DEPTH_QS
             && is_valid(tt_value)
@@ -2182,6 +2229,9 @@ impl<N: NetworkParams> QSearch<N> {
             }
             return tt_value;
         }
+        #[cfg(feature = "dupstats")]
+        let (tt_move, _, tt_value, tt_data) =
+            crate::channels::mask_after_cut(tt_move, false, tt_value_kept, tt_data);
 
         // Step 4. Static evaluation.
         let mut unadjusted_static_eval = VALUE_NONE;
@@ -2295,7 +2345,11 @@ impl<N: NetworkParams> QSearch<N> {
         // evasion ordering is a constant shift.
         let cont_planes: [ContPlane; 6] = std::array::from_fn(|i| recent[5 - i].cont_hist);
         let (slot, scratch) = Self::split_picker_scratch(scratch);
-        let mut mp = MovePicker::new_qsearch(pos, tt_move, cont_planes, slot);
+        #[cfg(feature = "dupstats")]
+        let picker_tt_move = crate::channels::mask_order(tt_move, false);
+        #[cfg(not(feature = "dupstats"))]
+        let picker_tt_move = tt_move;
+        let mut mp = MovePicker::new_qsearch(pos, picker_tt_move, cont_planes, slot);
 
         let mut best_move: Option<Move> = None;
 
@@ -2586,6 +2640,8 @@ impl<N: NetworkParams> QSearch<N> {
             let start = self.search_start.unwrap_or_else(Instant::now);
             self.timeline.reset(self.dup_worker, start);
             *self.node_hist = crate::dupstats::NodeHist::ZERO;
+            yorkie_storage::cut::set_worker(self.dup_worker);
+            self.channels.reset(self.dup_worker);
         }
         #[cfg(lazy_smp_spread)]
         self.spread.reset();
@@ -2938,6 +2994,9 @@ impl<N: NetworkParams> QSearch<N> {
             stop.store(true, Ordering::Relaxed);
         }
 
+        #[cfg(feature = "dupstats")]
+        self.channels.flush(self.dup_worker, self.nodes);
+
         // Only an abort during iteration 1 leaves `completed_best` empty, and
         // then `root_moves[0]` — the best-so-far after the partial iteration's
         // sort — is still a legal move. It is taken out of the list rather than
@@ -3030,9 +3089,15 @@ impl<N: NetworkParams> QSearch<N> {
 
         let mut best_value;
 
+        #[cfg(feature = "dupstats")]
+        {
+            self.channels.pass = 0;
+        }
         loop {
             let adjusted_depth =
                 1.max(root_depth - failed_high_cnt - 3 * (search_again_counter + 1) / 4);
+            #[cfg(feature = "dupstats")]
+            let nodes_before = self.nodes;
             self.set_root_delta(window_width(alpha, beta));
             self.root_depth = root_depth;
             // Slot 0 still holds the root refresh seeded by the caller.
@@ -3058,6 +3123,31 @@ impl<N: NetworkParams> QSearch<N> {
             root_moves[pv_idx..].sort_by(root_move_order);
             #[cfg(not(feature = "verbose2"))]
             root_moves.sort_by(root_move_order);
+
+            #[cfg(feature = "dupstats")]
+            {
+                use crate::channels::{Asp, AspResult};
+                let result = if self.stopped {
+                    AspResult::Stopped
+                } else if best_value <= alpha {
+                    AspResult::FailLow
+                } else if best_value >= beta {
+                    AspResult::FailHigh
+                } else {
+                    AspResult::Exact
+                };
+                self.channels.asp.push(Asp {
+                    depth: root_depth,
+                    pass: self.channels.pass,
+                    searched_depth: adjusted_depth,
+                    alpha,
+                    beta,
+                    value: best_value,
+                    result,
+                    nodes: self.nodes - nodes_before,
+                });
+                self.channels.pass += 1;
+            }
 
             // The sort above still leaves `root_moves[0]` a legal best-so-far,
             // since it ordered the previous iteration's scores.
@@ -3682,6 +3772,8 @@ impl<N: NetworkParams> QSearch<N> {
         // every write in this node targets this slot, not a re-probe.
         let (tt_hit, tt_data, tt_slot) =
             TranspositionTable::shared().locate(pos_key, side, |m16| pos.to_move(m16).is_some());
+        #[cfg(feature = "dupstats")]
+        let tt_data = crate::channels::mask_pv(tt_data);
         self.stack[s].tt_hit = tt_hit;
         // At the root the current PV line's move is treated as the TT move
         // regardless of what the probe returned; the rest of `tt_data` is still
@@ -3713,6 +3805,23 @@ impl<N: NetworkParams> QSearch<N> {
         // Never read past the start of the move loop.
         let mut ttpv = self.stack[s].tt_pv;
         let tt_capture = tt_move.is_some_and(|m| Self::is_capture(pos, m));
+
+        // A measurement that takes the cutoff away from the main worker hides
+        // the entry's value from the cutoff alone; every later use sees it.
+        #[cfg(feature = "dupstats")]
+        let tt_value_kept = tt_value;
+        #[cfg(feature = "dupstats")]
+        let tt_value = crate::channels::mask_cut_value(tt_value);
+        #[cfg(feature = "dupstats")]
+        if !root_node {
+            let cut = !pv_node
+                && !excluded_move.is_some_and(Move::is_ok)
+                && tt_data.depth > depth - (tt_value <= beta) as i32
+                && is_valid(tt_value)
+                && bound_matches(tt_data.bound, tt_value >= beta)
+                && (cut_node == (tt_value >= beta) || depth > 5);
+            self.channel_use(pos_key, tt_hit, &tt_data, depth, cut);
+        }
 
         // The node's buckets, and whether it is deep enough for the counts of
         // what the table and the move loop did — taken here, before the table
@@ -3799,6 +3908,14 @@ impl<N: NetworkParams> QSearch<N> {
             }
             return tt_value;
         }
+        #[cfg(feature = "dupstats")]
+        let tt_value = tt_value_kept;
+        #[cfg(feature = "dupstats")]
+        let (tt_move, tt_capture, tt_value, tt_data) = if root_node {
+            (tt_move, tt_capture, tt_value, tt_data)
+        } else {
+            crate::channels::mask_after_cut(tt_move, tt_capture, tt_value, tt_data)
+        };
 
         // From here on the node searches. Held to its end: dropping them
         // leaves its place on the path and in the presence table.
@@ -4080,8 +4197,12 @@ impl<N: NetworkParams> QSearch<N> {
                 // This picker is done before the node's own is built, so the
                 // buffer it takes is the one that picker will take.
                 let (slot, scratch) = Self::split_picker_scratch(scratch);
+                #[cfg(feature = "dupstats")]
+                let picker_tt_move = crate::channels::mask_order(tt_move, root_node);
+                #[cfg(not(feature = "dupstats"))]
+                let picker_tt_move = tt_move;
                 let mut mp =
-                    MovePicker::new_probcut(pos, tt_move, prob_cut_beta - static_eval, slot);
+                    MovePicker::new_probcut(pos, picker_tt_move, prob_cut_beta - static_eval, slot);
                 while let Some(mv) = mp.next_move(pos, &self.histories) {
                     if Some(mv) == excluded_move || !pos.is_legal(mv) {
                         continue;
@@ -4174,7 +4295,12 @@ impl<N: NetworkParams> QSearch<N> {
         // when a later stage scores against it.
         let cont_planes: [ContPlane; 6] = std::array::from_fn(|i| self.stack[s - 1 - i].cont_hist);
         let (slot, scratch) = Self::split_picker_scratch(scratch);
-        let mut mp = MovePicker::new_main_search(pos, tt_move, depth, ply, cont_planes, slot);
+        #[cfg(feature = "dupstats")]
+        let picker_tt_move = crate::channels::mask_order(tt_move, root_node);
+        #[cfg(not(feature = "dupstats"))]
+        let picker_tt_move = tt_move;
+        let mut mp =
+            MovePicker::new_main_search(pos, picker_tt_move, depth, ply, cont_planes, slot);
 
         let mut move_count = 0i32;
         let mut quiets_searched = SearchedList::new();
@@ -4703,6 +4829,17 @@ impl<N: NetworkParams> QSearch<N> {
             if root_node {
                 self.timeline
                     .root_move(move_count == 1, mv, self.nodes - node_count);
+                self.channels.root.push(crate::channels::RootSearch {
+                    depth: self.root_depth,
+                    pass: self.channels.pass,
+                    move_count,
+                    mv,
+                    alpha,
+                    beta,
+                    value,
+                    nodes: self.nodes - node_count,
+                    best: move_count == 1 || value > alpha,
+                });
             }
 
             // A stop that fired inside this move's subtree makes the returned

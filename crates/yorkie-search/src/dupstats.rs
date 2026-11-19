@@ -2,9 +2,9 @@
 //! `dupstats` build keeps beside the search, and the two statistics-only tables
 //! they are read from.
 //!
-//! Every worker of a parallel search shares one transposition table and nothing
-//! else, so two workers can search the same subtree, one after the other or both
-//! at once. Three kinds of count say where and how much, and a fourth what
+//! Every worker of a parallel search shares one transposition table (and, on
+//! its node, the correction and pawn tables), so two workers can search the
+//! same subtree, one after the other or both at once. Three kinds of count say where and how much, and a fourth what
 //! the sharing does to each worker's search:
 //!
 //! - **Store outcomes.** At each store that ends a node, what the table entry
@@ -40,7 +40,8 @@
 //! where a worker's work went, rather than where it repeated someone else's.
 //!
 //! Nothing here is read by the search: its decisions, node counts and best
-//! moves are those of a build without the feature. The side tables do cost
+//! moves are those of a build without the feature, unless a switch of
+//! `yorkie_storage::cut` is named, which is a measurement's own choice. The side tables do cost
 //! memory traffic, so the build is slower, and its timings are not comparable
 //! with a build without it.
 

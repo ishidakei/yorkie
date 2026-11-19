@@ -58,7 +58,11 @@ libc = "0.2"
 # `dupstats` is the measuring feature that counts how parallel search workers
 # repeat each other's work. Here it adds one read: the depth an entry holds a
 # position at and whether the running search wrote it, which a store looks at
-# before it writes. It implies `verbose1` and is off by default.
+# before it writes. It also adds the `cut` module: switches, read from the
+# `YORKIE_DUPSTATS_CUT` environment variable, that give each worker a slice of
+# the table of its own or keep the helpers from storing, so a measurement can cut
+# one channel between the workers. With the variable unset the table behaves as
+# without the feature. It implies `verbose1` and is off by default.
 [features]
 tt-entry16 = []
 verbose1 = []

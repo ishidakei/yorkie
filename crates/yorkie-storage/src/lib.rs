@@ -19,6 +19,8 @@ pub mod allocator;
 pub mod arena;
 pub mod book;
 mod config;
+#[cfg(feature = "dupstats")]
+pub mod cut;
 pub mod large_page;
 pub mod mapped;
 pub mod tt;

@@ -3463,6 +3463,12 @@ fn build_worker_shared(plan: &WorkerPlan) -> Vec<Arc<SharedHistories>> {
         std::collections::BTreeMap::new();
     for (&node, &count) in &counts {
         let thread_count = count.next_power_of_two();
+        #[cfg(feature = "dupstats")]
+        let thread_count = if yorkie_storage::cut::on(yorkie_storage::cut::Cut::HistSize1) {
+            1
+        } else {
+            thread_count
+        };
         // A CPU of that node: the first worker the plan puts there.
         let worker = plan
             .system_nodes()
@@ -3479,6 +3485,24 @@ fn build_worker_shared(plan: &WorkerPlan) -> Vec<Arc<SharedHistories>> {
             None => Arc::new(SharedHistories::new(thread_count)),
         };
         node_shared.insert(node, built);
+    }
+
+    #[cfg(feature = "dupstats")]
+    {
+        use yorkie_storage::cut::{Cut, on};
+        let (corr_own, pawn_own) = (on(Cut::CorrPrivate), on(Cut::PawnPrivate));
+        if corr_own || pawn_own {
+            return plan
+                .system_nodes()
+                .map(|node| {
+                    Arc::new(SharedHistories::private_over(
+                        Arc::clone(&node_shared[&node]),
+                        corr_own,
+                        pawn_own,
+                    ))
+                })
+                .collect();
+        }
     }
 
     plan.system_nodes()

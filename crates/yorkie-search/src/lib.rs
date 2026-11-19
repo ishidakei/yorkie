@@ -13,6 +13,10 @@ use yorkie_eval::{Accumulator, NetworkParams, evaluate_with};
 use yorkie_state::{Move, Position};
 
 pub mod book;
+// What each parallel worker takes from the others: only a build that measures
+// it.
+#[cfg(feature = "dupstats")]
+pub mod channels;
 mod config;
 // Parallel workers putting off a move another worker is searching: only a
 // build that asks for it, through the config or the feature.

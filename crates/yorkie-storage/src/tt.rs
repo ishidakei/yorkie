@@ -594,6 +594,10 @@ impl Cluster {
         #[cfg(feature = "verbose3")] marks: ValueMarks,
         #[cfg(feature = "verbose1")] updates: &mut u64,
     ) {
+        #[cfg(feature = "dupstats")]
+        if crate::cut::on(crate::cut::Cut::HelperNoStore) && crate::cut::worker() != 0 {
+            return;
+        }
         self.save_with_margin(
             REPLACE_DEPTH_MARGIN,
             slot,
@@ -859,8 +863,23 @@ fn mul_hi64(a: u64, b: u64) -> u64 {
 /// nothing is loaded to find the table's size.
 #[inline]
 fn cluster_index(key: u64, side_to_move: u8) -> usize {
+    #[cfg(feature = "dupstats")]
+    if crate::cut::on(crate::cut::Cut::TtPrivate) {
+        return private_cluster_index(key, side_to_move);
+    }
     let index = mul_hi64(key, CLUSTER_COUNT as u64) as usize;
     (index & !1) | (side_to_move as usize & 1)
+}
+
+/// The cluster index under [`crate::cut::Cut::TtPrivate`]: the same mapping
+/// into the calling worker's slice of the table instead of the whole of it.
+#[cfg(feature = "dupstats")]
+fn private_cluster_index(key: u64, side_to_move: u8) -> usize {
+    const SLICE: usize = (CLUSTER_COUNT / crate::cut::REGIONS) & !1;
+    const { assert!(SLICE >= 2) };
+    let base = (crate::cut::worker() as usize % crate::cut::REGIONS) * SLICE;
+    let index = mul_hi64(key, SLICE as u64) as usize;
+    base + ((index & !1) | (side_to_move as usize & 1))
 }
 
 /// The engine's transposition table — [`CLUSTER_COUNT`] contiguous `Cluster`s,

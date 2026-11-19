@@ -461,6 +461,17 @@ pub struct SharedHistories {
     pawn: Box<[AtomicI16], LargePageAlloc>,
     /// `pawnHistory.get_size() - 1` — the pawn slot mask.
     pawn_mask: usize,
+    /// The node's tables, which this worker's set reads and writes through for
+    /// each table it does not keep a private copy of; `None` on a node's own
+    /// set. See [`Self::private_over`].
+    #[cfg(feature = "dupstats")]
+    delegate: Option<std::sync::Arc<SharedHistories>>,
+    /// Whether this set keeps its correction table to itself.
+    #[cfg(feature = "dupstats")]
+    corr_own: bool,
+    /// Whether this set keeps its pawn table to itself.
+    #[cfg(feature = "dupstats")]
+    pawn_own: bool,
 }
 
 impl SharedHistories {
@@ -482,12 +493,35 @@ impl SharedHistories {
             corr_mask: corr_slots - 1,
             pawn: LargePageAlloc::zeroed_slice(pawn_slots * PAWN_SLOT_LEN),
             pawn_mask: pawn_slots - 1,
+            #[cfg(feature = "dupstats")]
+            delegate: None,
+            #[cfg(feature = "dupstats")]
+            corr_own: true,
+            #[cfg(feature = "dupstats")]
+            pawn_own: true,
         };
         // The correction fill of `0` is a no-op on the zeroed allocation, but is
         // written explicitly so every page is first-touched on the (bound) node.
         out.fill_correction(CORRECTION_INIT);
         out.fill_pawn(PAWN_INIT);
         out
+    }
+
+    /// One worker's set of the tables, for a measurement that cuts the sharing
+    /// of one or both: the correction table (when `corr_own`) and the pawn
+    /// table (when `pawn_own`) are the worker's own, sized for one worker as a
+    /// lone search's are, and every other read and write goes to `node`.
+    #[cfg(feature = "dupstats")]
+    pub fn private_over(
+        node: std::sync::Arc<SharedHistories>,
+        corr_own: bool,
+        pawn_own: bool,
+    ) -> Self {
+        let mut own = Self::new(1);
+        own.delegate = Some(node);
+        own.corr_own = corr_own;
+        own.pawn_own = pawn_own;
+        own
     }
 
     /// The node's thread count (the slot multiplier).
@@ -533,6 +567,12 @@ impl SharedHistories {
     /// is always inside the block. The length is a run-time value, so the bound
     /// has to be stated rather than derived from the type.
     fn corr_cell(&self, key: u64, color: Color, channel: CorrChannel) -> &AtomicI16 {
+        #[cfg(feature = "dupstats")]
+        if !self.corr_own
+            && let Some(node) = &self.delegate
+        {
+            return node.corr_cell(key, color, channel);
+        }
         let i = self.corr_index(key, color, channel);
         debug_assert!(i < self.correction.len());
         // SAFETY: see the doc comment — `key & corr_mask < corr_mask + 1` and
@@ -566,6 +606,12 @@ impl SharedHistories {
     /// The `[pc][to]` entry in the plane keyed by `pawn_key`. See
     /// [`Self::corr_cell`] for why the masked index needs no check.
     fn pawn_cell(&self, pawn_key: u64, pc: Piece, to: Square) -> &AtomicI16 {
+        #[cfg(feature = "dupstats")]
+        if !self.pawn_own
+            && let Some(node) = &self.delegate
+        {
+            return node.pawn_cell(pawn_key, pc, to);
+        }
         let i = self.pawn_index(pawn_key, pc, to);
         debug_assert!(i < self.pawn.len());
         // SAFETY: `pawn_key & pawn_mask < pawn_mask + 1` and the table holds

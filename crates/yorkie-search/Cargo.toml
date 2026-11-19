@@ -65,10 +65,15 @@ yorkie-eval = { path = "../yorkie-eval", features = ["source-network"] }
 # search does with the table and in its move loop: the shallower stores that
 # overwrite deeper entries, the table cutoffs, the singular extensions and where
 # a beta cutoff comes. It changes no search
-# decision, but the tables cost memory traffic, so a build with it is slower
+# decision unless the `YORKIE_DUPSTATS_CUT` environment variable names a switch
+# of `yorkie-storage`'s `cut` module (a worker's own correction or pawn table,
+# or a use of a table entry withheld from the main worker), but the tables cost
+# memory traffic, so a build with it is slower
 # than one without and its timings are not comparable with theirs. It also
 # keeps each worker's record of when it finished each root iteration (the
-# `timeline` module), and with `verbose3` the latch a measurement uses to end a
+# `timeline` module) and, when the `YORKIE_DUPSTATS_LOG` environment variable
+# names a file, appends to it what each worker took from the table and how its
+# root searches went (the `channels` module); with `verbose3` the latch a measurement uses to end a
 # search at its first worker to finish. It implies `verbose1`, whose statistics
 # line carries its totals. Off by default.
 #
