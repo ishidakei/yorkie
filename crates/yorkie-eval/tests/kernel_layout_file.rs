@@ -23,6 +23,7 @@ fn matching_header() -> Header {
         target_features: network_file::TARGET_FEATURES.to_string(),
         dims: NetDims::STANDARD,
         data_bytes: network_file::DATA_BYTES as u64,
+        ft_packed: network_file::FT_PACKED,
         net: yorkie_eval::NetHeader {
             version: 0x7AF3_2F16,
             hash: 0x3C20_3B32,
@@ -201,6 +202,38 @@ fn a_matching_file_opens_and_carries_its_warnings_forward() {
     assert_eq!(len, network_file::DATA_BYTES);
 
     let _ = std::fs::remove_file(&path);
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_file_whose_weights_are_in_the_other_form_is_refused_when_it_is_opened() {
+    // The kernels would read packed bytes as 16-bit weights, or the reverse.
+    let path = temp_path("other-form");
+    let mut header = matching_header();
+    header.ft_packed = !network_file::FT_PACKED;
+    write_file(&path, &header);
+
+    let err = place(&path).expect_err("must refuse");
+    let message = nnue_error_message(&err);
+    assert!(
+        message.contains("feature-transformer weights"),
+        "got: {message}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn the_weights_are_packed_exactly_where_the_build_has_the_kernels_for_them() {
+    // The shipped network needs far fewer corrections than the limit, so a
+    // build with a network staged packs it whenever its target features allow.
+    let staged = network_file::SOURCE != Source::Absent;
+    assert_eq!(
+        network_file::FT_PACKED,
+        staged && network_file::ft_packing_targets(network_file::TARGET_FEATURES),
+        "a build with no network staged packs nothing"
+    );
 }
 
 #[cfg_attr(miri, ignore)]

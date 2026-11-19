@@ -175,6 +175,7 @@ fn synthetic_header() -> network_file::Header {
         target_features: network_file::TARGET_FEATURES.to_string(),
         dims: network_file::NetDims::STANDARD,
         data_bytes: network_file::DATA_BYTES as u64,
+        ft_packed: network_file::FT_PACKED,
         net: yorkie_eval::NetHeader {
             version: NNUE_VERSION,
             hash: NNUE_HASH_VALUE,

@@ -48,8 +48,14 @@ fn the_evaluation_file_holds_the_source_networks_parameters() {
     }
 
     let bytes = std::fs::read(&source).expect("read the source network");
-    let converted =
+    let mut converted =
         parameter_bytes(&bytes, &NetDims::STANDARD).expect("the source network is readable");
+    if network_file::FT_PACKED {
+        assert!(
+            network_file::pack_ft_weights(&mut converted).is_some(),
+            "a build that packed the weights packed a network that needs few enough corrections"
+        );
+    }
     let written = parameter_region(&engine_file).expect("read the evaluation file");
 
     assert_eq!(

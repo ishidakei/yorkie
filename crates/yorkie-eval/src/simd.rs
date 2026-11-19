@@ -29,11 +29,16 @@ use crate::types::HIDDEN_SIZE;
 #[allow(dead_code)]
 pub mod scalar;
 #[allow(dead_code)]
+pub mod scalar_packed;
+#[allow(dead_code)]
 pub mod scalar_post_ft;
 
 #[allow(dead_code)]
 #[cfg(target_arch = "x86_64")]
 pub mod avx512;
+#[allow(dead_code)]
+#[cfg(target_arch = "x86_64")]
+pub mod avx512_packed;
 #[allow(dead_code)]
 #[cfg(target_arch = "x86_64")]
 pub mod avx512_post_ft;
@@ -99,49 +104,72 @@ pub const fn active_backend() -> Backend {
     target_feature = "avx512bw"
 ))]
 pub mod transformer_kernel {
-    use super::avx512;
+    use super::{avx512 as wide, avx512_packed as packed};
     use crate::features::FeatureIndex;
-    use crate::types::HIDDEN_SIZE;
+    use crate::types::{FtColumns, HIDDEN_SIZE};
+
+    /// Call kernel `$name` of whichever form `$cols` is in, the columns passed
+    /// between the `$pre` and the `$post` arguments.
+    macro_rules! by_form {
+        ($cols:expr, $name:ident, [$($pre:expr),*], [$($post:expr),*]) => {
+            match $cols {
+                // SAFETY: this module is compiled only into a build enabling
+                // exactly the features the callee's `#[target_feature]` names,
+                // and such a build is `-C target-cpu=native`, so it only ever
+                // runs on a host with them.
+                FtColumns::Wide(w) => unsafe { wide::$name($($pre,)* w, $($post),*) },
+                // SAFETY: as above.
+                FtColumns::Packed(p) => unsafe { packed::$name($($pre,)* p, $($post),*) },
+            }
+        };
+    }
 
     /// Add each active feature's FT weight column into `out`.
     #[inline]
-    pub fn add_features(out: &mut [i16; HIDDEN_SIZE], weights: &[i16], indices: &[FeatureIndex]) {
-        // SAFETY: this module is compiled only into a build enabling exactly
-        // the features the callee's `#[target_feature]` names, and such a build
-        // is `-C target-cpu=native`, so it only ever runs on a host with them.
-        unsafe { avx512::add_features(out, weights, indices) }
+    pub fn add_features(
+        out: &mut [i16; HIDDEN_SIZE],
+        cols: FtColumns<'_>,
+        indices: &[FeatureIndex],
+    ) {
+        by_form!(cols, add_features, [out], [indices])
     }
 
     /// Subtract each feature's FT weight column from `out`.
     #[inline]
-    pub fn sub_features(out: &mut [i16; HIDDEN_SIZE], weights: &[i16], indices: &[FeatureIndex]) {
-        // SAFETY: see `add_features`.
-        unsafe { avx512::sub_features(out, weights, indices) }
+    pub fn sub_features(
+        out: &mut [i16; HIDDEN_SIZE],
+        cols: FtColumns<'_>,
+        indices: &[FeatureIndex],
+    ) {
+        by_form!(cols, sub_features, [out], [indices])
     }
 
     /// Fused single-add / single-sub delta.
     #[inline]
     pub fn add_sub_features(
         out: &mut [i16; HIDDEN_SIZE],
-        weights: &[i16],
+        cols: FtColumns<'_>,
         added: FeatureIndex,
         removed: FeatureIndex,
     ) {
-        // SAFETY: see `add_features`.
-        unsafe { avx512::add_sub_features(out, weights, added, removed) }
+        by_form!(cols, add_sub_features, [out], [added, removed])
     }
 
     /// Fused single-add / double-sub delta (capture-style updates).
     #[inline]
     pub fn add_sub_sub_features(
         out: &mut [i16; HIDDEN_SIZE],
-        weights: &[i16],
+        cols: FtColumns<'_>,
         added: FeatureIndex,
         removed_a: FeatureIndex,
         removed_b: FeatureIndex,
     ) {
-        // SAFETY: see `add_features`.
-        unsafe { avx512::add_sub_sub_features(out, weights, added, removed_a, removed_b) }
+        by_form!(
+            cols,
+            add_sub_sub_features,
+            [out],
+            [added, removed_a, removed_b]
+        )
     }
 
     /// [`add_sub_features`] reading `src` and writing `dst`.
@@ -149,12 +177,11 @@ pub mod transformer_kernel {
     pub fn add_sub_features_from(
         src: &[i16; HIDDEN_SIZE],
         dst: &mut [i16; HIDDEN_SIZE],
-        weights: &[i16],
+        cols: FtColumns<'_>,
         added: FeatureIndex,
         removed: FeatureIndex,
     ) {
-        // SAFETY: see `add_features`.
-        unsafe { avx512::add_sub_features_from(src, dst, weights, added, removed) }
+        by_form!(cols, add_sub_features_from, [src, dst], [added, removed])
     }
 
     /// [`add_sub_sub_features`] reading `src` and writing `dst`.
@@ -162,13 +189,17 @@ pub mod transformer_kernel {
     pub fn add_sub_sub_features_from(
         src: &[i16; HIDDEN_SIZE],
         dst: &mut [i16; HIDDEN_SIZE],
-        weights: &[i16],
+        cols: FtColumns<'_>,
         added: FeatureIndex,
         removed_a: FeatureIndex,
         removed_b: FeatureIndex,
     ) {
-        // SAFETY: see `add_features`.
-        unsafe { avx512::add_sub_sub_features_from(src, dst, weights, added, removed_a, removed_b) }
+        by_form!(
+            cols,
+            add_sub_sub_features_from,
+            [src, dst],
+            [added, removed_a, removed_b]
+        )
     }
 
     /// `dst = src - sum(removed) + sum(added)`, the first pass reading `src`.
@@ -176,12 +207,11 @@ pub mod transformer_kernel {
     pub fn sub_add_features_from(
         src: &[i16; HIDDEN_SIZE],
         dst: &mut [i16; HIDDEN_SIZE],
-        weights: &[i16],
+        cols: FtColumns<'_>,
         added: &[FeatureIndex],
         removed: &[FeatureIndex],
     ) {
-        // SAFETY: see `add_features`.
-        unsafe { avx512::sub_add_features_from(src, dst, weights, added, removed) }
+        by_form!(cols, sub_add_features_from, [src, dst], [added, removed])
     }
 
     /// Update `out` in place and leave the result in `copy` too, the last pass
@@ -190,27 +220,123 @@ pub mod transformer_kernel {
     pub fn sub_add_features_tee(
         out: &mut [i16; HIDDEN_SIZE],
         copy: &mut [i16; HIDDEN_SIZE],
-        weights: &[i16],
+        cols: FtColumns<'_>,
         added: &[FeatureIndex],
         removed: &[FeatureIndex],
     ) {
-        // SAFETY: see `add_features`.
-        unsafe { avx512::sub_add_features_tee(out, copy, weights, added, removed) }
+        by_form!(cols, sub_add_features_tee, [out, copy], [added, removed])
     }
 }
 
 /// Feature-transformer kernels, scalar arm; the AVX-512 arm above carries the
-/// selection rule.
+/// selection rule. A build compiling this arm never packs its own network, so
+/// the packed form reaches it only from a network made in memory.
 #[cfg(not(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "avx512bw"
 )))]
 pub mod transformer_kernel {
-    pub use super::scalar::{
-        add_features, add_sub_features, add_sub_features_from, add_sub_sub_features,
-        add_sub_sub_features_from, sub_add_features_from, sub_add_features_tee, sub_features,
-    };
+    use super::{scalar as wide, scalar_packed as packed};
+    use crate::features::FeatureIndex;
+    use crate::types::{FtColumns, HIDDEN_SIZE};
+
+    /// Call kernel `$name` of whichever form `$cols` is in, the columns passed
+    /// between the `$pre` and the `$post` arguments.
+    macro_rules! by_form {
+        ($cols:expr, $name:ident, [$($pre:expr),*], [$($post:expr),*]) => {
+            match $cols {
+                FtColumns::Wide(w) => wide::$name($($pre,)* w, $($post),*),
+                FtColumns::Packed(p) => packed::$name($($pre,)* p, $($post),*),
+            }
+        };
+    }
+
+    pub fn add_features(
+        out: &mut [i16; HIDDEN_SIZE],
+        cols: FtColumns<'_>,
+        indices: &[FeatureIndex],
+    ) {
+        by_form!(cols, add_features, [out], [indices])
+    }
+
+    pub fn sub_features(
+        out: &mut [i16; HIDDEN_SIZE],
+        cols: FtColumns<'_>,
+        indices: &[FeatureIndex],
+    ) {
+        by_form!(cols, sub_features, [out], [indices])
+    }
+
+    pub fn add_sub_features(
+        out: &mut [i16; HIDDEN_SIZE],
+        cols: FtColumns<'_>,
+        added: FeatureIndex,
+        removed: FeatureIndex,
+    ) {
+        by_form!(cols, add_sub_features, [out], [added, removed])
+    }
+
+    pub fn add_sub_sub_features(
+        out: &mut [i16; HIDDEN_SIZE],
+        cols: FtColumns<'_>,
+        added: FeatureIndex,
+        removed_a: FeatureIndex,
+        removed_b: FeatureIndex,
+    ) {
+        by_form!(
+            cols,
+            add_sub_sub_features,
+            [out],
+            [added, removed_a, removed_b]
+        )
+    }
+
+    pub fn add_sub_features_from(
+        src: &[i16; HIDDEN_SIZE],
+        dst: &mut [i16; HIDDEN_SIZE],
+        cols: FtColumns<'_>,
+        added: FeatureIndex,
+        removed: FeatureIndex,
+    ) {
+        by_form!(cols, add_sub_features_from, [src, dst], [added, removed])
+    }
+
+    pub fn add_sub_sub_features_from(
+        src: &[i16; HIDDEN_SIZE],
+        dst: &mut [i16; HIDDEN_SIZE],
+        cols: FtColumns<'_>,
+        added: FeatureIndex,
+        removed_a: FeatureIndex,
+        removed_b: FeatureIndex,
+    ) {
+        by_form!(
+            cols,
+            add_sub_sub_features_from,
+            [src, dst],
+            [added, removed_a, removed_b]
+        )
+    }
+
+    pub fn sub_add_features_from(
+        src: &[i16; HIDDEN_SIZE],
+        dst: &mut [i16; HIDDEN_SIZE],
+        cols: FtColumns<'_>,
+        added: &[FeatureIndex],
+        removed: &[FeatureIndex],
+    ) {
+        by_form!(cols, sub_add_features_from, [src, dst], [added, removed])
+    }
+
+    pub fn sub_add_features_tee(
+        out: &mut [i16; HIDDEN_SIZE],
+        copy: &mut [i16; HIDDEN_SIZE],
+        cols: FtColumns<'_>,
+        added: &[FeatureIndex],
+        removed: &[FeatureIndex],
+    ) {
+        by_form!(cols, sub_add_features_tee, [out, copy], [added, removed])
+    }
 }
 
 /// Output-transform and layer element-wise kernels, selected on the same

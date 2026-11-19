@@ -360,7 +360,7 @@ fn a_faulty_yorkie_book_withholds_readyok() {
 /// A book the game below never hits: a shared entry for a position it does not
 /// reach, and a path-dependent entry for a position it does reach, by a move
 /// order other than the one the entry's support names.
-#[cfg(feature = "verbose1")]
+#[cfg(feature = "verbose2")]
 fn missed_book_image() -> Vec<u8> {
     let shared: Vec<YkEntry<'_>> = vec![(&["5g5f"], vec![("8c8d", 10_000)], vec![])];
     let pathdep: Vec<YkEntry<'_>> = vec![(
@@ -373,7 +373,7 @@ fn missed_book_image() -> Vec<u8> {
 
 /// The `alloc=` count of every `info string stats` line in `out`, an omitted
 /// item counting as zero.
-#[cfg(feature = "verbose1")]
+#[cfg(feature = "verbose2")]
 fn reply_allocations(out: &str) -> Vec<u64> {
     out.lines()
         .filter_map(|l| l.strip_prefix("info string stats "))
@@ -389,7 +389,14 @@ fn reply_allocations(out: &str) -> Vec<u64> {
 /// Recording and handing over the game path takes no allocation once the game
 /// has started: over one game, every reply of a session reading a yorkie book
 /// allocates no more than the same reply without one.
-#[cfg(feature = "verbose1")]
+///
+/// Every reply searches a fixed number of nodes rather than to a clock: a
+/// clocked search ends where the time manager stops it, so two sessions under a
+/// loaded machine search different trees and allocate different amounts with
+/// or without a book. A node bound is an analysis clause, so this needs
+/// `verbose2`; the book is probed and the game path recorded for it all the
+/// same.
+#[cfg(feature = "verbose2")]
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_loaded_yorkie_book_adds_no_allocation_to_a_reply() {
@@ -416,7 +423,7 @@ fn a_loaded_yorkie_book_adds_no_allocation_to_a_reply() {
     ];
     let mut input = String::from("isready\nusinewgame\n");
     for moves in game {
-        input.push_str(&format!("position startpos{moves}\n{GO}"));
+        input.push_str(&format!("position startpos{moves}\ngo nodes 500\n"));
     }
     input.push_str("quit\n");
 

@@ -23,7 +23,11 @@ use yorkie_state::TextWriter;
 #[cfg(any(test, feature = "source-network"))]
 use yorkie_storage::LargePageAlloc;
 
-use crate::nnue_layout::{DATA_BYTES, SECTION_ALIGN, SPANS, Span, StackSpans};
+use crate::features::FeatureIndex;
+use crate::nnue_layout::{
+    DATA_BYTES, FT_PACKED_OFFSETS_AT, FT_PACKED_RECORDS_AT, FT_WEIGHT_COUNT, SECTION_ALIGN, SPANS,
+    Span, StackSpans,
+};
 pub use crate::nnue_layout::{
     FC_0_INPUT_DIMS, FC_0_OUTPUT_DIMS, FC_0_PADDED_INPUT_DIMS, FC_1_INPUT_DIMS, FC_1_OUTPUT_DIMS,
     FC_1_PADDED_INPUT_DIMS, FC_2_INPUT_DIMS, FC_2_OUTPUT_DIMS, FC_2_PADDED_INPUT_DIMS, HIDDEN_SIZE,
@@ -149,9 +153,18 @@ pub trait NetworkParams: sealed::Sealed + Copy + Send + Sync + Sized {
         unsafe { array(self.parameters(), FT_BIASES) }
     }
 
+    /// The feature transformer's weights as 16-bit values, row-major
+    /// `[feature][lane]`. Meaningful only where [`Self::ft_columns`] says they
+    /// are not packed; a packed network's bytes read back as nonsense here.
     fn ft_weights(&self) -> &[i16] {
         // SAFETY: as above, for its weights.
         unsafe { array(self.parameters(), FT_WEIGHTS) }
+    }
+
+    /// The feature transformer's weight columns in whichever form they are
+    /// stored, which is what the accumulator kernels read.
+    fn ft_columns(&self) -> FtColumns<'_> {
+        FtColumns::Wide(self.ft_weights())
     }
 
     /// Layer stack `bucket`'s six arrays.
@@ -179,6 +192,8 @@ pub trait NetworkParams: sealed::Sealed + Copy + Send + Sync + Sized {
 #[derive(Clone, Copy, Debug)]
 pub struct PtrNetwork {
     base: *const u8,
+    /// Whether the feature-transformer weights at `base` are packed.
+    ft_packed: bool,
 }
 
 // SAFETY: a network is read-only from the moment it exists — the parameters are
@@ -196,13 +211,144 @@ impl PtrNetwork {
     /// `base` must meet what [`NetworkParams::parameters`] requires of the
     /// address it returns.
     pub const unsafe fn over(base: *const u8) -> Self {
-        Self { base }
+        Self {
+            base,
+            ft_packed: false,
+        }
+    }
+
+    /// The network whose parameters start at `base`, its feature-transformer
+    /// weights packed.
+    ///
+    /// # Safety
+    /// As [`Self::over`], and the weight array must hold the packed form
+    /// [`crate::network_file::pack_ft_weights`] writes.
+    pub const unsafe fn over_packed(base: *const u8) -> Self {
+        Self {
+            base,
+            ft_packed: true,
+        }
     }
 }
 
 impl NetworkParams for PtrNetwork {
     fn parameters(&self) -> *const u8 {
         self.base
+    }
+
+    fn ft_columns(&self) -> FtColumns<'_> {
+        if self.ft_packed {
+            // SAFETY: `over_packed`'s caller vouched for the packed form.
+            FtColumns::Packed(unsafe { PackedFt::at(self.base) })
+        } else {
+            FtColumns::Wide(self.ft_weights())
+        }
+    }
+}
+
+/// The feature transformer's weight columns, in one of the two forms a
+/// network can store them in.
+#[derive(Clone, Copy, Debug)]
+pub enum FtColumns<'a> {
+    /// 16-bit weights, row-major `[feature][lane]`.
+    Wide(&'a [i16]),
+    /// One byte per weight plus corrections.
+    Packed(PackedFt<'a>),
+}
+
+impl FtColumns<'_> {
+    /// Feature `idx`'s column, reconstructed as 16-bit weights.
+    pub fn column(self, idx: FeatureIndex) -> [i16; HIDDEN_SIZE] {
+        match self {
+            FtColumns::Wide(weights) => *crate::simd::ft_column(weights, idx),
+            FtColumns::Packed(packed) => {
+                let mut col = [0i16; HIDDEN_SIZE];
+                for (lane, &base) in col.iter_mut().zip(packed.bases(idx)) {
+                    *lane = i16::from(base) << 1;
+                }
+                packed.correct::<false>(&mut col, idx);
+                col
+            }
+        }
+    }
+}
+
+/// The packed feature-transformer weights: per feature, one signed byte per
+/// lane that reads back as twice its value, and a short list of corrections
+/// for the lanes that are not exactly that.
+#[derive(Clone, Copy, Debug)]
+pub struct PackedFt<'a> {
+    bases: &'a [i8],
+    offsets: &'a [u32],
+    /// Every record the weight array has room for. A feature's own are named by
+    /// its offsets; the rest are zero and never read.
+    records: &'a [u32],
+}
+
+impl PackedFt<'_> {
+    /// The packed weights of the network whose parameters start at `base`.
+    ///
+    /// # Safety
+    /// As [`NetworkParams::parameters`], with the weight array in the packed
+    /// form.
+    pub(crate) unsafe fn at<'a>(base: *const u8) -> PackedFt<'a> {
+        let weights = FT_WEIGHTS.offset;
+        let record_room = (FT_WEIGHT_COUNT * 2 - FT_PACKED_RECORDS_AT) / 4;
+        // SAFETY: the three arrays lie inside the weight array, which the
+        // caller vouches for, and each starts on a 64-byte boundary.
+        unsafe {
+            PackedFt {
+                bases: array(
+                    base,
+                    Span {
+                        offset: weights,
+                        count: FT_WEIGHT_COUNT,
+                    },
+                ),
+                offsets: array(
+                    base,
+                    Span {
+                        offset: weights + FT_PACKED_OFFSETS_AT,
+                        count: NUM_FEATURES + 1,
+                    },
+                ),
+                records: array(
+                    base,
+                    Span {
+                        offset: weights + FT_PACKED_RECORDS_AT,
+                        count: record_room,
+                    },
+                ),
+            }
+        }
+    }
+}
+
+impl<'a> PackedFt<'a> {
+    /// Feature `idx`'s bytes, one per lane.
+    #[inline]
+    pub(crate) fn bases(self, idx: FeatureIndex) -> &'a [i8; HIDDEN_SIZE] {
+        let base = idx as usize * HIDDEN_SIZE;
+        self.bases[base..base + HIDDEN_SIZE]
+            .as_array()
+            .expect("a HIDDEN_SIZE-long subslice borrows as the array of that width")
+    }
+
+    /// Add (or, `SUB`, subtract) feature `idx`'s corrections to `dst`, which
+    /// already holds the byte pass over that feature's column.
+    #[inline]
+    pub(crate) fn correct<const SUB: bool>(self, dst: &mut [i16; HIDDEN_SIZE], idx: FeatureIndex) {
+        let idx = idx as usize;
+        let (start, end) = (self.offsets[idx] as usize, self.offsets[idx + 1] as usize);
+        for &record in &self.records[start..end] {
+            let lane = &mut dst[usize::from(record as u16)];
+            let correction = (record >> 16) as i16;
+            *lane = if SUB {
+                lane.wrapping_sub(correction)
+            } else {
+                lane.wrapping_add(correction)
+            };
+        }
     }
 }
 
@@ -227,6 +373,7 @@ unsafe fn array<'a, T>(base: *const u8, span: Span) -> &'a [T] {
 #[cfg(any(test, feature = "source-network"))]
 pub struct OwnedNetwork {
     bytes: Box<[u8], LargePageAlloc>,
+    ft_packed: bool,
 }
 
 #[cfg(any(test, feature = "source-network"))]
@@ -235,6 +382,7 @@ impl OwnedNetwork {
     pub fn zeroed() -> Self {
         Self {
             bytes: LargePageAlloc::zeroed_slice::<u8>(DATA_BYTES),
+            ft_packed: false,
         }
     }
 
@@ -246,7 +394,26 @@ impl OwnedNetwork {
         // SAFETY: the block holds `DATA_BYTES` zeroed — hence initialised —
         // bytes on a large-page boundary, so every span is aligned and
         // in-bounds, and the borrow keeps it alive for as long as the network.
-        unsafe { PtrNetwork::over(self.bytes.as_ptr()) }
+        unsafe {
+            if self.ft_packed {
+                PtrNetwork::over_packed(self.bytes.as_ptr())
+            } else {
+                PtrNetwork::over(self.bytes.as_ptr())
+            }
+        }
+    }
+
+    /// Pack the feature-transformer weights in place, as a build does for the
+    /// file it writes, and report how many correction records that took — or
+    /// `None`, leaving the weights 16-bit, when the network needs too many.
+    ///
+    /// # Panics
+    /// Panics if the weights are packed already.
+    pub fn pack_ft(&mut self) -> Option<usize> {
+        assert!(!self.ft_packed, "the weights are packed already");
+        let records = crate::nnue_layout::pack_ft_weights(&mut self.bytes[..DATA_BYTES])?;
+        self.ft_packed = true;
+        Some(records)
     }
 
     /// Mutable view of `ft_biases` (`HIDDEN_SIZE` i16).
@@ -337,6 +504,13 @@ pub enum NnueError {
     Mismatch {
         reason: String,
     },
+    /// The evaluation file holds its feature-transformer weights in the other
+    /// form from the one this binary's kernels read: packed to a byte each, or
+    /// 16 bits wide.
+    PackingMismatch {
+        file_packed: bool,
+        build_packed: bool,
+    },
     NotLoaded,
 }
 
@@ -371,6 +545,17 @@ impl NnueError {
                 out.bytes(b"the evaluation file is not the one this build reads: ")
                     .bytes(reason.as_bytes());
             }
+            NnueError::PackingMismatch {
+                file_packed,
+                build_packed,
+            } => {
+                out.bytes(b"the evaluation file is not the one this build reads: ")
+                    .bytes(b"feature-transformer weights ")
+                    .bytes(packing(*file_packed))
+                    .bytes(b" in the file, ")
+                    .bytes(packing(*build_packed))
+                    .bytes(b" in this build");
+            }
             NnueError::NotLoaded => {
                 out.bytes(
                     b"no NNUE network loaded; the engine reads one from the evaluation \
@@ -381,10 +566,133 @@ impl NnueError {
     }
 }
 
+/// How a feature-transformer weight form reads in a message.
+fn packing(packed: bool) -> &'static [u8] {
+    if packed { b"packed" } else { b"16-bit" }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::nnue_layout::net_spans;
+    use crate::nnue_layout::{FT_PACKED_RECORD_LIMIT, ft_packed_base, net_spans};
+
+    /// A handful of packed columns in this process's own memory, so a kernel
+    /// test can run the packed form over a few features rather than over a
+    /// whole network's worth of them.
+    pub(crate) struct PackedColumns {
+        bases: Vec<i8>,
+        offsets: Vec<u32>,
+        records: Vec<u32>,
+    }
+
+    impl PackedColumns {
+        /// Pack `weights`, row-major `[feature][lane]`, as a build packs a
+        /// network, with no limit on the corrections.
+        pub(crate) fn from_wide(weights: &[i16]) -> Self {
+            let mut columns = PackedColumns {
+                bases: weights.iter().map(|&w| ft_packed_base(w)).collect(),
+                offsets: vec![0],
+                records: Vec::new(),
+            };
+            for column in weights.as_chunks::<HIDDEN_SIZE>().0 {
+                for (lane, &w) in column.iter().enumerate() {
+                    let correction = w.wrapping_sub(2 * i16::from(ft_packed_base(w)));
+                    if correction != 0 {
+                        columns
+                            .records
+                            .push(lane as u32 | (u32::from(correction as u16) << 16));
+                    }
+                }
+                columns.offsets.push(columns.records.len() as u32);
+            }
+            columns
+        }
+
+        pub(crate) fn view(&self) -> PackedFt<'_> {
+            PackedFt {
+                bases: &self.bases,
+                offsets: &self.offsets,
+                records: &self.records,
+            }
+        }
+
+        pub(crate) fn record_count(&self) -> usize {
+            self.records.len()
+        }
+    }
+
+    #[test]
+    fn a_packed_column_reads_back_as_the_16_bit_one() {
+        let mut weights = vec![0i16; 3 * HIDDEN_SIZE];
+        for (i, w) in weights.iter_mut().enumerate() {
+            *w = (i as i16).wrapping_mul(97) % 300;
+        }
+        // The extremes, whose halves clamp hardest.
+        weights[5] = i16::MIN;
+        weights[6] = i16::MAX;
+        weights[HIDDEN_SIZE + 7] = -257;
+        weights[2 * HIDDEN_SIZE - 1] = 256;
+        let packed = PackedColumns::from_wide(&weights);
+        assert!(packed.record_count() > 0);
+        for (idx, column) in weights.as_chunks::<HIDDEN_SIZE>().0.iter().enumerate() {
+            assert_eq!(
+                &FtColumns::Packed(packed.view()).column(idx as FeatureIndex),
+                column,
+                "column {idx}"
+            );
+        }
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn packing_a_network_keeps_every_weight() {
+        let mut owned = OwnedNetwork::zeroed();
+        let touched: [(usize, usize, i16); 7] = [
+            (0, 0, 254),
+            (0, 1, -256),
+            (0, HIDDEN_SIZE - 1, 3),
+            (17, 9, i16::MIN),
+            (17, 10, i16::MAX),
+            (NUM_FEATURES - 1, 0, -1),
+            (NUM_FEATURES - 1, HIDDEN_SIZE - 1, 500),
+        ];
+        for &(feature, lane, w) in &touched {
+            owned.ft_weights_mut()[feature * HIDDEN_SIZE + lane] = w;
+        }
+        let expected: Vec<[i16; HIDDEN_SIZE]> = touched
+            .iter()
+            .map(|&(feature, ..)| owned.network().ft_columns().column(feature as FeatureIndex))
+            .collect();
+
+        // Odd, or with a half outside a byte: 3, MIN, MAX, -1 and 500.
+        assert_eq!(owned.pack_ft(), Some(5));
+        let net = owned.network();
+        assert!(matches!(net.ft_columns(), FtColumns::Packed(_)));
+        for (&(feature, ..), column) in touched.iter().zip(&expected) {
+            assert_eq!(
+                &net.ft_columns().column(feature as FeatureIndex),
+                column,
+                "feature {feature}"
+            );
+        }
+        assert_eq!(net.ft_columns().column(1), [0; HIDDEN_SIZE]);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_network_needing_too_many_corrections_keeps_its_16_bit_weights() {
+        let mut owned = OwnedNetwork::zeroed();
+        owned.ft_weights_mut()[..=FT_PACKED_RECORD_LIMIT].fill(1);
+        assert_eq!(owned.pack_ft(), None);
+        let net = owned.network();
+        assert!(matches!(net.ft_columns(), FtColumns::Wide(_)));
+        assert!(
+            net.ft_weights()[..=FT_PACKED_RECORD_LIMIT]
+                .iter()
+                .all(|&w| w == 1)
+        );
+        assert_eq!(net.ft_weights()[FT_PACKED_RECORD_LIMIT + 1], 0);
+    }
 
     /// Every parameter sub-array's `(start_addr, byte_len)`.
     fn sub_arrays(net: &PtrNetwork) -> Vec<(usize, usize)> {
@@ -531,6 +839,18 @@ mod tests {
             reason: "made from no network file".to_string(),
         });
         assert!(msg.contains("made from no network file"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_packing_mismatch_names_both_forms() {
+        let msg = message(&NnueError::PackingMismatch {
+            file_packed: false,
+            build_packed: true,
+        });
+        assert!(
+            msg.contains("feature-transformer weights 16-bit in the file, packed in this build"),
+            "got: {msg}"
+        );
     }
 
     #[test]

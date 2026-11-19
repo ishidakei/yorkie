@@ -64,7 +64,7 @@ pub use transformer::{Accumulator, FT_OUTPUT_DIMS};
 pub use types::OwnedNetwork;
 pub use types::{
     FC_0_INPUT_DIMS, FC_0_OUTPUT_DIMS, FC_0_PADDED_INPUT_DIMS, FC_1_INPUT_DIMS, FC_1_OUTPUT_DIMS,
-    FC_1_PADDED_INPUT_DIMS, FC_2_INPUT_DIMS, FC_2_OUTPUT_DIMS, FC_2_PADDED_INPUT_DIMS, HIDDEN_SIZE,
-    HIDDEN1_DIMS, HIDDEN2_DIMS, LAYER_STACKS, NUM_FEATURES, NetDims, NetHeader, NetStack,
-    NetworkParams, NnueError, PtrNetwork,
+    FC_1_PADDED_INPUT_DIMS, FC_2_INPUT_DIMS, FC_2_OUTPUT_DIMS, FC_2_PADDED_INPUT_DIMS, FtColumns,
+    HIDDEN_SIZE, HIDDEN1_DIMS, HIDDEN2_DIMS, LAYER_STACKS, NUM_FEATURES, NetDims, NetHeader,
+    NetStack, NetworkParams, NnueError, PackedFt, PtrNetwork,
 };

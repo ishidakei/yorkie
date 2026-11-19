@@ -27,7 +27,7 @@ use crate::features::{
 };
 use crate::finny::FinnyCache;
 use crate::simd::{post_ft_kernel, transformer_kernel};
-use crate::types::{FC_0_INPUT_DIMS, HIDDEN_SIZE, NetworkParams};
+use crate::types::{FC_0_INPUT_DIMS, FtColumns, HIDDEN_SIZE, NetworkParams};
 
 /// Width of the byte buffer the output transform fills: one lane per fc_0
 /// input, i.e. `HIDDEN_SIZE/2` per perspective across the two perspectives.
@@ -97,7 +97,7 @@ impl Accumulator {
             refresh_perspective(
                 &mut self.perspectives[color.index()],
                 net.ft_biases(),
-                net.ft_weights(),
+                net.ft_columns(),
                 &feats,
             );
         }
@@ -146,7 +146,7 @@ impl Accumulator {
                 refresh_perspective(
                     &mut next.perspectives[i],
                     net.ft_biases(),
-                    net.ft_weights(),
+                    net.ft_columns(),
                     &active_features(pos, color),
                 );
             } else {
@@ -155,7 +155,7 @@ impl Accumulator {
                 next.perspectives[i] = self.perspectives[i];
                 apply_diff(
                     &mut next.perspectives[i],
-                    net.ft_weights(),
+                    net.ft_columns(),
                     &added,
                     &removed,
                 );
@@ -189,7 +189,7 @@ impl Accumulator {
                 Some(pd) => apply_diff_from(
                     &src.perspectives[i],
                     &mut dst.perspectives[i],
-                    net.ft_weights(),
+                    net.ft_columns(),
                     pd.added(),
                     pd.removed(),
                 ),
@@ -199,7 +199,7 @@ impl Accumulator {
                     refresh_perspective(
                         &mut dst.perspectives[i],
                         net.ft_biases(),
-                        net.ft_weights(),
+                        net.ft_columns(),
                         &feats,
                     );
                 }
@@ -234,7 +234,7 @@ impl Accumulator {
                 Some(pd) => apply_diff_from(
                     &src.perspectives[i],
                     &mut dst.perspectives[i],
-                    net.ft_weights(),
+                    net.ft_columns(),
                     pd.added(),
                     pd.removed(),
                 ),
@@ -289,7 +289,7 @@ impl Default for Accumulator {
 pub(crate) fn refresh_perspective(
     out: &mut [i16; HIDDEN_SIZE],
     ft_biases: &[i16],
-    ft_weights: &[i16],
+    ft_weights: FtColumns<'_>,
     indices: &[FeatureIndex],
 ) {
     out.copy_from_slice(ft_biases);
@@ -304,7 +304,7 @@ pub(crate) fn refresh_perspective(
 /// round-trip per lane; any other shape falls back to a separate sub-then-add.
 pub(crate) fn apply_diff(
     out: &mut [i16; HIDDEN_SIZE],
-    weights: &[i16],
+    weights: FtColumns<'_>,
     added: &[FeatureIndex],
     removed: &[FeatureIndex],
 ) {
@@ -329,7 +329,7 @@ pub(crate) fn apply_diff(
 pub(crate) fn apply_diff_from(
     src: &[i16; HIDDEN_SIZE],
     dst: &mut [i16; HIDDEN_SIZE],
-    weights: &[i16],
+    weights: FtColumns<'_>,
     added: &[FeatureIndex],
     removed: &[FeatureIndex],
 ) {
@@ -420,7 +420,7 @@ mod tests {
         }
 
         let mut out = [0i16; HIDDEN_SIZE];
-        refresh_perspective(&mut out, &biases, &weights, &[2, 5]);
+        refresh_perspective(&mut out, &biases, FtColumns::Wide(&weights), &[2, 5]);
 
         assert_eq!(out[0], 700);
         assert_eq!(out[1], 703);
@@ -436,7 +436,7 @@ mod tests {
         let biases: Vec<i16> = (0..HIDDEN_SIZE).map(|i| (i as i16) % 17 - 8).collect();
         let weights = vec![123i16; 4 * HIDDEN_SIZE];
         let mut out = [0i16; HIDDEN_SIZE];
-        refresh_perspective(&mut out, &biases, &weights, &[]);
+        refresh_perspective(&mut out, &biases, FtColumns::Wide(&weights), &[]);
         assert_eq!(out.as_slice(), biases.as_slice());
     }
 
@@ -445,7 +445,7 @@ mod tests {
         // A bias of `i16::MAX` plus a column of ones wraps to `i16::MIN`.
         let mut out = [i16::MAX; HIDDEN_SIZE];
         let weights = vec![1i16; HIDDEN_SIZE];
-        transformer_kernel::add_features(&mut out, &weights, &[0]);
+        transformer_kernel::add_features(&mut out, FtColumns::Wide(&weights), &[0]);
         assert!(out.iter().all(|&x| x == i16::MIN));
     }
 

@@ -94,7 +94,113 @@ pub const MAGIC: [u8; 16] = *b"YORKIE-NNUE-KL\0\0";
 /// Bumped whenever either changes, or whenever what the kernels expect of the
 /// bytes changes, so a file an older build wrote is refused rather than read as
 /// if it said something else.
-pub const LAYOUT_VERSION: u32 = 1;
+pub const LAYOUT_VERSION: u32 = 2;
+
+/// The number of feature-transformer weights: one per lane per feature.
+pub const FT_WEIGHT_COUNT: usize = HIDDEN_SIZE * NUM_FEATURES;
+
+/// Where the packed feature transformer keeps its correction offsets, as a byte
+/// offset from the start of the weight array: right after the one-byte bases,
+/// in the half of the array the bases leave free.
+///
+/// # The packed form
+///
+/// Every weight is stored as the signed byte `base = clamp(w / 2)`, and the
+/// lane reads back as `2 * base`. A weight that is not exactly that — an odd
+/// one, or one whose half falls outside a byte — also gets a correction record
+/// carrying `w - 2 * base`, applied after the byte pass, so the column is
+/// reconstructed exactly under the accumulator's wrapping `i16` arithmetic.
+/// The weight array keeps its size: the bases fill its first half, and the
+/// second half holds `NUM_FEATURES + 1` little-endian `u32` offsets (feature
+/// `f`'s records are `offsets[f]..offsets[f + 1]`) followed by the records,
+/// each a little-endian `u32` whose low half is the lane and whose high half is
+/// the correction. The rest of the array is zero.
+pub const FT_PACKED_OFFSETS_AT: usize = FT_WEIGHT_COUNT;
+
+/// Where the packed feature transformer's correction records start, as a byte
+/// offset from the start of the weight array.
+pub const FT_PACKED_RECORDS_AT: usize =
+    (FT_PACKED_OFFSETS_AT + (NUM_FEATURES + 1) * 4).next_multiple_of(SECTION_ALIGN);
+
+/// The most correction records a network may need and still be packed: one
+/// weight in 1024. A network that needs more keeps its 16-bit weights, since
+/// a column with many records spends on them what the byte pass saved.
+pub const FT_PACKED_RECORD_LIMIT: usize = FT_WEIGHT_COUNT / 1024;
+
+// A record names its lane in 16 bits, and the most records a network may carry
+// fit in the half of the weight array the bases leave free.
+const _: () = assert!(HIDDEN_SIZE - 1 <= u16::MAX as usize);
+const _: () = assert!(FT_PACKED_RECORDS_AT + FT_PACKED_RECORD_LIMIT * 4 <= FT_WEIGHT_COUNT * 2);
+
+/// The byte a weight is packed to: its half, truncated toward zero and clamped
+/// to a byte. Clamping rather than wrapping keeps `w - 2 * base` inside `i16`
+/// for every weight.
+pub const fn ft_packed_base(weight: i16) -> i8 {
+    let half = weight / 2;
+    if half < i8::MIN as i16 {
+        i8::MIN
+    } else if half > i8::MAX as i16 {
+        i8::MAX
+    } else {
+        half as i8
+    }
+}
+
+/// Whether a build compiling for `target_features` (cargo's comma-separated
+/// list) reads its feature-transformer weights packed: the kernels that apply a
+/// packed column are the AVX-512 BW ones, and every other build keeps the
+/// 16-bit weights.
+pub fn ft_packing_targets(target_features: &str) -> bool {
+    let has = |feature: &str| target_features.split(',').any(|f| f == feature);
+    has("avx512f") && has("avx512bw")
+}
+
+/// Pack the feature-transformer weights of `data`, a whole data region in the
+/// layout above, into the form described at [`FT_PACKED_OFFSETS_AT`], in place.
+///
+/// Returns the number of correction records written, or `None` — leaving
+/// `data` untouched — when the network needs more than
+/// [`FT_PACKED_RECORD_LIMIT`] of them.
+pub fn pack_ft_weights(data: &mut [u8]) -> Option<usize> {
+    let span = SPANS.ft_weights;
+    let weights = &mut data[span.offset..span.offset + span.count * 2];
+    assert_eq!(weights.len(), FT_WEIGHT_COUNT * 2, "a whole weight array");
+    let weight = |bytes: &[u8], i: usize| i16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]);
+
+    let mut offsets: Vec<u32> = Vec::with_capacity(NUM_FEATURES + 1);
+    let mut records: Vec<u32> = Vec::new();
+    for feature in 0..NUM_FEATURES {
+        offsets.push(records.len() as u32);
+        for lane in 0..HIDDEN_SIZE {
+            let w = weight(weights, feature * HIDDEN_SIZE + lane);
+            let correction = w.wrapping_sub(2 * ft_packed_base(w) as i16);
+            if correction != 0 {
+                if records.len() == FT_PACKED_RECORD_LIMIT {
+                    return None;
+                }
+                records.push(lane as u32 | (u32::from(correction as u16) << 16));
+            }
+        }
+    }
+    offsets.push(records.len() as u32);
+
+    // Byte `i` is written after weight `i` is read and before any weight past
+    // it is, and weight `j > i` sits at bytes `2j..2j + 2`, beyond `i`: packing
+    // forward in place never overwrites a weight still to be read.
+    for i in 0..FT_WEIGHT_COUNT {
+        weights[i] = ft_packed_base(weight(weights, i)) as u8;
+    }
+    weights[FT_WEIGHT_COUNT..].fill(0);
+    for (i, offset) in offsets.iter().enumerate() {
+        let at = FT_PACKED_OFFSETS_AT + 4 * i;
+        weights[at..at + 4].copy_from_slice(&offset.to_le_bytes());
+    }
+    for (i, record) in records.iter().enumerate() {
+        let at = FT_PACKED_RECORDS_AT + 4 * i;
+        weights[at..at + 4].copy_from_slice(&record.to_le_bytes());
+    }
+    Some(records.len())
+}
 
 /// One parameter array's place in the data region: its byte offset from the
 /// start of that region, and its element count.
@@ -289,6 +395,11 @@ pub struct Header {
     pub target_features: String,
     pub dims: NetDims,
     pub data_bytes: u64,
+    /// Whether the feature-transformer weights are in the packed form
+    /// described at [`FT_PACKED_OFFSETS_AT`] rather than 16 bits each. It
+    /// follows from the source and the target features, so it decides nothing
+    /// a matching file could disagree on; it says how to read the bytes.
+    pub ft_packed: bool,
     /// The source file's own version word and hash, and its architecture
     /// string.
     pub net: NetHeader,
@@ -320,6 +431,7 @@ impl Header {
             out.extend_from_slice(&value.to_le_bytes());
         }
         out.extend_from_slice(&self.data_bytes.to_le_bytes());
+        out.push(u8::from(self.ft_packed));
         out.extend_from_slice(&self.net.version.to_le_bytes());
         out.extend_from_slice(&self.net.hash.to_le_bytes());
         put_str(&mut out, &self.net.arch_id);
@@ -357,6 +469,11 @@ impl Header {
         }
         let dims = dims_from_words(&words);
         let data_bytes = r.u64()?;
+        let ft_packed = match r.u8()? {
+            0 => false,
+            1 => true,
+            other => return Err(format!("unknown weight-packing marker {other}")),
+        };
         let net = NetHeader {
             version: r.u32()?,
             hash: r.u32()?,
@@ -373,6 +490,7 @@ impl Header {
             target_features,
             dims,
             data_bytes,
+            ft_packed,
             net,
             warnings,
         })

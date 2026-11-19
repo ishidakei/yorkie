@@ -156,7 +156,7 @@ impl FinnyCache {
             transformer_kernel::sub_add_features_tee(
                 &mut entry.accumulation,
                 dst,
-                net.ft_weights(),
+                net.ft_columns(),
                 &diff.added,
                 &diff.removed,
             );
@@ -165,7 +165,7 @@ impl FinnyCache {
             refresh_perspective(
                 &mut entry.accumulation,
                 net.ft_biases(),
-                net.ft_weights(),
+                net.ft_columns(),
                 scratch_active,
             );
             entry.initialized = true;
@@ -195,8 +195,7 @@ impl FinnyCache {
                 }
                 let mut expected: Vec<i16> = net.ft_biases().to_vec();
                 for &idx in &entry.active {
-                    let base = idx as usize * HIDDEN_SIZE;
-                    let col = &net.ft_weights()[base..base + HIDDEN_SIZE];
+                    let col = net.ft_columns().column(idx);
                     for (a, &w) in expected.iter_mut().zip(col.iter()) {
                         *a = a.wrapping_add(w);
                     }
