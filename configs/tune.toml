@@ -88,8 +88,14 @@ flatten_winning_mate = true
 pv_interval = 0
 consideration_mode = false
 output_fail_lh_pv = true
-draw_value_black = -240
-draw_value_white = 240
+
+# DIFFERENCE: -240 / +240 in default.toml, set for a game in which a draw
+# counts 0.4 to black and 0.6 to white. The match driver scores a draw 0.5 for
+# either side, so the engines play for a draw worth what the match scores it:
+# nothing to either colour. The repetition filter's search reads these values
+# too, so it looks for the repetitions the games would play.
+draw_value_black = 0
+draw_value_white = 0
 resign_value = 99999
 generate_all_legal_moves = false
 random = 0
