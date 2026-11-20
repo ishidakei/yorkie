@@ -2411,13 +2411,14 @@ impl<N: NetworkParams> QSearch<N> {
                     best_value = self.mate_for(us, ply + 1);
                     // The returned value counts plies from the root; the
                     // stored one counts them from this position, so a probe
-                    // at any other ply reads back the same mate in one.
-                    let tt_pv = self.stack[Self::si(ply)].tt_pv;
+                    // at any other ply reads back the same mate in one. The
+                    // quiescence search never sets its stack cell's `tt_pv`,
+                    // so the PV flag comes from this node's own probe.
                     self.tt_store(
                         tt_slot,
                         pos_key,
                         value_to_tt(best_value, ply),
-                        tt_pv,
+                        pv_hit,
                         Bound::Exact,
                         DEPTH_QS,
                         move16_of(Some(mate_move)),
@@ -6061,6 +6062,73 @@ mod tests {
         );
         assert_eq!(data.eval, VALUE_NONE, "unadjustedStaticEval is still NONE");
         assert_eq!(data.move16, move16_of(p.mate_1ply()));
+    }
+
+    /// A quiescence node whose stack cell holds `tt_pv` left behind by another
+    /// node at that ply.
+    fn qsearch_mate_node_with_stale_tt_pv(net: &OwnedNetwork, read_tt: bool) -> Value {
+        let p = pos(MATE_IN_1);
+        let mut q = QSearch::new(net.network());
+        q.set_root_side(p.side_to_move().flip());
+        q.pv_node = false;
+        q.set_read_tt(read_tt);
+        q.stack[STACK_BASE + 4].tt_pv = true;
+        q.qsearch_at(&mut p.clone(), 4, -1, 0)
+    }
+
+    /// The quiescence search's mate-in-one store takes its PV flag from this
+    /// node's probe, not from whatever its stack cell holds.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn qsearch_one_ply_mate_is_stored_with_the_probe_pv_flag() {
+        let p = pos(MATE_IN_1);
+        let net = zero_net();
+        let table = fresh_tt();
+
+        // An empty table: the probe misses, so the entry is not PV.
+        assert_eq!(qsearch_mate_node_with_stale_tt_pv(&net, true), mate_in(5));
+        let (found, data) = probe_root(&table, &p);
+        assert!(found);
+        assert_eq!(data.value, VALUE_MATE - 1);
+        assert_eq!(data.move16, move16_of(p.mate_1ply()));
+        assert!(!data.is_pv, "the stale stack flag does not reach the entry");
+
+        // A PV entry the node does not take as a hit: the mate is stored, and
+        // a probe that is not a hit is not a PV hit either.
+        table.clear();
+        prewrite(
+            &table,
+            &p,
+            0,
+            true,
+            Bound::Upper,
+            DEPTH_QS,
+            None,
+            VALUE_NONE,
+        );
+        assert_eq!(qsearch_mate_node_with_stale_tt_pv(&net, false), mate_in(5));
+        let (_, data) = probe_root(&table, &p);
+        assert_eq!(data.value, VALUE_MATE - 1);
+        assert!(!data.is_pv);
+
+        // A PV entry the node does take as a hit: the mate-in-one store is
+        // reached only on a miss, so the entry keeps the PV flag its own
+        // probe found.
+        table.clear();
+        prewrite(
+            &table,
+            &p,
+            0,
+            true,
+            Bound::Upper,
+            DEPTH_QS,
+            None,
+            VALUE_NONE,
+        );
+        assert_ne!(qsearch_mate_node_with_stale_tt_pv(&net, true), mate_in(5));
+        let (_, data) = probe_root(&table, &p);
+        assert_ne!(data.value, VALUE_MATE - 1);
+        assert!(data.is_pv);
     }
 
     /// The entry a one-ply mate leaves behind holds "mate in one from here",
