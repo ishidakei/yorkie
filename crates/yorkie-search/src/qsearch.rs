@@ -31,6 +31,18 @@ use yorkie_eval::{Accumulator, FinnyCache, MoveDelta, NetworkParams, evaluate_wi
 use yorkie_state::{Color, Move, Piece, PieceKind, Position, RepetitionState, piece_value};
 #[cfg(feature = "verbose3")]
 use yorkie_storage::ValueMarks;
+
+#[cfg(feature = "verbose3")]
+use crate::causes::PathCauses;
+
+/// A node's marks and their causes, set aside across a sub-search that
+/// overwrites the live ones.
+#[cfg(feature = "verbose3")]
+#[derive(Clone, Copy)]
+struct Held {
+    marks: ValueMarks,
+    causes: PathCauses,
+}
 use yorkie_storage::{Bound, TranspositionTable, TtSlot, Value};
 
 #[cfg(feature = "verbose2")]
@@ -867,6 +879,12 @@ pub struct QSearch<N: NetworkParams> {
     /// rules the value it rests on is behind.
     #[cfg(feature = "verbose3")]
     marks: ValueMarks,
+    /// The positions before the current node that the repetition judgements
+    /// behind [`Self::marks`]' `pathdep` matched (see [`crate::causes`]).
+    /// They ride exactly as the marks do, and no search decision reads them
+    /// either.
+    #[cfg(feature = "verbose3")]
+    causes: PathCauses,
 
     /// The evaluation-noise amplitude for this game, in the unit the search
     /// scores in: [`Self::static_eval`] offsets every position by
@@ -1299,6 +1317,8 @@ impl<N: NetworkParams> QSearch<N> {
             last_pv_info_time: Instant::now(),
             #[cfg(feature = "verbose3")]
             marks: ValueMarks::NONE,
+            #[cfg(feature = "verbose3")]
+            causes: PathCauses::NONE,
             #[cfg(feature = "random")]
             random_amplitude: 0,
             #[cfg(feature = "random")]
@@ -2118,8 +2138,82 @@ impl<N: NetworkParams> QSearch<N> {
     /// the live ones.
     #[cfg(feature = "verbose3")]
     #[inline]
-    fn child_marks(&mut self, node_marks: ValueMarks) -> ValueMarks {
-        std::mem::replace(&mut self.marks, node_marks)
+    fn child_marks(&mut self, node_marks: Held) -> Held {
+        let child = self.held();
+        self.restore_held(node_marks);
+        child
+    }
+
+    /// The live marks and their causes, to set aside across a sub-search.
+    #[cfg(feature = "verbose3")]
+    #[inline]
+    fn held(&self) -> Held {
+        Held {
+            marks: self.marks,
+            causes: self.causes,
+        }
+    }
+
+    /// Make `held` the live marks and causes again.
+    #[cfg(feature = "verbose3")]
+    #[inline]
+    fn restore_held(&mut self, held: Held) {
+        self.marks = held.marks;
+        self.causes = held.causes;
+    }
+
+    /// Start a node unmarked and with no cause.
+    #[cfg(feature = "verbose3")]
+    #[inline]
+    fn clear_held(&mut self) {
+        self.marks = ValueMarks::NONE;
+        self.causes = PathCauses::NONE;
+    }
+
+    /// Fold in the marks and causes of a child that moved the window of the
+    /// node at `pos`. Only the causes standing before the node are kept: one at
+    /// the node or below it is a repetition closed inside the node's subtree.
+    #[cfg(feature = "verbose3")]
+    #[inline]
+    fn merge_held(&mut self, child: Held, pos: &Position) {
+        self.marks.merge(child.marks);
+        self.causes.merge_below(&child.causes, pos.timeline_index());
+    }
+
+    /// The value at `pos` is a repetition verdict: mark it, and record the
+    /// earlier position the verdict matched.
+    #[cfg(feature = "verbose3")]
+    fn mark_repetition(&mut self, pos: &Position) {
+        self.marks.path_dep = true;
+        let found = PathCauses::of_repetition(pos, self.repetition_window());
+        self.causes.merge_below(&found, usize::MAX);
+    }
+
+    /// The window [`Self::repetition`] judges over, as
+    /// [`Position::repetition_origin`] takes it.
+    #[cfg(feature = "verbose3")]
+    fn repetition_window(&self) -> u32 {
+        #[cfg(repetition_index)]
+        {
+            self.repetition_look_back
+        }
+        #[cfg(not(repetition_index))]
+        {
+            16
+        }
+    }
+
+    /// A table entry's value became the node's: take the entry's marks. An
+    /// entry stores no causes, so a path-dependent one makes the node's causes
+    /// open — unknown, whichever search wrote the entry.
+    #[cfg(feature = "verbose3")]
+    fn take_entry_marks(&mut self, marks: ValueMarks) {
+        self.marks = marks;
+        self.causes = if marks.path_dep {
+            PathCauses::OPEN
+        } else {
+            PathCauses::NONE
+        };
     }
 
     /// Widen a stored 16-bit move against `pos` and validate it: the unique
@@ -2174,7 +2268,7 @@ impl<N: NetworkParams> QSearch<N> {
         // marks of the value it returns.
         #[cfg(feature = "verbose3")]
         {
-            self.marks = ValueMarks::NONE;
+            self.clear_held();
         }
 
         // Poll the stop flag / hard deadline at the reference `check_time`
@@ -2206,7 +2300,7 @@ impl<N: NetworkParams> QSearch<N> {
             // dependent by construction — this is where the mark originates.
             #[cfg(feature = "verbose3")]
             {
-                self.marks.path_dep = true;
+                self.mark_repetition(pos);
             }
             if draw_type == RepetitionState::Draw {
                 // Ordinary repetition: the ±1 dither.
@@ -2266,7 +2360,7 @@ impl<N: NetworkParams> QSearch<N> {
             // it brings its marks with it.
             #[cfg(feature = "verbose3")]
             {
-                self.marks = tt_data.marks;
+                self.take_entry_marks(tt_data.marks);
             }
             return tt_value;
         }
@@ -2449,7 +2543,7 @@ impl<N: NetworkParams> QSearch<N> {
                 ContinuationCorrectionHistory::plane_index(moved, mv.to_sq());
             self.push_accumulator(pos, &acc_delta);
             #[cfg(feature = "verbose3")]
-            let node_marks = self.marks;
+            let node_marks = self.held();
             let value = -self.qsearch(pos, ply + 1, -beta, -alpha, scratch);
             #[cfg(feature = "verbose3")]
             let child_marks = self.child_marks(node_marks);
@@ -2471,7 +2565,7 @@ impl<N: NetworkParams> QSearch<N> {
                     // The child moved this node's window, so its marks become
                     // this node's too.
                     #[cfg(feature = "verbose3")]
-                    self.marks.merge(child_marks);
+                    self.merge_held(child_marks, pos);
                     best_move = Some(mv);
                     if pv_node {
                         self.update_pv(ply, mv);
@@ -2597,6 +2691,7 @@ impl<N: NetworkParams> QSearch<N> {
                     decl_rule: true,
                     ..ValueMarks::NONE
                 };
+                self.causes = PathCauses::NONE;
             }
             self.set_root_side(pos.side_to_move());
             return RootOutcome {
@@ -3698,7 +3793,7 @@ impl<N: NetworkParams> QSearch<N> {
         // marks of the value it returns.
         #[cfg(feature = "verbose3")]
         {
-            self.marks = ValueMarks::NONE;
+            self.clear_held();
         }
 
         depth = depth.min(MAX_PLY - 1);
@@ -3742,7 +3837,7 @@ impl<N: NetworkParams> QSearch<N> {
                 // originates.
                 #[cfg(feature = "verbose3")]
                 {
-                    self.marks.path_dep = true;
+                    self.mark_repetition(pos);
                 }
                 if draw_type == RepetitionState::Draw {
                     return self.draw_value(RepetitionState::Draw, us) + value_draw(self.nodes);
@@ -3945,7 +4040,7 @@ impl<N: NetworkParams> QSearch<N> {
             // it brings its marks with it.
             #[cfg(feature = "verbose3")]
             {
-                self.marks = tt_data.marks;
+                self.take_entry_marks(tt_data.marks);
             }
             #[cfg(all(lazy_smp_defer, feature = "verbose1"))]
             {
@@ -4153,7 +4248,7 @@ impl<N: NetworkParams> QSearch<N> {
                 // the reference's prefetch inside `do_null_move`.
                 TranspositionTable::shared().prefetch(pos.key(), pos.side_to_move().index() as u8);
                 #[cfg(feature = "verbose3")]
-                let node_marks = self.marks;
+                let node_marks = self.held();
                 let null_value = -self.search(
                     pos,
                     ply + 1,
@@ -4175,7 +4270,7 @@ impl<N: NetworkParams> QSearch<N> {
                 if null_value >= beta && !is_win(null_value) {
                     if self.nmp_min_ply != 0 || depth < 16 {
                         #[cfg(feature = "verbose3")]
-                        self.marks.merge(null_marks);
+                        self.merge_held(null_marks, pos);
                         return null_value;
                     }
                     debug_assert_eq!(
@@ -4187,7 +4282,7 @@ impl<N: NetworkParams> QSearch<N> {
                     // same stack cell, no `do_move`.
                     self.nmp_min_ply = ply + 3 * (depth - r) / 4;
                     #[cfg(feature = "verbose3")]
-                    let node_marks = self.marks;
+                    let node_marks = self.held();
                     let v = self.search(
                         pos,
                         ply,
@@ -4205,13 +4300,13 @@ impl<N: NetworkParams> QSearch<N> {
                     // `v` gates the return without being returned.
                     #[cfg(feature = "verbose3")]
                     {
-                        self.marks = node_marks;
+                        self.restore_held(node_marks);
                     }
                     self.nmp_min_ply = 0;
 
                     if v >= beta {
                         #[cfg(feature = "verbose3")]
-                        self.marks.merge(null_marks);
+                        self.merge_held(null_marks, pos);
                         return null_value;
                     }
                 }
@@ -4271,7 +4366,7 @@ impl<N: NetworkParams> QSearch<N> {
                     self.pv_node = false;
                     self.set_read_tt(true);
                     #[cfg(feature = "verbose3")]
-                    let node_marks = self.marks;
+                    let node_marks = self.held();
                     let mut value =
                         -self.qsearch(pos, ply + 1, -prob_cut_beta, -prob_cut_beta + 1, scratch);
                     if value >= prob_cut_beta && prob_cut_depth > 0 {
@@ -4297,7 +4392,7 @@ impl<N: NetworkParams> QSearch<N> {
                         // its value and the value returned below both carry its
                         // marks.
                         #[cfg(feature = "verbose3")]
-                        self.marks.merge(child_marks);
+                        self.merge_held(child_marks, pos);
                         #[cfg(feature = "dupstats")]
                         let dup_updates =
                             self.dup_store(tt_slot, pos_key, prob_cut_depth + 1, tt_hit, dup_at);
@@ -4549,7 +4644,7 @@ impl<N: NetworkParams> QSearch<N> {
                 self.pv_node = false;
                 self.set_read_tt(true);
                 #[cfg(feature = "verbose3")]
-                let node_marks = self.marks;
+                let node_marks = self.held();
                 // The re-entry shares this node's ply of pending moves too, and
                 // may cut off with some of its own still there.
                 #[cfg(lazy_smp_spread)]
@@ -4614,7 +4709,7 @@ impl<N: NetworkParams> QSearch<N> {
                         .tt_move
                         .update((-424 - 107 * depth).max(-3375));
                     #[cfg(feature = "verbose3")]
-                    self.marks.merge(singular_marks);
+                    self.merge_held(singular_marks, pos);
                     #[cfg(feature = "dupstats")]
                     self.dup.count(crate::dupstats::Event::SeMulticut, dup_at);
                     return s_value;
@@ -4739,7 +4834,7 @@ impl<N: NetworkParams> QSearch<N> {
             // the live marks, so the last one — the one `value` comes from — is
             // the one left standing when the move's result is folded in.
             #[cfg(feature = "verbose3")]
-            let node_marks = self.marks;
+            let node_marks = self.held();
             let mut value: Value = best_value;
             if depth >= 2 && move_count > 1 && !wide {
                 let d = ((new_depth - r / 1024).min(new_depth + 2)).max(1) + pv_node as i32;
@@ -4928,7 +5023,8 @@ impl<N: NetworkParams> QSearch<N> {
                     // the search has finished.
                     #[cfg(feature = "verbose3")]
                     {
-                        rm.marks = child_marks;
+                        rm.marks = child_marks.marks;
+                        rm.causes = child_marks.causes.below(pos.timeline_index());
                     }
                     rm.sel_depth = self.sel_depth;
                     // The two flags decide only which bound marker a PV line
@@ -4992,7 +5088,7 @@ impl<N: NetworkParams> QSearch<N> {
                     // or cut the node off below — so its marks become this
                     // node's too.
                     #[cfg(feature = "verbose3")]
-                    self.marks.merge(child_marks);
+                    self.merge_held(child_marks, pos);
                     best_move = Some(mv);
                     // Update the node PV even on a fail high, but not at the
                     // root, whose PV is the RootMove's.
@@ -6413,6 +6509,10 @@ mod tests {
                 },
                 "the repetition draw is a path-dependent value and nothing else"
             );
+            // Eight plies in, the nearest earlier occurrence is four back.
+            assert_eq!(p.timeline_index(), 8);
+            assert_eq!(q.causes.plies(), &[4], "the cause is the matched position");
+            assert!(!q.causes.is_open());
 
             // The same board before the shuffle, where nothing has recurred: an
             // ordinary node, and an unmarked value.
@@ -6421,6 +6521,107 @@ mod tests {
             q.nodes = 0;
             q.qsearch_at(&mut fresh, 4, -1, 0);
             assert_eq!(q.marks, ValueMarks::NONE);
+            assert_eq!(q.causes, PathCauses::NONE);
+        }
+
+        /// The causes a node keeps from a child are the ones before the node:
+        /// a repetition whose earlier occurrence is the node itself closed
+        /// inside its subtree. Searched from two plies before the repeating
+        /// position, the matched position (four plies back from it) is the
+        /// node's own line index, so the node lists nothing; searched from the
+        /// ply before it, the matched position is earlier and stays.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn a_repetition_closed_at_or_below_the_node_lists_nothing() {
+            let net = zero_net();
+            let _tt = fresh_tt();
+            let full = shuffled_two_kings();
+            let mut q = QSearch::new(net.network());
+            q.root_us = full.side_to_move();
+            q.pv_node = false;
+
+            let mut found = PathCauses::NONE;
+            found.insert(4);
+            let child = Held {
+                marks: ValueMarks {
+                    path_dep: true,
+                    ..ValueMarks::NONE
+                },
+                causes: found,
+            };
+            for (at, kept) in [(4usize, &[][..]), (5, &[4][..])] {
+                let mut node = pos(TWO_KINGS);
+                let mut replay = shuffled_two_kings_moves().into_iter();
+                for mv in replay.by_ref().take(at) {
+                    node.do_move(mv);
+                }
+                assert_eq!(node.timeline_index(), at);
+                q.clear_held();
+                q.merge_held(child, &node);
+                assert!(q.marks.path_dep, "the mark reaches the node either way");
+                assert_eq!(q.causes.plies(), kept, "from line index {at}");
+            }
+        }
+
+        /// The superior and inferior verdicts name the earlier position with
+        /// the same board and other hands. White drops a pawn the black king
+        /// takes, and both kings walk back: six plies on, the board is the
+        /// start's and Black holds a pawn it did not — superior for Black, to
+        /// move — and, the other way round, a line where Black dropped the pawn
+        /// White's king took leaves Black inferior.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn a_hand_verdict_names_the_position_with_the_other_hands() {
+            use crate::text_str::parse_usi_move;
+            let net = zero_net();
+            let _tt = fresh_tt();
+            let cases = [
+                (
+                    "4k4/9/9/9/9/9/9/9/4K4 b p 1",
+                    "5i4h P*5h 4h5h 5a5b 5h5i 5b5a",
+                    RepetitionState::Superior,
+                ),
+                (
+                    "4k4/9/9/9/9/9/9/9/4K4 b P 1",
+                    "P*5b 5a5b 5i5h 5b4a 5h5i 4a5a",
+                    RepetitionState::Inferior,
+                ),
+            ];
+            for (sfen, line, verdict) in cases {
+                let mut p = pos(sfen);
+                for usi in line.split(' ') {
+                    let mv = parse_usi_move(usi, &p).expect("a legal move");
+                    p.do_move(mv);
+                }
+                assert_eq!(p.is_repetition(), verdict, "{line}");
+                let mut q = QSearch::new(net.network());
+                q.root_us = p.side_to_move();
+                q.pv_node = false;
+                q.qsearch_at(&mut p, 6, -1, 0);
+                assert!(q.marks.path_dep, "{verdict:?}");
+                assert_eq!(q.causes.plies(), &[0], "{verdict:?} names the start");
+                assert!(!q.causes.is_open());
+            }
+        }
+
+        /// [`shuffled_two_kings`]' moves, in order.
+        fn shuffled_two_kings_moves() -> Vec<Move> {
+            let bk = Piece::new(PieceKind::King, Color::Black);
+            let wk = Piece::new(PieceKind::King, Color::White);
+            let step = |from: (u8, u8), to: (u8, u8), pc: Piece| {
+                Move::make(
+                    Square::new(from.0, from.1).unwrap(),
+                    Square::new(to.0, to.1).unwrap(),
+                    pc,
+                )
+            };
+            let cycle = [
+                step((4, 8), (3, 8), bk),
+                step((4, 0), (3, 0), wk),
+                step((3, 8), (4, 8), bk),
+                step((3, 0), (4, 0), wk),
+            ];
+            cycle.iter().chain(cycle.iter()).copied().collect()
         }
 
         /// The move limit is a rule of the tournament, so the draw it forces is
@@ -6491,13 +6692,21 @@ mod tests {
                 // sees +500 — above its beta of 1.
                 seed_every_child(&table, &p, -500, Bound::Upper, marks);
 
-                let (value, node_marks) = {
+                let (value, node_marks, node_causes) = {
                     let mut q = QSearch::new(net.network());
                     let out = q.run(&mut p.clone(), 0, 1, false, true);
-                    (out.value, q.marks)
+                    (out.value, q.marks, q.causes)
                 };
                 assert!(value > 0, "the node fails high on the marked child");
                 assert_eq!(node_marks, marks, "and returns a value marked {marks:?}");
+                // A table entry carries no causes, so a path-dependent value
+                // taken from one rests on positions nobody can name any more.
+                let expected = if marks.path_dep {
+                    PathCauses::OPEN
+                } else {
+                    PathCauses::NONE
+                };
+                assert_eq!(node_causes, expected, "the causes of {marks:?}");
 
                 let (found, data) = probe_root(&table, &p);
                 assert!(found);

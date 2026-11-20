@@ -10,5 +10,13 @@ publish = false
 proptest = "~1.11"
 serde_json = "~1.0"
 
+[features]
+# The most detailed diagnostic level. The search reports which earlier
+# positions of the game a repetition verdict behind its value matched; this
+# feature adds the accessors that answer it — where on the line a position
+# stands, and which earlier position a verdict came from. A build without it
+# has neither.
+verbose3 = []
+
 [lints]
 workspace = true

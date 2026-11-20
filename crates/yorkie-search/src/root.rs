@@ -13,6 +13,8 @@ use yorkie_storage::Value;
 #[cfg(feature = "verbose3")]
 use yorkie_storage::ValueMarks;
 
+#[cfg(feature = "verbose3")]
+use crate::causes::PathCauses;
 use crate::config::GENERATE_ALL_LEGAL_MOVES;
 use crate::qsearch::VALUE_INFINITE;
 
@@ -66,6 +68,11 @@ pub struct RootMove {
     /// node to return was carrying.
     #[cfg(feature = "verbose3")]
     pub marks: ValueMarks,
+    /// The positions before the root that the repetition judgements behind
+    /// [`Self::marks`]' `pathdep` matched, recorded with them, as line indices
+    /// of the game the `position` command named.
+    #[cfg(feature = "verbose3")]
+    pub causes: PathCauses,
     /// Previous iteration's `score` (the sort tie-break). All `-VALUE_INFINITE`
     /// in the single depth-1 iteration.
     pub previous_score: Value,
@@ -94,8 +101,10 @@ pub struct RootMove {
 // The move, its PV handle and its per-iteration statistics fill eight
 // eight-byte slots with nothing between them; the `far` flag opens a ninth. The
 // two fail-bound flags a PV-printing build adds and the three value marks of a
-// `verbose3` build are more bytes of that same ninth slot, so every build has
-// the one figure.
+// `verbose3` build are more bytes of that same ninth slot. The positions a
+// `verbose3` build records beside the marks do not fit there, so that build
+// alone is larger.
+#[cfg(not(feature = "verbose3"))]
 const _: () = assert!(size_of::<RootMove>() == 72);
 
 /// `Vec::clone` allocates exactly the length it copies, so a derived clone would
@@ -119,6 +128,7 @@ impl Clone for RootMove {
         #[cfg(feature = "verbose3")]
         {
             self.marks = source.marks;
+            self.causes = source.causes;
         }
         self.previous_score = source.previous_score;
         self.average_score = source.average_score;
@@ -147,6 +157,8 @@ impl RootMove {
             uci_score: -VALUE_INFINITE,
             #[cfg(feature = "verbose3")]
             marks: ValueMarks::NONE,
+            #[cfg(feature = "verbose3")]
+            causes: PathCauses::NONE,
             previous_score: -VALUE_INFINITE,
             average_score: -VALUE_INFINITE,
             mean_squared_score: MEAN_SQUARED_INIT,

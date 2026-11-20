@@ -13,6 +13,10 @@ use yorkie_eval::{Accumulator, NetworkParams, evaluate_with};
 use yorkie_state::{Move, Position};
 
 pub mod book;
+// The positions a path-dependent value rests on: only a build that reports
+// them.
+#[cfg(feature = "verbose3")]
+pub mod causes;
 // What each parallel worker takes from the others: only a build that measures
 // it.
 #[cfg(feature = "dupstats")]

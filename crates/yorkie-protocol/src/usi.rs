@@ -32,11 +32,11 @@ use yorkie_state::{Move, write_usi_move};
 // the `position` command's own is read field by field, into the position the
 // engine already holds.
 #[cfg(feature = "verbose3")]
+use yorkie_search::causes::ReplyMarks;
+#[cfg(feature = "verbose3")]
 use yorkie_state::{SfenBuf, parse_sfen};
 #[cfg(feature = "verbose2")]
 use yorkie_storage::Value;
-#[cfg(feature = "verbose3")]
-use yorkie_storage::ValueMarks;
 // The per-reply allocation tally: raised by the counting global allocator this
 // feature installs, and read by the statistics line that reports it.
 #[cfg(feature = "verbose1")]
@@ -286,7 +286,7 @@ impl<O: UsiOutput> UsiSink<O> {
         emit_stats(
             &mut *guard,
             #[cfg(feature = "verbose3")]
-            ValueMarks::NONE,
+            ReplyMarks::NONE,
         );
         Formatter::new(&mut *guard).bestmove(text)
     }
@@ -325,7 +325,7 @@ impl<O: UsiOutput> EngineSink for UsiSink<O> {
         let _ = self.info_string(msg);
     }
 
-    fn reply(&self, reply: Reply, #[cfg(feature = "verbose3")] marks: ValueMarks) {
+    fn reply(&self, reply: Reply, #[cfg(feature = "verbose3")] marks: ReplyMarks) {
         // Composed before the lock is taken, so the composing's own allocations
         // stay inside the interval the statistics line reports.
         let mut payload = BestmoveBuf::new();
@@ -394,7 +394,7 @@ impl<O: UsiOutput> EngineSink for UsiSink<O> {
         emit_stats(
             &mut *guard,
             #[cfg(feature = "verbose3")]
-            ValueMarks::NONE,
+            ReplyMarks::NONE,
         );
         let _ = Formatter::new(&mut *guard).bestmove(text);
     }
@@ -941,7 +941,7 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
         // item: the allocations stay reported per position, on those lines.
         let mut buf = StatsBuf::new();
         let counts = crate::stats::take_bench_counts();
-        if let Some(line) = crate::stats::render(&mut buf, 0, counts, ValueMarks::NONE) {
+        if let Some(line) = crate::stats::render(&mut buf, 0, counts, ReplyMarks::NONE) {
             Formatter::new(&mut *self.out.lock()).composed_line(line)?;
         }
         // The full histograms behind the duplication items the line above
@@ -976,7 +976,7 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
                 .bytes(b" bench_nodes=")
                 .u64(*nodes);
             let mut buf = StatsBuf::new();
-            let items = crate::stats::render(&mut buf, 0, *counts, ValueMarks::NONE)
+            let items = crate::stats::render(&mut buf, 0, *counts, ReplyMarks::NONE)
                 .map_or(&b""[..], crate::stats::line_items);
             self.out.info_string_parts(&[head.as_bytes(), items])?;
             crate::stats::histogram_lines(counts, |body| {
@@ -1058,7 +1058,7 @@ fn write_pv_info<W: Write + ?Sized>(w: &mut W, info: &PvInfo) -> io::Result<()> 
 }
 
 #[cfg(feature = "verbose1")]
-fn emit_stats<W: Write + ?Sized>(w: &mut W, #[cfg(feature = "verbose3")] marks: ValueMarks) {
+fn emit_stats<W: Write + ?Sized>(w: &mut W, #[cfg(feature = "verbose3")] marks: ReplyMarks) {
     let mut buf = StatsBuf::new();
     if let Some(line) = crate::stats::render(
         &mut buf,

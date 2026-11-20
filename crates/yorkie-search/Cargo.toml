@@ -107,7 +107,7 @@ tune = []
 tt-entry16 = ["yorkie-storage/tt-entry16"]
 verbose1 = ["yorkie-storage/verbose1"]
 verbose2 = ["verbose1", "yorkie-storage/verbose2"]
-verbose3 = ["verbose2", "yorkie-storage/verbose3"]
+verbose3 = ["verbose2", "yorkie-state/verbose3", "yorkie-storage/verbose3"]
 dupstats = ["verbose1", "yorkie-storage/dupstats"]
 
 [lints]

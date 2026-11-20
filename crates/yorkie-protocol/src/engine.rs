@@ -51,6 +51,8 @@ use yorkie_search::{
 #[cfg(feature = "verbose2")]
 use yorkie_search::{PvInfo, PvOutputConfig, PvSink};
 // The per-game evaluation-noise seed: drawn here, read only by the search.
+#[cfg(feature = "verbose3")]
+use yorkie_search::causes::ReplyMarks;
 #[cfg(feature = "random")]
 use yorkie_search::new_game_seed;
 use yorkie_state::{
@@ -820,7 +822,7 @@ pub trait EngineSink: Clone + Send + 'static {
     /// played move's value was derived through — for the statistics line to
     /// report, so a caller reading the stream learns them without a second probe
     /// of a root entry that may since have been replaced.
-    fn reply(&self, reply: Reply, #[cfg(feature = "verbose3")] marks: ValueMarks);
+    fn reply(&self, reply: Reply, #[cfg(feature = "verbose3")] marks: ReplyMarks);
 
     /// A book hit's surviving candidates, reported as the probe answers and
     /// before any hold.
@@ -3964,7 +3966,7 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
             // Nothing was searched and no rule was consulted: the position
             // simply has no move.
             #[cfg(feature = "verbose3")]
-            ValueMarks::NONE,
+            ReplyMarks::NONE,
         );
         return CoordinatedOutcome {
             histories,
@@ -3995,7 +3997,8 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
             ValueMarks {
                 decl_rule: true,
                 ..ValueMarks::NONE
-            },
+            }
+            .into(),
         );
         return CoordinatedOutcome {
             histories,
@@ -4291,7 +4294,10 @@ fn run_coordinated<P: EngineSink, N: NetworkParams>(
         // The chosen worker's root move, whose score the reply plays on — a
         // resign by value included, since that decision reads the same score.
         #[cfg(feature = "verbose3")]
-        best.marks,
+        ReplyMarks {
+            marks: best.marks,
+            causes: best.causes,
+        },
     );
 
     // Consume the search (ending the `&tt` / `&net` borrows) and reclaim the main

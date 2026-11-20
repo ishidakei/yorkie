@@ -991,6 +991,49 @@ impl Position {
         index
     }
 
+    /// Where the current state stands on its line: `0` for the position the
+    /// line was set up from, `n` after the line's `n`-th move (a null move
+    /// counting as one).
+    #[cfg(feature = "verbose3")]
+    pub fn timeline_index(&self) -> usize {
+        self.history.len()
+    }
+
+    /// Where on the line stands the earlier occurrence a repetition verdict
+    /// over a `look_back`-ply window (`0` meaning no limit, as for
+    /// [`Self::is_repetition_within`]) came from, as a [`Self::timeline_index`]
+    /// value, or `None` when the verdict is [`RepetitionState::None`].
+    ///
+    /// The verdict is that of the nearest earlier state with the same board
+    /// whose hands make the recurrence a judgement — equal for the draw and
+    /// the perpetual-check outcomes, one dominating the other for superior
+    /// and inferior — so the walk looks for that same state, nearest first.
+    /// It walks every state in the window, so it costs what the plain
+    /// sixteen-ply judgement costs per ply of window.
+    #[cfg(feature = "verbose3")]
+    pub fn repetition_origin(&self, look_back: u32) -> Option<usize> {
+        let pfn = self.current_plies_from_null();
+        let end = if look_back == 0 {
+            pfn
+        } else {
+            pfn.min(i32::try_from(look_back).unwrap_or(i32::MAX))
+        };
+        let stm = self.side_to_move;
+        let cc_stm = self.current_continuous_check(stm);
+        let cc_opp = self.current_continuous_check(stm.flip());
+        let mut i = 4i32;
+        while i <= end {
+            if let Some(prev) = self.state_back(i as usize)
+                && prev.board_key == self.board_key
+                && self.classify_recurrence(&prev.hands, i, cc_stm, cc_opp) != RepetitionState::None
+            {
+                return Some(self.history.len() - i as usize);
+            }
+            i += 2;
+        }
+        None
+    }
+
     /// The board key and the hands of the state at `at` on the timeline
     /// `[root, history[0], …, history[len - 1]]`, the root being the current
     /// position itself before any move.
@@ -2393,6 +2436,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The earlier occurrence a verdict came from, for every verdict kind,
+    /// within sixteen plies and beyond them when the window allows it.
+    #[cfg(feature = "verbose3")]
+    #[test]
+    fn the_origin_of_a_verdict_is_the_occurrence_it_matched() {
+        let none = [0, 0];
+        let cases = [
+            ("draw", black_hand(0, 0), black_hand(0, 0), none),
+            ("superior", black_hand(0, 0), black_hand(1, 0), none),
+            ("inferior", black_hand(1, 0), black_hand(0, 0), none),
+            (
+                "perpetual check by the side to move",
+                black_hand(0, 0),
+                black_hand(0, 0),
+                [18, 0],
+            ),
+            (
+                "perpetual check by the opponent",
+                black_hand(0, 0),
+                black_hand(0, 0),
+                [0, 18],
+            ),
+        ];
+        for (name, earlier, current, checks) in cases {
+            for (at, back) in [(0, 18), (3, 18), (12, 18), (5, 8), (2, 4)] {
+                let len = at + back;
+                let p = line_with(
+                    len,
+                    &[(at, recurring_state(earlier, [0, 0]))],
+                    recurring_state(current, checks.map(|c| c.min(back as u16))),
+                );
+                assert_eq!(p.timeline_index(), len);
+                let within_16 = (back <= 16).then_some(at);
+                assert_eq!(p.repetition_origin(16), within_16, "{name}, at {at}, 16");
+                assert_eq!(
+                    p.repetition_origin(0),
+                    Some(at),
+                    "{name}, at {at}, unlimited"
+                );
+                assert_eq!(
+                    p.repetition_origin(0).is_some(),
+                    p.is_repetition_within(0, &p.history_index()) != RepetitionState::None,
+                    "{name}, at {at}: an origin exactly when there is a verdict",
+                );
+            }
+        }
+        // The nearest occurrence that yields a verdict, past a coincidental
+        // board match whose hands neither dominate.
+        let p = line_with(
+            40,
+            &[
+                (0, recurring_state(black_hand(0, 1), none)),
+                (20, recurring_state(black_hand(1, 0), none)),
+            ],
+            recurring_state(black_hand(0, 1), none),
+        );
+        assert_eq!(p.repetition_origin(0), Some(0));
+        assert_eq!(p.repetition_origin(30), None);
     }
 
     #[test]

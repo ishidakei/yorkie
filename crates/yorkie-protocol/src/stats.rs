@@ -35,6 +35,8 @@ use std::sync::PoisonError;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use yorkie_search::WorkerResult;
+#[cfg(feature = "verbose3")]
+use yorkie_search::causes::{CAUSE_CAPACITY, ReplyMarks};
 #[cfg(lazy_smp_defer)]
 use yorkie_search::defer::DeferCounts;
 #[cfg(feature = "dupstats")]
@@ -48,7 +50,7 @@ use yorkie_search::spread::SpreadCounts;
 #[cfg(all(feature = "dupstats", feature = "verbose3"))]
 use yorkie_search::timeline::{Iteration, Timeline};
 use yorkie_state::TextWriter;
-#[cfg(feature = "verbose3")]
+#[cfg(all(test, feature = "verbose3"))]
 use yorkie_storage::ValueMarks;
 
 /// What every line starts with.
@@ -80,6 +82,26 @@ const COUNT_ITEMS_MAX: usize = COUNT_KEYS[0].len()
 /// The three mark items, in the order they are written.
 #[cfg(feature = "verbose3")]
 const MARK_ITEMS: [&[u8]; 3] = [b" pathdep=1", b" declrule=1", b" movelimit=1"];
+
+/// The key of the list of positions before the root a `pathdep` value rests
+/// on, written right after `pathdep=1`.
+#[cfg(feature = "verbose3")]
+const PATHDEP_PLIES: &[u8] = b" pathdep_plies=";
+
+/// Written after that list when the value may rest on positions it does not
+/// name.
+#[cfg(feature = "verbose3")]
+const PATHDEP_OPEN: &[u8] = b" pathdep_open=1";
+
+/// The decimal width of the widest `u32`, the type a listed ply is held in.
+#[cfg(feature = "verbose3")]
+const U32_DIGITS: usize = 10;
+
+/// The two items of a `pathdep` value's causes at their widest: a full list of
+/// ten-digit plies, comma-separated, and the open item.
+#[cfg(feature = "verbose3")]
+const CAUSE_ITEMS_MAX: usize =
+    PATHDEP_PLIES.len() + CAUSE_CAPACITY * (U32_DIGITS + 1) - 1 + PATHDEP_OPEN.len();
 
 /// The duplication items' keys after the store-outcome, presence and event
 /// ones, in the order they are written.
@@ -127,13 +149,14 @@ const LINE_MAX: usize = PREFIX.len() + COUNT_ITEMS_MAX;
 /// The longest line [`render`] can produce without the duplication items, with
 /// the three mark items of a `verbose3` build after the counted ones. Each is
 /// written only when its mark is set, so the widest line is the one that carries
-/// all three.
+/// all three, and the `pathdep` mark's causes at their widest.
 #[cfg(feature = "verbose3")]
 const LINE_MAX: usize = PREFIX.len()
     + COUNT_ITEMS_MAX
     + MARK_ITEMS[0].len()
     + MARK_ITEMS[1].len()
-    + MARK_ITEMS[2].len();
+    + MARK_ITEMS[2].len()
+    + CAUSE_ITEMS_MAX;
 
 /// The move-order spread's items, in the order they are written, each with the
 /// space that separates it from what comes before.
@@ -712,7 +735,10 @@ impl StatsBuf {
 ///
 /// `marks` are the marks of the value the reply rests on — the score of the root
 /// move the engine plays. Each is an item that appears only when it is set, like
-/// every other item on the line.
+/// every other item on the line. Right after `pathdep=1` come its causes:
+/// `pathdep_plies=<n>,<n>,…`, the positions before the root its repetition
+/// judgements matched, when there are any, and `pathdep_open=1` when there may
+/// be others the list does not name.
 ///
 /// [`MAX_LINE`] is the widest line the items can make, so nothing here can run
 /// out of room — and a truncated line would be worse than no line, so the
@@ -721,7 +747,7 @@ pub(crate) fn render(
     buf: &mut StatsBuf,
     alloc: u64,
     search: SearchCounts,
-    #[cfg(feature = "verbose3")] marks: ValueMarks,
+    #[cfg(feature = "verbose3")] marks: impl Into<ReplyMarks>,
 ) -> Option<&[u8]> {
     let mut out = TextWriter::new(&mut buf.bytes);
     out.bytes(PREFIX);
@@ -770,13 +796,29 @@ pub(crate) fn render(
         }
     }
     #[cfg(feature = "verbose3")]
-    for (item, set) in MARK_ITEMS
-        .iter()
-        .zip([marks.path_dep, marks.decl_rule, marks.move_limit])
     {
-        if set {
+        let ReplyMarks { marks, causes } = marks.into();
+        for (item, set) in
+            MARK_ITEMS
+                .iter()
+                .zip([marks.path_dep, marks.decl_rule, marks.move_limit])
+        {
+            if !set {
+                continue;
+            }
             out.bytes(item);
             carried = true;
+            if *item == MARK_ITEMS[0] {
+                if let Some((first, rest)) = causes.plies().split_first() {
+                    out.bytes(PATHDEP_PLIES).u64(u64::from(*first));
+                    for at in rest {
+                        out.byte(b',').u64(u64::from(*at));
+                    }
+                }
+                if causes.is_open() {
+                    out.bytes(PATHDEP_OPEN);
+                }
+            }
         }
     }
     debug_assert!(!out.overflowed(), "the widest line fits MAX_LINE");
@@ -1099,6 +1141,7 @@ mod tests {
     #[cfg(feature = "verbose3")]
     mod value_marks {
         use super::*;
+        use yorkie_search::causes::PathCauses;
 
         fn marks(path_dep: bool, decl_rule: bool, move_limit: bool) -> ValueMarks {
             ValueMarks {
@@ -1167,16 +1210,76 @@ mod tests {
         #[test]
         fn the_widest_line_fits_the_buffer() {
             let mut buf = StatsBuf::new();
-            let line = render(&mut buf, u64::MAX, all(u64::MAX), marks(true, true, true))
+            let widest = ReplyMarks {
+                marks: marks(true, true, true),
+                causes: causes(
+                    &(0..CAUSE_CAPACITY)
+                        .map(|i| u32::MAX as usize - i)
+                        .collect::<Vec<_>>(),
+                    true,
+                ),
+            };
+            let line = render(&mut buf, u64::MAX, all(u64::MAX), widest)
                 .expect("a marked reply is reported");
             assert_eq!(
                 line,
                 &b"info string stats alloc=18446744073709551615 nodes=18446744073709551615 \
                    tt_update=18446744073709551615 eval_dup=18446744073709551615 \
                    evals=18446744073709551615 eval_tt_hits=18446744073709551615 \
-                   pathdep=1 declrule=1 movelimit=1"[..]
+                   pathdep=1 pathdep_plies=4294967288,4294967289,4294967290,4294967291,\
+                   4294967292,4294967293,4294967294,4294967295 pathdep_open=1 \
+                   declrule=1 movelimit=1"[..]
             );
             assert_eq!(line.len(), MAX_LINE);
+        }
+
+        /// A set listing `plies`, open when `open` is.
+        fn causes(plies: &[usize], open: bool) -> PathCauses {
+            let mut out = PathCauses::NONE;
+            for &at in plies {
+                out.insert(at);
+            }
+            if open {
+                out.set_open();
+            }
+            out
+        }
+
+        /// The causes of a `pathdep` value follow `pathdep=1` directly: the list
+        /// ascending and comma-separated, then the open item; an empty list is
+        /// left off, and a set that is not open writes no open item.
+        #[test]
+        fn the_causes_follow_the_pathdep_mark() {
+            let mut buf = StatsBuf::new();
+            let cases: [(&[usize], bool, &[u8]); 4] = [
+                (&[], false, b"info string stats pathdep=1 declrule=1"),
+                (
+                    &[12, 4],
+                    false,
+                    b"info string stats pathdep=1 pathdep_plies=4,12 declrule=1",
+                ),
+                (
+                    &[],
+                    true,
+                    b"info string stats pathdep=1 pathdep_open=1 declrule=1",
+                ),
+                (
+                    &[7],
+                    true,
+                    b"info string stats pathdep=1 pathdep_plies=7 pathdep_open=1 declrule=1",
+                ),
+            ];
+            for (plies, open, want) in cases {
+                let report = ReplyMarks {
+                    marks: marks(true, true, false),
+                    causes: causes(plies, open),
+                };
+                assert_eq!(
+                    render(&mut buf, 0, SearchCounts::default(), report),
+                    Some(want),
+                    "causes {plies:?}, open {open}"
+                );
+            }
         }
     }
 
@@ -1366,10 +1469,20 @@ mod tests {
             };
             let mut buf = StatsBuf::new();
             #[cfg(feature = "verbose3")]
-            let marks = ValueMarks {
-                path_dep: true,
-                decl_rule: true,
-                move_limit: true,
+            let marks = {
+                let mut causes = yorkie_search::causes::PathCauses::NONE;
+                for i in 0..CAUSE_CAPACITY {
+                    causes.insert(u32::MAX as usize - i);
+                }
+                causes.set_open();
+                ReplyMarks {
+                    marks: ValueMarks {
+                        path_dep: true,
+                        decl_rule: true,
+                        move_limit: true,
+                    },
+                    causes,
+                }
             };
             let line = render(
                 &mut buf,

@@ -337,6 +337,37 @@ fn a_reply_that_starts_no_search_still_reports_its_interval() {
     }
 }
 
+/// Below `verbose3` the line carries no mark and no cause, even for a reply
+/// whose value a repetition judgement produced: the boxed-in king's one move
+/// makes a repetition draw, which a `verbose3` build reports as `pathdep=1`
+/// with the repeated position.
+#[cfg(not(feature = "verbose3"))]
+#[cfg_attr(miri, ignore)]
+#[test]
+fn below_verbose3_a_repetition_reply_carries_no_mark_and_no_cause() {
+    let _session = common::serial_session();
+    stage_configured_eval_dir();
+    let out = drive(
+        "usi\n\
+         isready\n\
+         position sfen 4k4/9/9/4P4/9/9/9/9/3LKL3 b - 1 \
+         moves 5i5h 5a5b 5h5i 5b5a 5i5h 5a5b 5h5i\n\
+         go byoyomi 1000\n\
+         quit\n",
+    );
+    let bestmoves = bestmove_indices(&out);
+    assert_eq!(bestmoves.len(), 1, "expected one reply in:\n{out}");
+    let line = out
+        .lines()
+        .nth(bestmoves[0] - 1)
+        .expect("a line before the reply");
+    let items = stats_items(line).unwrap_or_else(|| panic!("{line:?} is the statistics line"));
+    assert!(
+        !items.iter().any(|item| item.starts_with("pathdep")),
+        "no mark and no cause below verbose3, got {line:?}"
+    );
+}
+
 /// The three items a `verbose3` build adds: what the value the reply rests on —
 /// the score of the root move the engine plays — was derived through. A caller
 /// recording the reply keeps them beside the move, so the positions a change of
@@ -424,6 +455,128 @@ mod value_marks {
     fn reply_marks(out: &str) -> [bool; 3] {
         let items = reply_items(out);
         ["pathdep=1", "declrule=1", "movelimit=1"].map(|item| items.contains(&item))
+    }
+
+    /// The reply's `pathdep` causes: the listed plies (empty when the item is
+    /// left off) and whether `pathdep_open=1` is written.
+    fn reply_causes(out: &str) -> (Vec<u32>, bool) {
+        let items = reply_items(out);
+        let plies = items
+            .iter()
+            .find_map(|item| item.strip_prefix("pathdep_plies="))
+            .map_or_else(Vec::new, |list| {
+                list.split(',')
+                    .map(|n| n.parse().expect("a listed ply is a number"))
+                    .collect()
+            });
+        (plies, items.contains(&"pathdep_open=1"))
+    }
+
+    /// The move of the first `bestmove` in `out`.
+    fn played(out: &str) -> &str {
+        out.lines()
+            .find_map(|l| l.strip_prefix("bestmove "))
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap_or_else(|| panic!("a reply must be in:\n{out}"))
+    }
+
+    /// Search `position` to depth 2 and return the session's output.
+    fn searched(position: &str) -> String {
+        let h = ready_harness();
+        search(&h, position, 2);
+        h.quit_join()
+    }
+
+    /// The perpetual-check verdict: White's escape to 5a makes the position
+    /// after the twelfth move, which stood last after the eighth — so the reply
+    /// rests on that position, and on nothing else of the game.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_perpetual_check_names_the_position_it_repeats() {
+        let _session = common::serial_session();
+        let out = searched(&format!(
+            "position sfen {PERPETUAL_CHECK} moves {PERPETUAL_CYCLE}"
+        ));
+        assert_eq!(played(&out), "5b5a", "the escape wins, in:\n{out}");
+        assert_eq!(
+            reply_causes(&out),
+            (vec![8], false),
+            "the repeated position is the one after the eighth move, in:\n{out}"
+        );
+    }
+
+    /// The draw: the two kings shuffle, White's boxed in on file 5 by Black's
+    /// lances on files 4 and 6 and the pawn on 5d. Stepping back to 5a — its
+    /// one move — makes the position that stood after the fourth move again,
+    /// and the reply names that position.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_repetition_draw_names_the_position_it_repeats() {
+        let _session = common::serial_session();
+        let out = searched(
+            "position sfen 4k4/9/9/4P4/9/9/9/9/3LKL3 b - 1 \
+             moves 5i5h 5a5b 5h5i 5b5a 5i5h 5a5b 5h5i",
+        );
+        assert_eq!(played(&out), "5b5a", "White's one move, in:\n{out}");
+        assert_eq!(reply_marks(&out), [true, false, false], "in:\n{out}");
+        assert_eq!(reply_causes(&out), (vec![4], false), "in:\n{out}");
+    }
+
+    /// The inferior verdict, which compares hands: Black dropped a pawn
+    /// White's king took, and with the king's walk back to 5a the board is the
+    /// starting one again, Black to move and a pawn short of what it held
+    /// there. The position named is that start, ply 0.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn an_inferior_recurrence_names_the_position_with_the_other_hands() {
+        let _session = common::serial_session();
+        let out =
+            searched("position sfen 4k4/9/9/9/9/9/9/9/4K4 b P 1 moves P*5b 5a5b 5i5h 5b4a 5h5i");
+        assert_eq!(
+            played(&out),
+            "4a5a",
+            "the recurrence is White's best, in:\n{out}"
+        );
+        assert_eq!(reply_marks(&out), [true, false, false], "in:\n{out}");
+        assert_eq!(reply_causes(&out), (vec![0], false), "in:\n{out}");
+    }
+
+    /// The superior verdict: White dropped a pawn Black's king took, and with
+    /// both kings back the board is the starting one, Black to move with a pawn
+    /// more than it held there. White, boxed in as in the draw above, has that
+    /// step back as its one move, so the reply rests on the verdict and names
+    /// the start, ply 0. The verdict's score is far below any resign
+    /// threshold, so a config that resigns answers `resign` instead — which
+    /// reports the same move's marks and causes.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_superior_recurrence_names_the_position_with_the_other_hands() {
+        let _session = common::serial_session();
+        let out = searched(
+            "position sfen 4k4/9/9/4P4/9/9/9/9/3LKL3 b p 1 moves 5i4h P*5h 4h5h 5a5b 5h5i",
+        );
+        assert!(
+            matches!(played(&out), "5b5a" | "resign"),
+            "White's one move, or a resignation on its score, in:\n{out}"
+        );
+        assert_eq!(reply_marks(&out), [true, false, false], "in:\n{out}");
+        assert_eq!(reply_causes(&out), (vec![0], false), "in:\n{out}");
+    }
+
+    /// A reply with no repetition behind it lists no cause either.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_reply_without_the_mark_lists_no_cause() {
+        let _session = common::serial_session();
+        let out = searched("position startpos moves 7g7f 3c3d");
+        if reply_marks(&out)[0] {
+            return;
+        }
+        let items = reply_items(&out);
+        assert!(
+            !items.iter().any(|item| item.starts_with("pathdep_")),
+            "no cause without the mark, in:\n{out}"
+        );
     }
 
     /// A reply whose move was chosen on a value a repetition judgement produced
