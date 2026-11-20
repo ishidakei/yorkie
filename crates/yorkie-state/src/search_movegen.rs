@@ -774,6 +774,11 @@ pub struct CheckSquares {
 impl CheckSquares {
     /// True iff `m` gives a **direct** check by the moved piece —
     /// [`Position::gives_direct_check`] read off the snapshot.
+    ///
+    /// The move picker's quiet scoring calls this once per quiet move, and
+    /// left to itself the inliner keeps the call there; the hint folds it into
+    /// the scoring loop.
+    #[inline]
     pub fn gives_direct_check(&self, m: Move) -> bool {
         self.table[check_pattern(m.moved_piece_after())].test(m.to_sq())
     }

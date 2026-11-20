@@ -155,6 +155,35 @@ fn captured_code(p: Piece) -> usize {
     1 + p.kind.index() + if p.promoted { 8 } else { 0 }
 }
 
+/// The `[pc][to]` position of one entry within a `[pc][to]` plane, as one flat
+/// number.
+///
+/// A quiet move reads the same `[pc][to]` entry from six planes (five
+/// continuation planes and the pawn plane), so the index is computed once per
+/// move and each plane is then one load away. Like [`PlaneIndex`], the field is
+/// private and bounded by its constructor, so a plane lookup needs no check.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PieceSquare(u16);
+
+impl PieceSquare {
+    /// The entry of piece `pc` moving to `to`.
+    pub fn new(pc: Piece, to: Square) -> Self {
+        let i = piece_code(pc) * SQ_NB + to.index() as usize;
+        debug_assert!(i < PIECE_NB * SQ_NB);
+        Self(i as u16)
+    }
+
+    /// The flat index, known to the compiler to be inside a plane.
+    fn get(self) -> usize {
+        let i = self.0 as usize;
+        debug_assert!(i < PIECE_NB * SQ_NB);
+        // SAFETY: the field is private and `new` builds it from a piece code
+        // below `PIECE_NB` and a square index below `SQ_NB`.
+        unsafe { core::hint::assert_unchecked(i < PIECE_NB * SQ_NB) };
+        i
+    }
+}
+
 /// `captureHistory[pc][to][type_of(captured)]` — the capture-ordering bonus for
 /// "moved piece `pc` captures a `captured`-type piece on square `to`".
 pub struct CapturePieceToHistory {
@@ -279,11 +308,33 @@ impl ButterflyHistory {
         self.table[us.index()][move16(m)] as i32
     }
 
+    /// The side-to-move `us` row, for a caller that reads many moves of one
+    /// side; its [`MoveRow::get`] equals [`Self::get`] with `us`.
+    pub fn row(&self, us: Color) -> MoveRow<'_> {
+        MoveRow {
+            entries: &self.table[us.index()],
+        }
+    }
+
     /// Gravity-update `mainHistory[us][move.raw16]` (`D = 7183`).
     #[inline(always)]
     pub fn update(&mut self, us: Color, m: Move, bonus: i32) {
         let cell = &mut self.table[us.index()][move16(m)];
         *cell = apply_gravity(*cell, bonus, MAIN_HISTORY_D);
+    }
+}
+
+/// One row of a butterfly-shaped table (`mainHistory[us]`, `lowPlyHistory[ply]`),
+/// indexed by the move's low 16 bits.
+#[derive(Clone, Copy)]
+pub struct MoveRow<'a> {
+    entries: &'a [i16; 1 << 16],
+}
+
+impl MoveRow<'_> {
+    /// The entry for `m`.
+    pub fn get(self, m: Move) -> i32 {
+        self.entries[move16(m)] as i32
     }
 }
 
@@ -330,6 +381,12 @@ impl PieceToHistory {
     /// zero-filled plane.
     pub fn get(&self, pc: Piece, to: Square) -> i32 {
         self.table[piece_code(pc)][to.index() as usize] as i32
+    }
+
+    /// The entry at `ps`; equal to [`Self::get`] of the piece and square `ps`
+    /// was built from.
+    pub fn get_ps(&self, ps: PieceSquare) -> i32 {
+        self.table.as_flattened()[ps.get()] as i32
     }
 
     /// Gravity-update the `[pc][to]` continuation entry (`D = 30000`).
@@ -379,6 +436,11 @@ impl LowPlyHistory {
         self.table[ply][move16(m)] as i32
     }
 
+    /// The `ply` row, or `None` for a ply the table does not cover; its
+    /// [`MoveRow::get`] equals [`Self::get`] with `ply`.
+    pub fn row(&self, ply: usize) -> Option<MoveRow<'_>> {
+        self.table.get(ply).map(|entries| MoveRow { entries })
+    }
     /// Gravity-update `lowPlyHistory[ply][move.raw16]` (`D = 7183`). The caller
     /// guarantees `ply < LOW_PLY_HISTORY_SIZE`.
     pub fn update(&mut self, ply: usize, m: Move, bonus: i32) {
@@ -631,6 +693,47 @@ impl SharedHistories {
     pub fn pawn_update(&self, pawn_key: u64, pc: Piece, to: Square, bonus: i32) {
         apply_gravity_atomic(self.pawn_cell(pawn_key, pc, to), bonus, PAWN_HISTORY_D);
     }
+
+    /// The whole plane keyed by `pawn_key`, for a caller that reads many
+    /// entries of one position's plane: the key is masked, and the table's
+    /// base read, once rather than per entry.
+    pub fn pawn_plane(&self, pawn_key: u64) -> PawnPlane<'_> {
+        #[cfg(feature = "dupstats")]
+        if !self.pawn_own
+            && let Some(node) = &self.delegate
+        {
+            return node.pawn_plane(pawn_key);
+        }
+        let start = ((pawn_key as usize) & self.pawn_mask) * PAWN_SLOT_LEN;
+        debug_assert!(start + PAWN_SLOT_LEN <= self.pawn.len());
+        // SAFETY: as in `Self::pawn_cell`, the masked plane number is below
+        // `pawn_mask + 1` and the table holds `(pawn_mask + 1) * PAWN_SLOT_LEN`
+        // entries, so the `PAWN_SLOT_LEN` entries from `start` are in the
+        // block; an array of `AtomicI16` has the layout of that run.
+        let entries = unsafe {
+            &*self
+                .pawn
+                .as_ptr()
+                .add(start)
+                .cast::<[AtomicI16; PAWN_SLOT_LEN]>()
+        };
+        PawnPlane { entries }
+    }
+}
+
+/// One plane of the pawn history, resolved from a pawn key by
+/// [`SharedHistories::pawn_plane`].
+#[derive(Clone, Copy)]
+pub struct PawnPlane<'a> {
+    entries: &'a [AtomicI16; PAWN_SLOT_LEN],
+}
+
+impl PawnPlane<'_> {
+    /// The entry at `ps`; equal to [`SharedHistories::pawn_get`] with this
+    /// plane's key and the piece and square `ps` was built from.
+    pub fn get(self, ps: PieceSquare) -> i32 {
+        self.entries[ps.get()].load(Ordering::Relaxed) as i32
+    }
 }
 
 /// `CorrectionHistory<Continuation>`: a `[pc][to]` table whose every cell is
@@ -751,11 +854,16 @@ impl ContinuationHistory {
         self.table[plane.get()].get(pc, to)
     }
 
+    /// The inner entry `ps` in `plane`; equal to [`Self::get_at`] of the piece
+    /// and square `ps` was built from.
+    pub fn get_at_ps(&self, plane: ContPlane, ps: PieceSquare) -> i32 {
+        self.table[plane.get()].get_ps(ps)
+    }
+
     /// Gravity-update the inner `[pc][to]` entry in `plane` (`D = 30000`).
     pub fn update_at(&mut self, plane: ContPlane, pc: Piece, to: Square, bonus: i32) {
         self.table[plane.get()].update(pc, to, bonus);
     }
-
     /// Borrow `plane` whole, so a search that keeps its continuation table in
     /// this multi-plane form can hand the picker the six planes its `contHist`
     /// array names.
@@ -934,6 +1042,48 @@ mod shared_tests {
             b_before,
             "thread_count 2: keys 0 and 8192 must be in distinct planes"
         );
+    }
+
+    /// A resolved pawn plane reads the entries `pawn_get` reads, for keys that
+    /// land on the first plane, the last one and planes between, at two table
+    /// sizes.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn pawn_plane_reads_the_entries_pawn_get_reads() {
+        let pieces = [
+            bp(),
+            Piece::new(PieceKind::Gold, Color::White),
+            Piece {
+                kind: PieceKind::Rook,
+                color: Color::White,
+                promoted: true,
+            },
+        ];
+        let squares = [Square::new(0, 0).unwrap(), to(), Square::new(8, 8).unwrap()];
+        for tc in [1usize, 2] {
+            let sh = SharedHistories::new(tc);
+            let keys = [0u64, 1, 0x1234_5678_9abc_def0, u64::MAX];
+            for (k, &key) in keys.iter().enumerate() {
+                for (i, &pc) in pieces.iter().enumerate() {
+                    for (j, &sq) in squares.iter().enumerate() {
+                        let bonus = 1000 * (k as i32 + 1) + 100 * i as i32 + 10 * j as i32;
+                        sh.pawn_update(key, pc, sq, bonus);
+                    }
+                }
+            }
+            for &key in &keys {
+                let plane = sh.pawn_plane(key);
+                for &pc in &pieces {
+                    for &sq in &squares {
+                        assert_eq!(
+                            plane.get(PieceSquare::new(pc, sq)),
+                            sh.pawn_get(key, pc, sq),
+                            "tc {tc} key {key:#x}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// The same widening for the correction table (`65536` slot base).

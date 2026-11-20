@@ -36,7 +36,9 @@
 use yorkie_state::{CheckSquares, ExtMove, Move, MoveSink, Position, piece_value};
 
 use crate::config::GENERATE_ALL_LEGAL_MOVES;
-use crate::history::{ContPlane, LOW_PLY_HISTORY_SIZE};
+#[cfg(test)]
+use crate::history::LOW_PLY_HISTORY_SIZE;
+use crate::history::{ContPlane, MoveRow, PawnPlane, PieceSquare, PieceToHistory};
 use crate::update::WorkerHistories;
 
 /// `goodQuietThreshold`: quiets scoring above this go to `GOOD_QUIET`, the rest
@@ -257,11 +259,10 @@ fn score_evasion(pos: &Position, m: Move, hist: &WorkerHistories, cont_plane0: C
     }
 }
 
-/// `score<QUIETS>` for a single quiet move.
-///
-/// Reads continuation planes `[0][1][2][3][5]` — index `4` is deliberately
-/// absent. The Stockfish "threat by a lesser piece" term is `#if STOCKFISH`-
-/// only in the reference, so it is omitted.
+/// `score<QUIETS>` for a single quiet move, every table position computed from
+/// scratch. The twin picker scores with it, so the twin tests pin
+/// [`QuietScorer::score`] to it.
+#[cfg(test)]
 fn score_quiet(
     pos: &Position,
     m: Move,
@@ -298,6 +299,71 @@ fn score_quiet(
     }
 
     value
+}
+
+/// `score<QUIETS>`, with every table position that depends only on the node
+/// resolved once, when the quiets stage is entered, rather than once per move:
+/// the side-to-move row of the main history, the pawn-history plane of the
+/// position's pawn key, the five continuation planes, and the low-ply row and
+/// its divisor. Per move, one `[pc][to]` index then serves all six `[pc][to]`
+/// planes.
+///
+/// Reads continuation planes `[0][1][2][3][5]` — index `4` is deliberately
+/// absent. The Stockfish "threat by a lesser piece" term is `#if STOCKFISH`-
+/// only in the reference, so it is omitted.
+struct QuietScorer<'h> {
+    main: MoveRow<'h>,
+    pawn: PawnPlane<'h>,
+    cont: [&'h PieceToHistory; 5],
+    /// `lowPlyHistory[ply]` and `1 + ply`, near the root only.
+    low_ply: Option<(MoveRow<'h>, i32)>,
+}
+
+impl<'h> QuietScorer<'h> {
+    fn new(pos: &Position, ply: i32, hist: &'h WorkerHistories, planes: [ContPlane; 6]) -> Self {
+        let c = &hist.continuation;
+        // `ply` is never negative; the cast keeps a negative one out of the
+        // table as the `< LOW_PLY_HISTORY_SIZE` test on it does.
+        let low_ply = hist.low_ply.row(ply as usize).map(|row| (row, 1 + ply));
+        QuietScorer {
+            main: hist.main.row(pos.side_to_move()),
+            pawn: hist.shared.pawn_plane(pos.pawn_key()),
+            cont: [
+                c.plane(planes[0]),
+                c.plane(planes[1]),
+                c.plane(planes[2]),
+                c.plane(planes[3]),
+                c.plane(planes[5]),
+            ],
+            low_ply,
+        }
+    }
+
+    fn score(&self, pos: &Position, m: Move, check_squares: &CheckSquares) -> i32 {
+        let ps = PieceSquare::new(m.moved_piece_after(), m.to_sq());
+
+        let mut value = 2 * self.main.get(m);
+        value += 2 * self.pawn.get(ps);
+        value += self.cont[0].get_ps(ps);
+        value += self.cont[1].get_ps(ps);
+        value += self.cont[2].get_ps(ps);
+        value += self.cont[3].get_ps(ps);
+        value += self.cont[4].get_ps(ps);
+
+        // Bonus for a direct check that is not a losing sacrifice. Reads the
+        // `checkSquares` snapshot taken once at `QUIET_INIT` entry, rather than
+        // re-entering the lazy `check_info()` accessor per scored quiet.
+        if check_squares.gives_direct_check(m) && pos.see_ge(m, -75) {
+            value += 16384;
+        }
+
+        // Integer division truncates toward zero exactly as the C++ `/` does.
+        if let Some((row, divisor)) = self.low_ply {
+            value += 8 * row.get(m) / divisor;
+        }
+
+        value
+    }
 }
 
 /// Which family of moves this picker emits, and how its capture-like init stage
@@ -594,11 +660,11 @@ impl<'a> MovePicker<'a> {
         // board is fixed for the picker's lifetime, so the snapshot is valid for
         // every quiet scored here.
         let check_squares = pos.check_squares();
-        let (ply, planes, depth, end_captures) =
-            (self.ply, self.cont_planes, self.depth, self.end_captures);
+        let scorer = QuietScorer::new(pos, self.ply, hist, self.cont_planes);
+        let (depth, end_captures) = (self.depth, self.end_captures);
         let (_, quiets) = self.scratch.as_mut_slice().split_at_mut(end_captures);
         for e in quiets.iter_mut() {
-            e.value = score_quiet(pos, e.mv, ply, hist, planes, &check_squares);
+            e.value = scorer.score(pos, e.mv, &check_squares);
         }
         partial_insertion_sort(quiets, -3560 * depth);
     }
@@ -1701,6 +1767,55 @@ mod tests {
             first, q_target,
             "the quiet whose live continuation cell was bumped must lead"
         );
+    }
+
+    /// The node-resolved scorer gives every quiet the score the per-move one
+    /// gives it, over tables whose entries differ from move to move and from
+    /// plane to plane, so a wrong row, plane or index would show.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn quiet_scorer_equals_the_per_move_score_on_uneven_tables() {
+        let sfens = [
+            "l7l/1r1sg2k1/2nppgsp1/p1p3p1p/1p2N4/2P1P1P2/PPSP1PB1P/3GG1SR1/LN2K3L b BNPp 1",
+            "l7l/1r1sg2k1/2nppgsp1/p1p3p1p/1p2N4/2P1P1P2/PPSP1PB1P/3GG1SR1/LN2K3L w BNPp 1",
+            "6rkg/8G/9/9/9/9/9/9/K8 b - 1",
+        ];
+        let planes: [ContPlane; 6] = std::array::from_fn(|i| ContPlane::new(1 + 97 * i));
+        for sfen in sfens {
+            let p = pos(sfen);
+            let mut raw = Vec::new();
+            p.generate_quiets::<GENERATE_ALL_LEGAL_MOVES, _>(&mut raw);
+            let quiets: Vec<Move> = raw.into_iter().map(|e| e.mv).collect();
+            assert!(quiets.len() > 3, "{sfen}: too few quiets to compare");
+
+            let mut h = init_histories();
+            let us = p.side_to_move();
+            for (n, &m) in quiets.iter().enumerate() {
+                let (pc, to) = (m.moved_piece_after(), m.to_sq());
+                let b = |k: i32| (n as i32 * 37 + k * 211) % 4000 - 2000;
+                h.main.update(us, m, b(1));
+                h.shared.pawn_update(p.pawn_key(), pc, to, b(2));
+                for ply in 0..LOW_PLY_HISTORY_SIZE {
+                    h.low_ply.update(ply, m, b(3 + ply as i32));
+                }
+                for (k, &plane) in planes.iter().enumerate() {
+                    h.continuation.update_at(plane, pc, to, b(10 + k as i32));
+                }
+            }
+
+            let check_squares = p.check_squares();
+            for ply in [0, 1, 4, 5, 6, 40] {
+                let scorer = QuietScorer::new(&p, ply, &h, planes);
+                for &m in &quiets {
+                    assert_eq!(
+                        scorer.score(&p, m, &check_squares),
+                        score_quiet(&p, m, ply, &h, planes, &check_squares),
+                        "{sfen} ply {ply} move {}",
+                        format_usi_move(m)
+                    );
+                }
+            }
+        }
     }
 
     #[cfg_attr(miri, ignore)]
