@@ -90,10 +90,19 @@ yorkie-eval = { path = "../yorkie-eval", features = ["source-network"] }
 # more than one worker; without either, none of it exists in the crate. The
 # feature is how the tests reach the code under a config that leaves the key
 # off. Off by default.
+#
+# `repetition-index` compiles in each worker's index of the game before its
+# search root, and the repetition judgement that reads it, without widening
+# the look-back window. A config key `repetition_look_back` other than `16`
+# compiles the same code in and sets the window; without either, the search
+# judges a repetition with the plain sixteen-ply walk alone. The feature is how
+# the tests reach the code under a config that keeps `16`: they set a
+# worker's window themselves. Off by default.
 [features]
 lazy-smp-defer = []
 lazy-smp-spread = []
 random = []
+repetition-index = []
 tune = []
 tt-entry16 = ["yorkie-storage/tt-entry16"]
 verbose1 = ["yorkie-storage/verbose1"]

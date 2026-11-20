@@ -664,6 +664,12 @@ pub struct QSearch<N: NetworkParams> {
     /// search.
     #[cfg(all(lazy_smp_spread, test))]
     singular_audit: SingularAudit,
+    /// How many plies back this worker looks for a repetition, `0` for no
+    /// limit: the config's `repetition_look_back` unless a test set another.
+    /// The index of the game before the root that the window reaches into is
+    /// the histories bundle's (`WorkerHistories::history_index`).
+    #[cfg(repetition_index)]
+    repetition_look_back: u32,
     /// `selDepth`.
     sel_depth: i32,
     /// `nmpMinPly`: while a null-move verification search runs, the ply below
@@ -1220,6 +1226,8 @@ impl<N: NetworkParams> QSearch<N> {
             tt_cut_ply: -1,
             #[cfg(all(lazy_smp_spread, test))]
             singular_audit: SingularAudit::default(),
+            #[cfg(repetition_index)]
+            repetition_look_back: crate::config::REPETITION_LOOK_BACK as u32,
             sel_depth: 0,
             nmp_min_ply: 0,
             pv_node: false,
@@ -1475,6 +1483,37 @@ impl<N: NetworkParams> QSearch<N> {
         self.defer.set(on, workers);
     }
 
+    /// Look `plies` back for a repetition from the next search on, `0` for no
+    /// limit. A worker starts with the config's `repetition_look_back`.
+    #[cfg(repetition_index)]
+    pub fn set_repetition_look_back(&mut self, plies: u32) {
+        self.repetition_look_back = plies;
+    }
+
+    /// Index the game up to `root`, the root of the search about to start, for
+    /// [`Self::repetition`]. A window of sixteen is the plain walk, which never
+    /// reads the index, so then nothing is built.
+    #[cfg(repetition_index)]
+    fn index_root(&mut self, root: &Position) {
+        if self.repetition_look_back != 16 {
+            self.histories.history_index.rebuild(root);
+        }
+    }
+
+    /// The repetition verdict on `pos`, over the window this build looks back
+    /// across.
+    #[inline(always)]
+    fn repetition(&self, pos: &Position) -> RepetitionState {
+        #[cfg(repetition_index)]
+        {
+            pos.is_repetition_within(self.repetition_look_back, &self.histories.history_index)
+        }
+        #[cfg(not(repetition_index))]
+        {
+            pos.is_repetition()
+        }
+    }
+
     /// Install the raw `MultiPV` option value for this `go`. Every worker gets
     /// it, since it shapes the search; the main worker's PV *output* is
     /// configured separately by [`Self::set_pv_output`]. Both clamp to
@@ -1692,6 +1731,8 @@ impl<N: NetworkParams> QSearch<N> {
 
         // Seed the root accumulator; every node below derives from it.
         self.seed_accumulator(pos);
+        #[cfg(repetition_index)]
+        self.index_root(pos);
 
         let value =
             self.lend_picker_scratch(|this, scratch| this.qsearch(pos, 0, alpha, beta, scratch));
@@ -2159,7 +2200,7 @@ impl<N: NetworkParams> QSearch<N> {
 
         // Step 2. Immediate draw / max ply.
         let us = pos.side_to_move();
-        let draw_type = pos.is_repetition();
+        let draw_type = self.repetition(pos);
         if draw_type != RepetitionState::None {
             // The judgement read the move history, so the value is path
             // dependent by construction — this is where the mark originates.
@@ -2678,6 +2719,8 @@ impl<N: NetworkParams> QSearch<N> {
 
         // A private working copy; the caller's position is never mutated.
         let mut work = root_pos.clone();
+        #[cfg(repetition_index)]
+        self.index_root(&work);
 
         // Seed this worker's accumulator stack from the root once. `search<Root>`
         // restores `work` to the root after every iteration and never mutates
@@ -3365,7 +3408,7 @@ impl<N: NetworkParams> QSearch<N> {
         let mut applied: Vec<(Move, yorkie_state::Undo)> = Vec::new();
         let mut ply = 0usize;
         while ply < MAX_PLY as usize {
-            if ply >= 1 && pos.is_repetition() != RepetitionState::None {
+            if ply >= 1 && self.repetition(&pos) != RepetitionState::None {
                 break;
             }
             let m = if ply < root_pv.len() {
@@ -3608,6 +3651,8 @@ impl<N: NetworkParams> QSearch<N> {
             cell.pv = pv;
         }
         self.seed_accumulator(pos);
+        #[cfg(repetition_index)]
+        self.index_root(pos);
         self.lend_picker_scratch(|this, scratch| {
             this.search(
                 pos, ply, alpha, beta, depth, cut_node, pv_node, None, None, scratch,
@@ -3690,7 +3735,7 @@ impl<N: NetworkParams> QSearch<N> {
         // The root never draws or mate-distance-prunes.
         if !root_node {
             // Step 2. Immediate draw / max ply.
-            let draw_type = pos.is_repetition();
+            let draw_type = self.repetition(pos);
             if draw_type != RepetitionState::None {
                 // The judgement read the move history, so the value is path
                 // dependent by construction — this is where the mark
@@ -6179,6 +6224,72 @@ mod tests {
         q.nodes = 0;
         // draw_value(DRAW, Black=root_us) + value_draw(0) == -1 + -1 == -2.
         assert_eq!(q.qsearch_at(&mut p, 6, -1, 0), -2);
+    }
+
+    /// Both kings of [`TWO_KINGS`] walk a ten-square ring in step, so a
+    /// position first recurs twenty plies on: the moves of `laps` laps.
+    #[cfg(repetition_index)]
+    fn twenty_ply_laps(laps: usize) -> Vec<Move> {
+        let ring = |rank_home: u8, rank_away: u8| {
+            let mut squares = Vec::new();
+            for file in (0..=4).rev() {
+                squares.push(Square::new(file, rank_home).unwrap());
+            }
+            for file in 0..=4 {
+                squares.push(Square::new(file, rank_away).unwrap());
+            }
+            squares
+        };
+        let black = ring(8, 7);
+        let white = ring(0, 1);
+        let bk = Piece::new(PieceKind::King, Color::Black);
+        let wk = Piece::new(PieceKind::King, Color::White);
+        let mut moves = Vec::new();
+        for _ in 0..laps {
+            for i in 0..10 {
+                moves.push(Move::make(black[i], black[(i + 1) % 10], bk));
+                moves.push(Move::make(white[i], white[(i + 1) % 10], wk));
+            }
+        }
+        moves
+    }
+
+    /// A twenty-ply cycle is a draw to a search with no look-back limit,
+    /// whether its earlier occurrence lies in the search or in the game before
+    /// the root, and nothing to one with the default window.
+    #[cfg(repetition_index)]
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_twenty_ply_cycle_is_a_draw_only_without_the_look_back_limit() {
+        let net = zero_net();
+        let _tt = fresh_tt();
+        let moves = twenty_ply_laps(2);
+        // The node stands 22 plies in, its earlier occurrence 2 plies in; the
+        // root is the start (that occurrence in the search) or 21 plies in (it
+        // is in the game before the root).
+        for root in [0, 21] {
+            for (look_back, draw) in [(0, true), (16, false), (20, true), (19, false)] {
+                let mut p = pos(TWO_KINGS);
+                for &m in &moves[..root] {
+                    p.do_move(m);
+                }
+                let mut q = QSearch::new(net.network());
+                q.set_repetition_look_back(look_back);
+                q.index_root(&p);
+                for &m in &moves[root..22] {
+                    p.do_move(m);
+                }
+                q.root_us = p.side_to_move();
+                q.pv_node = false;
+                q.nodes = 0;
+                let value = q.qsearch_at(&mut p, 22 - root as i32, -1, 0);
+                assert_eq!(
+                    value == -2,
+                    draw,
+                    "root {root}, look-back {look_back}: value {value}",
+                );
+            }
+        }
     }
 
     /// The `verbose3` value marks: where each comes from, how they ride through

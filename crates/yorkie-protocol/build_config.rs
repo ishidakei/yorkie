@@ -451,6 +451,12 @@ const SCHEMA: &[Spec] = &[
          bounds every search by the clock",
     ),
     int("max_moves_to_draw", "MaxMovesToDraw", 0, 100_000),
+    int(
+        "repetition_look_back",
+        "(none: how many plies back the search looks for a repetition, 0 for no limit)",
+        0,
+        100_000,
+    ),
     boolean(
         "flatten_winning_mate",
         "(none: score every forced mate the engine delivers with one flat value)",
@@ -811,6 +817,16 @@ const CFG_SWITCHES: &[(&str, &str)] = &[
     ("low_priority_worker", "low_priority_worker"),
 ];
 
+/// The `repetition_look_back` the search judges with its plain sixteen-ply
+/// walk alone. Any other value — a different window or none at all — compiles
+/// in the index of the game before the search root, behind
+/// [`REPETITION_INDEX_CFG`], which only the search's build script sets.
+const REPETITION_LOOK_BACK_WALKED: i64 = 16;
+
+/// The `cfg` behind which the search carries the index of the game before its
+/// root (see [`REPETITION_LOOK_BACK_WALKED`]).
+const REPETITION_INDEX_CFG: &str = "repetition_index";
+
 /// Type-check and range-check every schema key against the parsed file, reject
 /// anything left over, and render the generated module.
 ///
@@ -1088,11 +1104,18 @@ fn generate(
         let _ = writeln!(out, "{rendered}");
     }
 
-    let cfgs = CFG_SWITCHES
+    let mut cfgs: Vec<&'static str> = CFG_SWITCHES
         .iter()
         .filter(|(key, _)| matches!(entries.get(*key), Some(Entry { value: Value::Bool(true), .. })))
         .map(|(_, cfg)| *cfg)
         .collect();
+    if matches!(
+        entries.get("repetition_look_back"),
+        Some(Entry { value: Value::Int(look_back), .. })
+            if *look_back != REPETITION_LOOK_BACK_WALKED
+    ) {
+        cfgs.push(REPETITION_INDEX_CFG);
+    }
 
     Ok(Generated {
         code: out,

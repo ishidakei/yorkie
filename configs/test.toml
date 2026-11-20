@@ -86,6 +86,7 @@ entering_king_rule = "CSARule27"
 depth_limit = 0
 nodes_limit = 0
 max_moves_to_draw = 0
+repetition_look_back = 16
 flatten_winning_mate = false
 
 # TEST VALUE: the play value is 300. A throttle makes which iterations print

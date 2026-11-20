@@ -3,8 +3,10 @@
 //! The search reads the settings that shape a node: the draw horizon and the
 //! draw contempt it scores a repetition with, whether the generators expose the
 //! suppressed non-promotions, which entering-king rule decides a declaration,
-//! and whether the engine's own mates are scored flat. Every one of them is fixed when the binary is built, so the node
-//! path reads a constant rather than a field a caller filled in.
+//! whether the engine's own mates are scored flat, and how far back a
+//! repetition is looked for. Every one of them is fixed when the binary is
+//! built, so the node path reads a constant rather than a field a caller filled
+//! in.
 //!
 //! The schema, parser, code generator and path resolution are shared verbatim
 //! with the protocol crate's build script, so the two builds cannot read the
@@ -12,11 +14,13 @@
 //! because a build script cannot depend on a member of the workspace it is
 //! building.
 //!
-//! Two switches reshape the search rather than setting a value in it: with
+//! Three settings reshape the search rather than setting a value in it: with
 //! `lazy_smp_spread` on, this script sets the `cfg` of the same name, behind
-//! which the workers' move-order spread is compiled, and with `lazy_smp_defer`
+//! which the workers' move-order spread is compiled, with `lazy_smp_defer`
 //! on, the one behind which a worker puts off a move another worker is
-//! searching; off, none of it exists.
+//! searching, and with a `repetition_look_back` other than 16, the
+//! `repetition_index` behind which each worker indexes the game before its
+//! root; off, none of it exists.
 //!
 //! The generated module carries every schema key it can render on its own, not
 //! just the ones read here: the generator renders the schema as a whole, and
@@ -75,6 +79,7 @@ fn main() {
         Err(e) => fail(&e),
     };
     emit_switch_cfgs(&generated.cfgs);
+    emit_repetition_index_cfg(&generated.cfgs);
 
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"))
         .join("engine_config.rs");
@@ -97,6 +102,19 @@ fn emit_switch_cfgs(on: &[&str]) {
         if on.contains(cfg) || std::env::var_os(feature).is_some() {
             println!("cargo::rustc-cfg={cfg}");
         }
+    }
+}
+
+/// Set the `cfg` behind which the search carries the index of the game before
+/// its root when the config's `repetition_look_back` is not the plain
+/// sixteen-ply walk's, or when the build carries the `repetition-index`
+/// feature, which compiles the same code in under any config.
+fn emit_repetition_index_cfg(on: &[&str]) {
+    println!("cargo::rustc-check-cfg=cfg({REPETITION_INDEX_CFG})");
+    if on.contains(&REPETITION_INDEX_CFG)
+        || std::env::var_os("CARGO_FEATURE_REPETITION_INDEX").is_some()
+    {
+        println!("cargo::rustc-cfg={REPETITION_INDEX_CFG}");
     }
 }
 

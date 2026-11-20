@@ -307,6 +307,21 @@ nodes_limit = 0
 # remaining-move estimate against this ply.
 max_moves_to_draw = 512
 
+# How many plies back the search looks for an earlier occurrence of the
+# position it stands on; `0` is no limit, back to the last null move or to the
+# start of the game named by `position ... moves`. Whatever the window, the
+# nearest earlier occurrence inside it is the verdict — a draw, a win or loss
+# by perpetual check, or a superior or inferior position — and the game itself
+# still ends in a repetition only at the fourth occurrence.
+#
+# `16` is the reference engine's window and the only value whose searches are
+# comparable with its. Any other value compiles in an index of the game's
+# positions up to the search root, built when each search starts, so that the
+# search tree is walked as before and everything before the root is found with
+# one lookup; a line returning to a position more than sixteen plies back then
+# gets a verdict the default build does not give it.
+repetition_look_back = 16
+
 # Score every forced mate the engine delivers with one flat winning value
 # instead of the usual "shorter mate scores higher" gradient. A shorter mate is
 # then worth no more than a longer one, so once any mate is proven the search

@@ -892,6 +892,262 @@ impl Position {
 
         RepetitionState::None
     }
+
+    /// [`Self::is_repetition`] over a look-back window `look_back` plies wide
+    /// instead of sixteen, `0` meaning no limit: the window then reaches back
+    /// to the last null move, or to the start of the game.
+    ///
+    /// The verdict is that of the nearest earlier occurrence in the window,
+    /// decided exactly as [`Self::is_repetition`] decides it; a window of
+    /// sixteen is that function itself. Any other window walks only the states
+    /// after the last one `before_root` holds — the search tree, when the index
+    /// was built at the search root — and finds an earlier occurrence among
+    /// those it holds with one probe of the board key, so a node's cost does
+    /// not grow with the length of the game in front of the root.
+    ///
+    /// Nothing between the two occurrences needs remembering. The hands at the
+    /// earlier one are in the index, and they decide draw against superior or
+    /// inferior. The current state's continuous-check runs, which `do_move`
+    /// carries over the whole game and resets only at a move that does not give
+    /// check, say whether every move one side made since the earlier occurrence
+    /// gave check, however far back it lies: that side has checked
+    /// perpetually exactly when its run is at least the distance.
+    ///
+    /// `before_root` must have been built from this position's own line, at a
+    /// state this position has since reached or still stands on. An empty
+    /// index ([`HistoryIndex::default`]) leaves the whole window to the walk.
+    pub fn is_repetition_within(
+        &self,
+        look_back: u32,
+        before_root: &HistoryIndex,
+    ) -> RepetitionState {
+        if look_back == MAX_REPETITION_PLY as u32 {
+            return self.is_repetition();
+        }
+        let pfn = self.current_plies_from_null();
+        let end = if look_back == 0 {
+            pfn
+        } else {
+            pfn.min(i32::try_from(look_back).unwrap_or(i32::MAX))
+        };
+        if end < 4 {
+            return RepetitionState::None;
+        }
+
+        let len = self.history.len();
+        debug_assert!(
+            before_root.covered <= len + 1,
+            "the history index holds more states than this position's line",
+        );
+        // The walk takes the newest `len + 1 - covered` states of the
+        // timeline, the ones the index does not hold.
+        let walk_end = end.min(len as i32 - before_root.covered as i32);
+        let stm = self.side_to_move;
+        let cc_stm = self.current_continuous_check(stm);
+        let cc_opp = self.current_continuous_check(stm.flip());
+
+        let mut i = 4i32;
+        while i <= walk_end {
+            if let Some(prev) = self.state_back(i as usize)
+                && prev.board_key == self.board_key
+            {
+                let verdict = self.classify_recurrence(&prev.hands, i, cc_stm, cc_opp);
+                if verdict != RepetitionState::None {
+                    return verdict;
+                }
+            }
+            i += 2;
+        }
+
+        if end > walk_end {
+            // Newest first, so the distance only grows.
+            for (at, hands) in before_root.occurrences(self.board_key) {
+                let Some(dist) = len.checked_sub(at) else {
+                    continue;
+                };
+                let dist = i32::try_from(dist).unwrap_or(i32::MAX);
+                if dist > end {
+                    break;
+                }
+                if dist < 4 || dist % 2 != 0 {
+                    continue;
+                }
+                let verdict = self.classify_recurrence(hands, dist, cc_stm, cc_opp);
+                if verdict != RepetitionState::None {
+                    return verdict;
+                }
+            }
+        }
+
+        RepetitionState::None
+    }
+
+    /// The index of this position's line up to and including the current
+    /// state, for [`Self::is_repetition_within`] at the positions a search
+    /// reaches from here.
+    pub fn history_index(&self) -> HistoryIndex {
+        let mut index = HistoryIndex::default();
+        index.rebuild(self);
+        index
+    }
+
+    /// The board key and the hands of the state at `at` on the timeline
+    /// `[root, history[0], …, history[len - 1]]`, the root being the current
+    /// position itself before any move.
+    fn timeline_state(&self, at: usize) -> Option<(u64, &[Hand; Color::COUNT])> {
+        if self.history.is_empty() {
+            return (at == 0).then_some((self.board_key, &self.hands));
+        }
+        let state = if at == 0 {
+            self.root.as_ref()?
+        } else {
+            self.history.get(at - 1)?
+        };
+        Some((state.board_key, &state.hands))
+    }
+
+    /// The verdict on an earlier state `dist` plies back whose board key is the
+    /// current one and whose hands were `prev_hands`, given the current
+    /// continuous-check runs of the side to move and of its opponent:
+    /// [`RepetitionState::None`] when neither hand dominates the other.
+    fn classify_recurrence(
+        &self,
+        prev_hands: &[Hand; Color::COUNT],
+        dist: i32,
+        cc_stm: i32,
+        cc_opp: i32,
+    ) -> RepetitionState {
+        if *prev_hands == self.hands {
+            return if dist <= cc_stm {
+                RepetitionState::Lose
+            } else if dist <= cc_opp {
+                RepetitionState::Win
+            } else {
+                RepetitionState::Draw
+            };
+        }
+        let stm = self.side_to_move;
+        let cur_hand = &self.hands[stm.index()];
+        let prev_hand = &prev_hands[stm.index()];
+        if hand_is_equal_or_superior(cur_hand, prev_hand) {
+            return RepetitionState::Superior;
+        }
+        if hand_is_equal_or_superior(prev_hand, cur_hand) {
+            return RepetitionState::Inferior;
+        }
+        RepetitionState::None
+    }
+}
+
+/// The states of a line up to a search root, indexed by board key, so that
+/// [`Position::is_repetition_within`] finds an occurrence before the root with
+/// one probe instead of a walk over the game.
+///
+/// Built once, at the root, by [`Position::history_index`]. The search's own
+/// moves and unmoves leave it as it is: it holds only states the search never
+/// unwinds.
+#[derive(Debug, Clone, Default)]
+pub struct HistoryIndex {
+    /// How many states of the timeline, from its start, the index holds.
+    covered: usize,
+    /// Open-addressed table of `(board key, newest state on it + 1)`, `0`
+    /// marking a free slot, at most half full. Empty when nothing is indexed.
+    slots: Vec<(u64, u32)>,
+    /// The indexed states, each linked to the next older one on its board key.
+    states: Vec<IndexedState>,
+}
+
+/// One state of a [`HistoryIndex`].
+#[derive(Debug, Clone)]
+struct IndexedState {
+    hands: [Hand; Color::COUNT],
+    /// Where on the timeline the state stands.
+    at: u32,
+    /// The next older state on the same board key, `+ 1`; `0` for none.
+    older: u32,
+}
+
+impl HistoryIndex {
+    /// An empty index with room for a line of `states` states, so that
+    /// rebuilding it for a line no longer than that allocates nothing.
+    pub fn with_capacity(states: usize) -> Self {
+        Self {
+            covered: 0,
+            slots: Vec::with_capacity(Self::slot_count(states)),
+            states: Vec::with_capacity(states),
+        }
+    }
+
+    /// Become the index of `pos`'s line up to and including its current state
+    /// ([`Position::history_index`]), in the room this index already holds
+    /// where it is enough.
+    pub fn rebuild(&mut self, pos: &Position) {
+        self.fill(pos, pos.history.len() + 1);
+    }
+
+    /// The table size for `states` states: a power of two, at most half full.
+    fn slot_count(states: usize) -> usize {
+        (2 * states).max(8).next_power_of_two()
+    }
+
+    /// Hold the first `covered` states of `pos`'s timeline.
+    fn fill(&mut self, pos: &Position, covered: usize) {
+        self.covered = covered;
+        self.slots.clear();
+        self.slots.resize(Self::slot_count(covered), (0, 0));
+        self.states.clear();
+        for at in 0..covered {
+            let Some((key, hands)) = pos.timeline_state(at) else {
+                continue;
+            };
+            let slot = self.slot_of(key);
+            let (_, newest) = self.slots[slot];
+            self.states.push(IndexedState {
+                hands: *hands,
+                at: at as u32,
+                older: newest,
+            });
+            self.slots[slot] = (key, self.states.len() as u32);
+        }
+    }
+
+    /// The first `covered` states of `pos`'s timeline.
+    #[cfg(test)]
+    fn of(pos: &Position, covered: usize) -> Self {
+        let mut index = Self::default();
+        index.fill(pos, covered);
+        index
+    }
+
+    /// The slot `key` sits in, or the free one it would take.
+    fn slot_of(&self, key: u64) -> usize {
+        let mask = self.slots.len() - 1;
+        // Fibonacci hashing, so the slot leans on no one bit of the key.
+        let mut slot = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & mask;
+        loop {
+            let (k, newest) = self.slots[slot];
+            if newest == 0 || k == key {
+                return slot;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    /// The indexed states on `key`, newest first: each one's place on the
+    /// timeline and its hands.
+    fn occurrences(&self, key: u64) -> impl Iterator<Item = (usize, &[Hand; Color::COUNT])> + '_ {
+        let mut next = if self.slots.is_empty() {
+            0
+        } else {
+            let (k, newest) = self.slots[self.slot_of(key)];
+            if k == key { newest } else { 0 }
+        };
+        std::iter::from_fn(move || {
+            let state = self.states.get(next.checked_sub(1)? as usize)?;
+            next = state.older;
+            Some((state.at as usize, &state.hands))
+        })
+    }
 }
 
 /// The mutable-board guard returned by [`Position::board_mut`].
@@ -1999,6 +2255,376 @@ mod tests {
 
         assert_eq!(with_root_back(16).is_repetition(), RepetitionState::Draw);
         assert_eq!(with_root_back(18).is_repetition(), RepetitionState::None);
+    }
+
+    /// A state of the [`superiority_board`] with the given hands, Black to
+    /// move, carrying the given continuous-check runs.
+    fn recurring_state(hands: [Hand; Color::COUNT], continuous_check: [u16; 2]) -> StateInfo {
+        StateInfo {
+            continuous_check,
+            ..make_state(superiority_board(), hands, Color::Black, false)
+        }
+    }
+
+    /// Hands holding `pawns` and `lances` for Black and nothing for White.
+    fn black_hand(pawns: u8, lances: u8) -> [Hand; Color::COUNT] {
+        let mut hand = Hand::empty();
+        for _ in 0..pawns {
+            hand.increment(PieceKind::Pawn);
+        }
+        for _ in 0..lances {
+            hand.increment(PieceKind::Lance);
+        }
+        [hand, Hand::empty()]
+    }
+
+    /// A line of `len` moves standing on `current`, with each of `earlier`
+    /// at its place on the timeline (`0` the root) and a board that matches
+    /// none of them everywhere else.
+    fn line_with(len: usize, earlier: &[(usize, StateInfo)], current: StateInfo) -> Position {
+        let mut other = superiority_board();
+        other.set(Square::new(0, 8).unwrap(), None);
+        other.set(
+            Square::new(1, 8).unwrap(),
+            Some(Piece::new(PieceKind::King, Color::Black)),
+        );
+        let filler = make_state(other, [Hand::empty(), Hand::empty()], Color::Black, false);
+        let mut timeline = vec![filler; len + 1];
+        for (at, state) in earlier {
+            timeline[*at] = state.clone();
+        }
+        timeline[len] = current;
+        let root = timeline.remove(0);
+        assemble(superiority_board(), &timeline, root)
+    }
+
+    /// The verdict with no look-back limit under an index of every prefix of
+    /// the line — from none of it, when the walk does it all, to all of it,
+    /// when the index does — which must not depend on where the index ends.
+    fn unlimited_verdict_for_every_root(p: &Position) -> RepetitionState {
+        let full_walk = p.is_repetition_within(0, &HistoryIndex::default());
+        for covered in 0..=p.history.len() + 1 {
+            assert_eq!(
+                p.is_repetition_within(0, &HistoryIndex::of(p, covered)),
+                full_walk,
+                "the verdict moved with an index of the first {covered} states",
+            );
+        }
+        full_walk
+    }
+
+    #[test]
+    fn a_cycle_longer_than_sixteen_plies_is_judged_only_without_the_limit() {
+        let none = [0, 0];
+        let cases = [
+            (
+                "draw",
+                black_hand(0, 0),
+                black_hand(0, 0),
+                none,
+                RepetitionState::Draw,
+            ),
+            (
+                "superior",
+                black_hand(0, 0),
+                black_hand(1, 0),
+                none,
+                RepetitionState::Superior,
+            ),
+            (
+                "inferior",
+                black_hand(1, 0),
+                black_hand(0, 0),
+                none,
+                RepetitionState::Inferior,
+            ),
+            // Black, to move, has checked with every move of the 18-ply cycle.
+            (
+                "perpetual check by the side to move",
+                black_hand(0, 0),
+                black_hand(0, 0),
+                [18, 0],
+                RepetitionState::Lose,
+            ),
+            (
+                "perpetual check by the opponent",
+                black_hand(0, 0),
+                black_hand(0, 0),
+                [0, 18],
+                RepetitionState::Win,
+            ),
+            // One move of the cycle did not check, so it is a draw.
+            (
+                "checks broken within the cycle",
+                black_hand(0, 0),
+                black_hand(0, 0),
+                [16, 16],
+                RepetitionState::Draw,
+            ),
+        ];
+        for (name, earlier, current, checks, verdict) in cases {
+            // The earlier occurrence at the root, and further into the line.
+            for at in [0, 3, 12] {
+                let len = at + 18;
+                let p = line_with(
+                    len,
+                    &[(at, recurring_state(earlier, [0, 0]))],
+                    recurring_state(current, checks),
+                );
+                assert_eq!(p.is_repetition(), RepetitionState::None, "{name}, at {at}");
+                assert_eq!(
+                    p.is_repetition_within(16, &p.history_index()),
+                    RepetitionState::None,
+                    "{name}, at {at}: a window of sixteen is the default's",
+                );
+                assert_eq!(
+                    unlimited_verdict_for_every_root(&p),
+                    verdict,
+                    "{name}, at {at}"
+                );
+                for (window, expected) in
+                    [(17, RepetitionState::None), (18, verdict), (40, verdict)]
+                {
+                    assert_eq!(
+                        p.is_repetition_within(window, &p.history_index()),
+                        expected,
+                        "{name}, at {at}, window {window}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_nearest_earlier_occurrence_decides_across_the_root() {
+        let none = [0, 0];
+        // A superior recurrence 20 plies back hides the draw 40 back.
+        let p = line_with(
+            40,
+            &[
+                (0, recurring_state(black_hand(0, 0), none)),
+                (20, recurring_state(black_hand(0, 0), none)),
+            ],
+            recurring_state(black_hand(1, 0), none),
+        );
+        assert_eq!(
+            unlimited_verdict_for_every_root(&p),
+            RepetitionState::Superior
+        );
+        // Neither hand dominating, the board match 20 back is a coincidence and
+        // the draw 40 back decides.
+        let p = line_with(
+            40,
+            &[
+                (0, recurring_state(black_hand(0, 1), none)),
+                (20, recurring_state(black_hand(1, 0), none)),
+            ],
+            recurring_state(black_hand(0, 1), none),
+        );
+        assert_eq!(unlimited_verdict_for_every_root(&p), RepetitionState::Draw);
+        // An odd distance is never a recurrence, wherever the index ends.
+        let p = line_with(
+            41,
+            &[(0, recurring_state(black_hand(0, 0), none))],
+            recurring_state(black_hand(0, 0), none),
+        );
+        assert_eq!(unlimited_verdict_for_every_root(&p), RepetitionState::None);
+    }
+
+    #[test]
+    fn a_null_move_bounds_the_unlimited_window_too() {
+        let none = [0, 0];
+        let mut p = line_with(
+            30,
+            &[(0, recurring_state(black_hand(0, 0), none))],
+            recurring_state(black_hand(0, 0), none),
+        );
+        assert_eq!(unlimited_verdict_for_every_root(&p), RepetitionState::Draw);
+        // The line now passes through a null move 29 plies back.
+        p.history.last_mut().unwrap().plies_from_null = 29;
+        assert_eq!(unlimited_verdict_for_every_root(&p), RepetitionState::None);
+    }
+
+    /// The ten squares round the two-file, five-rank block whose top-left
+    /// corner is `(file, rank)`, in walking order.
+    fn ring(file: u8, rank: u8) -> [Square; 10] {
+        let mut squares = [Square::new(file, rank).unwrap(); 10];
+        for i in 0..5u8 {
+            squares[i as usize] = Square::new(file, rank + i).unwrap();
+            squares[5 + i as usize] = Square::new(file + 1, rank + 4 - i).unwrap();
+        }
+        squares
+    }
+
+    /// Both kings walk a ten-square ring in step, so the position first
+    /// recurs twenty plies on. Black's ring is `black`, White's `white`.
+    fn twenty_ply_cycle() -> (Position, Vec<Move>) {
+        let black = ring(7, 4);
+        let white = ring(0, 0);
+        let bk = Piece::new(PieceKind::King, Color::Black);
+        let wk = Piece::new(PieceKind::King, Color::White);
+        let mut p = Position::empty();
+        p.board_mut().set(black[0], Some(bk));
+        p.board_mut().set(white[0], Some(wk));
+        p.refresh_keys();
+        let mut moves = Vec::new();
+        for i in 0..10 {
+            moves.push(Move::make(black[i], black[(i + 1) % 10], bk));
+            moves.push(Move::make(white[i], white[(i + 1) % 10], wk));
+        }
+        (p, moves)
+    }
+
+    #[test]
+    fn a_twenty_ply_king_walk_recurs_in_the_tree_and_before_the_root() {
+        let (mut p, moves) = twenty_ply_cycle();
+        // Two laps: from the end of the first, every state recurs twenty plies
+        // back, and the roots the check tries put that earlier occurrence on
+        // either side of the root in turn.
+        let mut verdicts = Vec::new();
+        for _ in 0..2 {
+            for &m in &moves {
+                p.do_move(m);
+                assert_eq!(p.is_repetition(), RepetitionState::None);
+                verdicts.push(unlimited_verdict_for_every_root(&p));
+            }
+        }
+        assert!(
+            verdicts[..19].iter().all(|&v| v == RepetitionState::None),
+            "{verdicts:?}"
+        );
+        assert!(
+            verdicts[19..].iter().all(|&v| v == RepetitionState::Draw),
+            "{verdicts:?}"
+        );
+    }
+
+    #[test]
+    fn the_unlimited_verdicts_survive_a_do_undo_round_trip_below_a_fixed_root() {
+        let (mut p, moves) = twenty_ply_cycle();
+        for &m in &moves[..7] {
+            p.do_move(m);
+        }
+        let root = p.clone();
+        let index = p.history_index();
+
+        let mut stack = Vec::new();
+        let mut forward = Vec::new();
+        for &m in moves[7..].iter().chain(&moves).chain(&moves[..7]) {
+            stack.push((m, p.do_move(m)));
+            forward.push(p.is_repetition_within(0, &index));
+        }
+        // The root stands seven plies into the lap, so the first eight
+        // recurrences find their earlier occurrence before it and the rest in
+        // the line after it.
+        assert!(
+            forward[..12].iter().all(|&v| v == RepetitionState::None),
+            "{forward:?}"
+        );
+        assert!(
+            forward[12..].iter().all(|&v| v == RepetitionState::Draw),
+            "{forward:?}"
+        );
+
+        while let Some((m, u)) = stack.pop() {
+            p.undo_move(m, u);
+            if let Some(&expected) = forward.get(stack.len().wrapping_sub(1)) {
+                assert_eq!(p.is_repetition_within(0, &index), expected);
+            }
+        }
+        assert_eq!(p, root);
+        assert_eq!(p.is_repetition_within(0, &index), RepetitionState::None);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn the_index_agrees_with_a_whole_game_walk_over_random_playouts() {
+        // Two kings and a rook each, and a pawn in each hand, play at random,
+        // but a side often takes back its own moves in reverse order, so
+        // positions recur at many distances, with checks, captures and drops
+        // among the moves between.
+        let mut rng = Rng(0x005E_ED0F_A11C_7C1E);
+        let mut found = [0usize; 6];
+        let mut beyond_sixteen = 0;
+        for game in 0..40 {
+            let mut p = Position::empty();
+            for (file, rank, kind, color) in [
+                (4, 8, PieceKind::King, Color::Black),
+                (4, 0, PieceKind::King, Color::White),
+                (1, 7, PieceKind::Rook, Color::Black),
+                (7, 1, PieceKind::Rook, Color::White),
+            ] {
+                p.board_mut().set(
+                    Square::new(file, rank).unwrap(),
+                    Some(Piece::new(kind, color)),
+                );
+            }
+            // A pawn in each hand, so captures and drops let one board recur
+            // with the hands shifted.
+            for hand in &mut p.hands {
+                hand.increment(PieceKind::Pawn);
+            }
+            p.refresh_keys();
+            let mut legal = Vec::new();
+            let mut roots = Vec::new();
+            // Each side's board moves not yet taken back, as `(from, to)`.
+            let mut played: [Vec<(Square, Square)>; 2] = [Vec::new(), Vec::new()];
+            for ply in 0..200 {
+                if ply % 23 == 0 {
+                    roots.push(p.history_index());
+                }
+                legal.clear();
+                p.generate_legal_all(&mut legal);
+                if legal.is_empty() {
+                    break;
+                }
+                let side = p.side_to_move().index();
+                let back = match played[side].last() {
+                    Some(&(from, to)) if rng.pick(3) != 0 => legal.iter().copied().find(|m| {
+                        !m.is_drop() && !m.is_promote() && m.from_sq() == to && m.to_sq() == from
+                    }),
+                    _ => None,
+                };
+                let m = match back {
+                    Some(m) => {
+                        played[side].pop();
+                        m
+                    }
+                    None => {
+                        let m = legal[rng.pick(legal.len())];
+                        if !m.is_drop() && !m.is_promote() {
+                            played[side].push((m.from_sq(), m.to_sq()));
+                        }
+                        m
+                    }
+                };
+                p.do_move(m);
+                for look_back in [0, 6, 18, 31] {
+                    let walked = p.is_repetition_within(look_back, &HistoryIndex::default());
+                    for index in &roots {
+                        assert_eq!(
+                            p.is_repetition_within(look_back, index),
+                            walked,
+                            "game {game}, ply {ply}, window {look_back}",
+                        );
+                    }
+                    if look_back == 0 {
+                        found[walked as usize] += 1;
+                        if p.is_repetition() == RepetitionState::None {
+                            beyond_sixteen += usize::from(walked != RepetitionState::None);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            found[1..].iter().all(|&n| n > 0),
+            "every verdict should come up in the playouts: {found:?}",
+        );
+        assert!(
+            beyond_sixteen > 0,
+            "some verdict should come from further back than sixteen plies",
+        );
     }
 
     #[cfg_attr(miri, ignore)]

@@ -29,7 +29,7 @@ pub use packed_sfen::{
     PACKED_SFEN_LEN, PackedSfen, PackedSfenError, position_from_packed_sfen, sfen_pack,
 };
 pub use piece::{Piece, PieceKind};
-pub use position::{Position, RepetitionState, Undo};
+pub use position::{HistoryIndex, Position, RepetitionState, Undo};
 pub use search_movegen::{CheckSquares, ExtMove, MoveSink};
 pub use see::piece_value;
 pub use sfen::{

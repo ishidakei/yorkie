@@ -111,6 +111,13 @@ pub struct WorkerHistories {
     /// pawn / correction read and update routes here, so an interior update on
     /// one worker is visible to every worker on the same node.
     pub shared: Arc<SharedHistories>,
+    /// The game up to the current search's root, indexed for the repetition
+    /// judgement. Not a history table: it rides in this bundle because the
+    /// bundle is what a worker keeps from one search to the next, so the room
+    /// the index is built in is allocated once, with the bundle, rather than
+    /// in every search.
+    #[cfg(repetition_index)]
+    pub history_index: yorkie_state::HistoryIndex,
 }
 
 // Five large-page boxes (one pointer each: the allocator is zero-sized and the
@@ -120,7 +127,10 @@ pub struct WorkerHistories {
 // reordered away: every other field is already eight bytes wide. The bundle is
 // per-worker and reached once per update, so its own line is never contended —
 // what a helper shares with its node is `shared`, whose entries are atomic.
+#[cfg(not(repetition_index))]
 const _: () = assert!(size_of::<WorkerHistories>() == 56);
+#[cfg(repetition_index)]
+const _: () = assert!(size_of::<WorkerHistories>() == 56 + size_of::<yorkie_state::HistoryIndex>());
 
 impl Default for WorkerHistories {
     fn default() -> Self {
@@ -156,6 +166,14 @@ impl WorkerHistories {
             continuation_correction,
             tt_move: TtMoveHistory::new(),
             shared,
+            // Room for a game of a thousand plies before the root. A window of
+            // sixteen never reads the index, so it gets none.
+            #[cfg(repetition_index)]
+            history_index: if crate::config::REPETITION_LOOK_BACK == 16 {
+                yorkie_state::HistoryIndex::default()
+            } else {
+                yorkie_state::HistoryIndex::with_capacity(1024)
+            },
         }
     }
 
