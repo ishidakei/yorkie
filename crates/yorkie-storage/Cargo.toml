@@ -13,14 +13,18 @@ publish = false
 # The process-wide `#[global_allocator]`; `src/allocator.rs` says why the
 # declaration lives here rather than in the binary root. Its transitive
 # `libmimalloc-sys` builds vendored C sources, so a C compiler is needed on the
-# build host.
+# build host. miri cannot run FFI, so the declaration is compiled out under it,
+# and the dependency carries the same `cfg`.
+[target.'cfg(not(miri))'.dependencies]
 mimalloc = "0.1"
 
 # Unix-only: `madvise(MADV_HUGEPAGE)` over a large-page block and over the
 # transposition table's `static`, mirroring the reference's
-# `aligned_large_pages_alloc`. The call is Linux-gated in code; the dependency is
-# `cfg(unix)`-gated so non-Unix targets never pull it in.
-[target.'cfg(unix)'.dependencies]
+# `aligned_large_pages_alloc`, and the `mmap` that lays a file over a block.
+# Every call is compiled out under miri, which cannot make them, and the
+# dependency carries the same `cfg`, so non-Unix targets and miri never pull it
+# in.
+[target.'cfg(all(unix, not(miri)))'.dependencies]
 libc = "0.2"
 
 # `tt-entry16` widens the transposition-table entry from the reference's 10 bytes

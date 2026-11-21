@@ -112,8 +112,10 @@ mod tests {
     }
 
     // Both tests read a file, which the interpreter running the crate's tests
-    // does not do.
-    #[cfg_attr(miri, ignore)]
+    // does not do. This one also puts the pages back through `libc`, which is a
+    // dependency only where the mapping itself is compiled, so under the
+    // interpreter it is compiled out rather than ignored.
+    #[cfg(all(unix, not(miri)))]
     #[test]
     fn the_file_lands_at_the_address_it_was_given() {
         let mut bytes = vec![0u8; LARGE_PAGE_ALIGN];

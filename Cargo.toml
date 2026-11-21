@@ -18,6 +18,13 @@ version = "3.3.0"
 [workspace.lints.clippy]
 mod_module_files = "warn"
 
+# Cargo's manifest lints are not reached by `-D warnings`, which escalates
+# rustc's lints only, so an unused dependency is denied here directly. There is
+# no `[workspace.dependencies]` table, so `unused_workspace_dependencies` has
+# nothing to check.
+[workspace.lints.cargo]
+unused_dependencies = "deny"
+
 # Build scripts are optimised in every profile. One of them decodes the whole
 # network and lays it out for the kernels, which is a few hundred megabytes of
 # arithmetic: unoptimised, that turns a build into a coffee break, and the code
