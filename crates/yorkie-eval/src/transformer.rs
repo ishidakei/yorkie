@@ -319,11 +319,12 @@ pub(crate) fn apply_diff(
 }
 
 /// Write `src` with a feature delta applied into `dst`, the two halves being
-/// distinct. For the common single-add arities every lane is read once from
-/// `src` and written once to `dst`, so deriving a child's half costs one pass
-/// over it rather than a copy and then an update in place; any other shape
-/// makes its first column's pass from `src` and the rest in place on `dst`.
-/// The result is bit-identical to that copy-then-update,
+/// distinct. Every lane is read once from `src` and written once to `dst`, so
+/// deriving a child's half costs one pass over it rather than a copy and then
+/// an update in place: the common single-add arities have fused kernels, and
+/// the AVX-512 list kernel that takes any other shape applies all its columns
+/// to each tile of the half in registers. (The scalar list kernel makes its
+/// first column's pass from `src` and the rest in place on `dst`.) The result is bit-identical to that copy-then-update,
 /// which [`Accumulator::update_after_move`] keeps doing as an independent
 /// check on this path.
 pub(crate) fn apply_diff_from(

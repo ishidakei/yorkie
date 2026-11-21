@@ -22,48 +22,83 @@ use crate::types::HIDDEN_SIZE;
 const NUM_CHUNKS: usize = HIDDEN_SIZE / 32;
 const LANES: usize = 32;
 
-/// Add each active feature's FT weight column into `out`.
+/// Chunks of the half held in registers at once by the list kernels. The half
+/// is [`NUM_CHUNKS`] chunks, which this divides; AVX-512 has 32 registers, and
+/// a tile of 24 leaves room for the column operand.
+const TILE: usize = 24;
+const _: () = assert!(NUM_CHUNKS.is_multiple_of(TILE));
+
+/// `dst = src - sum(removed) + sum(added)` for lists of any length, with `TEE`
+/// every result chunk stored to `tee` as well. The half goes through in tiles
+/// of [`TILE`] chunks: each tile is loaded once, every column is applied to it
+/// in registers, and it is stored once.
+///
+/// # Safety
+/// `src`, `dst` and (with `TEE`) `tee` must each address `HIDDEN_SIZE` `i16`s,
+/// readable for `src` and writable for the other two. `dst` may be `src`:
+/// every tile is read before it is written.
 #[target_feature(enable = "avx512f,avx512bw")]
-pub fn add_features(out: &mut [i16; HIDDEN_SIZE], weights: &[i16], indices: &[FeatureIndex]) {
-    let out_ptr = out.as_mut_ptr();
-    for &idx in indices {
-        let col_ptr = ft_column(weights, idx).as_ptr();
-        for chunk in 0..NUM_CHUNKS {
-            let offset = chunk * LANES;
-            // SAFETY: `chunk * LANES + LANES <= HIDDEN_SIZE`, which is both
-            // the length of both `out` and `col`; the unaligned 512-bit ops impose no
-            // alignment requirement.
-            unsafe {
-                let o = _mm512_loadu_si512(out_ptr.add(offset).cast::<__m512i>());
-                let w = _mm512_loadu_si512(col_ptr.add(offset).cast::<__m512i>());
-                _mm512_storeu_si512(
-                    out_ptr.add(offset).cast::<__m512i>(),
-                    _mm512_add_epi16(o, w),
-                );
+#[inline]
+unsafe fn tiled<const TEE: bool>(
+    src: *const i16,
+    dst: *mut i16,
+    tee: *mut i16,
+    weights: &[i16],
+    added: &[FeatureIndex],
+    removed: &[FeatureIndex],
+) {
+    // Every column is checked against the block once here, so the tile loop
+    // below can address each one by plain pointer arithmetic.
+    for &idx in added.iter().chain(removed) {
+        ft_column(weights, idx);
+    }
+    let base = weights.as_ptr();
+    for tile in 0..NUM_CHUNKS / TILE {
+        let first = tile * TILE * LANES;
+        // SAFETY: `first + TILE * LANES <= HIDDEN_SIZE`, the length of `src`,
+        // `dst` and `tee` by the caller's contract and of every column, each of
+        // which was checked to lie inside `weights` above; the unaligned
+        // 512-bit ops impose no alignment requirement.
+        unsafe {
+            let mut acc: [__m512i; TILE] =
+                std::array::from_fn(|i| _mm512_loadu_si512(src.add(first + i * LANES).cast()));
+            for &idx in removed {
+                let col = base.add(idx as usize * HIDDEN_SIZE + first);
+                for (i, a) in acc.iter_mut().enumerate() {
+                    *a = _mm512_sub_epi16(*a, _mm512_loadu_si512(col.add(i * LANES).cast()));
+                }
+            }
+            for &idx in added {
+                let col = base.add(idx as usize * HIDDEN_SIZE + first);
+                for (i, a) in acc.iter_mut().enumerate() {
+                    *a = _mm512_add_epi16(*a, _mm512_loadu_si512(col.add(i * LANES).cast()));
+                }
+            }
+            for (i, a) in acc.into_iter().enumerate() {
+                _mm512_storeu_si512(dst.add(first + i * LANES).cast(), a);
+                if TEE {
+                    _mm512_storeu_si512(tee.add(first + i * LANES).cast(), a);
+                }
             }
         }
     }
 }
 
+/// Add each active feature's FT weight column into `out`.
+#[target_feature(enable = "avx512f,avx512bw")]
+pub fn add_features(out: &mut [i16; HIDDEN_SIZE], weights: &[i16], indices: &[FeatureIndex]) {
+    let ptr = out.as_mut_ptr();
+    // SAFETY: `out` is `HIDDEN_SIZE` lanes, read and written through the one
+    // pointer; `tee` is never touched without `TEE`.
+    unsafe { tiled::<false>(ptr, ptr, std::ptr::null_mut(), weights, indices, &[]) };
+}
+
 /// Subtract each feature's FT weight column from `out`.
 #[target_feature(enable = "avx512f,avx512bw")]
 pub fn sub_features(out: &mut [i16; HIDDEN_SIZE], weights: &[i16], indices: &[FeatureIndex]) {
-    let out_ptr = out.as_mut_ptr();
-    for &idx in indices {
-        let col_ptr = ft_column(weights, idx).as_ptr();
-        for chunk in 0..NUM_CHUNKS {
-            let offset = chunk * LANES;
-            // SAFETY: see `add_features`.
-            unsafe {
-                let o = _mm512_loadu_si512(out_ptr.add(offset).cast::<__m512i>());
-                let w = _mm512_loadu_si512(col_ptr.add(offset).cast::<__m512i>());
-                _mm512_storeu_si512(
-                    out_ptr.add(offset).cast::<__m512i>(),
-                    _mm512_sub_epi16(o, w),
-                );
-            }
-        }
-    }
+    let ptr = out.as_mut_ptr();
+    // SAFETY: as `add_features`.
+    unsafe { tiled::<false>(ptr, ptr, std::ptr::null_mut(), weights, &[], indices) };
 }
 
 /// Fused single-add / single-sub delta.
@@ -176,67 +211,8 @@ pub fn add_sub_sub_features_from(
     }
 }
 
-/// `dst = src - col` (`SUB`) or `dst = src + col`, one pass over the half.
-#[target_feature(enable = "avx512f,avx512bw")]
-#[inline]
-fn column_from<const SUB: bool>(
-    src: &[i16; HIDDEN_SIZE],
-    dst: &mut [i16; HIDDEN_SIZE],
-    col: &[i16; HIDDEN_SIZE],
-) {
-    let src_ptr = src.as_ptr();
-    let dst_ptr = dst.as_mut_ptr();
-    let col_ptr = col.as_ptr();
-    for chunk in 0..NUM_CHUNKS {
-        let offset = chunk * LANES;
-        // SAFETY: `chunk * LANES + LANES <= HIDDEN_SIZE`, the length of `src`,
-        // `dst` and `col`.
-        unsafe {
-            let acc = _mm512_loadu_si512(src_ptr.add(offset).cast::<__m512i>());
-            let w = _mm512_loadu_si512(col_ptr.add(offset).cast::<__m512i>());
-            let acc = if SUB {
-                _mm512_sub_epi16(acc, w)
-            } else {
-                _mm512_add_epi16(acc, w)
-            };
-            _mm512_storeu_si512(dst_ptr.add(offset).cast::<__m512i>(), acc);
-        }
-    }
-}
-
-/// `out -= col` (`SUB`) or `out += col` in place, storing each result lane to
-/// `copy` as well.
-#[target_feature(enable = "avx512f,avx512bw")]
-#[inline]
-fn column_tee<const SUB: bool>(
-    out: &mut [i16; HIDDEN_SIZE],
-    copy: &mut [i16; HIDDEN_SIZE],
-    col: &[i16; HIDDEN_SIZE],
-) {
-    let out_ptr = out.as_mut_ptr();
-    let copy_ptr = copy.as_mut_ptr();
-    let col_ptr = col.as_ptr();
-    for chunk in 0..NUM_CHUNKS {
-        let offset = chunk * LANES;
-        // SAFETY: `chunk * LANES + LANES <= HIDDEN_SIZE`, the length of `out`,
-        // `copy` and `col`.
-        unsafe {
-            let acc = _mm512_loadu_si512(out_ptr.add(offset).cast::<__m512i>());
-            let w = _mm512_loadu_si512(col_ptr.add(offset).cast::<__m512i>());
-            let acc = if SUB {
-                _mm512_sub_epi16(acc, w)
-            } else {
-                _mm512_add_epi16(acc, w)
-            };
-            _mm512_storeu_si512(out_ptr.add(offset).cast::<__m512i>(), acc);
-            _mm512_storeu_si512(copy_ptr.add(offset).cast::<__m512i>(), acc);
-        }
-    }
-}
-
-/// `dst = src - sum(removed) + sum(added)` for lists of any length: the first
-/// column's pass reads `src` and writes `dst`, every later one runs in place on
-/// `dst`. Both lists empty is a plain copy.
+/// `dst = src - sum(removed) + sum(added)` for lists of any length, in one pass
+/// over the half. Both lists empty is a plain copy.
 #[target_feature(enable = "avx512f,avx512bw")]
 pub fn sub_add_features_from(
     src: &[i16; HIDDEN_SIZE],
@@ -245,23 +221,23 @@ pub fn sub_add_features_from(
     added: &[FeatureIndex],
     removed: &[FeatureIndex],
 ) {
-    match (removed, added) {
-        ([first, rest @ ..], _) => {
-            column_from::<true>(src, dst, ft_column(weights, *first));
-            sub_features(dst, weights, rest);
-            add_features(dst, weights, added);
-        }
-        ([], [first, rest @ ..]) => {
-            column_from::<false>(src, dst, ft_column(weights, *first));
-            add_features(dst, weights, rest);
-        }
-        ([], []) => *dst = *src,
-    }
+    // SAFETY: `src` and `dst` are `HIDDEN_SIZE` lanes each and distinct; `tee`
+    // is never touched without `TEE`.
+    unsafe {
+        tiled::<false>(
+            src.as_ptr(),
+            dst.as_mut_ptr(),
+            std::ptr::null_mut(),
+            weights,
+            added,
+            removed,
+        )
+    };
 }
 
 /// Apply `-sum(removed) + sum(added)` to `out` in place and leave the result in
-/// `copy` as well: the last column's pass stores each lane to both, so the copy
-/// costs no pass of its own. Both lists empty is a plain copy.
+/// `copy` as well, in one pass over the half that stores each tile to both.
+/// Both lists empty is a plain copy.
 #[target_feature(enable = "avx512f,avx512bw")]
 pub fn sub_add_features_tee(
     out: &mut [i16; HIDDEN_SIZE],
@@ -270,22 +246,14 @@ pub fn sub_add_features_tee(
     added: &[FeatureIndex],
     removed: &[FeatureIndex],
 ) {
-    match (removed, added) {
-        (_, [rest @ .., last]) => {
-            sub_features(out, weights, removed);
-            add_features(out, weights, rest);
-            column_tee::<false>(out, copy, ft_column(weights, *last));
-        }
-        ([rest @ .., last], []) => {
-            sub_features(out, weights, rest);
-            column_tee::<true>(out, copy, ft_column(weights, *last));
-        }
-        ([], []) => *copy = *out,
-    }
+    let ptr = out.as_mut_ptr();
+    // SAFETY: `out` and `copy` are `HIDDEN_SIZE` lanes each and distinct, `out`
+    // read and written through the one pointer.
+    unsafe { tiled::<true>(ptr, ptr, copy.as_mut_ptr(), weights, added, removed) };
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::simd::scalar;
     use crate::simd::scalar::tests::{DIFFS, Lanes};
@@ -445,5 +413,75 @@ mod tests {
                 "sub_add_features_tee (copy) {added:?} {removed:?}"
             );
         }
+    }
+
+    #[test]
+    fn list_kernels_match_scalar_for_every_list_length() {
+        require_avx512bw!();
+        let mut rng = Lanes(0x9e37_79b9_7f4a_7c15);
+        let weights = rng.weights(COLUMNS);
+        for (added, removed) in list_lengths(&mut rng) {
+            let src = rng.half();
+            let mut expected = src;
+            scalar::sub_features(&mut expected, &weights, &removed);
+            scalar::add_features(&mut expected, &weights, &added);
+
+            let mut in_place = src;
+            // SAFETY: guarded by `require_avx512bw!`.
+            unsafe {
+                sub_features(&mut in_place, &weights, &removed);
+                add_features(&mut in_place, &weights, &added);
+            }
+            assert_eq!(in_place, expected, "in place {added:?} {removed:?}");
+
+            let mut dst = rng.half();
+            // SAFETY: guarded by `require_avx512bw!`.
+            unsafe { sub_add_features_from(&src, &mut dst, &weights, &added, &removed) };
+            assert_eq!(dst, expected, "from {added:?} {removed:?}");
+
+            let mut out = src;
+            let mut copy = rng.half();
+            // SAFETY: guarded by `require_avx512bw!`.
+            unsafe { sub_add_features_tee(&mut out, &mut copy, &weights, &added, &removed) };
+            assert_eq!(out, expected, "tee (in place) {added:?} {removed:?}");
+            assert_eq!(copy, expected, "tee (copy) {added:?} {removed:?}");
+        }
+    }
+
+    /// Columns in the weight block of the list-length tests.
+    pub(crate) const COLUMNS: usize = if cfg!(miri) { 8 } else { 64 };
+
+    /// `(added, removed)` lists of every pair of lengths up to
+    /// [`MAX_ACTIVE_FEATURES`](crate::features::MAX_ACTIVE_FEATURES), each
+    /// drawn from [`COLUMNS`] columns with repeats allowed: every length on its
+    /// own against both an empty list and a full one, and the two lists equal
+    /// in length.
+    ///
+    /// Under Miri, which interprets every lane operation, only the short
+    /// lengths 0, 1 and 3, each alone and paired with itself: the tile loop
+    /// addresses a column the same way whatever the list's length, so these
+    /// cover what Miri checks, and the native run covers every length.
+    pub(crate) fn list_lengths(rng: &mut Lanes) -> Vec<(Vec<FeatureIndex>, Vec<FeatureIndex>)> {
+        use crate::features::MAX_ACTIVE_FEATURES as MAX;
+        let mut list = |len: usize| -> Vec<FeatureIndex> {
+            (0..len)
+                .map(|_| (rng.next() as u16 as usize % COLUMNS) as FeatureIndex)
+                .collect()
+        };
+        let mut cases = Vec::new();
+        if cfg!(miri) {
+            for len in [0, 1, 3] {
+                for (a, r) in [(len, 0), (0, len), (len, len)] {
+                    cases.push((list(a), list(r)));
+                }
+            }
+            return cases;
+        }
+        for len in 0..=MAX {
+            for (a, r) in [(len, 0), (0, len), (len, len), (len, MAX), (MAX, len)] {
+                cases.push((list(a), list(r)));
+            }
+        }
+        cases
     }
 }

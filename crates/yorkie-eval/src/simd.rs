@@ -202,7 +202,7 @@ pub mod transformer_kernel {
         )
     }
 
-    /// `dst = src - sum(removed) + sum(added)`, the first pass reading `src`.
+    /// `dst = src - sum(removed) + sum(added)`, in one pass over the half.
     #[inline]
     pub fn sub_add_features_from(
         src: &[i16; HIDDEN_SIZE],
@@ -214,8 +214,8 @@ pub mod transformer_kernel {
         by_form!(cols, sub_add_features_from, [src, dst], [added, removed])
     }
 
-    /// Update `out` in place and leave the result in `copy` too, the last pass
-    /// storing to both.
+    /// Update `out` in place and leave the result in `copy` too, in one pass
+    /// over the half that stores to both.
     #[inline]
     pub fn sub_add_features_tee(
         out: &mut [i16; HIDDEN_SIZE],

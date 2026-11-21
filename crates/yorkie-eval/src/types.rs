@@ -334,6 +334,13 @@ impl<'a> PackedFt<'a> {
             .expect("a HIDDEN_SIZE-long subslice borrows as the array of that width")
     }
 
+    /// The first byte of the packed columns, feature `idx`'s starting
+    /// `idx * HIDDEN_SIZE` bytes in. A caller reading through it checks each
+    /// column with [`Self::bases`] first.
+    pub(crate) fn bases_ptr(self) -> *const i8 {
+        self.bases.as_ptr()
+    }
+
     /// Add (or, `SUB`, subtract) feature `idx`'s corrections to `dst`, which
     /// already holds the byte pass over that feature's column.
     #[inline]
