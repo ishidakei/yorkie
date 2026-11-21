@@ -415,3 +415,39 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::read_signed_leb128;
+
+    fn decode(bytes: &[u8]) -> Result<i64, String> {
+        let mut pos = 0;
+        read_signed_leb128(bytes, &mut pos)
+    }
+
+    #[test]
+    fn signed_leb128_decodes_both_signs() {
+        assert_eq!(decode(&[0x00]), Ok(0));
+        assert_eq!(decode(&[0x3F]), Ok(63));
+        assert_eq!(decode(&[0x40]), Ok(-64));
+        assert_eq!(decode(&[0x80, 0x01]), Ok(128));
+        assert_eq!(decode(&[0x80, 0x7F]), Ok(-128));
+    }
+
+    /// A value longer than 64 bits of payload is refused as an error: every
+    /// shift stays below the width of the integer, so none overflows, and the
+    /// check is not an assertion a release build leaves out.
+    #[test]
+    fn an_overlong_signed_leb128_value_is_an_error() {
+        assert!(decode(&[0x80; 11]).is_err());
+        let mut ten = [0xFF; 10];
+        ten[9] = 0x7F;
+        assert_eq!(decode(&ten), Ok(-1), "ten bytes still fit in the shifts");
+    }
+
+    #[test]
+    fn a_truncated_signed_leb128_value_is_an_error() {
+        assert!(decode(&[]).is_err());
+        assert!(decode(&[0x80, 0x80]).is_err());
+    }
+}

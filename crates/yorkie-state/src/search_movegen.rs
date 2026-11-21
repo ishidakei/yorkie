@@ -1765,6 +1765,23 @@ mod tests {
         v.into_iter().map(|e| e.mv).collect()
     }
 
+    /// The special moves are refused at the check's entry, out of check and
+    /// in it, so a caller that hands one over by mistake gets `false` rather
+    /// than a read of the board through the sentinel's bits. A table entry that
+    /// holds no move has no `Move` to hand over: it reads as `None`.
+    #[test]
+    fn pseudo_legal_refuses_every_special_move() {
+        let quiet = Position::startpos();
+        let in_check = pos("4k4/9/9/9/9/9/9/4r4/4K4 b - 1");
+        assert!(in_check.in_check());
+        for p in [&quiet, &in_check] {
+            for m in [Move::null(), Move::resign(), Move::win()] {
+                assert!(!p.pseudo_legal::<false>(m), "{m:?}");
+                assert!(!p.pseudo_legal::<true>(m), "{m:?}");
+            }
+        }
+    }
+
     fn captures(p: &Position) -> Vec<Move> {
         let mut v = Vec::new();
         p.generate_captures::<false, _>(&mut v);

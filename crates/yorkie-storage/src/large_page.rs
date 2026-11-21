@@ -213,6 +213,18 @@ unsafe impl Allocator for LargePageAlloc {
 mod tests {
     use super::*;
 
+    /// A request no machine can satisfy comes back as an error rather than a
+    /// pointer to write through: the allocator returns `Result`, and the
+    /// zeroed constructors turn the error into `handle_alloc_error`, which ends
+    /// the process before anything is written.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_failed_allocation_is_an_error_not_a_pointer() {
+        let layout = Layout::from_size_align(1 << 62, 64).expect("a valid layout");
+        assert!(LargePageAlloc.allocate_zeroed(layout).is_err());
+        assert!(LargePageAlloc.allocate(layout).is_err());
+    }
+
     #[test]
     fn rounded_size_rounds_up_to_alignment() {
         assert_eq!(rounded_size(1), LARGE_PAGE_ALIGN);

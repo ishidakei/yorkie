@@ -6213,6 +6213,106 @@ mod tests {
         assert_one_ply_mate_entry(&table, &p);
     }
 
+    /// Black to move with the one-ply mate `B*2b`, a position known to expose a
+    /// one-ply mate stored with its root-relative value: such an entry, written
+    /// four plies below the root, holds `mate_in(5)` = 31995 where the distance
+    /// from the position is `mate_in(1)` = 31999, and the next probe at that
+    /// ply reads 31991.
+    const BISHOP_DROP_MATE: &str = "7nk/8l/7R1/9/9/9/9/9/K8 b R2B4G4S3N3L18P 1";
+
+    const STARTPOS_SFEN: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
+
+    /// Both one-ply mate stores, the quiescence search's and the main
+    /// search's, write the position-relative mate in one at ply 4, and a
+    /// second visit at the same ply returns the same root-relative value. Right.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn the_bishop_drop_mate_four_plies_down_is_stored_position_relative() {
+        let p = pos(BISHOP_DROP_MATE);
+        let mate = p.mate_1ply().expect("a one-ply mate");
+        assert_eq!(crate::text_str::format_usi_move(mate), "B*2b");
+        assert_eq!(mate_in(5), 31995);
+        assert_eq!(VALUE_MATE - 1, 31999);
+        let net = zero_net();
+
+        let table = fresh_tt();
+        for visit in 0..2 {
+            let mut q = QSearch::new(net.network());
+            q.set_root_side(p.side_to_move().flip());
+            q.pv_node = false;
+            q.set_read_tt(true);
+            let v = q.qsearch_at(&mut p.clone(), 4, -1, 0);
+            assert_eq!(v, mate_in(5), "quiescence visit {visit}");
+        }
+        assert_one_ply_mate_entry(&table, &p);
+
+        table.clear();
+        for visit in 0..2 {
+            let mut q = QSearch::new(net.network());
+            q.set_thinking_ahead(true);
+            let v = q.run_search_at(&mut p.clone(), 4, -1, 0, 1, false, false);
+            assert_eq!(v, mate_in(5), "search visit {visit}");
+        }
+        assert_one_ply_mate_entry(&table, &p);
+    }
+
+    /// A MultiPV line other than the one being searched is printed exact even
+    /// when its root move holds a fail bound: only the line at `pv_idx` reads
+    /// its flags. Wrong: the second line's `lowerbound` is lost. The output is
+    /// all it reaches; the move played does not read the flags.
+    #[cfg(feature = "verbose2")]
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_bounded_multipv_line_off_the_searched_index_is_reported_exact_today() {
+        let p = pos(STARTPOS_SFEN);
+        let _tt = fresh_tt();
+        let net = zero_net();
+        let q = QSearch::new(net.network());
+        let mut root_moves: Vec<RootMove> = legal_moves(&p)
+            .into_iter()
+            .take(2)
+            .map(RootMove::new)
+            .collect();
+        for (rm, score) in root_moves.iter_mut().zip([120, 80]) {
+            rm.score = score;
+            rm.uci_score = score;
+        }
+        root_moves[0].score_lowerbound = true;
+
+        let bounds = |pv_idx| -> Vec<PvBound> {
+            q.build_pv_infos(&p, &root_moves, pv_idx, 5, 2, 0)
+                .iter()
+                .map(|info| info.bound)
+                .collect()
+        };
+        assert_eq!(bounds(0), [PvBound::Lower, PvBound::Exact]);
+        assert_eq!(
+            bounds(1),
+            [PvBound::Exact, PvBound::Exact],
+            "the first line's lower bound is dropped while the second is searched"
+        );
+    }
+
+    /// A root move's `effort` leaves out the node its own move adds: the count
+    /// is read after the increment for that move, so over one depth-1 iteration
+    /// the efforts sum to the nodes searched less one per root move. Wrong by
+    /// one node per root move per search of it; the effort feeds time
+    /// management only.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_root_moves_effort_misses_its_own_node_today() {
+        let p = pos(STARTPOS_SFEN);
+        let _tt = fresh_tt();
+        let net = zero_net();
+        let mut q = QSearch::new(net.network());
+        let out = q.run_root(&p, 1);
+        assert_eq!(out.depth, 1);
+        let root_moves = std::mem::take(&mut q.last_root_moves);
+        assert!(root_moves.len() > 1);
+        let efforts: u64 = root_moves.iter().map(|rm| rm.effort).sum();
+        assert_eq!(efforts + root_moves.len() as u64, out.nodes);
+    }
+
     /// White to move with one legal move, K9a-8a, after which black mates with
     /// G*8b.
     const ONE_MOVE_TO_MATE: &str = "k8/9/1G7/9/9/9/9/9/8K w G 1";

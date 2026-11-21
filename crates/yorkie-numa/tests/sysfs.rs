@@ -118,6 +118,32 @@ fn a_cpu_without_a_reported_l3_is_a_domain_of_its_own() {
     }
 }
 
+/// A machine whose CPU numbers have a gap: CPUs 0-1 and 4-5 are online and no
+/// CPU 2 or 3 exists, so there is no cache file for them either. Every online
+/// CPU is still read, because the scan walks the online set rather than
+/// counting up from CPU 0 until a file is missing.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_gap_in_cpu_numbering_keeps_the_cpus_after_it() {
+    let o = yorkie_numa::machine_sysfs_options(&fixture("cpu_number_gap")).expect("a full tree");
+    assert_eq!(o.online_cpus, BTreeSet::from([0, 1, 4, 5]));
+    let layout = NumaLayout::of_machine(&o);
+    assert_eq!(layout.nodes, vec![vec![0, 1, 4, 5]]);
+    assert_eq!(
+        yorkie_numa::l3_domains(&o, &layout),
+        vec![
+            L3Domain {
+                system_node: 0,
+                cpus: vec![0, 1]
+            },
+            L3Domain {
+                system_node: 0,
+                cpus: vec![4, 5]
+            },
+        ]
+    );
+}
+
 // -- the machine behind a sysfs root --------------------------------------
 
 #[cfg_attr(miri, ignore)]
