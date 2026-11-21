@@ -1852,15 +1852,22 @@ impl<N: NetworkParams> QSearch<N> {
     /// mirroring a `do_move`. `post_pos` is the position *after* the move, used
     /// only to rebuild a perspective whose own king moved; `delta` is the
     /// add/sub feature delta captured from the pre-move position.
+    ///
+    /// `mv` is the move just made; with `post_pos` it addresses the shared
+    /// history entries the child reads, which are prefetched here.
     #[inline]
-    fn push_accumulator(&mut self, post_pos: &Position, delta: &MoveDelta) {
-        // The reference prefetches the child's TT cluster inside `do_move`, the
-        // moment the post-move key is known. This port's `Position` cannot
-        // reach the TT, so the hint goes here instead — the accumulator seam
-        // every real-search `do_move` funnels through, later than the reference
-        // but still well before the child probes.
+    fn push_accumulator(&mut self, post_pos: &Position, mv: Move, delta: &MoveDelta) {
+        // The reference prefetches the child's TT cluster and its shared
+        // history entries inside `do_move`, the moment the post-move keys are
+        // known. This port's `Position` cannot reach either table, so the hints
+        // go here instead — the accumulator seam every real-search `do_move`
+        // funnels through, later than the reference but still well before the
+        // child probes.
         TranspositionTable::shared()
             .prefetch(post_pos.key(), post_pos.side_to_move().index() as u8);
+        self.histories
+            .shared
+            .prefetch_child(post_pos, mv.moved_piece_after(), mv.to_sq());
 
         let net = self.net;
         let d = self.acc_depth;
@@ -1874,6 +1881,22 @@ impl<N: NetworkParams> QSearch<N> {
             &mut self.finny,
         );
         self.acc_depth = d + 1;
+    }
+
+    /// Prefetch the two continuation-correction entries the child of `mv`,
+    /// made from stack cell `s`, reads for its corrected evaluation. The child
+    /// reads its `(ss-2)` and `(ss-4)` planes at the moved piece and its
+    /// destination; before the move those cells are `s - 1` and `s - 3`, and
+    /// both planes are already set, so this can run before `do_move`.
+    ///
+    /// The cells are bounds-checked indexes into the stack, and the entry is a
+    /// bounds-checked index into the table.
+    #[inline]
+    fn prefetch_child_corrections(&self, s: usize, mv: Move) {
+        let (pc, to) = (mv.moved_piece_after(), mv.to_sq());
+        let cc = &self.histories.continuation_correction;
+        cc.prefetch_at(self.stack[s - 1].cont_corr, pc, to);
+        cc.prefetch_at(self.stack[s - 3].cont_corr, pc, to);
     }
 
     /// Pop the child accumulator, mirroring an `undo_move`. The parent slot is
@@ -2530,6 +2553,7 @@ impl<N: NetworkParams> QSearch<N> {
             #[cfg(feature = "dupstats")]
             self.node_hist
                 .count(ply + 1, 0, crate::dupstats::NodeKind::Quiescence);
+            self.prefetch_child_corrections(Self::si(ply), mv);
             let undo = pos.do_move_with_check(mv, gives_check);
             // The reference sets these inside `do_move`, for every move,
             // qsearch's included. A deeper node reads the
@@ -2542,7 +2566,7 @@ impl<N: NetworkParams> QSearch<N> {
                 ContinuationHistory::plane_index(in_check, capture, moved, mv.to_sq());
             self.stack[Self::si(ply)].cont_corr =
                 ContinuationCorrectionHistory::plane_index(moved, mv.to_sq());
-            self.push_accumulator(pos, &acc_delta);
+            self.push_accumulator(pos, mv, &acc_delta);
             #[cfg(feature = "verbose3")]
             let node_marks = self.held();
             let value = -self.qsearch(pos, ply + 1, -beta, -alpha, scratch);
@@ -4356,6 +4380,7 @@ impl<N: NetworkParams> QSearch<N> {
                         depth,
                         crate::dupstats::NodeKind::of(pv_node, cut_node),
                     );
+                    self.prefetch_child_corrections(s, mv);
                     let undo = pos.do_move(mv);
                     let moved = mv.moved_piece_after();
                     self.stack[s].current_move = Some(mv);
@@ -4363,7 +4388,7 @@ impl<N: NetworkParams> QSearch<N> {
                         ContinuationHistory::plane_index(in_check, true, moved, mv.to_sq());
                     self.stack[s].cont_corr =
                         ContinuationCorrectionHistory::plane_index(moved, mv.to_sq());
-                    self.push_accumulator(pos, &acc_delta);
+                    self.push_accumulator(pos, mv, &acc_delta);
                     self.pv_node = false;
                     self.set_read_tt(true);
                     #[cfg(feature = "verbose3")]
@@ -4763,13 +4788,14 @@ impl<N: NetworkParams> QSearch<N> {
                 depth,
                 crate::dupstats::NodeKind::of(pv_node, cut_node),
             );
+            self.prefetch_child_corrections(s, mv);
             let undo = pos.do_move_with_check(mv, gives_check);
             self.stack[s].current_move = Some(mv);
             self.stack[s].cont_hist =
                 ContinuationHistory::plane_index(in_check, capture, moved_piece, mv.to_sq());
             self.stack[s].cont_corr =
                 ContinuationCorrectionHistory::plane_index(moved_piece, mv.to_sq());
-            self.push_accumulator(pos, &acc_delta);
+            self.push_accumulator(pos, mv, &acc_delta);
             new_depth += extension;
 
             // Read *after* this move's node increment, so `rm.effort` sums

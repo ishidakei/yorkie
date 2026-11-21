@@ -31,6 +31,25 @@ use std::sync::atomic::{AtomicI16, Ordering};
 use yorkie_state::{Color, Move, Piece, Square};
 use yorkie_storage::{LargePageAlloc, Zeroable};
 
+/// Ask the CPU to bring the cache line holding `entry` into every cache level.
+/// A no-op off x86-64.
+///
+/// The address is taken from a reference, so it is always that of a live,
+/// in-bounds entry.
+#[inline(always)]
+fn prefetch_t0<T>(entry: &T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `_mm_prefetch` is a hardware hint with no architectural effect:
+    // it neither reads nor writes the memory observably and cannot fault. The
+    // pointer comes from a reference, so it is valid besides.
+    unsafe {
+        use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        _mm_prefetch::<_MM_HINT_T0>(std::ptr::from_ref(entry).cast::<i8>());
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = entry;
+}
+
 /// Index of one plane of an `N`-plane continuation-style history table.
 ///
 /// Every way of making one bounds the value below `N`, and the field is private,
@@ -694,6 +713,32 @@ impl SharedHistories {
         apply_gravity_atomic(self.pawn_cell(pawn_key, pc, to), bonus, PAWN_HISTORY_D);
     }
 
+    /// Prefetch the entries of these tables that the position `child` will
+    /// read, `child` having just been reached by moving `pc` to `to`: its four
+    /// correction channels for its side to move, and the pawn-history entry
+    /// `[pc][to]` in its pawn plane — the same set the reference prefetches
+    /// inside its `do_move`.
+    ///
+    /// Each address is that of the cell the matching read would load, formed
+    /// by the same masked lookup, so it is always inside the table.
+    #[inline]
+    pub fn prefetch_child(&self, child: &yorkie_state::Position, pc: Piece, to: Square) {
+        let us = child.side_to_move();
+        prefetch_t0(self.pawn_cell(child.pawn_key(), pc, to));
+        prefetch_t0(self.corr_cell(child.pawn_key(), us, CorrChannel::Pawn));
+        prefetch_t0(self.corr_cell(child.minor_piece_key(), us, CorrChannel::Minor));
+        prefetch_t0(self.corr_cell(
+            child.non_pawn_key(Color::White),
+            us,
+            CorrChannel::NonPawnWhite,
+        ));
+        prefetch_t0(self.corr_cell(
+            child.non_pawn_key(Color::Black),
+            us,
+            CorrChannel::NonPawnBlack,
+        ));
+    }
+
     /// The whole plane keyed by `pawn_key`, for a caller that reads many
     /// entries of one position's plane: the key is masked, and the table's
     /// base read, once rather than per entry.
@@ -791,6 +836,13 @@ impl ContinuationCorrectionHistory {
     /// The inner `[pc][to]` value in `plane`. The fill value on a filled table.
     pub fn get_at(&self, plane: CorrPlane, pc: Piece, to: Square) -> i32 {
         self.table[plane.get()][piece_code(pc)][to.index() as usize] as i32
+    }
+
+    /// Prefetch the inner `[pc][to]` entry in `plane`, the one [`Self::get_at`]
+    /// with the same arguments reads. The address is a bounds-checked index.
+    #[inline]
+    pub fn prefetch_at(&self, plane: CorrPlane, pc: Piece, to: Square) {
+        prefetch_t0(&self.table[plane.get()][piece_code(pc)][to.index() as usize]);
     }
 
     /// Gravity-update the inner `[pc][to]` entry in `plane` (`D = 1024`).
