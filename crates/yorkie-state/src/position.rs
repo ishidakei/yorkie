@@ -982,6 +982,67 @@ impl Position {
         RepetitionState::None
     }
 
+    /// Whether the game has ended by repetition at the current position, under
+    /// the game rule: the same position for the fourth time.
+    ///
+    /// This is the game's rule, not the search's. [`Self::is_repetition`] and
+    /// [`Self::is_repetition_within`] already give a verdict at a position's
+    /// second occurrence and score hand gains and losses, which suits a search
+    /// but not a referee. This function answers only what the game asks after
+    /// a move is played, and returns only [`RepetitionState::None`],
+    /// [`RepetitionState::Draw`], [`RepetitionState::Win`] or
+    /// [`RepetitionState::Lose`], never `Superior` or `Inferior`.
+    ///
+    /// Two states are the same position when the board, both hands and the
+    /// side to move are equal. The occurrences are counted over this
+    /// position's whole line, the current state included, and so is the
+    /// position the line was set up from, before its first move. There is no
+    /// look-back limit: neither the sixteen-ply window of the search rule nor
+    /// a null move bounds the count. A null move is no occurrence of its own
+    /// but a move that does not give check, so it ends the passing side's run
+    /// of checks.
+    ///
+    /// Fewer than four occurrences is [`RepetitionState::None`]. At four or
+    /// more, the span from the fourth most recent occurrence to the current
+    /// state decides: when every move one side made in that span gave check,
+    /// that side has checked perpetually and loses — [`RepetitionState::Lose`]
+    /// when it is the side to move, [`RepetitionState::Win`] when it is the
+    /// opponent, the convention [`Self::is_repetition`] uses. Otherwise the
+    /// game is a [`RepetitionState::Draw`], including when only part of the
+    /// span was checks.
+    ///
+    /// The answer is computed on call by walking the line every second state,
+    /// so its cost grows with the length of the game. It is meant for once per
+    /// played move, not for a search node.
+    pub fn game_repetition(&self) -> RepetitionState {
+        const OCCURRENCES_TO_END: usize = 4;
+
+        let mut occurrences = 0;
+        let mut dist = 0usize;
+        // Every state the walk visits has the current side to move, the only
+        // ones that can match: each move, null or not, flips it.
+        while let Some(state) = self.state_back(dist) {
+            if self.matches_current_state(state) {
+                occurrences += 1;
+                if occurrences == OCCURRENCES_TO_END {
+                    let stm = self.side_to_move;
+                    let run = |color: Color| {
+                        usize::try_from(self.current_continuous_check(color)).unwrap_or(0)
+                    };
+                    return if dist <= run(stm) {
+                        RepetitionState::Lose
+                    } else if dist <= run(stm.flip()) {
+                        RepetitionState::Win
+                    } else {
+                        RepetitionState::Draw
+                    };
+                }
+            }
+            dist += 2;
+        }
+        RepetitionState::None
+    }
+
     /// The index of this position's line up to and including the current
     /// state, for [`Self::is_repetition_within`] at the positions a search
     /// reaches from here.
@@ -2907,5 +2968,159 @@ mod tests {
                 pos.undo_move(m, u);
             }
         }
+    }
+
+    #[test]
+    fn game_repetition_is_a_draw_only_at_the_fourth_occurrence() {
+        let mut p = setup_king_shuffle_pos();
+        assert_eq!(p.game_repetition(), RepetitionState::None);
+        for cycle in 1..=3 {
+            for (idx, m) in shuffle_cycle().into_iter().enumerate() {
+                p.do_move(m);
+                if cycle < 3 || idx < 3 {
+                    assert_eq!(
+                        p.game_repetition(),
+                        RepetitionState::None,
+                        "cycle {cycle}, ply {idx}: fewer than four occurrences",
+                    );
+                }
+            }
+        }
+        // The set-up position is the first of the four: the moves made reach
+        // the current position only three times.
+        assert_eq!(p.position_occurrences(), 3);
+        assert_eq!(p.game_repetition(), RepetitionState::Draw);
+    }
+
+    #[test]
+    fn game_repetition_stays_a_draw_past_the_fourth_occurrence() {
+        let mut p = setup_king_shuffle_pos();
+        for _ in 0..4 {
+            for m in shuffle_cycle() {
+                p.do_move(m);
+            }
+        }
+        assert_eq!(p.game_repetition(), RepetitionState::Draw);
+    }
+
+    #[test]
+    fn game_repetition_loses_for_the_perpetual_checker_to_move() {
+        let br = Piece::new(PieceKind::Rook, Color::Black);
+        let wk = Piece::new(PieceKind::King, Color::White);
+        let a = Square::new(8, 1).unwrap();
+        let b = Square::new(8, 0).unwrap();
+        let k0 = Square::new(4, 0).unwrap();
+        let k1 = Square::new(4, 1).unwrap();
+        let cycle = [
+            Move::make(a, b, br),
+            Move::make(k0, k1, wk),
+            Move::make(b, a, br),
+            Move::make(k1, k0, wk),
+        ];
+        let mut p = perpetual_check_by_side_to_move();
+        assert_eq!(p.game_repetition(), RepetitionState::None);
+        for m in cycle {
+            p.do_move(m);
+        }
+        assert_eq!(p.game_repetition(), RepetitionState::None);
+        for m in cycle {
+            p.do_move(m);
+        }
+        assert_eq!(p.game_repetition(), RepetitionState::Lose);
+    }
+
+    #[test]
+    fn game_repetition_wins_for_the_perpetually_checked_side_to_move() {
+        let bk = Piece::new(PieceKind::King, Color::Black);
+        let wr = Piece::new(PieceKind::Rook, Color::White);
+        let a = Square::new(8, 1).unwrap();
+        let b = Square::new(8, 0).unwrap();
+        let k0 = Square::new(4, 0).unwrap();
+        let k1 = Square::new(4, 1).unwrap();
+        let cycle = [
+            Move::make(k0, k1, bk),
+            Move::make(b, a, wr),
+            Move::make(k1, k0, bk),
+            Move::make(a, b, wr),
+        ];
+        let mut p = perpetual_check_by_opponent();
+        for m in cycle {
+            p.do_move(m);
+        }
+        assert_eq!(p.game_repetition(), RepetitionState::None);
+        for m in cycle {
+            p.do_move(m);
+        }
+        assert_eq!(p.game_repetition(), RepetitionState::Win);
+    }
+
+    #[test]
+    fn game_repetition_is_a_draw_when_only_part_of_the_span_was_checks() {
+        let hands = black_hand(0, 0);
+        let earlier: Vec<_> = [0, 4, 8]
+            .into_iter()
+            .map(|at| (at, recurring_state(hands, [0, 0])))
+            .collect();
+        // The side to move's checks cover the last eight of the twelve plies,
+        // and the opponent's the last four.
+        let partial = line_with(12, &earlier, recurring_state(hands, [8, 4]));
+        assert_eq!(partial.game_repetition(), RepetitionState::Draw);
+        let whole = line_with(12, &earlier, recurring_state(hands, [12, 4]));
+        assert_eq!(whole.game_repetition(), RepetitionState::Lose);
+        let whole_opp = line_with(12, &earlier, recurring_state(hands, [4, 12]));
+        assert_eq!(whole_opp.game_repetition(), RepetitionState::Win);
+    }
+
+    #[test]
+    fn game_repetition_counts_occurrences_far_beyond_sixteen_plies() {
+        let hands = black_hand(0, 0);
+        let at = |places: &[usize]| -> Vec<_> {
+            places
+                .iter()
+                .map(|&at| (at, recurring_state(hands, [0, 0])))
+                .collect()
+        };
+        let three = line_with(60, &at(&[0, 30]), recurring_state(hands, [0, 0]));
+        assert_eq!(three.game_repetition(), RepetitionState::None);
+        let four = line_with(60, &at(&[0, 20, 40]), recurring_state(hands, [0, 0]));
+        assert_eq!(four.game_repetition(), RepetitionState::Draw);
+        // A perpetual check over the whole sixty plies is still found.
+        let perpetual = line_with(60, &at(&[0, 20, 40]), recurring_state(hands, [0, 60]));
+        assert_eq!(perpetual.game_repetition(), RepetitionState::Win);
+    }
+
+    #[test]
+    fn game_repetition_tells_positions_with_different_hands_apart() {
+        let same = recurring_state(black_hand(1, 0), [0, 0]);
+        let other_hand = recurring_state(black_hand(0, 1), [0, 0]);
+        let mixed = line_with(
+            12,
+            &[(0, same.clone()), (4, other_hand), (8, same.clone())],
+            same.clone(),
+        );
+        assert_eq!(mixed.game_repetition(), RepetitionState::None);
+        let equal = line_with(
+            12,
+            &[(0, same.clone()), (4, same.clone()), (8, same.clone())],
+            same,
+        );
+        assert_eq!(equal.game_repetition(), RepetitionState::Draw);
+    }
+
+    #[test]
+    fn game_repetition_counts_across_a_null_move() {
+        let mut p = setup_king_shuffle_pos();
+        for m in shuffle_cycle() {
+            p.do_move(m);
+        }
+        p.do_null_move();
+        p.do_null_move();
+        assert_eq!(p.game_repetition(), RepetitionState::None);
+        for m in shuffle_cycle() {
+            p.do_move(m);
+        }
+        // Set-up position, after the first cycle, after the two null moves,
+        // and now.
+        assert_eq!(p.game_repetition(), RepetitionState::Draw);
     }
 }
