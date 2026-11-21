@@ -21,10 +21,7 @@ use std::time::Instant;
 
 #[cfg(feature = "verbose2")]
 use crate::book::Prng;
-
-/// The reference `MoveHorizon`: the assumed number of plies still to play when
-/// planning the time budget.
-const MOVE_HORIZON: i32 = 160;
+use crate::params;
 
 /// The raw inputs [`TimeManagement::init`] needs, extracted by the Protocol
 /// layer from a `go` request and the root position. Keeping the input primitive
@@ -215,12 +212,15 @@ impl TimeManagement {
         // Time-forfeit (sudden death): neither increment nor byoyomi.
         let time_forfeit = inc_us == 0 && byoyomi_us == 0;
 
-        // The planning horizon, wider early and narrower once out of the
-        // opening.
+        // The planning horizon (the reference `MoveHorizon`, the plies assumed
+        // still to play), wider early and narrower once out of the opening.
+        let move_horizon = params::TM_MOVE_HORIZON.get();
         let move_horizon = if time_forfeit {
-            MOVE_HORIZON + 40 - ply.min(40)
+            let opening = params::TM_OPENING_FORFEIT.get();
+            move_horizon + opening - ply.min(opening)
         } else {
-            MOVE_HORIZON + 20 - ply.min(80)
+            move_horizon + params::TM_OPENING_INC.get()
+                - ply.min(params::TM_OPENING_INC_PLIES.get())
         };
 
         // Own remaining moves until the draw horizon.
@@ -260,14 +260,16 @@ impl TimeManagement {
         // optimum candidate.
         let t1 = minimum_time + remain_estimate / mtg as i64;
 
-        // maximum candidate: up to `max_ratio`× the optimum, capped at 30% of
-        // the remaining estimate.
-        let mut max_ratio = 5.0f32;
+        // maximum candidate: up to `max_ratio`× the optimum, capped at a share
+        // (30% by default) of the remaining estimate.
+        // In `f32`, as the reference computes it: the ratio in thousandths is
+        // divided in `f32` so that 5000 gives exactly the reference's 5.0.
+        let mut max_ratio = params::TM_MAX_RATIO.get() as f32 / 1000.0;
         if time_forfeit {
             max_ratio = max_ratio.min((time_us as f32 / (60.0 * 1000.0)).max(1.0));
         }
         let mut t2 = minimum_time + (remain_estimate as f32 * max_ratio / mtg as f32) as i64;
-        t2 = t2.min((remain_estimate as f64 * 0.3) as i64);
+        t2 = t2.min((remain_estimate as f64 * params::TM_MAX_SHARE.scaled(1000.0)) as i64);
 
         // Fold in SlowMover and clamp to the remaining time.
         tm.optimum_time = t1.min(remain_time) * slow_mover / 100;
@@ -924,6 +926,145 @@ mod tests {
         let (mut tm, now) = credited(50_000, 1950);
         tm.set_search_end(tm.credited_elapsed_from(now));
         assert_eq!(tm.search_end, 2880);
+    }
+
+    /// The allocation with the reference's literals written in, where the
+    /// engine reads its time parameters: what [`TimeManagement::init_with`]
+    /// gives at the parameters' defaults, for a clock, the move-number terms
+    /// and the settings, outside `go movetime` and `go rtime`.
+    fn literal_budget(input: &TimeInput, s: &TimeSettings) -> (i64, i64, i64) {
+        let (time_us, inc_us, byoyomi_us, ply) =
+            (input.time_us, input.inc_us, input.byoyomi_us, input.ply);
+        let remain_time = (time_us + byoyomi_us - s.network_delay2)
+            .max(if s.round_up_to_fullsecond { 100 } else { 1 });
+        let time_forfeit = inc_us == 0 && byoyomi_us == 0;
+        let move_horizon = if time_forfeit {
+            160 + 40 - ply.min(40)
+        } else {
+            160 + 20 - ply.min(80)
+        };
+        let mtg = (s.max_moves_to_draw - ply + 2).min(move_horizon) / 2;
+        if mtg <= 0 {
+            return (500, 500, 500);
+        }
+        if mtg == 1 {
+            return (remain_time, remain_time, remain_time);
+        }
+        let minimum_time = (s.minimum_thinking_time - s.network_delay)
+            .max(if s.round_up_to_fullsecond { 1000 } else { 1 });
+        let mut remain_estimate = time_us + inc_us * mtg as i64 + byoyomi_us * mtg as i64;
+        if s.round_up_to_fullsecond {
+            remain_estimate -= (mtg as i64 + 1) * 1000;
+        }
+        remain_estimate = remain_estimate.max(0);
+        let t1 = minimum_time + remain_estimate / mtg as i64;
+        let mut max_ratio = 5.0f32;
+        if time_forfeit {
+            max_ratio = max_ratio.min((time_us as f32 / (60.0 * 1000.0)).max(1.0));
+        }
+        let mut t2 = minimum_time + (remain_estimate as f32 * max_ratio / mtg as f32) as i64;
+        t2 = t2.min((remain_estimate as f64 * 0.3) as i64);
+        let (mut minimum, mut optimum, mut maximum) = (
+            minimum_time,
+            t1.min(remain_time) * s.slow_mover / 100,
+            t2.min(remain_time),
+        );
+        if byoyomi_us != 0 && time_us < (byoyomi_us as f64 * 1.2) as i64 {
+            let v = byoyomi_us + time_us;
+            (minimum, optimum, maximum) = (v, v, v);
+        }
+        let round_up = |t0: i64| {
+            let t = if s.round_up_to_fullsecond {
+                let mut t =
+                    (((t0 + 999) / 1000) * 1000).max(s.minimum_thinking_time) - s.network_delay;
+                if t < t0 {
+                    t += 1000;
+                }
+                t
+            } else {
+                t0.max(s.minimum_thinking_time) - s.network_delay
+            };
+            t.min(remain_time)
+        };
+        (
+            round_up(minimum).min(remain_time),
+            optimum.min(remain_time),
+            round_up(maximum).min(remain_time),
+        )
+    }
+
+    /// Every clock shape (sudden death, increment, byoyomi, a spent main
+    /// clock), from the first move to past the draw horizon, under the
+    /// compiled settings and under a match-like set without the whole-second
+    /// rounding.
+    fn assert_the_defaults_allocate_as_the_literals() {
+        let local = TimeSettings {
+            network_delay: 20,
+            network_delay2: 100,
+            minimum_thinking_time: 100,
+            slow_mover: 100,
+            round_up_to_fullsecond: false,
+            max_moves_to_draw: 320,
+        };
+        let clocks = [
+            (0, 0, 0),
+            (500, 0, 1_000),
+            (5_000, 60_000, 0),
+            (10_000, 100, 0),
+            (30_000, 0, 0),
+            (60_000, 0, 5_000),
+            (180_000, 2_000, 0),
+            (300_000, 5_000, 0),
+            (600_000, 0, 0),
+            (600_000, 0, 10_000),
+            (900_000, 10_000, 0),
+            (3_600_000, 0, 0),
+        ];
+        let plies = [
+            1, 2, 20, 39, 40, 41, 79, 80, 81, 150, 250, 318, 319, 320, 322,
+        ];
+        for settings in [COMPILED, local] {
+            for (time_us, inc_us, byoyomi_us) in clocks {
+                for ply in plies {
+                    let input = TimeInput {
+                        time_us,
+                        inc_us,
+                        byoyomi_us,
+                        ply,
+                        ..base()
+                    };
+                    let tm = init_settings(&input, &settings);
+                    assert_eq!(
+                        (tm.minimum(), tm.optimum(), tm.maximum()),
+                        literal_budget(&input, &settings),
+                        "{settings:?} {time_us}+{inc_us}/{byoyomi_us} at ply {ply}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_time_parameters_defaults_allocate_as_the_literals() {
+        assert_the_defaults_allocate_as_the_literals();
+    }
+
+    /// A tuning list that spells out the time parameters' defaults allocates
+    /// as no list does.
+    #[cfg(feature = "tune")]
+    #[test]
+    fn the_time_parameters_defaults_spelled_out_allocate_as_the_literals() {
+        params::apply(
+            b"tm_move_horizon=160,tm_opening_forfeit=40,tm_opening_inc=20,\
+              tm_opening_inc_plies=80,tm_max_ratio=5000,tm_max_share=300,\
+              tm_falling_base=11325,tm_falling_average=2115,tm_falling_iteration=987,\
+              tm_falling_min=5688,tm_falling_max=15698,tm_reduction_k=5189,\
+              tm_reduction_center=1157,tm_reduction_base=723,tm_reduction_amplitude=790,\
+              tm_reduction_previous=1455,tm_instability_base=1040,\
+              tm_instability_weight=18956,tm_effort_factor=666,tm_deepen_share=503",
+        )
+        .expect("the defaults are in range");
+        assert_the_defaults_allocate_as_the_literals();
     }
 
     /// No credit is today's arithmetic, floor included.

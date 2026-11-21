@@ -3098,23 +3098,35 @@ impl<N: NetworkParams> QSearch<N> {
 
                 // `falling_eval` is > 1 when the score is dropping against
                 // the previous iterations and < 1 when rising.
-                let falling_eval = ((11.325
-                    + 2.115 * (best_previous_average_score - iter_best_value) as f64
-                    + 0.987 * (iter_value[iter_idx] - iter_best_value) as f64)
+                // The coefficients are the registered parameters; each one's
+                // default is the reference's literal, as the same `f64`.
+                let falling_eval = ((params::TM_FALLING_BASE.scaled(1000.0)
+                    + params::TM_FALLING_AVERAGE.scaled(1000.0)
+                        * (best_previous_average_score - iter_best_value) as f64
+                    + params::TM_FALLING_ITERATION.scaled(1000.0)
+                        * (iter_value[iter_idx] - iter_best_value) as f64)
                     / 100.0)
-                    .clamp(0.5688, 1.5698);
+                    .clamp(
+                        params::TM_FALLING_MIN.scaled(10000.0),
+                        params::TM_FALLING_MAX.scaled(10000.0),
+                    );
 
                 // Shorter when the best move is stable across iterations.
-                let k = 0.5189;
-                let center = last_best_move_depth as f64 + 11.57;
-                time_reduction =
-                    0.723 + 0.79 / (1.104 + (-k * (completed_depth as f64 - center)).exp());
-                let reduction = (1.455 + previous_time_reduction) / (2.2375 * time_reduction);
+                let k = params::TM_REDUCTION_K.scaled(10000.0);
+                let center =
+                    last_best_move_depth as f64 + params::TM_REDUCTION_CENTER.scaled(100.0);
+                time_reduction = params::TM_REDUCTION_BASE.scaled(1000.0)
+                    + params::TM_REDUCTION_AMPLITUDE.scaled(1000.0)
+                        / (1.104 + (-k * (completed_depth as f64 - center)).exp());
+                let reduction = (params::TM_REDUCTION_PREVIOUS.scaled(1000.0)
+                    + previous_time_reduction)
+                    / (2.2375 * time_reduction);
 
-                let best_move_instability =
-                    1.04 + 1.8956 * tot_best_move_changes / n_threads as f64;
+                let best_move_instability = params::TM_INSTABILITY_BASE.scaled(1000.0)
+                    + params::TM_INSTABILITY_WEIGHT.scaled(10000.0) * tot_best_move_changes
+                        / n_threads as f64;
                 let high_best_move_effort = if completed_depth >= 10 && nodes_effort >= 92425 {
-                    0.666
+                    params::TM_EFFORT_FACTOR.scaled(1000.0)
                 } else {
                     1.0
                 };
@@ -3138,7 +3150,8 @@ impl<N: NetworkParams> QSearch<N> {
                         .tm
                         .set_search_end(elapsed);
                 } else {
-                    increase_depth = elapsed as f64 <= total_time * 0.503;
+                    increase_depth =
+                        elapsed as f64 <= total_time * params::TM_DEEPEN_SHARE.scaled(1000.0);
                 }
             }
 

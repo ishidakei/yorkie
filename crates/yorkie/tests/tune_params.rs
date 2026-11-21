@@ -42,6 +42,11 @@ fn a_list_that_cannot_be_honoured_stops_the_engine_before_usiok() {
             "info string YORKIE_TUNE refused: bad value `4.5` for `razor_base` \
              (an integer in 0..=2000)\n",
         ),
+        (
+            "tm_max_ratio=999",
+            "info string YORKIE_TUNE refused: bad value `999` for `tm_max_ratio` \
+             (an integer in 1000..=20000)\n",
+        ),
     ] {
         let out = run(Some(list), b"usi\nisready\nquit\n");
         assert_eq!(out.status.code(), Some(2), "{list}");

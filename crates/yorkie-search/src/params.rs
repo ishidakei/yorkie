@@ -1,6 +1,13 @@
 //! The search parameters a tuning run varies: the pruning and reduction
-//! constants that shape the tree, each named once here and read through
+//! constants that shape the tree, and the coefficients of the time allocation
+//! that decide how long a search runs, each named once here and read through
 //! `Param::get` wherever the search uses it.
+//!
+//! Every parameter is an integer. A coefficient the arithmetic uses as a
+//! floating-point number is registered scaled by a power of ten and read
+//! through `Param::scaled`: the default divided by its scale is the
+//! correctly rounded quotient, which is the same `f64` the decimal literal
+//! spells, so the default allocates bit for bit as the literal would.
 //!
 //! In every build but `tune` a parameter is a `const`, and `get` on it is the
 //! constant: the search compiles to what a literal at the use site would give.
@@ -36,6 +43,12 @@ impl Param {
     pub(crate) const fn get(self) -> i32 {
         self.0
     }
+
+    /// The value divided by `scale`, for a coefficient registered scaled.
+    #[inline(always)]
+    pub(crate) fn scaled(self, scale: f64) -> f64 {
+        f64::from(self.0) / scale
+    }
 }
 
 /// One search parameter, written at startup by [`apply`].
@@ -56,6 +69,12 @@ impl Param {
     #[inline(always)]
     pub(crate) fn get(&self) -> i32 {
         self.0.load(Ordering::Relaxed)
+    }
+
+    /// The value divided by `scale`, for a coefficient registered scaled.
+    #[inline(always)]
+    pub(crate) fn scaled(&self, scale: f64) -> f64 {
+        f64::from(self.get()) / scale
     }
 }
 
@@ -135,6 +154,75 @@ search_params! {
     /// The aspiration window's half-width before the root score's spread is
     /// added. At least one, so each fail widens the window.
     ASPIRATION_DELTA = b"aspiration_delta", 5, 1..=1000;
+
+    // The time allocation. None of these can make a search outlast the clock:
+    // the optimum and the maximum are clamped to the remaining time after the
+    // terms below, and the search loop's per-iteration target is capped at the
+    // maximum, so a range only has to keep the arithmetic defined (no zero
+    // divisor, no inverted clamp, no factor that turns the target into NaN).
+
+    /// The planning horizon in plies once out of the opening. With the
+    /// smallest opening terms below it still leaves at least two own moves to
+    /// plan for, so the spend-everything branch for the last move before the
+    /// draw horizon is reached only there.
+    TM_MOVE_HORIZON = b"tm_move_horizon", 160, 100..=400;
+    /// On a clock with neither increment nor byoyomi, how many plies the
+    /// horizon is wider by at the start; it narrows by one a ply to the base.
+    TM_OPENING_FORFEIT = b"tm_opening_forfeit", 40, 0..=100;
+    /// On a clock with an increment or byoyomi, how many plies the horizon is
+    /// wider by at the start, before the narrowing below.
+    TM_OPENING_INC = b"tm_opening_inc", 20, 0..=100;
+    /// On a clock with an increment or byoyomi, the ply up to which the
+    /// horizon narrows by one a ply. The ceiling keeps the narrowed horizon at
+    /// least four plies above zero with the smallest base horizon.
+    TM_OPENING_INC_PLIES = b"tm_opening_inc_plies", 80, 0..=96;
+    /// The maximum time's ratio to the per-move share, in thousandths. At
+    /// least one, so the uncapped maximum is never below the optimum.
+    TM_MAX_RATIO = b"tm_max_ratio", 5000, 1000..=20000;
+    /// The share of the estimated remaining time the maximum is capped at, in
+    /// thousandths.
+    TM_MAX_SHARE = b"tm_max_share", 300, 100..=600;
+    /// The falling-evaluation factor: its constant term, in thousandths of a
+    /// percent.
+    TM_FALLING_BASE = b"tm_falling_base", 11325, 0..=50000;
+    /// The falling-evaluation factor: the weight of the drop from the previous
+    /// move's average score, in thousandths of a percent per unit of score.
+    TM_FALLING_AVERAGE = b"tm_falling_average", 2115, 0..=10000;
+    /// The falling-evaluation factor: the weight of the drop from the score
+    /// four iterations back, in thousandths of a percent per unit of score.
+    TM_FALLING_ITERATION = b"tm_falling_iteration", 987, 0..=10000;
+    /// The falling-evaluation factor's floor, in ten-thousandths. Positive,
+    /// and at most the ceiling's floor, so the clamp is never inverted.
+    TM_FALLING_MIN = b"tm_falling_min", 5688, 1000..=10000;
+    /// The falling-evaluation factor's ceiling, in ten-thousandths.
+    TM_FALLING_MAX = b"tm_falling_max", 15698, 10000..=30000;
+    /// The best-move-stability curve: its steepness per ply of depth, in
+    /// ten-thousandths. Positive, so the curve rises with depth.
+    TM_REDUCTION_K = b"tm_reduction_k", 5189, 1000..=20000;
+    /// The best-move-stability curve: how many plies past the depth at which
+    /// the best move last changed its midpoint sits, in hundredths.
+    TM_REDUCTION_CENTER = b"tm_reduction_center", 1157, 0..=3000;
+    /// The best-move-stability curve: its floor, in thousandths. Positive, so
+    /// the reduction it divides stays finite.
+    TM_REDUCTION_BASE = b"tm_reduction_base", 723, 100..=2000;
+    /// The best-move-stability curve: its height above the floor, in
+    /// thousandths.
+    TM_REDUCTION_AMPLITUDE = b"tm_reduction_amplitude", 790, 0..=3000;
+    /// The term added to the previous move's curve value before the
+    /// reduction divides by this move's, in thousandths.
+    TM_REDUCTION_PREVIOUS = b"tm_reduction_previous", 1455, 0..=5000;
+    /// The best-move-instability factor's constant term, in thousandths.
+    /// Positive, so the target time is never zero.
+    TM_INSTABILITY_BASE = b"tm_instability_base", 1040, 100..=3000;
+    /// The best-move-instability factor's weight on the aged count of
+    /// best-move changes per thread, in ten-thousandths.
+    TM_INSTABILITY_WEIGHT = b"tm_instability_weight", 18956, 0..=60000;
+    /// The factor on the target time when most of the nodes went under the
+    /// best move, in thousandths. Positive, so the target time is never zero.
+    TM_EFFORT_FACTOR = b"tm_effort_factor", 666, 100..=1500;
+    /// The share of the target time an iteration may start under and still
+    /// deepen, in thousandths; past it the next iteration repeats the depth.
+    TM_DEEPEN_SHARE = b"tm_deepen_share", 503, 100..=1000;
 }
 
 /// Why a tuning list was refused. Each variant borrows the part of the list it
@@ -227,6 +315,43 @@ pub fn apply(list: &[u8]) -> Result<(), TuneError<'_>> {
         REGISTRY[index].param.0.store(value, Ordering::Relaxed);
     }
     Ok(())
+}
+
+/// The scaled time coefficients at their defaults are the very `f64`s (and,
+/// for the maximum ratio, the `f32`) the reference's literals spell, so the
+/// per-iteration time scaling computes what the literals computed.
+#[cfg(test)]
+mod scaled_defaults {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn each_scaled_default_is_the_literal() {
+        for (got, literal) in [
+            (TM_MAX_SHARE.scaled(1000.0), 0.3),
+            (TM_FALLING_BASE.scaled(1000.0), 11.325),
+            (TM_FALLING_AVERAGE.scaled(1000.0), 2.115),
+            (TM_FALLING_ITERATION.scaled(1000.0), 0.987),
+            (TM_FALLING_MIN.scaled(10000.0), 0.5688),
+            (TM_FALLING_MAX.scaled(10000.0), 1.5698),
+            (TM_REDUCTION_K.scaled(10000.0), 0.5189),
+            (TM_REDUCTION_CENTER.scaled(100.0), 11.57),
+            (TM_REDUCTION_BASE.scaled(1000.0), 0.723),
+            (TM_REDUCTION_AMPLITUDE.scaled(1000.0), 0.79),
+            (TM_REDUCTION_PREVIOUS.scaled(1000.0), 1.455),
+            (TM_INSTABILITY_BASE.scaled(1000.0), 1.04),
+            (TM_INSTABILITY_WEIGHT.scaled(10000.0), 1.8956),
+            (TM_EFFORT_FACTOR.scaled(1000.0), 0.666),
+            (TM_DEEPEN_SHARE.scaled(1000.0), 0.503),
+        ] {
+            assert_eq!(
+                got.to_bits(),
+                f64::to_bits(literal),
+                "{got} against {literal}"
+            );
+        }
+        assert_eq!(TM_MAX_RATIO.get() as f32 / 1000.0, 5.0f32);
+    }
 }
 
 #[cfg(test)]
