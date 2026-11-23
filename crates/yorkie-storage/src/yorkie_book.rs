@@ -4,8 +4,9 @@
 //! A `.ybb` keys an entry by the position alone. A yorkie book carries two
 //! sections: **shared** entries, keyed by the position alone, and
 //! **path-dependent** entries, which apply only when every position in their
-//! support list has already occurred in the game. A position never has entries
-//! in both sections.
+//! support list has already occurred in the game. When a position has a
+//! shared entry this reader answers with it, and otherwise with the first
+//! path-dependent entry whose whole support list has been seen.
 //!
 //! The file is read whole and validated once, at open: magics, version,
 //! checksum, every offset, every entry's extent and the key order. A book that
@@ -18,7 +19,8 @@
 //!
 //! # Layout (version 2)
 //!
-//! All integers little-endian, offsets from the start of the file: a 40-byte
+//! `specs/yorkie-book-format.md` is the full specification;
+//! this is its outline. All integers little-endian, offsets from the start of the file: a 40-byte
 //! header (magic, version, padding, `n_shared`, `n_pathdep`,
 //! `pathdep_index_off`); the shared offset table (`n_shared` × u64), directly
 //! after the header, and the shared entries, sorted by key; the path-dependent
@@ -688,5 +690,125 @@ mod tests {
     fn an_empty_book_is_valid_and_misses_everything() {
         let book = YorkieBook::from_bytes(build(&[], &[])).expect("valid");
         assert!(book.probe(&key(1), |_| true).is_none());
+    }
+
+    /// The format specification published beside the source.
+    const FORMAT_DOC: &str = include_str!("../../../specs/yorkie-book-format.md");
+
+    /// The bytes of the specification's example file: the code block after the
+    /// heading `heading`, one line per 16 bytes, each led by its offset.
+    fn documented_example(doc: &str, heading: &str) -> Vec<u8> {
+        let mut lines = doc.lines().skip_while(|l| *l != heading).skip(1);
+        lines
+            .by_ref()
+            .find(|l| l.starts_with("```"))
+            .expect("a code block after the heading");
+        let mut bytes = Vec::new();
+        for line in lines.take_while(|l| !l.starts_with("```")) {
+            let mut fields = line.split_whitespace();
+            let offset = fields.next().expect("an offset");
+            assert_eq!(
+                usize::from_str_radix(offset, 16).expect("a hex offset"),
+                bytes.len(),
+                "offset column of {line:?}"
+            );
+            bytes.extend(fields.map(|b| u8::from_str_radix(b, 16).expect("a hex byte")));
+        }
+        bytes
+    }
+
+    /// `lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1`.
+    const EXAMPLE_START: [u8; 32] = [
+        0x58, 0xa4, 0x51, 0x22, 0x0c, 0xeb, 0x67, 0x22, 0x7e, 0x96, 0x53, 0x22, 0x1c, 0xaf, 0x44,
+        0x78, 0x24, 0xc2, 0x2b, 0x11, 0x9e, 0x53, 0x22, 0x1c, 0xeb, 0x6f, 0x22, 0x3e, 0x96, 0x51,
+        0x22, 0x0c,
+    ];
+    /// The start position after `2g2f`.
+    const EXAMPLE_AFTER_2G2F: [u8; 32] = [
+        0x59, 0xa4, 0x51, 0x22, 0x0c, 0xeb, 0x67, 0x12, 0x7e, 0x96, 0x53, 0x22, 0x1c, 0xaf, 0x44,
+        0x78, 0x24, 0xc2, 0x2b, 0x11, 0x9e, 0x53, 0x22, 0x1c, 0xeb, 0x6f, 0x22, 0x3e, 0x96, 0x51,
+        0x22, 0x0c,
+    ];
+    /// The start position after `7g7f`.
+    const EXAMPLE_AFTER_7G7F: [u8; 32] = [
+        0x59, 0xa4, 0x51, 0x22, 0x0c, 0xeb, 0x67, 0x22, 0x7e, 0x96, 0x53, 0x22, 0x1c, 0xaf, 0x44,
+        0x78, 0x24, 0xc2, 0x2b, 0x11, 0x9e, 0x53, 0x12, 0x1c, 0xeb, 0x6f, 0x22, 0x3e, 0x96, 0x51,
+        0x22, 0x0c,
+    ];
+    /// The start position after `7g7f 3c3d 2g2f`, which `2g2f 3c3d 7g7f` also
+    /// reaches.
+    const EXAMPLE_P: [u8; 32] = [
+        0x59, 0xa4, 0x51, 0x22, 0x0c, 0xeb, 0x67, 0x12, 0x7e, 0x96, 0x93, 0x24, 0x1c, 0xaf, 0x44,
+        0x78, 0x24, 0xc2, 0x2b, 0x11, 0x9e, 0x53, 0x12, 0x1c, 0xeb, 0x6f, 0x22, 0x3e, 0x96, 0x51,
+        0x22, 0x0c,
+    ];
+
+    /// The specification's example, as the builder writes it: `7g7f` and
+    /// `2g2f` at the start position; `8c8d` at `EXAMPLE_P` once the position
+    /// after `2g2f` has occurred, else `4a3b` once the one after `7g7f` has.
+    fn example() -> Vec<u8> {
+        build(
+            &[(
+                EXAMPLE_START,
+                vec![(0x1e3b, 6_000), (0x078e, 4_000)],
+                vec![],
+            )],
+            &[
+                (EXAMPLE_P, vec![(0x20c2, 10_000)], vec![EXAMPLE_AFTER_2G2F]),
+                (EXAMPLE_P, vec![(0x0d93, 10_000)], vec![EXAMPLE_AFTER_7G7F]),
+            ],
+        )
+    }
+
+    #[test]
+    fn the_documented_example_is_byte_for_byte_the_builder_output() {
+        let expected = example();
+        let documented = documented_example(FORMAT_DOC, "#### 16 進ダンプ");
+        let dump: String = expected
+            .chunks(16)
+            .enumerate()
+            .map(|(i, row)| {
+                let bytes: Vec<String> = row.iter().map(|b| format!("{b:02x}")).collect();
+                format!("{:08x}  {}\n", i * 16, bytes.join(" "))
+            })
+            .collect();
+        assert_eq!(documented, expected, "the dump should read:\n{dump}");
+    }
+
+    #[test]
+    fn the_documented_example_answers_as_its_entries_describe() {
+        let book = YorkieBook::from_bytes(documented_example(FORMAT_DOC, "#### 16 進ダンプ"))
+            .expect("valid");
+        assert_eq!((book.shared_count(), book.path_dependent_count()), (1, 2));
+
+        let start = book.probe(&EXAMPLE_START, |_| false).expect("shared hit");
+        assert!(!start.path_dependent);
+        let moves: Vec<_> = start.moves().map(|m| (m.move16, m.weight)).collect();
+        assert_eq!(moves, vec![(0x1e3b, 6_000), (0x078e, 4_000)]);
+
+        let via_2g2f = [EXAMPLE_START, EXAMPLE_AFTER_2G2F, EXAMPLE_P];
+        let hit = book
+            .probe(&EXAMPLE_P, |k| via_2g2f.contains(k))
+            .expect("first entry applies");
+        assert!(hit.path_dependent);
+        assert_eq!(hit.moves().next().map(|m| m.move16), Some(0x20c2));
+
+        let via_7g7f = [EXAMPLE_START, EXAMPLE_AFTER_7G7F, EXAMPLE_P];
+        let hit = book
+            .probe(&EXAMPLE_P, |k| via_7g7f.contains(k))
+            .expect("second entry applies");
+        assert_eq!(hit.moves().next().map(|m| m.move16), Some(0x0d93));
+
+        assert!(book.probe(&EXAMPLE_P, |k| *k == EXAMPLE_P).is_none());
+        assert!(book.probe(&EXAMPLE_AFTER_7G7F, |_| true).is_none());
+    }
+
+    #[test]
+    fn the_format_document_has_a_section_for_the_version_read() {
+        let heading = format!("## `YKBOOK01` バージョン {VERSION}");
+        assert!(
+            FORMAT_DOC.lines().any(|l| l == heading),
+            "specs/yorkie-book-format.md has no heading {heading:?}"
+        );
     }
 }

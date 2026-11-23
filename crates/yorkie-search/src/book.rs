@@ -2061,4 +2061,84 @@ mod tests {
         assert_eq!(hit.info_lines[0].depth, 0);
         assert_eq!(hit.info_lines[0].score, 0);
     }
+
+    /// The example file of the published format specification: the code block
+    /// after its hex-dump heading, one line per 16 bytes, each led by its
+    /// offset.
+    fn documented_example() -> YorkieBook {
+        let doc = include_str!("../../../specs/yorkie-book-format.md");
+        let mut lines = doc.lines().skip_while(|l| *l != "#### 16 進ダンプ").skip(1);
+        lines
+            .by_ref()
+            .find(|l| l.starts_with("```"))
+            .expect("a code block after the heading");
+        let bytes: Vec<u8> = lines
+            .take_while(|l| !l.starts_with("```"))
+            .flat_map(|l| l.split_whitespace().skip(1))
+            .map(|b| u8::from_str_radix(b, 16).expect("a hex byte"))
+            .collect();
+        YorkieBook::from_bytes(bytes).expect("the documented example is valid")
+    }
+
+    /// The specification's example file, probed from real game paths: its
+    /// entries answer as the example describes them, its keys are these
+    /// positions packed, and its moves widen to these legal moves.
+    #[test]
+    fn the_documented_example_answers_as_its_entries_describe() {
+        let book = documented_example();
+        let probe = |moves: &[&str], start: &str| {
+            let (here, path) = walk(start, moves);
+            let mut prng = Prng::new(7);
+            probe_book(
+                Some(&yprobe(&book, &path)),
+                &[],
+                false,
+                &here,
+                &cfg(),
+                &mut prng,
+            )
+            .hit
+            .map(|h| usi(h.best))
+        };
+
+        // The shared entry: a draw below 6,000 picks 7g7f, the rest 2g2f.
+        for seed in 1..=64u64 {
+            let (root, path) = walk(STARTPOS_B, &[]);
+            let expected = if Prng::new(seed).rand(10_000) < 6_000 {
+                "7g7f"
+            } else {
+                "2g2f"
+            };
+            let mut prng = Prng::new(seed);
+            let hit = probe_book(
+                Some(&yprobe(&book, &path)),
+                &[],
+                false,
+                &root,
+                &cfg(),
+                &mut prng,
+            )
+            .hit
+            .expect("shared hit");
+            assert_eq!(usi(hit.best), expected, "seed {seed}");
+        }
+
+        assert_eq!(
+            probe(&["2g2f", "3c3d", "7g7f"], STARTPOS_B).as_deref(),
+            Some("8c8d")
+        );
+        assert_eq!(
+            probe(&["7g7f", "3c3d", "2g2f"], STARTPOS_B).as_deref(),
+            Some("4a3b")
+        );
+        let (p, _) = walk(STARTPOS_B, &["7g7f", "3c3d", "2g2f"]);
+        let p_sfen = "lnsgkgsnl/1r5b1/pppppp1pp/6p2/9/2P4P1/PP1PPPP1P/1B5R1/LNSGKGSNL w - 4";
+        assert_eq!(sfen_pack(&pos(p_sfen)), sfen_pack(&p));
+        assert_eq!(
+            probe(&[], p_sfen),
+            None,
+            "a game that starts at the position has seen neither support"
+        );
+        assert_eq!(probe(&["7g7f"], STARTPOS_B), None);
+    }
 }
