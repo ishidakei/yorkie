@@ -900,35 +900,12 @@ pub struct TranspositionTable {
 /// without naming a neighbour's page.
 const TABLE_STORAGE_BYTES: usize = size_of::<TranspositionTable>();
 
-// The one transposition table's storage: `TABLE_STORAGE_BYTES` zero bytes on a
-// `TT_ALIGN` boundary, stated to the assembler rather than built by the
-// constant evaluator (see the module docs). The symbol is hidden, so a
-// reference to it resolves within this binary instead of through the dynamic
-// symbol table.
-//
-// The section is writable and `nobits` like `.bss`, but is deliberately not
-// named `.bss.*`: a linker script folds those into `.bss` in input order, and
-// this object landing anywhere but last there pushes the ordinary
-// zero-initialised objects — every `static` in the program, standard library
-// included — beyond the ±2 GiB a `R_X86_64_PC32` reference can reach, which
-// fails the link outright at the sizes a large-memory host is configured for.
-// Under its own name it is an orphan section, placed after the last section
-// like it, so only the table itself sits far from the code and nothing has to
-// reach past it.
-#[cfg(not(miri))]
-core::arch::global_asm!(
-    ".section .yorkie_transposition_table,\"aw\",@nobits",
-    ".balign {align}",
-    ".globl yorkie_transposition_table",
-    ".hidden yorkie_transposition_table",
-    ".type yorkie_transposition_table, @object",
-    "yorkie_transposition_table:",
-    ".zero {bytes}",
-    ".size yorkie_transposition_table, {bytes}",
-    ".previous",
-    align = const TT_ALIGN,
-    bytes = const TABLE_STORAGE_BYTES,
-);
+crate::large_page_bss! {
+    /// The one transposition table's storage: `TABLE_STORAGE_BYTES` zero bytes
+    /// on a `TT_ALIGN` boundary, stated to the assembler rather than built by
+    /// the constant evaluator (see the module docs).
+    fn table_storage() -> *mut TranspositionTable = "yorkie_transposition_table";
+}
 
 /// The same table for a miri build, which can neither assemble the storage
 /// above nor take its address.
@@ -964,33 +941,22 @@ impl TranspositionTable {
     /// rather than carrying a reference to it, because its address is a
     /// link-time constant that costs one `lea` to name.
     ///
-    /// The address is taken in assembly rather than as `&TABLE`. A Rust
-    /// `extern` static is a declaration the compiler assumes some other object
-    /// might define, so naming it emits a load from the global offset table;
-    /// the symbol is in fact defined right above and hidden, so the `lea` is
-    /// what the address actually costs. Written with `nomem` and `pure` so it
-    /// is hoisted and folded like any other constant.
+    /// The address is a `lea` of the storage's symbol (see
+    /// [`large_page_bss!`](crate::large_page_bss)), so naming the table costs
+    /// one instruction that the compiler hoists like any other constant.
     #[inline]
     pub fn shared() -> &'static TranspositionTable {
         #[cfg(not(miri))]
         {
-            let table: *const TranspositionTable;
-            // SAFETY: the symbol is defined in this binary, by the
-            // `global_asm!` above, as `size_of::<TranspositionTable>()` zero
-            // bytes aligned to the type's alignment, so the `lea` yields a
-            // pointer to that many initialised, correctly aligned bytes. Every
-            // byte of the type is an atomic or padding, so any bit pattern —
-            // the zeros BSS starts as included — is a valid value of it, and
-            // every access to it goes through a shared reference. Nothing else
-            // in the process names the symbol, so no `&mut` to it can exist.
-            unsafe {
-                core::arch::asm!(
-                    "lea {table}, [rip + yorkie_transposition_table]",
-                    table = out(reg) table,
-                    options(nomem, nostack, preserves_flags, pure),
-                );
-                &*table
-            }
+            // SAFETY: `table_storage` addresses `size_of::<TranspositionTable>()`
+            // zero bytes defined in this binary, aligned to the type's
+            // alignment, so it points to that many initialised, correctly
+            // aligned bytes. Every byte of the type is an atomic or padding, so
+            // any bit pattern — the zeros BSS starts as included — is a valid
+            // value of it, and every access to it goes through a shared
+            // reference. Nothing else in the process names the symbol, so no
+            // `&mut` to it can exist.
+            unsafe { &*table_storage() }
         }
         #[cfg(miri)]
         {

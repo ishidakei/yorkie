@@ -103,11 +103,29 @@ impl FinnyCache {
     /// worker thread's stack is not that large.
     pub fn new() -> Box<Self> {
         let mut cache = Box::<FinnyCache>::new_uninit();
-        let base = cache.as_mut_ptr();
-        // SAFETY: `base` addresses one uninitialised, suitably aligned
-        // `FinnyCache` this call owns; every field is written exactly once, and
-        // through a raw pointer, so nothing reads the memory before it holds a
-        // value. `assume_init` runs only once all of them have.
+        // SAFETY: the pointer addresses one uninitialised, suitably aligned
+        // `FinnyCache` this call owns, and `assume_init` runs only once
+        // `write_new` has written all of it.
+        unsafe {
+            Self::write_new(cache.as_mut_ptr());
+            cache.assume_init()
+        }
+    }
+
+    /// Write an empty cache — the one [`Self::new`] returns — into storage the
+    /// caller owns, a field at a time, so the half-mebibyte never passes
+    /// through the stack.
+    ///
+    /// Whatever `base` held is overwritten without being dropped.
+    ///
+    /// # Safety
+    ///
+    /// `base` must be valid for writes of one `FinnyCache` and aligned for it,
+    /// and nothing may read or write that memory while this runs.
+    pub unsafe fn write_new(base: *mut Self) {
+        // SAFETY: the caller hands over `base` as writable, aligned storage for
+        // one `FinnyCache`; every field is written exactly once, and through a
+        // raw pointer, so nothing reads the memory before it holds a value.
         unsafe {
             for perspective in 0..Color::COUNT {
                 for bucket in 0..Square::COUNT {
@@ -116,7 +134,6 @@ impl FinnyCache {
             }
             (&raw mut (*base).scratch_active).write(Vec::with_capacity(MAX_ACTIVE_FEATURES));
             (&raw mut (*base).diff).write(DiffScratch::default());
-            cache.assume_init()
         }
     }
 

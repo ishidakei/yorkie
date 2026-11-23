@@ -29,7 +29,24 @@
 use std::sync::atomic::{AtomicI16, Ordering};
 
 use yorkie_state::{Color, Move, Piece, Square};
-use yorkie_storage::{LargePageAlloc, Zeroable};
+use yorkie_storage::{LARGE_PAGE_ALIGN, LargePageAlloc, Zeroable};
+
+use crate::worker_block::WorkerAlloc;
+
+/// The `(address, byte length)` of the large-page block behind a heap table:
+/// the table's bytes rounded up to whole large pages, which is what the
+/// allocator handed out. A table inside a worker's block is placed with the
+/// block instead (`BlockClaim::backing_region`).
+#[expect(
+    clippy::borrowed_box,
+    reason = "only a box from the large-page policy names a rounded block"
+)]
+fn heap_region<T>(table: &Box<T, WorkerAlloc>) -> (usize, usize) {
+    (
+        Box::as_ptr(table).addr(),
+        size_of::<T>().next_multiple_of(LARGE_PAGE_ALIGN),
+    )
+}
 
 /// Ask the CPU to bring the cache line holding `entry` into every cache level.
 /// A no-op off x86-64.
@@ -203,18 +220,33 @@ impl PieceSquare {
     }
 }
 
+/// The storage of a [`CapturePieceToHistory`].
+pub(crate) type CaptureTable = [[[i16; CAPTURED_NB]; SQ_NB]; PIECE_NB];
+
 /// `captureHistory[pc][to][type_of(captured)]` — the capture-ordering bonus for
 /// "moved piece `pc` captures a `captured`-type piece on square `to`".
 pub struct CapturePieceToHistory {
     /// The dimensions are part of the type, so an entry's address is one
     /// computation from the block's base and each index carries its own bound.
-    table: Box<[[[i16; CAPTURED_NB]; SQ_NB]; PIECE_NB], LargePageAlloc>,
+    table: Box<CaptureTable, WorkerAlloc>,
 }
 
 impl Default for CapturePieceToHistory {
     fn default() -> Self {
         Self {
-            table: LargePageAlloc::zeroed(),
+            table: WorkerAlloc::zeroed(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl CapturePieceToHistory {
+    /// The table's entries as bytes, for a test comparing two tables whole.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        // SAFETY: the table is plain `i16` data with no padding, so every one
+        // of its bytes is initialised.
+        unsafe {
+            std::slice::from_raw_parts(Box::as_ptr(&self.table).cast(), size_of_val(&*self.table))
         }
     }
 }
@@ -225,11 +257,17 @@ impl CapturePieceToHistory {
         Self::default()
     }
 
+    /// The table over `table`, as it stands — a worker's block hands its
+    /// storage over unfilled.
+    pub(crate) fn over(table: Box<CaptureTable, WorkerAlloc>) -> Self {
+        Self { table }
+    }
+
     /// The `(address, byte length)` of this table's large-page block — see
     /// [`WorkerHistories::backing_regions`](crate::WorkerHistories::backing_regions).
     /// The table is not zero-sized, so it always owns a block.
     pub fn backing_region(&self) -> (usize, usize) {
-        LargePageAlloc::backing_region(&self.table).expect("a history table is not zero-sized")
+        heap_region(&self.table)
     }
 
     /// Overwrite every entry with `v` — the reference's
@@ -285,19 +323,34 @@ fn move16(m: Move) -> usize {
     (m.to_bits() & 0xFFFF) as usize
 }
 
+/// The storage of a [`ButterflyHistory`].
+pub(crate) type ButterflyTable = [[i16; 1 << 16]; Color::COUNT];
+
 /// `mainHistory[us][move]` — the butterfly (from-to) quiet-move history for the
 /// side to move. Indexed by the low 16 bits of the packed move, which encode
 /// exactly the `(from-or-dropped-type, to)` pair the reference's `move.raw()`
 /// uses.
 pub struct ButterflyHistory {
     /// Layout `[us][move16]`, both dimensions compile-time.
-    table: Box<[[i16; 1 << 16]; Color::COUNT], LargePageAlloc>,
+    table: Box<ButterflyTable, WorkerAlloc>,
 }
 
 impl Default for ButterflyHistory {
     fn default() -> Self {
         Self {
-            table: LargePageAlloc::zeroed(),
+            table: WorkerAlloc::zeroed(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ButterflyHistory {
+    /// The table's entries as bytes, for a test comparing two tables whole.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        // SAFETY: the table is plain `i16` data with no padding, so every one
+        // of its bytes is initialised.
+        unsafe {
+            std::slice::from_raw_parts(Box::as_ptr(&self.table).cast(), size_of_val(&*self.table))
         }
     }
 }
@@ -308,11 +361,17 @@ impl ButterflyHistory {
         Self::default()
     }
 
+    /// The table over `table`, as it stands — a worker's block hands its
+    /// storage over unfilled.
+    pub(crate) fn over(table: Box<ButterflyTable, WorkerAlloc>) -> Self {
+        Self { table }
+    }
+
     /// The `(address, byte length)` of this table's large-page block — see
     /// [`WorkerHistories::backing_regions`](crate::WorkerHistories::backing_regions).
     /// The table is not zero-sized, so it always owns a block.
     pub fn backing_region(&self) -> (usize, usize) {
-        LargePageAlloc::backing_region(&self.table).expect("a history table is not zero-sized")
+        heap_region(&self.table)
     }
 
     /// Overwrite every entry with `v` — the reference's `mainHistory.fill(v)`
@@ -415,17 +474,32 @@ impl PieceToHistory {
     }
 }
 
+/// The storage of a [`LowPlyHistory`].
+pub(crate) type LowPlyTable = [[i16; 1 << 16]; LOW_PLY_HISTORY_SIZE];
+
 /// `lowPlyHistory[ply][move]` — the near-root quiet bonus. Re-filled per `go`
 /// through [`fill`](LowPlyHistory::fill) at the root.
 pub struct LowPlyHistory {
     /// Layout `[ply][move16]`, both dimensions compile-time.
-    table: Box<[[i16; 1 << 16]; LOW_PLY_HISTORY_SIZE], LargePageAlloc>,
+    table: Box<LowPlyTable, WorkerAlloc>,
 }
 
 impl Default for LowPlyHistory {
     fn default() -> Self {
         Self {
-            table: LargePageAlloc::zeroed(),
+            table: WorkerAlloc::zeroed(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl LowPlyHistory {
+    /// The table's entries as bytes, for a test comparing two tables whole.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        // SAFETY: the table is plain `i16` data with no padding, so every one
+        // of its bytes is initialised.
+        unsafe {
+            std::slice::from_raw_parts(Box::as_ptr(&self.table).cast(), size_of_val(&*self.table))
         }
     }
 }
@@ -436,11 +510,17 @@ impl LowPlyHistory {
         Self::default()
     }
 
+    /// The table over `table`, as it stands — a worker's block hands its
+    /// storage over unfilled.
+    pub(crate) fn over(table: Box<LowPlyTable, WorkerAlloc>) -> Self {
+        Self { table }
+    }
+
     /// The `(address, byte length)` of this table's large-page block — see
     /// [`WorkerHistories::backing_regions`](crate::WorkerHistories::backing_regions).
     /// The table is not zero-sized, so it always owns a block.
     pub fn backing_region(&self) -> (usize, usize) {
-        LargePageAlloc::backing_region(&self.table).expect("a history table is not zero-sized")
+        heap_region(&self.table)
     }
 
     /// Overwrite every entry with `v` — the reference's `lowPlyHistory.fill(v)`
@@ -781,6 +861,9 @@ impl PawnPlane<'_> {
     }
 }
 
+/// The storage of a [`ContinuationCorrectionHistory`].
+pub(crate) type ContCorrTable = [[[i16; SQ_NB]; PIECE_NB]; CONT_CORR_PLANES];
+
 /// `CorrectionHistory<Continuation>`: a `[pc][to]` table whose every cell is
 /// itself a `[pc][to]` `i16` table.
 ///
@@ -790,7 +873,7 @@ impl PawnPlane<'_> {
 pub struct ContinuationCorrectionHistory {
     /// Layout: `[plane = outer_pc*SQ_NB + outer_to][inner_pc][inner_to]`. Every
     /// dimension is fixed so each access carries a compile-time length.
-    table: Box<[[[i16; SQ_NB]; PIECE_NB]; CONT_CORR_PLANES], LargePageAlloc>,
+    table: Box<ContCorrTable, WorkerAlloc>,
 }
 
 impl Default for ContinuationCorrectionHistory {
@@ -798,7 +881,19 @@ impl Default for ContinuationCorrectionHistory {
         // Huge-page-backed, zero-initialised; the compile-time dimensions are
         // preserved by the `Box`.
         Self {
-            table: LargePageAlloc::zeroed(),
+            table: WorkerAlloc::zeroed(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ContinuationCorrectionHistory {
+    /// The table's entries as bytes, for a test comparing two tables whole.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        // SAFETY: the table is plain `i16` data with no padding, so every one
+        // of its bytes is initialised.
+        unsafe {
+            std::slice::from_raw_parts(Box::as_ptr(&self.table).cast(), size_of_val(&*self.table))
         }
     }
 }
@@ -810,11 +905,17 @@ impl ContinuationCorrectionHistory {
         Self::default()
     }
 
+    /// The table over `table`, as it stands — a worker's block hands its
+    /// storage over unfilled.
+    pub(crate) fn over(table: Box<ContCorrTable, WorkerAlloc>) -> Self {
+        Self { table }
+    }
+
     /// The `(address, byte length)` of this table's large-page block — see
     /// [`WorkerHistories::backing_regions`](crate::WorkerHistories::backing_regions).
     /// The table is not zero-sized, so it always owns a block.
     pub fn backing_region(&self) -> (usize, usize) {
-        LargePageAlloc::backing_region(&self.table).expect("a history table is not zero-sized")
+        heap_region(&self.table)
     }
 
     /// Overwrite every entry with `v` — the reference fills each continuation
@@ -861,21 +962,40 @@ pub struct ContinuationHistory {
     /// Layout: `[plane][inner_pc][inner_to]`, `plane` from [`Self::plane_index`].
     /// The planes are inline, so their length is part of the type and an entry's
     /// address is one computation from the block's base.
-    table: Box<[PieceToHistory; CONT_PLANES], LargePageAlloc>,
+    table: Box<[PieceToHistory; CONT_PLANES], WorkerAlloc>,
 }
 
 impl Default for ContinuationHistory {
     fn default() -> Self {
         Self {
-            table: LargePageAlloc::zeroed(),
+            table: WorkerAlloc::zeroed(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ContinuationHistory {
+    /// The table's entries as bytes, for a test comparing two tables whole.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        // SAFETY: the table is plain `i16` data with no padding, so every one
+        // of its bytes is initialised.
+        unsafe {
+            std::slice::from_raw_parts(Box::as_ptr(&self.table).cast(), size_of_val(&*self.table))
         }
     }
 }
 
 impl ContinuationHistory {
-    /// A fresh, zero-filled table. Use [`Self::fill`] for the reference init.
+    /// A fresh, zero-filled table on the heap. Use [`Self::fill`] for the
+    /// reference init.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The table over `table`, as it stands — a worker's block hands its
+    /// storage over unfilled.
+    pub(crate) fn over(table: Box<[PieceToHistory; CONT_PLANES], WorkerAlloc>) -> Self {
+        Self { table }
     }
 
     /// The `(address, byte length)` of this table's large-page block — see
@@ -884,7 +1004,7 @@ impl ContinuationHistory {
     /// private footprint. The table is not zero-sized, so it always owns a
     /// block.
     pub fn backing_region(&self) -> (usize, usize) {
-        LargePageAlloc::backing_region(&self.table).expect("a history table is not zero-sized")
+        heap_region(&self.table)
     }
 
     /// Overwrite every entry with `v` — the reference fills each continuation

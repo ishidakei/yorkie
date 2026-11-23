@@ -157,6 +157,14 @@ impl Default for PickerScratch {
     }
 }
 
+#[cfg(test)]
+impl PickerScratch {
+    /// Hold one move, for a test that needs a buffer that is not empty.
+    pub(crate) fn push_for_test(&mut self) {
+        self.push(EMPTY_SLOT);
+    }
+}
+
 impl MoveSink for PickerScratch {
     #[inline]
     fn push(&mut self, m: ExtMove) {

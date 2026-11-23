@@ -51,6 +51,7 @@ pub mod timeman;
 #[cfg(feature = "dupstats")]
 pub mod timeline;
 pub mod update;
+pub mod worker_block;
 
 pub use book::{BookConfig, BookHit, BookProbeResult, Prng, YorkieProbe, probe_book};
 // The book probe's diagnostic notices: only a build that prints them.

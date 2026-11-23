@@ -1039,10 +1039,12 @@ impl<P: EngineSink> Engine<P> {
         // what the buffers are sized by is the pool, not the setting it was
         // asked for.
         let workers = pool.size();
-        let histories = Some(WorkerHistories::with_shared(Arc::clone(&worker_shared[0])));
-        // The coordinator's bundle is built (and filled) right here, on the
-        // command thread — so place it explicitly; see
-        // `place_coordinator_histories`.
+        let histories = Some(WorkerHistories::for_worker(
+            0,
+            Arc::clone(&worker_shared[0]),
+        ));
+        // The coordinator's bundle is built right here, on the command thread
+        // — so place it explicitly; see `place_coordinator_histories`.
         place_coordinator_histories(histories.as_ref(), &worker_plan);
         let yorkie_choices = settings
             .yorkie_book_files()
@@ -1371,9 +1373,9 @@ impl<P: EngineSink> Engine<P> {
             h.set_shared(Arc::clone(&self.worker_shared[0]));
         }
         // The coordinator's per-worker tables outlive a pool rebuild and were
-        // faulted on the command thread, so re-assert their placement for the fresh
+        // built on the command thread, so re-assert their placement for the fresh
         // assignment. Helpers need nothing here: they are respawned and each
-        // allocates its own bundle on-thread after pinning.
+        // builds its own bundle on-thread after pinning.
         place_coordinator_histories(self.histories.as_ref(), &self.worker_plan);
         self.pool
             .set_with_binding(requested, self.worker_plan, &self.worker_shared);
@@ -1881,9 +1883,13 @@ impl<P: EngineSink> Engine<P> {
         // Fresh per-worker tables. The shared correction / pawn handle is swapped
         // to the freshly (re)built node table set by `rebuild_pool` below, so a
         // cheap clone of the current handle here avoids a throwaway allocation.
-        self.histories = Some(WorkerHistories::with_shared(Arc::clone(
-            &self.worker_shared[0],
-        )));
+        // The last game's bundle is dropped first, which gives worker 0's block
+        // back for the new one to claim.
+        self.histories = None;
+        self.histories = Some(WorkerHistories::for_worker(
+            0,
+            Arc::clone(&self.worker_shared[0]),
+        ));
         // A new game draws a new evaluation-noise seed, which is what makes the
         // engine play the next game differently from this one.
         #[cfg(feature = "random")]
@@ -2931,6 +2937,7 @@ impl Helpers {
 /// never dispatches a job hands over none.
 fn helper_loop<N: NetworkParams>(
     net: N,
+    worker_id: usize,
     slot: &'static HelperSlot,
     mut shared: Option<Arc<SharedHistories>>,
 ) {
@@ -2960,7 +2967,8 @@ fn helper_loop<N: NetworkParams>(
         // runs `check_time` on the main worker alone; helpers merely poll the
         // shared stop flag.
         let histories_in = histories.unwrap_or_else(|| {
-            WorkerHistories::with_shared(
+            WorkerHistories::for_worker(
+                worker_id,
                 shared
                     .take()
                     .expect("the pool hands every helper it dispatches to its node's tables"),
@@ -3110,7 +3118,7 @@ impl ThreadPool {
                 pin_worker(&plan, worker_id);
                 // The one place this helper's node becomes the network type its
                 // search is compiled for. Once per thread, before it parks.
-                with_eval_network!(node, |net| helper_loop(net, slot, shared));
+                with_eval_network!(node, |net| helper_loop(net, worker_id, slot, shared));
             }));
         }
         self.helpers = size - 1;
@@ -3418,13 +3426,16 @@ fn table_placement(plan: &WorkerPlan) -> TablePlacement {
 
 /// Move the coordinator's session-owned history tables onto worker 0's node.
 ///
-/// This is the one per-worker bundle the engine does **not** allocate inside the
-/// worker that uses it: it is built and filled on the command thread and only then
-/// lent to the per-`go` coordinator. Its pages are therefore already faulted
-/// wherever the process policy put them, and no per-thread policy can move them
-/// retroactively — `mbind(MPOL_BIND | MPOL_MF_MOVE)` can, so that is what this
-/// does. The helpers need none of this, each allocating its own bundle after it
-/// has pinned itself.
+/// This is the one per-worker bundle the engine does **not** build inside the
+/// worker that uses it: it is built on the command thread and only then lent to
+/// the per-`go` coordinator. Over worker 0's block of static storage nothing is
+/// written until the coordinator fills it, so binding the block here makes its
+/// pages fault in on worker 0's node. A bundle on the heap (a build with no
+/// block for worker 0, or a block already held) is filled on the command thread,
+/// so its pages are already faulted wherever the process policy put them, and no
+/// per-thread policy can move them retroactively — `mbind(MPOL_BIND |
+/// MPOL_MF_MOVE)` can, so that is what this does either way. The helpers need
+/// none of this, each building its own bundle after it has pinned itself.
 ///
 /// Best-effort throughout, and run at pool-(re)build time only, outside any
 /// clock. A build that pins no worker places nothing here either.
@@ -5061,11 +5072,22 @@ mod tests {
             .expect("the coordinator bundle survives a pool rebuild")
             .backing_regions();
         assert!(!regions.is_empty(), "the bundle owns large-page blocks");
+        if let Some(block) = engine.histories.as_ref().and_then(|h| h.block()) {
+            assert_eq!(
+                regions,
+                vec![block.backing_region()],
+                "a bundle over worker 0's block is placed as that one block"
+            );
+        }
 
         for (addr, len) in regions {
             let Some(policy) = mempolicy::policy_at_address(addr) else {
                 continue; // `get_mempolicy` unavailable — nothing to assert.
             };
+            eprintln!(
+                "coordinator region {addr:#x}+{len}: policy mode {} nodes {:?} (worker 0's node {node})",
+                policy.mode, policy.nodes
+            );
             if policy.mode == mempolicy::MODE_DEFAULT {
                 // The kernel refused the `mbind` (no CONFIG_NUMA, seccomp, a
                 // restricted cgroup). Best-effort: today's behaviour stands.
@@ -5082,6 +5104,57 @@ mod tests {
                 "region {addr:#x}+{len} must name worker 0's system node"
             );
         }
+    }
+
+    /// How many of the 4 KiB pages of `[addr, addr + len)` are resident.
+    #[cfg(target_os = "linux")]
+    fn resident_pages(addr: usize, len: usize) -> usize {
+        let mut resident = vec![0u8; len.div_ceil(4096)];
+        // SAFETY: the range is a page-aligned part of this process's mapped
+        // memory, and `resident` holds one byte per page of it; `mincore`
+        // writes only that vector.
+        let rc = unsafe { libc::mincore(addr as *mut libc::c_void, len, resident.as_mut_ptr()) };
+        assert_eq!(rc, 0, "mincore failed");
+        resident.iter().filter(|&&r| r & 1 != 0).count()
+    }
+
+    /// Building the coordinator's bundle over worker 0's block, and placing it,
+    /// writes none of the block: no page of it becomes resident until the
+    /// worker's own fill, so its first touch is the worker's.
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn building_and_placing_the_coordinators_block_touches_none_of_it() {
+        let _session = serial_session();
+        let mut engine = idle_engine();
+        let shared = Arc::clone(&engine.worker_shared[0]);
+        engine.histories = None;
+        let Some((addr, len)) = WorkerHistories::for_worker(0, Arc::clone(&shared))
+            .block()
+            .map(|b| b.backing_region())
+        else {
+            return; // This build has no block for worker 0.
+        };
+        let before = resident_pages(addr, len);
+        let mut histories = WorkerHistories::for_worker(0, shared);
+        assert!(histories.block().is_some(), "block 0 was given back");
+        place_coordinator_histories(Some(&histories), &engine.worker_plan);
+        let built = resident_pages(addr, len);
+        histories.fill_if_pending();
+        let filled = resident_pages(addr, len);
+        eprintln!(
+            "worker 0's block: {} pages; resident before {before}, after building and placing \
+             {built}, after the owner's fill {filled}",
+            len / 4096
+        );
+        assert_eq!(
+            built, before,
+            "building or placing the bundle touched the block"
+        );
+        assert!(
+            filled > before || before == len / 4096,
+            "the fill touched nothing"
+        );
     }
 
     // A short-circuit carries the reference's SKIP_SEARCH bookkeeping: both

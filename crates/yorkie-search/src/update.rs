@@ -19,6 +19,7 @@ use crate::history::{
     ContinuationHistory, CorrChannel, CorrPlane, LOW_PLY_HISTORY_SIZE, LowPlyHistory,
     SharedHistories, TtMoveHistory,
 };
+use crate::worker_block::{BlockClaim, SearchTables};
 
 /// Reference `clear()` init constants.
 const MAIN_HISTORY_INIT: i16 = 0;
@@ -118,15 +119,29 @@ pub struct WorkerHistories {
     /// in every search.
     #[cfg(repetition_index)]
     pub history_index: yorkie_state::HistoryIndex,
+    /// Whether the tables hold their initial fill. A bundle over a worker's
+    /// block is built without it, so that the first write to the block is its
+    /// owner's ([`Self::fill_if_pending`]).
+    ///
+    /// A `u8`, `0` or `1`, rather than a `bool`: the bundle's largest niche
+    /// would be the `bool`'s, and rustc places the field with the largest
+    /// niche first, so the search, which holds the bundle inline, would be
+    /// laid out with the bundle ahead of its stack, accumulator and finny
+    /// pointers instead of after them.
+    filled: u8,
+    /// The worker's block the tables above are carved from, or `None` when
+    /// they are on the heap. The block is given back once neither this claim
+    /// nor any box over the block is left, whichever goes last.
+    block: Option<BlockClaim>,
 }
 
 // Five large-page boxes (one pointer each: the allocator is zero-sized and the
-// layout comes from the type), the single gravity entry and the shared-table
-// handle.
-// The six bytes past the entry are the bundle's own alignment and cannot be
-// reordered away: every other field is already eight bytes wide. The bundle is
-// per-worker and reached once per update, so its own line is never contended —
-// what a helper shares with its node is `shared`, whose entries are atomic.
+// layout comes from the type), the shared-table handle, and in the last word
+// the single gravity entry, the fill flag and the four-byte block claim. The
+// bundle sits inline in the search, so a wider one moves every field the
+// search lays out after it. The bundle is per-worker and reached once per
+// update, so its own line is never contended — what a helper shares with its
+// node is `shared`, whose entries are atomic.
 #[cfg(not(repetition_index))]
 const _: () = assert!(size_of::<WorkerHistories>() == 56);
 #[cfg(repetition_index)]
@@ -149,18 +164,60 @@ impl WorkerHistories {
     /// A fresh bundle of per-worker tables (reference `clear()` init) attached to
     /// the given node-shared tables. The driver builds one [`SharedHistories`]
     /// per NUMA node and hands each worker on that node a cheap [`Arc`] clone.
+    ///
+    /// The tables are on the heap and filled here, on the calling thread.
     pub fn with_shared(shared: Arc<SharedHistories>) -> Self {
-        let mut main = ButterflyHistory::new();
-        main.fill(MAIN_HISTORY_INIT);
-        let mut capture = CapturePieceToHistory::new();
-        capture.fill(CAPTURE_HISTORY_INIT);
-        let mut continuation = ContinuationHistory::new();
-        continuation.fill(CONTINUATION_INIT);
-        let mut continuation_correction = ContinuationCorrectionHistory::new();
-        continuation_correction.fill(CONTINUATION_CORRECTION_INIT);
+        let mut bundle = Self::assemble(
+            ButterflyHistory::new(),
+            LowPlyHistory::new(),
+            CapturePieceToHistory::new(),
+            ContinuationHistory::new(),
+            ContinuationCorrectionHistory::new(),
+            shared,
+            None,
+        );
+        bundle.fill_if_pending();
+        bundle
+    }
+
+    /// Worker `worker`'s bundle, over that worker's block of static storage
+    /// when the build has one for it and nobody holds it, and on the heap
+    /// (filled, as [`Self::with_shared`]'s) otherwise.
+    ///
+    /// Over the block nothing is written here: the tables get their initial
+    /// fill from [`Self::fill_if_pending`], which the search runs on the
+    /// worker's own thread before it reads them, so the block's pages are first
+    /// touched there. A new owner of a block that was held before finds the
+    /// last owner's values in it, and the fill overwrites every one of them, so
+    /// the bundle starts exactly as a freshly allocated one does.
+    pub fn for_worker(worker: usize, shared: Arc<SharedHistories>) -> Self {
+        let Some((claim, tables)) = BlockClaim::claim(worker) else {
+            return Self::with_shared(shared);
+        };
+        Self::assemble(
+            ButterflyHistory::over(tables.main),
+            LowPlyHistory::over(tables.low_ply),
+            CapturePieceToHistory::over(tables.capture),
+            ContinuationHistory::over(tables.continuation),
+            ContinuationCorrectionHistory::over(tables.continuation_correction),
+            shared,
+            Some(claim),
+        )
+    }
+
+    /// The bundle over the given tables, unfilled.
+    fn assemble(
+        main: ButterflyHistory,
+        low_ply: LowPlyHistory,
+        capture: CapturePieceToHistory,
+        continuation: ContinuationHistory,
+        continuation_correction: ContinuationCorrectionHistory,
+        shared: Arc<SharedHistories>,
+        block: Option<BlockClaim>,
+    ) -> Self {
         Self {
             main,
-            low_ply: LowPlyHistory::new(),
+            low_ply,
             capture,
             continuation,
             continuation_correction,
@@ -174,7 +231,50 @@ impl WorkerHistories {
             } else {
                 yorkie_state::HistoryIndex::with_capacity(1024)
             },
+            filled: 0,
+            block,
         }
+    }
+
+    /// Give the tables their initial fill (reference `clear()` init), unless
+    /// they hold it already. Called by the search on the worker's own thread,
+    /// so a bundle over a worker's block is first written there.
+    ///
+    /// `lowPlyHistory` starts at zero, which a heap table is already; a table
+    /// in a block may hold its last owner's values, so it is zeroed there.
+    pub fn fill_if_pending(&mut self) {
+        if self.filled != 0 {
+            return;
+        }
+        self.main.fill(MAIN_HISTORY_INIT);
+        self.capture.fill(CAPTURE_HISTORY_INIT);
+        self.continuation.fill(CONTINUATION_INIT);
+        self.continuation_correction
+            .fill(CONTINUATION_CORRECTION_INIT);
+        if self.block.is_some() {
+            self.low_ply.fill(0);
+        }
+        self.filled = 1;
+    }
+
+    /// Fresh tables for one search: carved from the bundle's block when it
+    /// has one, on the heap otherwise.
+    ///
+    /// # Safety
+    ///
+    /// No table an earlier call returned may be left, since a block's search
+    /// tables are written over again for each search.
+    pub(crate) unsafe fn lend_search_tables(&mut self) -> SearchTables {
+        match &mut self.block {
+            // SAFETY: the caller's guarantee is the one the block asks for.
+            Some(block) => unsafe { block.lend_search_tables() },
+            None => SearchTables::heap(),
+        }
+    }
+
+    /// The worker's block this bundle is carved from, if it is.
+    pub fn block(&self) -> Option<&BlockClaim> {
+        self.block.as_ref()
     }
 
     /// The `(address, byte length)` of every large-page block backing this
@@ -188,7 +288,13 @@ impl WorkerHistories {
     ///
     /// [`Self::shared`] is deliberately absent: those tables are shared by every
     /// worker of a node and placed by whoever builds them.
+    ///
+    /// A bundle over a worker's block names the whole block instead, which
+    /// holds every one of those tables and is a whole number of large pages.
     pub fn backing_regions(&self) -> Vec<(usize, usize)> {
+        if let Some(block) = &self.block {
+            return vec![block.backing_region()];
+        }
         vec![
             self.main.backing_region(),
             self.low_ply.backing_region(),
@@ -700,6 +806,91 @@ mod tests {
         );
         // ttMoveHistory init 0.
         assert_eq!(hist.tt_move.get(), 0);
+    }
+
+    /// Every per-worker table of `hist`, as bytes.
+    fn table_bytes(hist: &WorkerHistories) -> [&[u8]; 5] {
+        [
+            hist.main.as_bytes(),
+            hist.low_ply.as_bytes(),
+            hist.capture.as_bytes(),
+            hist.continuation.as_bytes(),
+            hist.continuation_correction.as_bytes(),
+        ]
+    }
+
+    /// A bundle over worker 0's block, once filled by its owner, holds what a
+    /// freshly built heap bundle holds — and so does the next one over the
+    /// same block after a game has written every table of it, which is what
+    /// a new game's bundle is.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_bundle_over_a_block_starts_as_a_fresh_heap_bundle_does() {
+        let _lock = crate::worker_block::claim_lock();
+        let shared = Arc::new(SharedHistories::new(1));
+        let fresh = WorkerHistories::with_shared(Arc::clone(&shared));
+        assert!(fresh.block().is_none());
+        for game in 0..2 {
+            let mut hist = WorkerHistories::for_worker(0, Arc::clone(&shared));
+            assert!(hist.block().is_some(), "game {game}: block 0 is free");
+            hist.fill_if_pending();
+            assert!(
+                table_bytes(&hist) == table_bytes(&fresh),
+                "game {game}: a table differs from a fresh bundle's"
+            );
+            assert_eq!(hist.tt_move.get(), fresh.tt_move.get());
+            hist.main.fill(7);
+            hist.low_ply.fill(9);
+            hist.capture.fill(1);
+            hist.continuation.fill(2);
+            hist.continuation_correction.fill(3);
+            hist.tt_move.update(500);
+        }
+    }
+
+    /// A bundle for a worker the build has no block for, or whose block is
+    /// held, is a filled heap bundle.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_bundle_without_a_free_block_is_on_the_heap_and_filled() {
+        let _lock = crate::worker_block::claim_lock();
+        let shared = Arc::new(SharedHistories::new(1));
+        let fresh = WorkerHistories::with_shared(Arc::clone(&shared));
+        let past =
+            WorkerHistories::for_worker(crate::worker_block::WORKER_BLOCKS, Arc::clone(&shared));
+        assert!(past.block().is_none());
+        assert!(table_bytes(&past) == table_bytes(&fresh));
+        let held = WorkerHistories::for_worker(0, Arc::clone(&shared));
+        let second = WorkerHistories::for_worker(0, Arc::clone(&shared));
+        assert!(held.block().is_some());
+        assert!(second.block().is_none(), "block 0 is held");
+        assert!(table_bytes(&second) == table_bytes(&fresh));
+    }
+
+    /// A worker over its block takes none of its nine fixed-size tables from
+    /// the allocator — the five history tables and the four a search lends —
+    /// where the same worker on the heap takes one block for each. What both
+    /// still allocate are the vectors inside the tables (the stack cells' PVs,
+    /// the finny table's feature lists), whose lengths are run-time values.
+    #[cfg(all(feature = "verbose1", not(miri)))]
+    #[test]
+    fn a_worker_over_its_block_allocates_none_of_its_tables() {
+        let _lock = crate::worker_block::claim_lock();
+        let shared = Arc::new(SharedHistories::new(1));
+        yorkie_storage::clear_alloc_count();
+        let mut on_heap = WorkerHistories::with_shared(Arc::clone(&shared));
+        // SAFETY: nothing has been lent out of this bundle.
+        let heap_tables = unsafe { on_heap.lend_search_tables() };
+        let heap_count = yorkie_storage::take_alloc_count();
+        let mut in_block = WorkerHistories::for_worker(0, Arc::clone(&shared));
+        assert!(in_block.block().is_some(), "block 0 is free");
+        in_block.fill_if_pending();
+        // SAFETY: nothing has been lent out of this bundle.
+        let block_tables = unsafe { in_block.lend_search_tables() };
+        let block_count = yorkie_storage::take_alloc_count();
+        eprintln!("allocations per worker: heap {heap_count}, block {block_count}");
+        assert_eq!(heap_count - block_count, 9);
+        drop((heap_tables, block_tables));
     }
 
     // ---- fixtures for the update-function scenarios -----------------------

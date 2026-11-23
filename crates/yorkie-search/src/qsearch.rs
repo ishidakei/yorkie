@@ -60,11 +60,12 @@ use crate::update::{
     SEARCHED_LIST_CAPACITY, SearchStackCell, SearchedList, WorkerHistories, update_all_stats,
     update_continuation_histories, update_correction_history, update_quiet_histories,
 };
+use crate::worker_block::WorkerAlloc;
 
 // Value / depth constants and helpers.
 
 /// `MAX_PLY`: the standard engine build value.
-const MAX_PLY: i32 = 246;
+pub(crate) const MAX_PLY: i32 = 246;
 /// Whether a forced mate the engine delivers is scored [`VALUE_MATE_FLAT`]
 /// rather than by its distance (the `flatten_winning_mate` setting).
 ///
@@ -406,12 +407,18 @@ const STACK_BASE: usize = 7;
 /// in range. A compile-time constant rather than a `Vec` length, so the
 /// optimizer can range-analyze the ply indexes and drop the per-access bounds
 /// checks that otherwise dominate the hot function's panic paths.
-const STACK_LEN: usize = STACK_BASE + MAX_PLY as usize + 2;
+pub(crate) const STACK_LEN: usize = STACK_BASE + MAX_PLY as usize + 2;
+
+/// The search stack's storage.
+pub(crate) type SearchStack = [SearchStackCell; STACK_LEN];
 
 /// Length of the differential-NNUE accumulator stack: one slot per reachable
 /// do/undo depth, plus headroom. Boxed, so the large `Accumulator` slots stay
 /// on the heap while the length remains a compile-time constant.
-const ACC_LEN: usize = MAX_PLY as usize + 8;
+pub(crate) const ACC_LEN: usize = MAX_PLY as usize + 8;
+
+/// The accumulator stack's storage.
+pub(crate) type AccStack = [Accumulator; ACC_LEN];
 
 /// Number of [`PickerScratch`] buffers: one per [`MovePicker`] that can be live
 /// at once, which is two per ply.
@@ -423,7 +430,10 @@ const ACC_LEN: usize = MAX_PLY as usize + 8;
 /// neither the singular nor a further re-entry path. The ProbCut picker needs
 /// no slot of its own — it is finished before the node's own picker is built —
 /// and a node only reaches either with `ply < MAX_PLY`.
-const PICKER_SCRATCH_LEN: usize = 2 * MAX_PLY as usize + 4;
+pub(crate) const PICKER_SCRATCH_LEN: usize = 2 * MAX_PLY as usize + 4;
+
+/// The picker buffers' storage.
+pub(crate) type PickerStack = [PickerScratch; PICKER_SCRATCH_LEN];
 
 /// Outcome of a top-level [`QSearch::run`].
 #[derive(Debug, Clone)]
@@ -712,7 +722,7 @@ pub struct QSearch<N: NetworkParams> {
     /// `Stack stack[MAX_PLY + 10]`. The constant length lets the optimizer
     /// prove `si(ply)` indexes in range and elide bounds checks in the hot
     /// search function.
-    stack: Box<[SearchStackCell; STACK_LEN]>,
+    stack: Box<SearchStack, WorkerAlloc>,
 
     /// This worker's private differential-NNUE accumulator stack, whose top is
     /// always the accumulator for the position the current node is searching.
@@ -723,14 +733,14 @@ pub struct QSearch<N: NetworkParams> {
     /// contiguous block and a row is the base address plus a constant: the depth
     /// scales the slot size, and nothing on the way to the lanes is loaded from
     /// memory.
-    acc_stack: Box<[Accumulator; ACC_LEN]>,
+    acc_stack: Box<AccStack, WorkerAlloc>,
     /// Index of the current node's accumulator within [`Self::acc_stack`] (the
     /// live top of the do/undo stack). Incremented per `do_move`, decremented per
     /// `undo_move`; `0` at every root node.
     acc_depth: usize,
     /// This worker's private finny table. Allocated once and never shared, so
     /// it needs no synchronisation.
-    finny: Box<FinnyCache>,
+    finny: Box<FinnyCache, WorkerAlloc>,
 
     /// The [`MovePicker`] buffers, [`PICKER_SCRATCH_LEN`] of them, in one
     /// block allocated once here so no node ever reaches the allocator.
@@ -740,7 +750,7 @@ pub struct QSearch<N: NetworkParams> {
     /// self` of the search call it spans — so the array is lent out for the
     /// length of one run ([`Self::lend_picker_scratch`]) and this field is
     /// `None` while that run is in flight. Nothing reads it there.
-    picker_scratch: Option<Box<[PickerScratch; PICKER_SCRATCH_LEN]>>,
+    picker_scratch: Option<Box<PickerStack, WorkerAlloc>>,
     /// Test-only: when set, [`Self::static_eval`] asserts the differential
     /// accumulator equals a from-scratch [`yorkie_eval::evaluate`] at every
     /// evaluation point (the accumulator-equivalence test). Enabled via
@@ -756,6 +766,10 @@ pub struct QSearch<N: NetworkParams> {
     /// The single set of live worker history tables, read **everywhere** in the
     /// search tree, so that an interior update is visible to a later leaf
     /// qsearch — the reference's contract.
+    ///
+    /// When the bundle is over a worker's block, the tables lent out of it for
+    /// this search are boxes over that block, and the block stays held until
+    /// both they and the bundle are dropped.
     histories: WorkerHistories,
     /// `rootDelta` — the width `beta - alpha` of the *root* aspiration window,
     /// read by [`Self::reduction`]. [`Self::set_root_delta`] is the only way in;
@@ -1208,7 +1222,16 @@ impl<N: NetworkParams> QSearch<N> {
     /// The game-scoped path: histories persist across `go`s within a game, as
     /// the reference's do, and are reclaimed afterwards with
     /// [`Self::into_histories`].
-    pub fn with_histories(net: N, histories: WorkerHistories) -> Self {
+    ///
+    /// A bundle over a worker's block gets its initial fill here, if it has
+    /// not had it, so the thread that runs the worker is the block's first
+    /// writer.
+    pub fn with_histories(net: N, mut histories: WorkerHistories) -> Self {
+        histories.fill_if_pending();
+        // SAFETY: `histories` arrived by value, so no search holds tables lent
+        // out of it: a search gives its lent tables up when it gives up its
+        // histories (`into_histories`), or together with them.
+        let tables = unsafe { histories.lend_search_tables() };
         Self {
             net,
             nodes: 0,
@@ -1252,37 +1275,11 @@ impl<N: NetworkParams> QSearch<N> {
             #[cfg(test)]
             read_tt: true,
             root_us: Color::Black,
-            // A fixed-size boxed array; each cell's `pv` is preallocated so a
-            // PV update never grows the buffer on the hot path. Built as a
-            // `Vec` (each cell distinct — `SearchStackCell` is not `Copy`) then
-            // converted to the boxed array without a stack copy.
-            stack: Vec::from_fn(STACK_LEN, |_| {
-                let mut cell = SearchStackCell::default();
-                cell.pv.reserve_exact(MAX_PLY as usize + 1);
-                cell
-            })
-            .try_into()
-                .map_err(|_| ())
-                .expect("STACK_LEN cells collected"),
-            // One accumulator slot per reachable do/undo depth (bounded by
-            // `MAX_PLY`, plus headroom); `Accumulator` is not `Clone`, so build
-            // the slots individually. A boxed fixed-size array keeps the large
-            // slots on the heap (no stack copy) with a compile-time length, and
-            // is the whole stack's one allocation: a slot's rows are part of it.
-            acc_stack: Vec::from_fn(ACC_LEN, |_| Accumulator::new())
-                .try_into()
-                .map_err(|_| ())
-                .expect("ACC_LEN slots collected"),
+            stack: tables.stack,
+            acc_stack: tables.acc_stack,
             acc_depth: 0,
-            finny: FinnyCache::new(),
-            // One block for the whole set: the buffers carry their storage
-            // inline, so this is the only allocation any of them costs.
-            picker_scratch: Some(
-                Vec::from_fn(PICKER_SCRATCH_LEN, |_| PickerScratch::new())
-                    .try_into()
-                    .map_err(|_| ())
-                    .expect("PICKER_SCRATCH_LEN buffers collected"),
-            ),
+            finny: tables.finny,
+            picker_scratch: Some(tables.picker_scratch),
             #[cfg(test)]
             verify_accumulator: false,
             #[cfg(test)]
@@ -5493,6 +5490,50 @@ mod tests {
             // loop, null moves, and ProbCut — every one of the six eval sites.
             q.run_search(&mut p, -VALUE_INFINITE, VALUE_INFINITE, 5, false, true);
         }
+    }
+
+    /// A worker over its block searches exactly as one over heap tables: the
+    /// same values and node counts over several searches that carry the bundle
+    /// from one to the next, with the accumulator self-check armed. The block
+    /// lends a search the accumulator stack the previous search left, so a slot
+    /// read before it was written would show here as a mismatch.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_search_over_a_worker_block_searches_as_one_over_the_heap() {
+        let path = real_nn_bin();
+        if !path.exists() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+        let net = yorkie_eval::load_network(&path).expect("real nn.bin loads");
+        let _claims = crate::worker_block::claim_lock();
+        const FIXTURES: [&str; 3] = [
+            "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
+            "k8/1P7/G8/1N2P4/9/9/9/9/8K b 2PG2pg 1",
+            "2k6/9/4+R4/8P/9/1n7/9/9/6K2 b B2Pgp 1",
+        ];
+        let mut runs = Vec::new();
+        for over_block in [false, true] {
+            let _tt = fresh_tt();
+            let shared = std::sync::Arc::new(crate::SharedHistories::new(1));
+            let mut histories = if over_block {
+                WorkerHistories::for_worker(0, shared)
+            } else {
+                WorkerHistories::with_shared(shared)
+            };
+            assert_eq!(histories.block().is_some(), over_block);
+            let mut seen = Vec::new();
+            for sfen in FIXTURES {
+                let mut p = pos(sfen);
+                let mut q = QSearch::with_histories(net.network(), histories);
+                q.set_verify_accumulator(true);
+                let value = q.run_search(&mut p, -VALUE_INFINITE, VALUE_INFINITE, 5, false, true);
+                seen.push((value, q.nodes));
+                histories = q.into_histories();
+            }
+            runs.push(seen);
+        }
+        assert_eq!(runs[0], runs[1]);
     }
 
     // Value / depth helper unit tests.

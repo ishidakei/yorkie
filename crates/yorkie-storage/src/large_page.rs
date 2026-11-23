@@ -91,6 +91,173 @@ pub fn advise_huge_pages(addr: usize, len: usize) -> bool {
     }
 }
 
+/// Declare zero-filled storage for one value of a type in the binary's BSS, on
+/// a large-page boundary, and a function that returns its address.
+///
+/// ```ignore
+/// yorkie_storage::large_page_bss! {
+///     /// Docs for the accessor.
+///     pub(crate) fn storage() -> *mut Table = "symbol_name";
+/// }
+/// ```
+///
+/// The storage is stated to the assembler — `size_of` zero bytes in a
+/// writable `nobits` section of its own, named after the symbol with a leading
+/// dot — rather than built as a Rust `static` with an initialiser, because
+/// rustc const-evaluates such an initialiser by materialising every one of its
+/// bytes: minutes of compile time at a gigabyte, and out of reach at the sizes
+/// a large-memory host is configured for. A `#[link_section]` attribute on an
+/// initialised `static` does not help, since the initialiser is still
+/// evaluated. A `nobits` section keeps the bytes out of the file as well.
+///
+/// The section is deliberately not named `.bss.*`: a linker script folds those
+/// into `.bss` in input order, and a large object landing anywhere but last
+/// there pushes the ordinary zero-initialised objects — every `static` in the
+/// program, standard library included — beyond the ±2 GiB a `R_X86_64_PC32`
+/// reference can reach, which fails the link outright. Under its own name it
+/// is an orphan section, placed after the last section like it, so only the
+/// large object itself sits far from the code.
+///
+/// The type's alignment must be a whole multiple of [`LARGE_PAGE_ALIGN`] (the
+/// build fails otherwise), so the storage starts on a huge-page boundary and
+/// its size, which Rust rounds up to the alignment, is a whole number of huge
+/// pages: [`advise_huge_pages`] over exactly that span names no neighbour's
+/// page. BSS is zero at process start, so the type's all-zero pattern is what
+/// the storage holds until something writes it.
+///
+/// The symbol is hidden, so the reference resolves within the binary instead
+/// of through the dynamic symbol table, and the address is taken with a `lea`
+/// rather than through a Rust `extern` static, which the compiler would reach
+/// through the global offset table. The `lea` is written `nomem` and `pure`, so
+/// it is hoisted and folded like any other constant.
+///
+/// # Near and far storage
+///
+/// The binary is position-independent and built for the small code model, so
+/// the `lea` above is a 32-bit displacement from the instruction: it reaches
+/// the storage only while the storage *starts* within ±2 GiB of the code. What
+/// lies past that start does not matter, because an access adds its offset to
+/// the address in a register. Storage the form above states is *near*, and
+/// costs that one `lea`.
+///
+/// Storage whose size grows with a build setting other than its own, and which
+/// a link places before near storage, would push that near storage out of
+/// reach. The second form states such storage *far*:
+///
+/// ```ignore
+/// yorkie_storage::large_page_bss! {
+///     pub(crate) fn storage() -> *mut Table = far "symbol_name";
+/// }
+/// ```
+///
+/// Far storage sits in a `.lbss.<symbol>` section carrying the x86-64
+/// `SHF_X86_64_LARGE` flag — the flag the medium and large code models mark
+/// their large data with. Both linkers the toolchain can use place every such
+/// section after all the program's other data, so far storage never lies
+/// between the code and any near storage, however large it is, and near
+/// storage keeps the reach it has without it. Far storage itself may then lie
+/// anywhere in the address space, so its accessor does not take a displacement
+/// to it: it loads the full 64-bit address from a word in `.data.rel.ro`,
+/// which sits with the other relocated data next to the code and which the
+/// dynamic loader fills in at start-up. That costs one load instead of a
+/// `lea`, so far storage is for regions addressed once, not on every access.
+///
+/// Miri can neither assemble the storage nor resolve the symbol, so under miri
+/// the macro expands to nothing and the caller supplies a stand-in.
+#[macro_export]
+macro_rules! large_page_bss {
+    ($(#[$attr:meta])* $vis:vis fn $name:ident() -> *mut $ty:ty = far $symbol:literal;) => {
+        #[cfg(not(miri))]
+        core::arch::global_asm!(
+            concat!(".pushsection .lbss.", $symbol, ",\"awl\",@nobits"),
+            ".balign {align}",
+            concat!(".globl ", $symbol),
+            concat!(".hidden ", $symbol),
+            concat!(".type ", $symbol, ", @object"),
+            concat!($symbol, ":"),
+            ".zero {bytes}",
+            concat!(".size ", $symbol, ", {bytes}"),
+            ".popsection",
+            concat!(".pushsection .data.rel.ro.", $symbol, "_address,\"aw\",@progbits"),
+            ".balign 8",
+            concat!(".globl ", $symbol, "_address"),
+            concat!(".hidden ", $symbol, "_address"),
+            concat!(".type ", $symbol, "_address, @object"),
+            concat!($symbol, "_address:"),
+            concat!(".quad ", $symbol),
+            concat!(".size ", $symbol, "_address, 8"),
+            ".popsection",
+            align = const core::mem::align_of::<$ty>(),
+            bytes = const core::mem::size_of::<$ty>(),
+        );
+
+        #[cfg(not(miri))]
+        const _: () = assert!(
+            core::mem::align_of::<$ty>().is_multiple_of($crate::LARGE_PAGE_ALIGN),
+            "large-page BSS storage must start on a large-page boundary",
+        );
+
+        #[cfg(not(miri))]
+        $(#[$attr])*
+        #[inline]
+        $vis fn $name() -> *mut $ty {
+            let storage: *mut $ty;
+            // SAFETY: the load reads the address word the `global_asm!` above
+            // defines in this binary, which the dynamic loader has filled in
+            // before any code runs and nothing writes after; it writes no
+            // memory and touches no flags or stack.
+            unsafe {
+                core::arch::asm!(
+                    concat!("mov {storage}, qword ptr [rip + ", $symbol, "_address]"),
+                    storage = out(reg) storage,
+                    options(readonly, nostack, preserves_flags, pure),
+                );
+            }
+            storage
+        }
+    };
+    ($(#[$attr:meta])* $vis:vis fn $name:ident() -> *mut $ty:ty = $symbol:literal;) => {
+        #[cfg(not(miri))]
+        core::arch::global_asm!(
+            concat!(".section .", $symbol, ",\"aw\",@nobits"),
+            ".balign {align}",
+            concat!(".globl ", $symbol),
+            concat!(".hidden ", $symbol),
+            concat!(".type ", $symbol, ", @object"),
+            concat!($symbol, ":"),
+            ".zero {bytes}",
+            concat!(".size ", $symbol, ", {bytes}"),
+            ".previous",
+            align = const core::mem::align_of::<$ty>(),
+            bytes = const core::mem::size_of::<$ty>(),
+        );
+
+        #[cfg(not(miri))]
+        const _: () = assert!(
+            core::mem::align_of::<$ty>().is_multiple_of($crate::LARGE_PAGE_ALIGN),
+            "large-page BSS storage must start on a large-page boundary",
+        );
+
+        #[cfg(not(miri))]
+        $(#[$attr])*
+        #[inline]
+        $vis fn $name() -> *mut $ty {
+            let storage: *mut $ty;
+            // SAFETY: the `lea` only computes the address of the symbol the
+            // `global_asm!` above defines in this binary; it reads and writes
+            // no memory and touches no flags or stack.
+            unsafe {
+                core::arch::asm!(
+                    concat!("lea {storage}, [rip + ", $symbol, "]"),
+                    storage = out(reg) storage,
+                    options(nomem, nostack, preserves_flags, pure),
+                );
+            }
+            storage
+        }
+    };
+}
+
 /// An [`Allocator`] that hands out blocks under the huge-page policy: the
 /// request's alignment raised to [`LARGE_PAGE_ALIGN`], its size rounded up to a
 /// whole multiple of it, and the whole block `MADV_HUGEPAGE`-hinted. The
