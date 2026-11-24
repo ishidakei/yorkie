@@ -305,7 +305,17 @@ fn lane_eq(a: [u64; 2], b: [u64; 2]) -> bool {
 
 /// Byte-reverse the 128-bit value: one `_mm_shuffle_epi8`.
 /// SAFETY: as [`lane_testz`]; the shuffle mask reverses all 16 bytes.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(
+        test,
+        not(all(
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vl"
+        ))
+    )
+))]
 fn lane_byte_reverse(a: [u64; 2]) -> [u64; 2] {
     use core::arch::x86_64::{__m128i, _mm_set_epi8, _mm_shuffle_epi8};
     unsafe {
@@ -317,7 +327,17 @@ fn lane_byte_reverse(a: [u64; 2]) -> [u64; 2] {
 
 /// SSE unpack: `(unpackhi(lo_in, hi_in), unpacklo(lo_in, hi_in))`.
 /// SAFETY: as [`lane_testz`].
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(
+        test,
+        not(all(
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vl"
+        ))
+    )
+))]
 fn lane_unpack(hi_in: [u64; 2], lo_in: [u64; 2]) -> ([u64; 2], [u64; 2]) {
     use core::arch::x86_64::{__m128i, _mm_unpackhi_epi64, _mm_unpacklo_epi64};
     unsafe {
@@ -348,7 +368,17 @@ fn lane_decrement(a: [u64; 2]) -> [u64; 2] {
 /// SSE pairwise 128-bit decrement (`Bitboard::decrement(hi, lo, …)`): each lane
 /// index `i` decrements the pair `[lo_in[i], hi_in[i]]`.
 /// SAFETY: as [`lane_testz`].
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(
+        test,
+        not(all(
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vl"
+        ))
+    )
+))]
 fn lane_pair_decrement(hi_in: [u64; 2], lo_in: [u64; 2]) -> ([u64; 2], [u64; 2]) {
     use core::arch::x86_64::{
         __m128i, _mm_add_epi64, _mm_cmpeq_epi64, _mm_set1_epi64x, _mm_setzero_si128,
@@ -1008,245 +1038,46 @@ static QUGIY_ROOK_MASK: [[Bitboard; 2]; N] = build_qugiy_rook_mask();
 
 /// The four bishop diagonals in [`DIRECTIONS`] order, and whether each runs
 /// toward *decreasing* square index — so that its mask is byte-reversed and the
-/// query byte-reverses the occupancy. The reference `bishopEffect` calls the
-/// increasing pair LU/LD and the decreasing one RU/RD, and packs the mask as
-/// `[LU, RU, LD, RD]` per 64-bit lane so the unpacked halves feed `occ` to the
-/// non-reversed diagonals and `rocc` to the reversed ones.
+/// query byte-reverses the occupancy.
 const BISHOP_DIAG_DIRS: [usize; 4] = [4, 5, 6, 7];
 const BISHOP_DIAG_REV: [bool; 4] = [false, true, false, true];
 
-/// Two [`Bitboard`]s packed into one 256-bit value (`Bitboard256`), so
-/// `bishop_attacks` covers all four diagonals in one pass. Only the operations
-/// that query consumes are ported.
+/// One square's four diagonal rays in one cache line: the two that run toward
+/// higher squares in words 0..4 as they are, the two that run toward lower
+/// squares in words 4..8 byte-reversed. Both bishop kernels read it.
 #[derive(Clone, Copy)]
-#[repr(C, align(32))]
-struct Bitboard256 {
-    p: [u64; 4],
+#[repr(C, align(64))]
+struct BishopRays {
+    p: [u64; 8],
 }
 
-impl Bitboard256 {
-    /// Low half `b1`, high half `b2`.
-    const fn from_pair(b1: Bitboard, b2: Bitboard) -> Bitboard256 {
-        Bitboard256 {
-            p: [b1.p[0], b1.p[1], b2.p[0], b2.p[1]],
-        }
-    }
-}
-
-// The AVX2 arm pins the intrinsic each operation is ported to; the other
-// arm names the scalar twin below in its place.
-std::cfg_select! {
-    target_feature = "avx2" => {
-        /// Broadcast one [`Bitboard`]'s lanes into both halves.
-        ///
-        /// SAFETY: gated on `target_feature = "avx2"` (statically enabled by the
-        /// release `target-cpu=native`); the `transmute`s only bit-cast between
-        /// `[u64; N]` and the equally-sized `__m128i` / `__m256i`.
-        fn bb256_broadcast(a: [u64; 2]) -> [u64; 4] {
-            use core::arch::x86_64::{__m128i, __m256i, _mm256_broadcastsi128_si256};
-            unsafe {
-                let va: __m128i = core::mem::transmute(a);
-                core::mem::transmute::<__m256i, [u64; 4]>(_mm256_broadcastsi128_si256(va))
-            }
-        }
-
-        /// Bitboard256 `AND` (pin `_mm256_and_si256`). SAFETY: as [`bb256_broadcast`].
-        fn bb256_and(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
-            use core::arch::x86_64::{__m256i, _mm256_and_si256};
-            unsafe {
-                let va: __m256i = core::mem::transmute(a);
-                let vb: __m256i = core::mem::transmute(b);
-                core::mem::transmute(_mm256_and_si256(va, vb))
-            }
-        }
-
-        /// Bitboard256 `OR` (pin `_mm256_or_si256`). SAFETY: as [`bb256_broadcast`].
-        fn bb256_or(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
-            use core::arch::x86_64::{__m256i, _mm256_or_si256};
-            unsafe {
-                let va: __m256i = core::mem::transmute(a);
-                let vb: __m256i = core::mem::transmute(b);
-                core::mem::transmute(_mm256_or_si256(va, vb))
-            }
-        }
-
-        /// Bitboard256 `XOR` (pin `_mm256_xor_si256`). SAFETY: as [`bb256_broadcast`].
-        fn bb256_xor(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
-            use core::arch::x86_64::{__m256i, _mm256_xor_si256};
-            unsafe {
-                let va: __m256i = core::mem::transmute(a);
-                let vb: __m256i = core::mem::transmute(b);
-                core::mem::transmute(_mm256_xor_si256(va, vb))
-            }
-        }
-
-        /// Byte-reverse each 128-bit half. SAFETY: as [`bb256_broadcast`]; the shuffle
-        /// mask reverses all 16 bytes within each half.
-        fn bb256_byte_reverse(a: [u64; 4]) -> [u64; 4] {
-            use core::arch::x86_64::{__m256i, _mm256_set_epi8, _mm256_shuffle_epi8};
-            unsafe {
-                let va: __m256i = core::mem::transmute(a);
-                let shuffle = _mm256_set_epi8(
-                    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-                    11, 12, 13, 14, 15,
-                );
-                core::mem::transmute(_mm256_shuffle_epi8(va, shuffle))
-            }
-        }
-
-        /// Bitboard256 `unpack`, per 128-bit lane. SAFETY: as [`bb256_broadcast`].
-        fn bb256_unpack(hi_in: [u64; 4], lo_in: [u64; 4]) -> ([u64; 4], [u64; 4]) {
-            use core::arch::x86_64::{__m256i, _mm256_unpackhi_epi64, _mm256_unpacklo_epi64};
-            unsafe {
-                let vh: __m256i = core::mem::transmute(hi_in);
-                let vl: __m256i = core::mem::transmute(lo_in);
-                let hi_out: [u64; 4] = core::mem::transmute(_mm256_unpackhi_epi64(vl, vh));
-                let lo_out: [u64; 4] = core::mem::transmute(_mm256_unpacklo_epi64(vl, vh));
-                (hi_out, lo_out)
-            }
-        }
-
-        /// Bitboard256 pairwise 128-bit decrement: each lane index `i` decrements the
-        /// pair `[lo_in[i], hi_in[i]]`. SAFETY: as [`bb256_broadcast`].
-        fn bb256_pair_decrement(hi_in: [u64; 4], lo_in: [u64; 4]) -> ([u64; 4], [u64; 4]) {
-            use core::arch::x86_64::{
-                __m256i, _mm256_add_epi64, _mm256_cmpeq_epi64, _mm256_set1_epi64x, _mm256_setzero_si256,
-            };
-            unsafe {
-                let vh: __m256i = core::mem::transmute(hi_in);
-                let vl: __m256i = core::mem::transmute(lo_in);
-                let hi_out: [u64; 4] = core::mem::transmute(_mm256_add_epi64(
-                    vh,
-                    _mm256_cmpeq_epi64(vl, _mm256_setzero_si256()),
-                ));
-                let lo_out: [u64; 4] =
-                    core::mem::transmute(_mm256_add_epi64(vl, _mm256_set1_epi64x(-1i64)));
-                (hi_out, lo_out)
-            }
-        }
-
-        /// Merge the two halves into one [`Bitboard`] by OR.
-        /// SAFETY: as [`bb256_broadcast`].
-        fn bb256_merge(a: [u64; 4]) -> [u64; 2] {
-            use core::arch::x86_64::{
-                __m128i, __m256i, _mm_or_si128, _mm256_castsi256_si128, _mm256_extracti128_si256,
-            };
-            unsafe {
-                let va: __m256i = core::mem::transmute(a);
-                let lo: __m128i = _mm256_castsi256_si128(va);
-                let hi: __m128i = _mm256_extracti128_si256::<1>(va);
-                core::mem::transmute(_mm_or_si128(lo, hi))
-            }
-        }
-    }
-    _ => {
-        use bb256_and_scalar as bb256_and;
-        use bb256_broadcast_scalar as bb256_broadcast;
-        use bb256_byte_reverse_scalar as bb256_byte_reverse;
-        use bb256_merge_scalar as bb256_merge;
-        use bb256_or_scalar as bb256_or;
-        use bb256_pair_decrement_scalar as bb256_pair_decrement;
-        use bb256_unpack_scalar as bb256_unpack;
-        use bb256_xor_scalar as bb256_xor;
-    }
-}
-
-// Scalar `u64[4]` twins. On the non-AVX2 build these *are* the `bb256_*` ops;
-// a test build keeps them so the AVX2 path can be gated against them.
-
-#[cfg(any(test, not(target_feature = "avx2")))]
-fn bb256_broadcast_scalar(a: [u64; 2]) -> [u64; 4] {
-    [a[0], a[1], a[0], a[1]]
-}
-
-#[cfg(any(test, not(target_feature = "avx2")))]
-fn bb256_and_scalar(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
-    [a[0] & b[0], a[1] & b[1], a[2] & b[2], a[3] & b[3]]
-}
-
-#[cfg(any(test, not(target_feature = "avx2")))]
-fn bb256_or_scalar(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
-    [a[0] | b[0], a[1] | b[1], a[2] | b[2], a[3] | b[3]]
-}
-
-#[cfg(any(test, not(target_feature = "avx2")))]
-fn bb256_xor_scalar(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
-    [a[0] ^ b[0], a[1] ^ b[1], a[2] ^ b[2], a[3] ^ b[3]]
-}
-
-#[cfg(any(test, not(target_feature = "avx2")))]
-fn bb256_byte_reverse_scalar(a: [u64; 4]) -> [u64; 4] {
-    [
-        a[1].swap_bytes(),
-        a[0].swap_bytes(),
-        a[3].swap_bytes(),
-        a[2].swap_bytes(),
-    ]
-}
-
-#[cfg(any(test, not(target_feature = "avx2")))]
-fn bb256_unpack_scalar(hi_in: [u64; 4], lo_in: [u64; 4]) -> ([u64; 4], [u64; 4]) {
-    (
-        [lo_in[1], hi_in[1], lo_in[3], hi_in[3]],
-        [lo_in[0], hi_in[0], lo_in[2], hi_in[2]],
-    )
-}
-
-#[cfg(any(test, not(target_feature = "avx2")))]
-fn bb256_pair_decrement_scalar(hi_in: [u64; 4], lo_in: [u64; 4]) -> ([u64; 4], [u64; 4]) {
-    let mut hi_out = [0u64; 4];
-    let mut lo_out = [0u64; 4];
-    let mut i = 0;
-    while i < 4 {
-        hi_out[i] = hi_in[i].wrapping_sub((lo_in[i] == 0) as u64);
-        lo_out[i] = lo_in[i].wrapping_sub(1);
-        i += 1;
-    }
-    (hi_out, lo_out)
-}
-
-#[cfg(any(test, not(target_feature = "avx2")))]
-fn bb256_merge_scalar(a: [u64; 4]) -> [u64; 2] {
-    [a[0] | a[2], a[1] | a[3]]
-}
-
-/// `[sq][i]` is the four diagonal step effects packed as the `Bitboard256` pair
-/// `[LU, RU, LD, RD]` in 64-bit lane `i`, with RU and RD stored byte-reversed.
-const fn build_qugiy_bishop_mask() -> [[Bitboard256; 2]; N] {
-    let mut t = [[Bitboard256 { p: [0; 4] }; 2]; N];
+const fn build_bishop_rays() -> [BishopRays; N] {
+    let mut t = [BishopRays { p: [0; 8] }; N];
     let mut s = 0;
     while s < N {
-        // Byte-reversed for the decreasing directions, per `BISHOP_DIAG_REV`.
-        let mut diag = [[0u64; 2]; 4];
-        let mut d = 0;
-        while d < 4 {
-            let step = Bitboard::from_contiguous(RAY_BITS[BISHOP_DIAG_DIRS[d]][s]).p;
-            diag[d] = if BISHOP_DIAG_REV[d] {
-                cbyte_reverse(step)
-            } else {
-                step
-            };
-            d += 1;
-        }
-        // LU=diag[0], RU=diag[1], LD=diag[2], RD=diag[3].
-        let mut i = 0;
-        while i < 2 {
-            t[s][i] = Bitboard256::from_pair(
-                Bitboard {
-                    p: [diag[0][i], diag[1][i]],
-                },
-                Bitboard {
-                    p: [diag[2][i], diag[3][i]],
-                },
-            );
-            i += 1;
+        let mut slot = 0;
+        // The increasing pass fills rays 0 and 1, the decreasing pass 2 and 3.
+        let mut rev = 0;
+        while rev < 2 {
+            let mut d = 0;
+            while d < 4 {
+                if BISHOP_DIAG_REV[d] == (rev == 1) {
+                    let ray = Bitboard::from_contiguous(RAY_BITS[BISHOP_DIAG_DIRS[d]][s]).p;
+                    let ray = if rev == 1 { cbyte_reverse(ray) } else { ray };
+                    t[s].p[2 * slot] = ray[0];
+                    t[s].p[2 * slot + 1] = ray[1];
+                    slot += 1;
+                }
+                d += 1;
+            }
+            rev += 1;
         }
         s += 1;
     }
     t
 }
 
-static QUGIY_BISHOP_MASK: [[Bitboard256; 2]; N] = build_qugiy_bishop_mask();
+static BISHOP_RAYS: [BishopRays; N] = build_bishop_rays();
 
 /// The increasing-index (White) file ray cut at the first blocker, per lane.
 fn file_up(occ_lane: u64, mask: u64) -> u64 {
@@ -1289,9 +1120,42 @@ fn rook_file(s: usize, occ: Bitboard) -> Bitboard {
     Bitboard { p: out }
 }
 
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vl"
+))]
+mod avx512;
+
+// The 128-bit rank pass and the 64-bit bishop pass serve every build without
+// the AVX-512 kernels; a test build keeps them so those kernels can be gated
+// against them.
+std::cfg_select! {
+    all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vl"
+    ) => {
+        use avx512::bishop_attacks as bishop_kernel;
+        use avx512::rook_rank;
+    }
+    _ => {
+        use bishop_attacks_64 as bishop_kernel;
+        use rook_rank_sse as rook_rank;
+    }
+}
+
 /// The rook's rank effect, which crosses the lane boundary and so takes the
 /// `byte_reverse` + `unpack` + `decrement` route.
-fn rook_rank(s: usize, occ: Bitboard) -> Bitboard {
+#[cfg(any(
+    test,
+    not(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vl"
+    ))
+))]
+fn rook_rank_sse(s: usize, occ: Bitboard) -> Bitboard {
     let mask_lo = QUGIY_ROOK_MASK[s][0].p;
     let mask_hi = QUGIY_ROOK_MASK[s][1].p;
 
@@ -1310,27 +1174,56 @@ fn rook_rank(s: usize, occ: Bitboard) -> Bitboard {
     }
 }
 
-/// Squares a bishop on `sq` attacks under occupancy `occ` — all four diagonals
-/// in one `Bitboard256` pass (`bishopEffect`).
+/// Squares a bishop on `sq` attacks under occupancy `occ`.
 pub fn bishop_attacks(sq: Square, occ: Bitboard) -> Bitboard {
-    let s = sq.index() as usize;
-    let mask_lo = QUGIY_BISHOP_MASK[s][0].p;
-    let mask_hi = QUGIY_BISHOP_MASK[s][1].p;
+    bishop_kernel(sq.index() as usize, occ)
+}
 
-    let occ2 = bb256_broadcast(occ.p);
-    let rocc2 = bb256_broadcast(lane_byte_reverse(occ.p));
+/// One ray toward higher bits through `o`, cut at its first blocker: the
+/// 128-bit `(o ^ (o - 1)) & mask` taken word by word. The borrow out of the low
+/// word reaches the high word only when the masked low word is zero, and then
+/// the high word's own `o - 1` gives the same bits, so the high word is kept
+/// exactly then.
+#[cfg(any(
+    test,
+    not(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vl"
+    ))
+))]
+fn ray_cut(o: [u64; 2], mask_lo: u64, mask_hi: u64) -> [u64; 2] {
+    let low = o[0] & mask_lo;
+    let high = o[1] & mask_hi;
+    let keep_high = 0u64.wrapping_sub((low == 0) as u64);
+    [
+        (low ^ low.wrapping_sub(1)) & mask_lo,
+        (high ^ high.wrapping_sub(1)) & mask_hi & keep_high,
+    ]
+}
 
-    let (hi, lo) = bb256_unpack(rocc2, occ2);
-    let hi = bb256_and(hi, mask_hi);
-    let lo = bb256_and(lo, mask_lo);
-
-    let (t1, t0) = bb256_pair_decrement(hi, lo);
-    let t1 = bb256_and(bb256_xor(t1, hi), mask_hi);
-    let t0 = bb256_and(bb256_xor(t0, lo), mask_lo);
-
-    let (hi2, lo2) = bb256_unpack(t1, t0);
+/// The bishop attack in 64-bit operations over [`BISHOP_RAYS`]: the two rays
+/// toward higher squares on the occupancy, the two toward lower squares on its
+/// byte reverse, which puts their nearest blocker lowest.
+#[cfg(any(
+    test,
+    not(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vl"
+    ))
+))]
+fn bishop_attacks_64(s: usize, occ: Bitboard) -> Bitboard {
+    let m = &BISHOP_RAYS[s].p;
+    let o = occ.p;
+    let ro = cbyte_reverse(o);
+    let a = ray_cut(o, m[0], m[1]);
+    let b = ray_cut(o, m[2], m[3]);
+    let c = ray_cut(ro, m[4], m[5]);
+    let d = ray_cut(ro, m[6], m[7]);
+    let down = cbyte_reverse([c[0] | d[0], c[1] | d[1]]);
     Bitboard {
-        p: bb256_merge(bb256_or(bb256_byte_reverse(hi2), lo2)),
+        p: [a[0] | b[0] | down[0], a[1] | b[1] | down[1]],
     }
 }
 
@@ -1470,6 +1363,17 @@ mod tests {
                     "bishop from {from:?} occ {occ:#x}",
                 );
                 assert_eq!(
+                    bishop_attacks_64(from.index() as usize, occ_bb),
+                    bishop_attacks_oracle(from, occ_bb),
+                    "64-bit bishop from {from:?} occ {occ:#x}",
+                );
+                assert_eq!(
+                    rook_rank_sse(from.index() as usize, occ_bb)
+                        | rook_file(from.index() as usize, occ_bb),
+                    rook_attacks_oracle(from, occ_bb),
+                    "128-bit rook from {from:?} occ {occ:#x}",
+                );
+                assert_eq!(
                     horse_attacks(from, occ_bb),
                     horse_attacks_oracle(from, occ_bb),
                     "horse from {from:?} occ {occ:#x}",
@@ -1587,28 +1491,22 @@ mod tests {
             assert_eq!(QUGIY_ROOK_MASK[s][0].p, lo, "rook mask lo at {s}");
             assert_eq!(QUGIY_ROOK_MASK[s][1].p, hi, "rook mask hi at {s}");
 
-            // Bishop diagonal masks in the `Bitboard256` pair format.
-            let mut diag = [[0u64; 2]; 4];
-            for d in 0..4 {
-                let step = Bitboard::from_raw(RAY_BITS[BISHOP_DIAG_DIRS[d]][s]).p;
-                diag[d] = if BISHOP_DIAG_REV[d] {
-                    cbyte_reverse(step)
-                } else {
-                    step
-                };
-            }
-            for i in 0..2 {
-                let want = [diag[0][i], diag[1][i], diag[2][i], diag[3][i]];
+            // Bishop rays: the increasing directions 4 and 6 as they are, then
+            // the decreasing directions 5 and 7 byte-reversed.
+            let ray = |d: usize| Bitboard::from_raw(RAY_BITS[d][s]).p;
+            let want = [ray(4), ray(6), cbyte_reverse(ray(5)), cbyte_reverse(ray(7))];
+            for (k, w) in want.iter().enumerate() {
                 assert_eq!(
-                    QUGIY_BISHOP_MASK[s][i].p, want,
-                    "bishop mask256 pair {i} at {s}"
+                    &BISHOP_RAYS[s].p[2 * k..2 * k + 2],
+                    w,
+                    "bishop ray {k} at {s}"
                 );
             }
         }
     }
 
-    // A third bishop oracle: one `rayEffect` per diagonal, at `Bitboard` rather
-    // than `Bitboard256` width, so its masks are rebuilt here.
+    // A third bishop oracle: one `rayEffect` per diagonal, with its masks
+    // rebuilt here rather than read from the kernels' table.
 
     /// One diagonal's occupancy-limited ray via `rayEffect`.
     fn diag_ray_oracle(mask: [u64; 2], occ: [u64; 2], reverse: bool) -> [u64; 2] {
@@ -1634,35 +1532,12 @@ mod tests {
         Bitboard { p: r }
     }
 
-    /// `bishopEffect` evaluated purely through the scalar `u64[4]` twins. On an
-    /// AVX2 host this is the only exercise the fallback ops get.
-    fn bishop_attacks_scalar256_oracle(sq: Square, occ: Bitboard) -> Bitboard {
-        let s = sq.index() as usize;
-        let mask_lo = QUGIY_BISHOP_MASK[s][0].p;
-        let mask_hi = QUGIY_BISHOP_MASK[s][1].p;
-
-        let occ2 = bb256_broadcast_scalar(occ.p);
-        let rocc2 = bb256_broadcast_scalar(cbyte_reverse(occ.p));
-
-        let (hi, lo) = bb256_unpack_scalar(rocc2, occ2);
-        let hi = bb256_and_scalar(hi, mask_hi);
-        let lo = bb256_and_scalar(lo, mask_lo);
-
-        let (t1, t0) = bb256_pair_decrement_scalar(hi, lo);
-        let t1 = bb256_and_scalar(bb256_xor_scalar(t1, hi), mask_hi);
-        let t0 = bb256_and_scalar(bb256_xor_scalar(t0, lo), mask_lo);
-
-        let (hi2, lo2) = bb256_unpack_scalar(t1, t0);
-        Bitboard {
-            p: bb256_merge_scalar(bb256_or_scalar(bb256_byte_reverse_scalar(hi2), lo2)),
-        }
-    }
-
-    /// Against both bishop oracles, over the structural corpus plus 100k
-    /// deterministic pseudo-random occupancies.
+    /// The build's bishop attack and the 64-bit kernel against the four-ray
+    /// oracle, over the structural corpus plus 100k deterministic
+    /// pseudo-random occupancies.
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn bishop_matches_four_ray_and_scalar256_oracles() {
+    fn bishop_matches_four_ray_oracle() {
         let mut state: u128 = 0xF00D_CAFE_1234_5678_9ABC_DEF0_0FED_CBA9;
         let mut rng = move || {
             state ^= state << 13;
@@ -1684,9 +1559,9 @@ mod tests {
                     "bishop vs four-ray oracle from {from:?} occ {occ:#x}",
                 );
                 assert_eq!(
+                    bishop_attacks_64(from.index() as usize, occ_bb),
                     prod,
-                    bishop_attacks_scalar256_oracle(from, occ_bb),
-                    "bishop vs scalar256 oracle from {from:?} occ {occ:#x}",
+                    "64-bit bishop kernel from {from:?} occ {occ:#x}",
                 );
                 // The king ring is independent of `occ`.
                 assert_eq!(
@@ -1694,6 +1569,86 @@ mod tests {
                     prod | KING_ATTACKS[0][from.index() as usize],
                     "horse from {from:?} occ {occ:#x}",
                 );
+            }
+        }
+    }
+
+    /// The four lines through square index `s`, without `s`: file, rank and
+    /// the two diagonals, each as the union of two opposite rays.
+    fn lines_through(s: usize) -> [u128; 4] {
+        [
+            RAY_BITS[0][s] | RAY_BITS[1][s],
+            RAY_BITS[2][s] | RAY_BITS[3][s],
+            RAY_BITS[4][s] | RAY_BITS[7][s],
+            RAY_BITS[5][s] | RAY_BITS[6][s],
+        ]
+    }
+
+    /// Every occupancy of every line through every square, with the source
+    /// square empty and occupied and with four kinds of noise off the line
+    /// (none, every square, two pseudo-random), for each sliding attack. The
+    /// 128-bit rank pass and the 64-bit bishop pass run here too, so a build
+    /// with the AVX-512 kernels checks both forms.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn every_line_occupancy_equals_ray_walk() {
+        let mut state: u128 = 0x0BAD_F00D_DEAD_BEEF_1357_9BDF_2468_ACE0;
+        let mut rng = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state & BOARD_MASK
+        };
+        let walk = |dirs: &[usize], sq: Square, occ: Bitboard| {
+            dirs.iter()
+                .fold(Bitboard::EMPTY, |bb, &d| bb | ray_attacks(d, sq, occ))
+        };
+        for from in all_squares() {
+            let s = from.index() as usize;
+            let src = 1u128 << s;
+            for line in lines_through(s) {
+                let squares: Vec<u32> = (0..N as u32).filter(|&i| line >> i & 1 == 1).collect();
+                for subset in 0u32..1 << squares.len() {
+                    let on_line = squares
+                        .iter()
+                        .enumerate()
+                        .filter(|&(k, _)| subset >> k & 1 == 1)
+                        .fold(0u128, |acc, (_, &i)| acc | 1u128 << i);
+                    for noise in [0, BOARD_MASK, rng(), rng()] {
+                        let off_line = noise & !line & !src;
+                        for with_src in [0, src] {
+                            let occ_raw = on_line | off_line | with_src;
+                            let occ = Bitboard::from_raw(occ_raw);
+                            let ctx = format!("from {from:?} occ {occ_raw:#x}");
+                            let bishop = bishop_attacks_oracle(from, occ);
+                            let file = walk(&[0, 1], from, occ);
+                            let rank = walk(&[2, 3], from, occ);
+                            assert_eq!(bishop_attacks(from, occ), bishop, "bishop {ctx}");
+                            assert_eq!(bishop_attacks_64(s, occ), bishop, "bishop64 {ctx}");
+                            assert_eq!(rook_file(s, occ), file, "rook file {ctx}");
+                            assert_eq!(rook_rank(s, occ), rank, "rook rank {ctx}");
+                            assert_eq!(rook_rank_sse(s, occ), rank, "rook rank sse {ctx}");
+                            assert_eq!(rook_attacks(from, occ), file | rank, "rook {ctx}");
+                            assert_eq!(
+                                horse_attacks(from, occ),
+                                horse_attacks_oracle(from, occ),
+                                "horse {ctx}"
+                            );
+                            assert_eq!(
+                                dragon_attacks(from, occ),
+                                dragon_attacks_oracle(from, occ),
+                                "dragon {ctx}"
+                            );
+                            for color in [Color::Black, Color::White] {
+                                assert_eq!(
+                                    lance_attacks(color, from, occ),
+                                    lance_attacks_oracle(color, from, occ),
+                                    "lance {color:?} {ctx}"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
