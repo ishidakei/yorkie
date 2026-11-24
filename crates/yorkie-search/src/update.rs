@@ -9,8 +9,6 @@
 //! reconciles [`SearchStackCell`] with its live search stack and supplies the
 //! real plane indices.
 
-use std::sync::Arc;
-
 use yorkie_state::{Color, Move, Piece, Position, Square};
 use yorkie_storage::{VALUE_NONE, Value};
 
@@ -110,8 +108,10 @@ pub struct WorkerHistories {
     pub tt_move: TtMoveHistory,
     /// The node-shared `correctionHistory` and `pawnHistory`. Every
     /// pawn / correction read and update routes here, so an interior update on
-    /// one worker is visible to every worker on the same node.
-    pub shared: Arc<SharedHistories>,
+    /// one worker is visible to every worker on the same node. The handle sits
+    /// in the bundle itself, so a lookup reads the table's base and mask from
+    /// the worker's own state and goes straight to the entry.
+    pub shared: SharedHistories,
     /// The game up to the current search's root, indexed for the repetition
     /// judgement. Not a history table: it rides in this bundle because the
     /// bundle is what a worker keeps from one search to the next, so the room
@@ -140,12 +140,15 @@ pub struct WorkerHistories {
 // the single gravity entry, the fill flag and the four-byte block claim. The
 // bundle sits inline in the search, so a wider one moves every field the
 // search lays out after it. The bundle is per-worker and reached once per
-// update, so its own line is never contended — what a helper shares with its
-// node is `shared`, whose entries are atomic.
+// update, so its own lines are never contended — what a helper shares with its
+// node is the tables `shared` addresses, whose entries are atomic.
 #[cfg(not(repetition_index))]
-const _: () = assert!(size_of::<WorkerHistories>() == 56);
+const _: () = assert!(size_of::<WorkerHistories>() == 48 + size_of::<SharedHistories>());
 #[cfg(repetition_index)]
-const _: () = assert!(size_of::<WorkerHistories>() == 56 + size_of::<yorkie_state::HistoryIndex>());
+const _: () = assert!(
+    size_of::<WorkerHistories>()
+        == 48 + size_of::<SharedHistories>() + size_of::<yorkie_state::HistoryIndex>()
+);
 
 impl Default for WorkerHistories {
     fn default() -> Self {
@@ -158,15 +161,15 @@ impl WorkerHistories {
     /// driver's multi-thread path uses [`Self::with_shared`] instead, to hand
     /// each worker its node's shared tables.
     pub fn new() -> Self {
-        Self::with_shared(Arc::new(SharedHistories::new(1)))
+        Self::with_shared(SharedHistories::new(1))
     }
 
     /// A fresh bundle of per-worker tables (reference `clear()` init) attached to
     /// the given node-shared tables. The driver builds one [`SharedHistories`]
-    /// per NUMA node and hands each worker on that node a cheap [`Arc`] clone.
+    /// per NUMA node and hands each worker on that node a clone of it.
     ///
     /// The tables are on the heap and filled here, on the calling thread.
-    pub fn with_shared(shared: Arc<SharedHistories>) -> Self {
+    pub fn with_shared(shared: SharedHistories) -> Self {
         let mut bundle = Self::assemble(
             ButterflyHistory::new(),
             LowPlyHistory::new(),
@@ -190,7 +193,7 @@ impl WorkerHistories {
     /// touched there. A new owner of a block that was held before finds the
     /// last owner's values in it, and the fill overwrites every one of them, so
     /// the bundle starts exactly as a freshly allocated one does.
-    pub fn for_worker(worker: usize, shared: Arc<SharedHistories>) -> Self {
+    pub fn for_worker(worker: usize, shared: SharedHistories) -> Self {
         let Some((claim, tables)) = BlockClaim::claim(worker) else {
             return Self::with_shared(shared);
         };
@@ -212,7 +215,7 @@ impl WorkerHistories {
         capture: CapturePieceToHistory,
         continuation: ContinuationHistory,
         continuation_correction: ContinuationCorrectionHistory,
-        shared: Arc<SharedHistories>,
+        shared: SharedHistories,
         block: Option<BlockClaim>,
     ) -> Self {
         Self {
@@ -308,7 +311,7 @@ impl WorkerHistories {
     /// untouched. The driver calls this on a pool rebuild so the session
     /// (coordinator) worker keeps its game-scoped per-worker tables while picking
     /// up freshly (re)built shared tables for its assigned node.
-    pub fn set_shared(&mut self, shared: Arc<SharedHistories>) {
+    pub fn set_shared(&mut self, shared: SharedHistories) {
         self.shared = shared;
     }
 }
@@ -827,11 +830,11 @@ mod tests {
     #[test]
     fn a_bundle_over_a_block_starts_as_a_fresh_heap_bundle_does() {
         let _lock = crate::worker_block::claim_lock();
-        let shared = Arc::new(SharedHistories::new(1));
-        let fresh = WorkerHistories::with_shared(Arc::clone(&shared));
+        let shared = SharedHistories::new(1);
+        let fresh = WorkerHistories::with_shared(shared.clone());
         assert!(fresh.block().is_none());
         for game in 0..2 {
-            let mut hist = WorkerHistories::for_worker(0, Arc::clone(&shared));
+            let mut hist = WorkerHistories::for_worker(0, shared.clone());
             assert!(hist.block().is_some(), "game {game}: block 0 is free");
             hist.fill_if_pending();
             assert!(
@@ -854,14 +857,13 @@ mod tests {
     #[test]
     fn a_bundle_without_a_free_block_is_on_the_heap_and_filled() {
         let _lock = crate::worker_block::claim_lock();
-        let shared = Arc::new(SharedHistories::new(1));
-        let fresh = WorkerHistories::with_shared(Arc::clone(&shared));
-        let past =
-            WorkerHistories::for_worker(crate::worker_block::WORKER_BLOCKS, Arc::clone(&shared));
+        let shared = SharedHistories::new(1);
+        let fresh = WorkerHistories::with_shared(shared.clone());
+        let past = WorkerHistories::for_worker(crate::worker_block::WORKER_BLOCKS, shared.clone());
         assert!(past.block().is_none());
         assert!(table_bytes(&past) == table_bytes(&fresh));
-        let held = WorkerHistories::for_worker(0, Arc::clone(&shared));
-        let second = WorkerHistories::for_worker(0, Arc::clone(&shared));
+        let held = WorkerHistories::for_worker(0, shared.clone());
+        let second = WorkerHistories::for_worker(0, shared.clone());
         assert!(held.block().is_some());
         assert!(second.block().is_none(), "block 0 is held");
         assert!(table_bytes(&second) == table_bytes(&fresh));
@@ -876,13 +878,13 @@ mod tests {
     #[test]
     fn a_worker_over_its_block_allocates_none_of_its_tables() {
         let _lock = crate::worker_block::claim_lock();
-        let shared = Arc::new(SharedHistories::new(1));
+        let shared = SharedHistories::new(1);
         yorkie_storage::clear_alloc_count();
-        let mut on_heap = WorkerHistories::with_shared(Arc::clone(&shared));
+        let mut on_heap = WorkerHistories::with_shared(shared.clone());
         // SAFETY: nothing has been lent out of this bundle.
         let heap_tables = unsafe { on_heap.lend_search_tables() };
         let heap_count = yorkie_storage::take_alloc_count();
-        let mut in_block = WorkerHistories::for_worker(0, Arc::clone(&shared));
+        let mut in_block = WorkerHistories::for_worker(0, shared.clone());
         assert!(in_block.block().is_some(), "block 0 is free");
         in_block.fill_if_pending();
         // SAFETY: nothing has been lent out of this bundle.

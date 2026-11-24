@@ -28,7 +28,7 @@ use std::sync::TryLockError;
 #[cfg(low_priority_worker)]
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 // The engine waits on a clock in two places: the hold of a `go infinite` reply,
 // a clause that arrives with `verbose2`, and the bounded wait for a
@@ -68,6 +68,7 @@ use yorkie_storage::{Book, TranspositionTable, Value, YorkieBook, YorkieBookErro
 use yorkie_storage::clear_alloc_count;
 
 use crate::config::{self, with_eval_network};
+use crate::node_block::NodeClaim;
 use crate::settings::PONDER_ROOT_WIDTH;
 #[cfg(feature = "random")]
 use crate::settings::RANDOM_AMPLITUDE;
@@ -978,7 +979,11 @@ pub struct Engine<P: EngineSink> {
     /// at every pool (re)build from [`Self::worker_plan`]. Length equals the pool
     /// size, so `[0]` is the coordinator's and `[1..]` the helpers', each of
     /// which is handed its own when the pool spawns it.
-    worker_shared: Vec<Arc<SharedHistories>>,
+    worker_shared: Vec<SharedHistories>,
+    /// This engine's hold on the static storage of the node-shared tables, or
+    /// `None` when another engine in the process holds it and this one keeps
+    /// its tables on the heap.
+    node_tables: Option<NodeClaim>,
     /// The coordinator's collection buffers. `None` only while a search holds
     /// them, exactly like [`Self::histories`].
     vote_buffers: Option<VoteBuffers>,
@@ -1033,16 +1038,14 @@ impl<P: EngineSink> Engine<P> {
         // Build the per-node shared correction / pawn tables: the helpers are
         // handed theirs as the pool spawns them, and the coordinator (worker 0)
         // gets its node's set here.
-        let worker_shared = build_worker_shared(&worker_plan);
+        let node_tables = NodeClaim::claim();
+        let worker_shared = build_worker_shared(&worker_plan, node_tables.as_ref());
         let pool = ThreadPool::with_binding(threads, worker_plan, &worker_shared);
         // The pool decides the worker count — it refuses a size below one — so
         // what the buffers are sized by is the pool, not the setting it was
         // asked for.
         let workers = pool.size();
-        let histories = Some(WorkerHistories::for_worker(
-            0,
-            Arc::clone(&worker_shared[0]),
-        ));
+        let histories = Some(WorkerHistories::for_worker(0, worker_shared[0].clone()));
         // The coordinator's bundle is built right here, on the command thread
         // — so place it explicitly; see `place_coordinator_histories`.
         place_coordinator_histories(histories.as_ref(), &worker_plan);
@@ -1091,6 +1094,7 @@ impl<P: EngineSink> Engine<P> {
             numa_layout,
             worker_plan,
             worker_shared,
+            node_tables,
             vote_buffers: Some(VoteBuffers::for_pool(workers)),
             eval_root: network_file::executable_directory(),
             sysfs_root: PathBuf::from(SYSFS_ROOT),
@@ -1368,9 +1372,9 @@ impl<P: EngineSink> Engine<P> {
         // assignment, so every pool rebuild resets them. The coordinator's own
         // game-scoped per-worker tables persist, so only its shared handle is
         // swapped.
-        self.worker_shared = build_worker_shared(&self.worker_plan);
+        self.worker_shared = build_worker_shared(&self.worker_plan, self.node_tables.as_ref());
         if let Some(h) = self.histories.as_mut() {
-            h.set_shared(Arc::clone(&self.worker_shared[0]));
+            h.set_shared(self.worker_shared[0].clone());
         }
         // The coordinator's per-worker tables outlive a pool rebuild and were
         // built on the command thread, so re-assert their placement for the fresh
@@ -1888,7 +1892,7 @@ impl<P: EngineSink> Engine<P> {
         self.histories = None;
         self.histories = Some(WorkerHistories::for_worker(
             0,
-            Arc::clone(&self.worker_shared[0]),
+            self.worker_shared[0].clone(),
         ));
         // A new game draws a new evaluation-noise seed, which is what makes the
         // engine play the next game differently from this one.
@@ -2939,7 +2943,7 @@ fn helper_loop<N: NetworkParams>(
     net: N,
     worker_id: usize,
     slot: &'static HelperSlot,
-    mut shared: Option<Arc<SharedHistories>>,
+    mut shared: Option<SharedHistories>,
 ) {
     // The per-worker tables persist across `go`s (game-scoped) and are built on
     // the first job, attached to the node's shared tables, so a pool that is
@@ -3051,7 +3055,7 @@ impl ThreadPool {
     /// Build a pool of `size` slots with a worker plan. Each helper thread
     /// (worker `1..`) pins itself to its assigned CPU once at spawn, before it
     /// parks, and takes worker `w`'s node-shared tables `shared[w]` with it.
-    fn with_binding(size: usize, plan: WorkerPlan, shared: &[Arc<SharedHistories>]) -> Self {
+    fn with_binding(size: usize, plan: WorkerPlan, shared: &[SharedHistories]) -> Self {
         let mut pool = ThreadPool {
             helpers: 0,
             #[cfg(low_priority_worker)]
@@ -3085,7 +3089,7 @@ impl ThreadPool {
     ///
     /// `size` is at most [`POOL_CAPACITY`]: the measurement command, the one
     /// caller with a size of its own, refuses a larger one before it gets here.
-    fn set_with_binding(&mut self, size: usize, plan: WorkerPlan, shared: &[Arc<SharedHistories>]) {
+    fn set_with_binding(&mut self, size: usize, plan: WorkerPlan, shared: &[SharedHistories]) {
         self.shutdown();
         let size = size.max(1);
         assert!(
@@ -3101,7 +3105,7 @@ impl ThreadPool {
         for (worker_id, slot) in (1..size).zip(&HELPER_SLOTS) {
             // The slot is left `Exit` by the pool that used it last.
             *slot.lock() = SlotState::Parked;
-            let shared = shared.get(worker_id).map(Arc::clone);
+            let shared = shared.get(worker_id).cloned();
             #[cfg(low_priority_worker)]
             let lowered = low == Some(worker_id);
             self.handles.push(std::thread::spawn(move || {
@@ -3464,15 +3468,21 @@ fn pin_worker(plan: &WorkerPlan, worker: usize) {
 /// Build the per-worker handles to the node-shared correction / pawn tables, one
 /// set per system NUMA node the plan's workers sit on.
 ///
-/// Each node's set is allocated and filled *inside* a thread pinned to one of
-/// that node's worker CPUs, so the pages first-touch there. A build that pins
-/// no worker allocates its one set on the calling thread.
+/// Each node's set is built — every entry of its tables written — *inside* a
+/// thread pinned to one of that node's worker CPUs, so the pages first-touch
+/// there. A build that pins no worker builds its one set on the calling thread.
 ///
-/// Returns one [`Arc`] per worker, each pointing at its node's table set.
-fn build_worker_shared(plan: &WorkerPlan) -> Vec<Arc<SharedHistories>> {
+/// A table goes in the node's block of static storage when `node_tables` holds
+/// it and the build laid one out for the node at least as large as the set
+/// (a plan with the build's own workers, or fewer); on the heap otherwise.
+/// Building over a block writes every entry the set uses, so a rebuild starts
+/// it over exactly as a fresh heap table would.
+///
+/// Returns one handle per worker, each addressing its node's table set.
+fn build_worker_shared(plan: &WorkerPlan, node_tables: Option<&NodeClaim>) -> Vec<SharedHistories> {
     let counts = shared_node_counts(plan.system_nodes());
 
-    let mut node_shared: std::collections::BTreeMap<NumaIndex, Arc<SharedHistories>> =
+    let mut node_shared: std::collections::BTreeMap<NumaIndex, SharedHistories> =
         std::collections::BTreeMap::new();
     for (&node, &count) in &counts {
         let thread_count = count.next_power_of_two();
@@ -3487,15 +3497,16 @@ fn build_worker_shared(plan: &WorkerPlan) -> Vec<Arc<SharedHistories>> {
             .system_nodes()
             .position(|n| n == node)
             .expect("every counted node holds at least one worker");
+        let correction = node_tables.and_then(|t| t.correction(node, thread_count));
+        let pawn = node_tables.and_then(|t| t.pawn(node, thread_count));
+        let build = || SharedHistories::build(thread_count, correction, pawn);
         let built = match plan.cpu(worker) {
             Some(cpu) => {
-                let mut built: Option<Arc<SharedHistories>> = None;
-                yorkie_numa::execute_on_cpu(cpu, || {
-                    built = Some(Arc::new(SharedHistories::new(thread_count)));
-                });
+                let mut built: Option<SharedHistories> = None;
+                yorkie_numa::execute_on_cpu(cpu, || built = Some(build()));
                 built.expect("execute_on_cpu ran the closure")
             }
-            None => Arc::new(SharedHistories::new(thread_count)),
+            None => build(),
         };
         node_shared.insert(node, built);
     }
@@ -3508,18 +3519,14 @@ fn build_worker_shared(plan: &WorkerPlan) -> Vec<Arc<SharedHistories>> {
             return plan
                 .system_nodes()
                 .map(|node| {
-                    Arc::new(SharedHistories::private_over(
-                        Arc::clone(&node_shared[&node]),
-                        corr_own,
-                        pawn_own,
-                    ))
+                    SharedHistories::private_over(node_shared[&node].clone(), corr_own, pawn_own)
                 })
                 .collect();
         }
     }
 
     plan.system_nodes()
-        .map(|node| Arc::clone(&node_shared[&node]))
+        .map(|node| node_shared[&node].clone())
         .collect()
 }
 
@@ -4990,12 +4997,12 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn build_worker_shared_shares_one_set_per_node() {
-        let ws = build_worker_shared(&allowed_plan(4));
+        let ws = build_worker_shared(&allowed_plan(4), None);
         assert_eq!(ws.len(), 4, "one handle per worker");
         // The plan puts every worker on node 0, so all four share one set.
         for i in 1..4 {
             assert!(
-                Arc::ptr_eq(&ws[0], &ws[i]),
+                ws[0].same_tables(&ws[i]),
                 "workers on one node point at one shared set"
             );
         }
@@ -5007,13 +5014,93 @@ mod tests {
     #[test]
     fn build_worker_shared_rounds_thread_count_up() {
         // 3 workers → next_power_of_two(3) == 4.
-        let ws = build_worker_shared(&allowed_plan(3));
+        let ws = build_worker_shared(&allowed_plan(3), None);
         assert_eq!(ws.len(), 3);
         assert_eq!(ws[0].thread_count(), 4);
         // Single worker → thread_count 1.
-        let ws1 = build_worker_shared(&allowed_plan(1));
+        let ws1 = build_worker_shared(&allowed_plan(1), None);
         assert_eq!(ws1.len(), 1);
         assert_eq!(ws1[0].thread_count(), 1);
+    }
+
+    /// With the node region held, each worker's set lies in its node's block
+    /// of static storage, and the workers of one node — only they — share it.
+    /// Building the sets again writes every entry back to its initial value.
+    /// A plan larger than the build's, or an engine without the region, gets
+    /// heap tables.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_held_region_holds_each_nodes_set_in_its_block() {
+        use yorkie_search::CorrChannel;
+        use yorkie_state::Color;
+        let _session = serial_session();
+        let claim = NodeClaim::claim().expect("no engine holds the region");
+        let nodes = config::WORKER_SYSTEM_NODES;
+        let inside = |(at, len): (usize, usize), node| {
+            let (addr, bytes) = claim.backing_region(node).expect("the node has a block");
+            at >= addr && at + len <= addr + bytes
+        };
+        let plan = WorkerPlan::of(&[], nodes, config::THREADS as usize);
+        let ws = build_worker_shared(&plan, Some(&claim));
+        assert_eq!(ws.len(), nodes.len());
+        for (w, set) in ws.iter().enumerate() {
+            assert!(inside(set.correction_region(), nodes[w]));
+            assert!(inside(set.pawn_region(), nodes[w]));
+            for (v, other) in ws.iter().enumerate() {
+                assert_eq!(set.same_tables(other), nodes[v] == nodes[w]);
+            }
+        }
+
+        let pawn = yorkie_state::Piece::new(yorkie_state::PieceKind::Pawn, Color::Black);
+        let to = yorkie_state::Square::new(4, 3).expect("a square");
+        let pawn_init = ws[0].pawn_get(5, pawn, to);
+        ws[0].correction_update(5, Color::Black, CorrChannel::Pawn, 900);
+        ws[0].pawn_update(5, pawn, to, 4000);
+        assert_ne!(ws[0].correction_get(5, Color::Black, CorrChannel::Pawn), 0);
+        assert_ne!(ws[0].pawn_get(5, pawn, to), pawn_init);
+        let again = build_worker_shared(&plan, Some(&claim));
+        assert!(again[0].same_tables(&ws[0]));
+        assert_eq!(ws[0].correction_get(5, Color::Black, CorrChannel::Pawn), 0);
+        assert_eq!(ws[0].pawn_get(5, pawn, to), pawn_init);
+
+        let larger = WorkerPlan::of(&[], nodes, 2 * config::THREADS as usize);
+        let on_heap = build_worker_shared(&larger, Some(&claim));
+        assert!(!inside(on_heap[0].correction_region(), nodes[0]));
+        assert!(!inside(on_heap[0].pawn_region(), nodes[0]));
+        let unheld = build_worker_shared(&plan, None);
+        assert!(!inside(unheld[0].correction_region(), nodes[0]));
+        assert!(!inside(unheld[0].pawn_region(), nodes[0]));
+    }
+
+    /// A node's set over its block takes nothing from the allocator: neither
+    /// table, nor a count to share them by. The same set on the heap takes a
+    /// block for each table and one for the count.
+    #[cfg(all(feature = "verbose1", not(miri)))]
+    #[test]
+    fn a_set_over_its_block_allocates_nothing() {
+        let _session = serial_session();
+        let claim = NodeClaim::claim().expect("no engine holds the region");
+        let node = config::WORKER_SYSTEM_NODES[0];
+        let thread_count = crate::node_block::LAYOUT
+            .block(node)
+            .expect("worker 0's node has a block")
+            .thread_count;
+        clear_alloc_count();
+        let on_heap = SharedHistories::new(thread_count);
+        let heap_count = yorkie_storage::take_alloc_count();
+        let in_block = SharedHistories::build(
+            thread_count,
+            claim.correction(node, thread_count),
+            claim.pawn(node, thread_count),
+        );
+        let block_count = yorkie_storage::take_alloc_count();
+        let copies: Vec<SharedHistories> = (0..4).map(|_| in_block.clone()).collect();
+        let clone_count = yorkie_storage::take_alloc_count() - 1;
+        eprintln!("allocations per set: heap {heap_count}, block {block_count}");
+        assert_eq!(heap_count, 3);
+        assert_eq!(block_count, 0);
+        assert_eq!(clone_count, 0, "only the vector of copies allocates");
+        drop((on_heap, copies));
     }
 
     // --- NUMA memory placement --------------------------------------------
@@ -5127,9 +5214,9 @@ mod tests {
     fn building_and_placing_the_coordinators_block_touches_none_of_it() {
         let _session = serial_session();
         let mut engine = idle_engine();
-        let shared = Arc::clone(&engine.worker_shared[0]);
+        let shared = engine.worker_shared[0].clone();
         engine.histories = None;
-        let Some((addr, len)) = WorkerHistories::for_worker(0, Arc::clone(&shared))
+        let Some((addr, len)) = WorkerHistories::for_worker(0, shared.clone())
             .block()
             .map(|b| b.backing_region())
         else {

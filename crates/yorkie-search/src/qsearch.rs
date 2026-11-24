@@ -5515,7 +5515,7 @@ mod tests {
         let mut runs = Vec::new();
         for over_block in [false, true] {
             let _tt = fresh_tt();
-            let shared = std::sync::Arc::new(crate::SharedHistories::new(1));
+            let shared = crate::SharedHistories::new(1);
             let mut histories = if over_block {
                 WorkerHistories::for_worker(0, shared)
             } else {

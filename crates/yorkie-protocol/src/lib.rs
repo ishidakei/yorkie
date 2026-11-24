@@ -5,6 +5,7 @@ pub(crate) mod bestmove;
 pub mod config;
 pub mod engine;
 pub mod formatter;
+pub(crate) mod node_block;
 pub mod parser;
 pub(crate) mod settings;
 /// The per-reply statistics line, which only a `verbose1` build writes.

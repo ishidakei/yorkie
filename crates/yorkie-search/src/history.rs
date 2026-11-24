@@ -15,10 +15,10 @@
 //! byte-identical to a per-worker copy, so single-thread node counts are
 //! unaffected by the sharing.
 //!
-//! Entries are `i16` to match the reference's `StatsEntry` width, and each
-//! table's heap array goes through the shared huge-page allocator, mirroring
-//! the reference's `make_unique_large_page`. The allocator affects placement
-//! only.
+//! Entries are `i16` to match the reference's `StatsEntry` width. A table is
+//! either in large-page static storage laid out when the binary is built, or
+//! on the heap through the shared huge-page allocator, mirroring the
+//! reference's `make_unique_large_page`; either affects placement only.
 //!
 //! Three of the update methods carry `#[inline(always)]`. Their caller is the
 //! main search function, which is large enough that the ordinary `#[inline]`
@@ -26,6 +26,8 @@
 //! binary's text section smaller than it was. Every other accessor here is
 //! inlined without an attribute.
 
+use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI16, Ordering};
 
 use yorkie_state::{Color, Move, Piece, Square};
@@ -599,34 +601,41 @@ const PAWN_SLOT_LEN: usize = PIECE_NB * SQ_NB;
 /// that node's thread count, so a larger node gets a proportionally larger,
 /// less-contended table.
 ///
-/// `thread_count` must be a non-zero power of two (asserted) so slot selection
-/// is a single mask over the full 64-bit key.
+/// The thread count must be a non-zero power of two (asserted) so slot
+/// selection is a single mask over the full 64-bit key.
 ///
-/// Every field here is written once, by whoever builds the tables, and only read
-/// afterwards — the entries the workers write live in the two blocks these
-/// handles address, not in the struct. So the struct's own cache lines are
-/// read-shared and need no boundary between fields; what the workers contend for
-/// is a table entry, and the tables are sized by the node's thread count exactly
-/// so that contention thins out as the node grows.
+/// A value of this type is one worker's handle to its node's tables: each
+/// table's base address and slot mask, which a lookup reads straight out of
+/// the worker's own state, with nothing else on the path to an entry. Every
+/// worker of a node holds a handle of its own, a clone of the node's; the
+/// entries the workers write live in the tables these handles address, not in
+/// the handle, and the tables are sized by the node's thread count exactly so
+/// that contention for an entry thins out as the node grows.
+///
+/// A table is either in static storage, which lives as long as the program, or
+/// on the heap, kept alive by the reference count every handle over it holds.
+/// Static storage is never freed, so a set wholly in static storage counts
+/// nothing.
+#[derive(Clone)]
 pub struct SharedHistories {
-    /// The node's thread count (a power of two); the slot multiplier of both
-    /// tables.
-    thread_count: usize,
-    /// Correction table: `thread_count * CORRHIST_BASE_SIZE` slots, each
-    /// [`CORR_SLOT_LEN`] atomic `i16`. Layout `[slot][color][channel]`, flat.
-    correction: Box<[AtomicI16], LargePageAlloc>,
+    /// Correction table: `(corr_mask + 1) * CORR_SLOT_LEN` atomic `i16`.
+    /// Layout `[slot][color][channel]`, flat.
+    correction: NonNull<AtomicI16>,
     /// `correctionHistory.get_size() - 1` — the correction slot mask.
     corr_mask: usize,
-    /// Pawn table: `thread_count * PAWN_HISTORY_BASE_SIZE` slots, each
-    /// [`PAWN_SLOT_LEN`] atomic `i16`. Layout `[plane][pc][to]`, flat.
-    pawn: Box<[AtomicI16], LargePageAlloc>,
+    /// Pawn table: `(pawn_mask + 1) * PAWN_SLOT_LEN` atomic `i16`. Layout
+    /// `[plane][pc][to]`, flat.
+    pawn: NonNull<AtomicI16>,
     /// `pawnHistory.get_size() - 1` — the pawn slot mask.
     pawn_mask: usize,
+    /// Those of the two tables that are on the heap, held by every handle over
+    /// them; `None` when both are in static storage.
+    _heap: Option<Arc<HeapTables>>,
     /// The node's tables, which this worker's set reads and writes through for
     /// each table it does not keep a private copy of; `None` on a node's own
     /// set. See [`Self::private_over`].
     #[cfg(feature = "dupstats")]
-    delegate: Option<std::sync::Arc<SharedHistories>>,
+    delegate: Option<Box<SharedHistories>>,
     /// Whether this set keeps its correction table to itself.
     #[cfg(feature = "dupstats")]
     corr_own: bool,
@@ -635,25 +644,105 @@ pub struct SharedHistories {
     pawn_own: bool,
 }
 
+// Two table addresses, two masks and the heap handle. A worker holds the
+// handle inline, so this is what it adds to the worker's own state.
+#[cfg(not(feature = "dupstats"))]
+const _: () = assert!(size_of::<SharedHistories>() == 40);
+
+// SAFETY: the handle holds the addresses of `AtomicI16` entries, which are
+// `Sync`, and the entries live for as long as the handle does: static storage
+// for the whole program, and heap tables for as long as `heap`, an `Arc` that
+// is itself `Send + Sync`. Every access through the handle is a shared
+// reference to an atomic.
+unsafe impl Send for SharedHistories {}
+// SAFETY: as for `Send`.
+unsafe impl Sync for SharedHistories {}
+
+/// The tables of a set that are on the heap, behind every handle over them.
+/// The boxes are never moved out or touched after the set is built: the
+/// handles reach the entries through the addresses taken then.
+struct HeapTables {
+    _correction: Option<Box<[AtomicI16], LargePageAlloc>>,
+    _pawn: Option<Box<[AtomicI16], LargePageAlloc>>,
+}
+
+/// The base of `table`, which must hold `len` entries.
+fn table_base(table: &[AtomicI16], len: usize, name: &str) -> NonNull<AtomicI16> {
+    assert_eq!(
+        table.len(),
+        len,
+        "the {name} table does not hold the entries its thread count gives"
+    );
+    NonNull::from(table).cast()
+}
+
 impl SharedHistories {
+    /// Entries in a correction table for a node of `thread_count` workers.
+    pub const fn correction_len(thread_count: usize) -> usize {
+        thread_count * CORRHIST_BASE_SIZE * CORR_SLOT_LEN
+    }
+
+    /// Entries in a pawn table for a node of `thread_count` workers.
+    pub const fn pawn_len(thread_count: usize) -> usize {
+        thread_count * PAWN_HISTORY_BASE_SIZE * PAWN_SLOT_LEN
+    }
+
     /// Build the shared tables for a node of `thread_count` workers, which must
-    /// be a non-zero power of two.
+    /// be a non-zero power of two, both on the heap.
     ///
     /// The allocation **and** the initial fill run here, so calling this inside
     /// a node-bound thread lets first-touch place every page on that node.
     pub fn new(thread_count: usize) -> Self {
+        Self::build(thread_count, None, None)
+    }
+
+    /// Build the shared tables for a node of `thread_count` workers, which must
+    /// be a non-zero power of two: each table over the static storage given
+    /// for it, which must hold exactly [`Self::correction_len`] or
+    /// [`Self::pawn_len`] entries, and on the heap when none is given.
+    ///
+    /// Every entry of both tables is written here, so calling this inside a
+    /// node-bound thread lets first-touch place every page on that node, and a
+    /// table over static storage starts exactly as a fresh heap table does,
+    /// whatever the storage held before.
+    pub fn build(
+        thread_count: usize,
+        correction: Option<&'static [AtomicI16]>,
+        pawn: Option<&'static [AtomicI16]>,
+    ) -> Self {
         assert!(
             thread_count.is_power_of_two() && thread_count != 0,
             "SharedHistories thread_count must be a non-zero power of two, got {thread_count}"
         );
-        let corr_slots = thread_count * CORRHIST_BASE_SIZE;
-        let pawn_slots = thread_count * PAWN_HISTORY_BASE_SIZE;
+        let corr_len = Self::correction_len(thread_count);
+        let pawn_len = Self::pawn_len(thread_count);
+        let heap_correction = correction
+            .is_none()
+            .then(|| LargePageAlloc::zeroed_slice(corr_len));
+        let heap_pawn = pawn
+            .is_none()
+            .then(|| LargePageAlloc::zeroed_slice(pawn_len));
+        let heap = (heap_correction.is_some() || heap_pawn.is_some()).then(|| {
+            Arc::new(HeapTables {
+                _correction: heap_correction,
+                _pawn: heap_pawn,
+            })
+        });
+        let heap_tables = heap.as_deref();
+        let correction = correction
+            .or_else(|| heap_tables.and_then(|h| h._correction.as_deref()))
+            .expect("a correction table without static storage is on the heap");
+        let pawn = pawn
+            .or_else(|| heap_tables.and_then(|h| h._pawn.as_deref()))
+            .expect("a pawn table without static storage is on the heap");
+        let correction = table_base(correction, corr_len, "correction");
+        let pawn = table_base(pawn, pawn_len, "pawn");
         let out = Self {
-            thread_count,
-            correction: LargePageAlloc::zeroed_slice(corr_slots * CORR_SLOT_LEN),
-            corr_mask: corr_slots - 1,
-            pawn: LargePageAlloc::zeroed_slice(pawn_slots * PAWN_SLOT_LEN),
-            pawn_mask: pawn_slots - 1,
+            correction,
+            corr_mask: thread_count * CORRHIST_BASE_SIZE - 1,
+            pawn,
+            pawn_mask: thread_count * PAWN_HISTORY_BASE_SIZE - 1,
+            _heap: heap,
             #[cfg(feature = "dupstats")]
             delegate: None,
             #[cfg(feature = "dupstats")]
@@ -661,8 +750,10 @@ impl SharedHistories {
             #[cfg(feature = "dupstats")]
             pawn_own: true,
         };
-        // The correction fill of `0` is a no-op on the zeroed allocation, but is
-        // written explicitly so every page is first-touched on the (bound) node.
+        // The correction fill of `0` is a no-op on a zeroed heap table, but is
+        // written explicitly so every page is first-touched on the (bound)
+        // node, and so static storage an earlier set left values in starts
+        // over.
         out.fill_correction(CORRECTION_INIT);
         out.fill_pawn(PAWN_INIT);
         out
@@ -670,16 +761,13 @@ impl SharedHistories {
 
     /// One worker's set of the tables, for a measurement that cuts the sharing
     /// of one or both: the correction table (when `corr_own`) and the pawn
-    /// table (when `pawn_own`) are the worker's own, sized for one worker as a
-    /// lone search's are, and every other read and write goes to `node`.
+    /// table (when `pawn_own`) are the worker's own, on the heap and sized for
+    /// one worker as a lone search's are, and every other read and write goes
+    /// to `node`.
     #[cfg(feature = "dupstats")]
-    pub fn private_over(
-        node: std::sync::Arc<SharedHistories>,
-        corr_own: bool,
-        pawn_own: bool,
-    ) -> Self {
+    pub fn private_over(node: SharedHistories, corr_own: bool, pawn_own: bool) -> Self {
         let mut own = Self::new(1);
-        own.delegate = Some(node);
+        own.delegate = Some(Box::new(node));
         own.corr_own = corr_own;
         own.pawn_own = pawn_own;
         own
@@ -687,7 +775,7 @@ impl SharedHistories {
 
     /// The node's thread count (the slot multiplier).
     pub fn thread_count(&self) -> usize {
-        self.thread_count
+        (self.corr_mask + 1) / CORRHIST_BASE_SIZE
     }
 
     /// Number of correction slots (`thread_count * CORRHIST_BASE_SIZE`).
@@ -700,16 +788,56 @@ impl SharedHistories {
         self.pawn_mask + 1
     }
 
+    /// The correction table's `(address, byte length)`.
+    pub fn correction_region(&self) -> (usize, usize) {
+        let entries = self.correction_entries();
+        (entries.as_ptr().addr(), size_of_val(entries))
+    }
+
+    /// The pawn table's `(address, byte length)`.
+    pub fn pawn_region(&self) -> (usize, usize) {
+        let entries = self.pawn_entries();
+        (entries.as_ptr().addr(), size_of_val(entries))
+    }
+
+    /// Whether `self` and `other` address the same two tables.
+    pub fn same_tables(&self, other: &Self) -> bool {
+        self.correction == other.correction && self.pawn == other.pawn
+    }
+
+    /// Every correction entry.
+    fn correction_entries(&self) -> &[AtomicI16] {
+        // SAFETY: `correction` addresses `(corr_mask + 1) * CORR_SLOT_LEN`
+        // entries, set together in `build`, that live as long as the handle
+        // does (see the `Send` impl); an entry is only ever reached through a
+        // shared reference, and an atomic allows any number of those.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.correction.as_ptr(),
+                (self.corr_mask + 1) * CORR_SLOT_LEN,
+            )
+        }
+    }
+
+    /// Every pawn entry.
+    fn pawn_entries(&self) -> &[AtomicI16] {
+        // SAFETY: as in `Self::correction_entries`, for the pawn table's
+        // `(pawn_mask + 1) * PAWN_SLOT_LEN` entries.
+        unsafe {
+            std::slice::from_raw_parts(self.pawn.as_ptr(), (self.pawn_mask + 1) * PAWN_SLOT_LEN)
+        }
+    }
+
     /// Overwrite every correction entry with `v` (atomic RELAXED stores).
     pub fn fill_correction(&self, v: i16) {
-        for e in self.correction.iter() {
+        for e in self.correction_entries() {
             e.store(v, Ordering::Relaxed);
         }
     }
 
     /// Overwrite every pawn entry with `v` (atomic RELAXED stores).
     pub fn fill_pawn(&self, v: i16) {
-        for e in self.pawn.iter() {
+        for e in self.pawn_entries() {
             e.store(v, Ordering::Relaxed);
         }
     }
@@ -723,10 +851,11 @@ impl SharedHistories {
 
     /// The `channel` entry for side-to-move `color` in the slot keyed by `key`.
     ///
-    /// Both tables are sized `slots * SLOT_LEN` and masked with `slots - 1` in
-    /// [`Self::new`], which is the only place either is built, so a masked index
-    /// is always inside the block. The length is a run-time value, so the bound
-    /// has to be stated rather than derived from the type.
+    /// Both tables hold `slots * SLOT_LEN` entries and are masked with
+    /// `slots - 1`, both set together in [`Self::build`], which is the only
+    /// place a set is made, so a masked index is always inside the table. The
+    /// length is a run-time value, so the bound has to be stated rather than
+    /// derived from the type.
     fn corr_cell(&self, key: u64, color: Color, channel: CorrChannel) -> &AtomicI16 {
         #[cfg(feature = "dupstats")]
         if !self.corr_own
@@ -735,10 +864,11 @@ impl SharedHistories {
             return node.corr_cell(key, color, channel);
         }
         let i = self.corr_index(key, color, channel);
-        debug_assert!(i < self.correction.len());
+        debug_assert!(i < (self.corr_mask + 1) * CORR_SLOT_LEN);
         // SAFETY: see the doc comment — `key & corr_mask < corr_mask + 1` and
-        // the table holds `(corr_mask + 1) * CORR_SLOT_LEN` entries.
-        unsafe { self.correction.get_unchecked(i) }
+        // the table holds `(corr_mask + 1) * CORR_SLOT_LEN` entries, which live
+        // as long as the handle; an entry is only reached by shared reference.
+        unsafe { &*self.correction.as_ptr().add(i) }
     }
 
     /// The `channel` correction value for side-to-move `color` in the slot keyed
@@ -774,10 +904,11 @@ impl SharedHistories {
             return node.pawn_cell(pawn_key, pc, to);
         }
         let i = self.pawn_index(pawn_key, pc, to);
-        debug_assert!(i < self.pawn.len());
+        debug_assert!(i < (self.pawn_mask + 1) * PAWN_SLOT_LEN);
         // SAFETY: `pawn_key & pawn_mask < pawn_mask + 1` and the table holds
-        // `(pawn_mask + 1) * PAWN_SLOT_LEN` entries.
-        unsafe { self.pawn.get_unchecked(i) }
+        // `(pawn_mask + 1) * PAWN_SLOT_LEN` entries, which live as long as the
+        // handle; an entry is only reached by shared reference.
+        unsafe { &*self.pawn.as_ptr().add(i) }
     }
 
     /// The pawn-structure bonus for piece `pc` moving to `to` in the plane keyed
@@ -830,11 +961,11 @@ impl SharedHistories {
             return node.pawn_plane(pawn_key);
         }
         let start = ((pawn_key as usize) & self.pawn_mask) * PAWN_SLOT_LEN;
-        debug_assert!(start + PAWN_SLOT_LEN <= self.pawn.len());
+        debug_assert!(start + PAWN_SLOT_LEN <= (self.pawn_mask + 1) * PAWN_SLOT_LEN);
         // SAFETY: as in `Self::pawn_cell`, the masked plane number is below
         // `pawn_mask + 1` and the table holds `(pawn_mask + 1) * PAWN_SLOT_LEN`
         // entries, so the `PAWN_SLOT_LEN` entries from `start` are in the
-        // block; an array of `AtomicI16` has the layout of that run.
+        // table; an array of `AtomicI16` has the layout of that run.
         let entries = unsafe {
             &*self
                 .pawn
@@ -1127,7 +1258,6 @@ mod plane_tests {
 #[cfg(test)]
 mod shared_tests {
     use super::*;
-    use std::sync::Arc;
     use yorkie_state::PieceKind;
 
     fn bp() -> Piece {
@@ -1292,11 +1422,11 @@ mod shared_tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn concurrent_updates_terminate_within_limit() {
-        let sh = Arc::new(SharedHistories::new(2));
+        let sh = SharedHistories::new(2);
         let key = 12_345u64;
         let handles: Vec<_> = (0..2)
             .map(|t| {
-                let sh = Arc::clone(&sh);
+                let sh = sh.clone();
                 std::thread::spawn(move || {
                     for i in 0..20_000i32 {
                         let bonus = if (i + t) % 2 == 0 { 5000 } else { -5000 };
@@ -1316,5 +1446,69 @@ mod shared_tests {
             cv.abs() <= CORRECTION_HISTORY_D,
             "correction value {cv} exceeds D"
         );
+    }
+
+    /// A clone of a handle addresses the tables the original does, so an
+    /// update through one is read through the other, and the heap tables stay
+    /// alive while any handle over them does; a second set is a second pair
+    /// of tables.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_clone_addresses_the_same_tables_and_keeps_them_alive() {
+        let first = SharedHistories::new(1);
+        let second = first.clone();
+        assert!(first.same_tables(&second));
+        assert_eq!(first.correction_region(), second.correction_region());
+        assert_eq!(first.pawn_region(), second.pawn_region());
+        drop(first);
+        second.pawn_update(7, bp(), to(), 4000);
+        second.correction_update(7, Color::Black, CorrChannel::Minor, 500);
+        let third = second.clone();
+        assert_eq!(
+            third.pawn_get(7, bp(), to()),
+            second.pawn_get(7, bp(), to())
+        );
+        assert_ne!(third.pawn_get(7, bp(), to()), PAWN_INIT as i32);
+        assert_ne!(third.correction_get(7, Color::Black, CorrChannel::Minor), 0);
+        let other = SharedHistories::new(1);
+        assert!(!other.same_tables(&second));
+        let (a, alen) = other.pawn_region();
+        let (b, blen) = second.pawn_region();
+        assert!(a + alen <= b || b + blen <= a, "two sets overlap");
+    }
+
+    /// A table given static storage is built over that storage, its every
+    /// entry written to the initial value whatever it held, and reads and
+    /// writes through it exactly as a heap table does.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_table_over_static_storage_is_filled_and_used_in_place() {
+        let corr: &'static [AtomicI16] = Box::leak(
+            (0..SharedHistories::correction_len(1))
+                .map(|_| AtomicI16::new(77))
+                .collect(),
+        );
+        let sh = SharedHistories::build(1, Some(corr), None);
+        assert_eq!(
+            sh.correction_region(),
+            (corr.as_ptr().addr(), size_of_val(corr))
+        );
+        assert!(corr.iter().all(|e| e.load(Ordering::Relaxed) == 0));
+        sh.correction_update(3, Color::White, CorrChannel::Pawn, 300);
+        let i = sh.corr_index(3, Color::White, CorrChannel::Pawn);
+        assert_eq!(
+            corr[i].load(Ordering::Relaxed) as i32,
+            sh.correction_get(3, Color::White, CorrChannel::Pawn)
+        );
+        assert_ne!(corr[i].load(Ordering::Relaxed), 0);
+        assert_eq!(sh.pawn_get(3, bp(), to()), PAWN_INIT as i32);
+    }
+
+    /// Static storage of the wrong length is refused.
+    #[test]
+    #[should_panic(expected = "does not hold the entries")]
+    fn static_storage_of_the_wrong_length_is_refused() {
+        static SHORT: [AtomicI16; 8] = [const { AtomicI16::new(0) }; 8];
+        let _ = SharedHistories::build(1, Some(&SHORT), Some(&SHORT));
     }
 }
