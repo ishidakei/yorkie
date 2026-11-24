@@ -355,8 +355,9 @@ TOML ファイルを参照してください。
 | `entering_king_rule` | 文字列 | `NoEnteringKing` / `CSARule24` / `CSARule24H` / `CSARule27` / `CSARule27H` / `TryRule` | 入玉宣言勝ちのルール |
 | `depth_limit` | 整数 | 0〜2147483647 | 探索深さの上限（0 = 無制限）。`verbose2` のあるビルドでのみ効き、それのないビルドは深さの上限を持たない（時間と `stop` だけで探索を打ち切る）ため、`0` 以外を書いた config はビルドエラーになる |
 | `nodes_limit` | 整数 | 0〜9223372036854775807 | 探索ノード数の上限（0 = 無制限）。`depth_limit` と同じく `verbose2` のあるビルドでのみ効き、それのないビルドでは `0` 以外を書くとビルドエラーになる |
-| `max_moves_to_draw` | 整数 | 0〜100000 | 引き分けとする手数（0 = 無制限） |
-| `flatten_winning_mate` | 真偽値 | `true` / `false` | エンジン側が詰ます手順の評価値を、手数によらない一定の値にする。短い詰みも長い詰みも同じ値になるので、詰みを一つ証明したあとは短い詰みを探し続けない。詰まされる側の評価は通常どおり手数で決まる。`max_moves_to_draw` の手数内に詰む場合に限る。`info` の `score mate N` の N は読み筋（PV）の長さから求める |
+| `max_moves_to_draw` | 整数 | 0〜100000 | 引き分けとする手数（0 = 無制限）。この手数を超えた局面を引き分けとする。最後の手で詰ませた場合の扱いは `mate_on_max_move` で決まる |
+| `mate_on_max_move` | 文字列 | `draw` / `win` | `max_moves_to_draw` が許す最後の手で詰ませたときの扱い。`draw` ではその手で詰んでいても引き分けとする。`win` では詰ませた側の勝ちとし、手数を超えた局面は手番側に合法手が残っている場合に限り引き分けとする。`max_moves_to_draw` が 0 のときは使わない |
+| `flatten_winning_mate` | 真偽値 | `true` / `false` | エンジン側が詰ます手順の評価値を、手数によらない一定の値にする。短い詰みも長い詰みも同じ値になるので、詰みを一つ証明したあとは短い詰みを探し続けない。詰まされる側の評価は通常どおり手数で決まる。`max_moves_to_draw` の手数内に詰む場合に限る（`mate_on_max_move = "win"` では最後の手で詰む場合も含む）。`info` の `score mate N` の N は読み筋（PV）の長さから求める |
 | `pv_interval` | 整数 | 0〜100000000 | PV 出力の最小間隔 [ms]（0 = 抑制しない） |
 | `consideration_mode` | 真偽値 | `true` / `false` | 検討モード |
 | `output_fail_lh_pv` | 真偽値 | `true` / `false` | fail-high/low 時にも PV を出力する |

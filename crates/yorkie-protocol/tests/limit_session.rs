@@ -261,6 +261,47 @@ fn max_moves_to_draw_adjudicates_a_draw_past_the_horizon() {
     }
 }
 
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_mate_on_the_last_move_is_worth_what_mate_on_max_move_says() {
+    let _session = common::serial_session();
+    // The same mate in one, at the horizon's own ply: the mating drop is the
+    // last move the limit allows, and the mated position sits one ply past it.
+    // `mate_on_max_move = "draw"` makes that position the move-limit draw;
+    // `"win"` lets the mate stand. Unlimited, it is a plain mate.
+    let horizon = config::MAX_MOVES_TO_DRAW;
+    let ply = if horizon == 0 { 100 } else { horizon };
+    let h = start_ready();
+    go_and_wait(
+        &h,
+        &format!("position sfen k8/9/G1N6/9/9/9/9/9/8K b G {ply}"),
+        "go depth 2",
+        1,
+    );
+    let out = h.quit_join();
+
+    if horizon == 0 || config::MATE_ON_MAX_MOVE == "win" {
+        assert!(
+            out.lines().any(|l| l.contains("score mate")),
+            "a mate on the last move must stand in:\n{out}"
+        );
+        assert_eq!(
+            bestmove_lines(&out)[0].split_whitespace().next().unwrap(),
+            "G*8a",
+            "the search plays the mating drop in:\n{out}"
+        );
+    } else {
+        assert!(
+            !out.lines().any(|l| l.contains("score mate")),
+            "mate_on_max_move = \"draw\" must suppress the mate in:\n{out}"
+        );
+        assert!(
+            out.lines().any(|l| l.contains("score cp")),
+            "the root must report a draw-adjudicated cp score in:\n{out}"
+        );
+    }
+}
+
 // Gameover (handled exactly like stop).
 
 #[cfg_attr(miri, ignore)]

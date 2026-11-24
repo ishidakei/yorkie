@@ -285,6 +285,16 @@ fn an_unlisted_combo_choice_is_an_error() {
         err.contains("is not one of: NoEnteringKing,"),
         "message: {err}"
     );
+
+    let err = compile(&default_with(
+        "mate_on_max_move",
+        Some("mate_on_max_move = \"loss\""),
+    ))
+    .expect_err("must fail");
+    assert!(
+        err.contains("`mate_on_max_move` = \"loss\" is not one of: draw, win"),
+        "the message must name the key and list the choices: {err}"
+    );
 }
 
 // --- Fail-loud: a setting the build's features do not implement -----------

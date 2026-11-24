@@ -302,10 +302,17 @@ depth_limit = 0
 nodes_limit = 0
 
 # Ply past which the search adjudicates an unconditional draw
-# (`MaxMovesToDraw`); `0` is unlimited. A position reached after the last move
-# is a draw even when that move mates. The time management also plans its
-# remaining-move estimate against this ply.
+# (`MaxMovesToDraw`); `0` is unlimited. Whether a position reached after the
+# last move is a draw even when that move mates is `mate_on_max_move` below.
+# The time management also plans its remaining-move estimate against this ply.
 max_moves_to_draw = 512
+
+# What a mate delivered by the last move `max_moves_to_draw` allows is worth.
+# "draw": the position after that move is the move-limit draw even when the
+# move mates. "win": the side that delivers the mate wins, and the position
+# past the limit is a draw only when the side to move still has a legal move.
+# Read only when `max_moves_to_draw` is not 0.
+mate_on_max_move = "draw"
 
 # How many plies back the search looks for an earlier occurrence of the
 # position it stands on; `0` is no limit, back to the last null move or to the
@@ -327,7 +334,9 @@ repetition_look_back = 16
 # then worth no more than a longer one, so once any mate is proven the search
 # stops spending time on finding a shorter one. Being mated keeps the gradient,
 # so the engine still prefers the longest defence. A mate counts as the
-# engine's only when it lands inside the `max_moves_to_draw` limit.
+# engine's only when it lands inside the `max_moves_to_draw` limit; under
+# `mate_on_max_move = "win"` a mate delivered by the last move the limit allows
+# lands inside it too.
 #
 # The engine's side is the side it plays in the game, also while it searches
 # the position after its own move (`ponder` above). `info` lines still print

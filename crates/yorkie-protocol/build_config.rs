@@ -44,6 +44,10 @@ const ENTERING_KING_RULE_CHOICES: &[&str] = &[
     "TryRule",
 ];
 
+/// The `mate_on_max_move` choice list: a mate on the last move the move limit
+/// allows is the move-limit draw, or a win for the side that mates.
+const MATE_ON_MAX_MOVE_CHOICES: &[&str] = &["draw", "win"];
+
 /// The `BookFile` choice list — the same set the runtime combo advertises.
 const BOOK_FILE_CHOICES: &[&str] = &[
     "no_book",
@@ -451,6 +455,11 @@ const SCHEMA: &[Spec] = &[
          bounds every search by the clock",
     ),
     int("max_moves_to_draw", "MaxMovesToDraw", 0, 100_000),
+    choice(
+        "mate_on_max_move",
+        "(none: what a mate delivered by the last move the move limit allows is worth)",
+        MATE_ON_MAX_MOVE_CHOICES,
+    ),
     int(
         "repetition_look_back",
         "(none: how many plies back the search looks for a repetition, 0 for no limit)",

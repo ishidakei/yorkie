@@ -75,6 +75,7 @@ nodes_limit = 3000
 # DIFFERENCE: 0 in test.toml. Below the ply-100 fixture position, so the
 # search adjudicates a draw before it can see the mate.
 max_moves_to_draw = 50
+mate_on_max_move = "draw"
 repetition_look_back = 16
 
 flatten_winning_mate = false

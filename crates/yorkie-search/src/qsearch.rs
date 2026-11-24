@@ -158,41 +158,83 @@ const DEPTH_UNSEARCHED: i32 = -2;
 /// (`100000`) and compares against it like any other limit. That compare is
 /// unreachable but not removable: the game ply is a run-time value, so every
 /// node pays for a test whose answer the setting already fixed. `None` fixes it
-/// where the compiler can see it — see [`is_past_move_limit`].
+/// where the compiler can see it — see [`MoveLimitRule::is_past`].
 const MOVE_LIMIT: Option<NonZeroI32> = NonZeroI32::new(crate::config::MAX_MOVES_TO_DRAW as i32);
 
-/// Whether `game_ply` is past the configured [`MOVE_LIMIT`], so that the node
-/// holding that position is an unconditional draw.
+/// Whether a mate delivered by the last move the [`MOVE_LIMIT`] allows wins
+/// (`mate_on_max_move = "win"`) rather than being the move-limit draw.
+const MATE_ON_MAX_MOVE_WINS: bool = matches!(crate::config::MATE_ON_MAX_MOVE.as_bytes(), b"win");
+
+/// The game-length rule a search plays under: the move limit, and what a mate
+/// delivered by the last move it allows is worth.
 ///
-/// With no limit configured this is a constant `false`, and the draw clauses
-/// calling it fold away to the search's own `MAX_PLY` horizon.
-#[inline(always)]
-const fn is_past_move_limit(game_ply: u16) -> bool {
-    match MOVE_LIMIT {
-        Some(limit) => game_ply as i32 > limit.get(),
-        None => false,
+/// The engine plays under [`MoveLimitRule::COMPILED`] alone, so every test on
+/// it folds to the constant the config fixed; only the test build carries a
+/// rule a test can set (see [`QSearch::move_limit_rule`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MoveLimitRule {
+    /// The last game ply still played, `None` for no limit.
+    limit: Option<NonZeroI32>,
+    /// Whether a position past the limit whose side to move has no legal move
+    /// is mated rather than drawn.
+    mate_on_last_move_wins: bool,
+}
+
+impl MoveLimitRule {
+    /// The rule this binary plays under.
+    const COMPILED: Self = Self {
+        limit: MOVE_LIMIT,
+        mate_on_last_move_wins: MATE_ON_MAX_MOVE_WINS,
+    };
+
+    /// Whether `game_ply` is past the limit, so that the node holding that
+    /// position is adjudicated by the rule instead of searched.
+    ///
+    /// With no limit this is a constant `false`, and the clauses calling it
+    /// fold away to the search's own `MAX_PLY` horizon.
+    #[inline(always)]
+    const fn is_past(self, game_ply: u16) -> bool {
+        match self.limit {
+            Some(limit) => game_ply as i32 > limit.get(),
+            None => false,
+        }
+    }
+
+    /// Whether a position past the limit is mated when its side to move has no
+    /// legal move. Asked only of a position [`Self::is_past`] holds for, so a
+    /// position inside the limit never generates moves for it.
+    #[inline(always)]
+    const fn mates_past_the_limit(self) -> bool {
+        self.limit.is_some() && self.mate_on_last_move_wins
+    }
+
+    /// Whether a mate delivered by the side to move at `game_ply` counts as a
+    /// mate under this rule.
+    ///
+    /// The mated position sits one ply further on. Past the limit every node
+    /// adjudicates the move-limit draw before it looks for a mate unless the
+    /// rule lets a mate on the last move win, so a shortcut that claims the mate
+    /// one ply early must ask this first or it scores a game the full search
+    /// calls drawn.
+    #[inline(always)]
+    const fn mate_lands_inside(self, game_ply: u16) -> bool {
+        match self.limit {
+            Some(limit) if self.mate_on_last_move_wins => (game_ply as i32) <= limit.get(),
+            Some(limit) => (game_ply as i32) < limit.get(),
+            None => true,
+        }
     }
 }
 
-/// Whether a mate delivered by the side to move at `game_ply` lands on a ply
-/// the configured [`MOVE_LIMIT`] still plays.
+/// Whether the side to move in `pos` has no legal move at all.
 ///
-/// The mated position sits one ply further on, and past the limit every node
-/// adjudicates a draw before it looks for a mate, so a shortcut that claims the
-/// mate one ply early must ask this first or it scores a game the full search
-/// calls drawn.
-#[inline(always)]
-const fn mate_lands_inside_move_limit(game_ply: u16) -> bool {
-    mate_lands_inside(MOVE_LIMIT, game_ply)
-}
-
-/// [`mate_lands_inside_move_limit`] against an explicit `limit`.
-#[inline(always)]
-const fn mate_lands_inside(limit: Option<NonZeroI32>, game_ply: u16) -> bool {
-    match limit {
-        Some(limit) => (game_ply as i32) < limit.get(),
-        None => true,
-    }
+/// Generates every legal move, so it is for a position the search would
+/// otherwise end on without generating any — one past the move limit.
+#[cold]
+fn has_no_legal_move(pos: &Position) -> bool {
+    let mut legal = Vec::new();
+    pos.generate_legal_all(&mut legal);
+    legal.is_empty()
 }
 
 /// Entries in the `reductions[]` table — `1..600` are filled, `[0]` is 0.
@@ -709,6 +751,11 @@ pub struct QSearch<N: NetworkParams> {
     /// there is [`Self::reads_tt`] anything but the constant `true`.
     #[cfg(test)]
     read_tt: bool,
+    /// The game-length rule a test plays this search under; the engine has
+    /// only [`MoveLimitRule::COMPILED`], so only a test build carries one (see
+    /// [`Self::move_limit_rule`]).
+    #[cfg(test)]
+    move_limit_rule: MoveLimitRule,
 
     /// Root side-to-move, used by [`Self::draw_value`] to reproduce the
     /// contempt-signed `drawValueTable[REPETITION_DRAW]` (set once per search
@@ -1274,6 +1321,8 @@ impl<N: NetworkParams> QSearch<N> {
             pv_node: false,
             #[cfg(test)]
             read_tt: true,
+            #[cfg(test)]
+            move_limit_rule: MoveLimitRule::COMPILED,
             root_us: Color::Black,
             stack: tables.stack,
             acc_stack: tables.acc_stack,
@@ -1348,6 +1397,33 @@ impl<N: NetworkParams> QSearch<N> {
         {
             true
         }
+    }
+
+    /// The game-length rule this search plays under: the compiled one outside
+    /// the test build, which is what lets every clause asking it fold to the
+    /// config's constants there.
+    #[inline(always)]
+    fn move_limit_rule(&self) -> MoveLimitRule {
+        #[cfg(test)]
+        {
+            self.move_limit_rule
+        }
+        #[cfg(not(test))]
+        {
+            MoveLimitRule::COMPILED
+        }
+    }
+
+    /// Whether the node holding `pos` at `ply` is past the move limit and its
+    /// side to move is mated there: the rule lets a mate on the last move win
+    /// and no legal move is left. Only a node [`MoveLimitRule::is_past`] holds
+    /// for asks, and inside the `MAX_PLY` horizon, whose draw comes first.
+    #[inline(always)]
+    fn mated_past_the_move_limit(&self, pos: &Position, ply: i32) -> bool {
+        self.move_limit_rule().mates_past_the_limit()
+            && ply < MAX_PLY
+            && self.move_limit_rule().is_past(pos.ply())
+            && has_no_legal_move(pos)
     }
 
     /// Set whether TT hits are honoured. Every descent into a child restores
@@ -2332,7 +2408,12 @@ impl<N: NetworkParams> QSearch<N> {
             }
         }
         // The reference's `depth <= -16 → draw` measure is `#if 0`: not ported.
-        if ply >= MAX_PLY || is_past_move_limit(pos.ply()) {
+        if ply >= MAX_PLY || self.move_limit_rule().is_past(pos.ply()) {
+            // A mate on the last move the limit allows is a mate, not a value
+            // the limit produced, so it carries no mark.
+            if self.mated_past_the_move_limit(pos, ply) {
+                return self.mated_for(us, ply);
+            }
             // The move limit is a rule of the tournament and could be set
             // differently; the `MAX_PLY` search horizon is not, so only the
             // first marks the value it produces.
@@ -2425,7 +2506,7 @@ impl<N: NetworkParams> QSearch<N> {
                 // 🌈 1-ply mate check, only when the TT missed. Under
                 // `FLATTEN` the mate must also land inside the move limit, as
                 // the flat value claims a game won rather than a distance.
-                if (!FLATTEN || mate_lands_inside_move_limit(pos.ply()))
+                if (!FLATTEN || self.move_limit_rule().mate_lands_inside(pos.ply()))
                     && let Some(mate_move) = pos.mate_1ply()
                 {
                     best_value = self.mate_for(us, ply + 1);
@@ -3882,7 +3963,12 @@ impl<N: NetworkParams> QSearch<N> {
             // The reference folds `threads.stop` into this return: an
             // aborted non-root node yields the draw score without touching the
             // TT.
-            if self.stopped || ply >= MAX_PLY || is_past_move_limit(pos.ply()) {
+            if self.stopped || ply >= MAX_PLY || self.move_limit_rule().is_past(pos.ply()) {
+                // A mate on the last move the limit allows is a mate, not a
+                // value the limit produced, so it carries no mark.
+                if !self.stopped && self.mated_past_the_move_limit(pos, ply) {
+                    return self.mated_for(us, ply);
+                }
                 // The move limit is a rule of the tournament and could be set
                 // differently; neither an abort nor the `MAX_PLY` search
                 // horizon is, so only the first marks the value it produces.
@@ -4103,7 +4189,7 @@ impl<N: NetworkParams> QSearch<N> {
             && !tt_hit
             && !excluded_move.is_some_and(Move::is_ok)
             && !in_check
-            && (!FLATTEN || mate_lands_inside_move_limit(pos.ply()))
+            && (!FLATTEN || self.move_limit_rule().mate_lands_inside(pos.ply()))
             && let Some(mate_move) = pos.mate_1ply()
         {
             best_value = self.mate_for(us, ply + 1);
@@ -5368,6 +5454,22 @@ mod tests {
         parse_sfen(sfen).expect("valid SFEN")
     }
 
+    /// A move limit of `limit` plies under which a mate on the last move wins
+    /// when `wins` holds — the rule a test plays a search under to see the
+    /// side of `max_moves_to_draw` / `mate_on_max_move` its build did not
+    /// compile in.
+    /// Whether `game_ply` is past the compiled move limit.
+    fn is_past_move_limit(game_ply: u16) -> bool {
+        MoveLimitRule::COMPILED.is_past(game_ply)
+    }
+
+    fn rule(limit: i32, wins: bool) -> MoveLimitRule {
+        MoveLimitRule {
+            limit: NonZeroI32::new(limit),
+            mate_on_last_move_wins: wins,
+        }
+    }
+
     /// Serialises the tests that use the transposition table.
     ///
     /// There is one table in the process — a `static` — so two tests running as
@@ -5640,21 +5742,54 @@ mod tests {
 
     #[test]
     fn a_mate_lands_inside_the_move_limit_only_below_it() {
-        let limit = NonZeroI32::new(50);
-        assert!(mate_lands_inside(limit, 0));
-        assert!(mate_lands_inside(limit, 49));
+        let draw = rule(50, false);
+        assert!(draw.mate_lands_inside(0));
+        assert!(draw.mate_lands_inside(49));
         // At the limit the move is still played, but the position it mates is
         // past the limit and adjudicated a draw.
-        assert!(!mate_lands_inside(limit, 50));
-        assert!(!mate_lands_inside(limit, 51));
-        assert!(mate_lands_inside(None, u16::MAX));
-        // The compiled limit agrees with the draw rule one ply on.
-        for ply in [0u16, 1, 49, 50, 51, 100, 1000] {
-            assert_eq!(
-                mate_lands_inside_move_limit(ply),
-                !is_past_move_limit(ply + 1)
-            );
+        assert!(!draw.mate_lands_inside(50));
+        assert!(!draw.mate_lands_inside(51));
+        for wins in [false, true] {
+            let unlimited = MoveLimitRule {
+                limit: None,
+                mate_on_last_move_wins: wins,
+            };
+            assert!(unlimited.mate_lands_inside(u16::MAX));
+            assert!(!unlimited.mates_past_the_limit());
         }
+        // The compiled rule agrees with the draw rule one ply on.
+        let compiled = MoveLimitRule::COMPILED;
+        if !compiled.mate_on_last_move_wins {
+            for ply in [0u16, 1, 49, 50, 51, 100, 1000] {
+                assert_eq!(compiled.mate_lands_inside(ply), !compiled.is_past(ply + 1));
+            }
+        }
+    }
+
+    #[test]
+    fn a_mate_on_the_last_move_lands_inside_the_limit_when_it_wins() {
+        let win = rule(50, true);
+        assert!(win.mates_past_the_limit());
+        assert!(win.mate_lands_inside(49));
+        // The last move the limit allows mates a position one ply past it,
+        // which the rule scores as mated.
+        assert!(win.mate_lands_inside(50));
+        // A position past the limit is already adjudicated, mate or draw.
+        assert!(!win.mate_lands_inside(51));
+        for ply in [0u16, 1, 49, 50, 51, 100, 1000] {
+            assert_eq!(win.mate_lands_inside(ply), !win.is_past(ply));
+        }
+        assert!(!rule(50, false).mates_past_the_limit());
+    }
+
+    #[test]
+    fn the_compiled_rule_is_the_config() {
+        let compiled = MoveLimitRule::COMPILED;
+        assert_eq!(
+            compiled.mate_on_last_move_wins,
+            crate::config::MATE_ON_MAX_MOVE == "win"
+        );
+        assert!(matches!(crate::config::MATE_ON_MAX_MOVE, "draw" | "win"));
     }
 
     #[test]
@@ -6477,12 +6612,44 @@ mod tests {
     #[test]
     fn the_one_ply_mate_shortcuts_respect_the_move_limit_boundary() {
         let game_ply = MOVE_LIMIT.map_or(100, |limit| limit.get() as u16);
+        let compiled = MoveLimitRule::COMPILED;
+        for value in one_ply_mate_shortcut_values(compiled, game_ply) {
+            if compiled.mate_lands_inside(game_ply) {
+                assert!(is_win(value), "a mate inside the limit, got {value}");
+            } else if FLATTEN {
+                assert!(
+                    !is_decisive(value),
+                    "a mate past the limit must not be claimed, got {value}"
+                );
+            }
+        }
+    }
+
+    /// The `mate_on_max_move = "win"` counterpart: the mate-in-one at the
+    /// limit's own ply is a mate, the shortcuts claim it, and the full search —
+    /// whose root takes no shortcut — finds the same mate one ply on.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn the_one_ply_mate_shortcuts_claim_a_mate_on_the_last_move_when_it_wins() {
+        const LIMIT: u16 = 50;
+        let win = rule(LIMIT.into(), true);
+        for value in one_ply_mate_shortcut_values(win, LIMIT) {
+            assert!(is_win(value), "a mate on the last move wins, got {value}");
+        }
+        let (score, _) = root_under(win, &format!("k8/9/G1N6/9/9/9/9/9/8K b G {LIMIT}"), 2);
+        assert!(is_win(score), "the full search agrees, got {score}");
+    }
+
+    /// The values qsearch's and the interior search's mate-in-one shortcuts
+    /// give the gold-drop mate at `game_ply` under `rule`.
+    fn one_ply_mate_shortcut_values(rule: MoveLimitRule, game_ply: u16) -> [Value; 2] {
         let sfen = format!("k8/9/G1N6/9/9/9/9/9/8K b G {game_ply}");
         let net = zero_net();
 
         let tt = fresh_tt();
         let qsearch_value = {
             let mut q = QSearch::new(net.network());
+            q.move_limit_rule = rule;
             q.run(&mut pos(&sfen), -VALUE_INFINITE, VALUE_INFINITE, true, true)
                 .value
         };
@@ -6490,6 +6657,7 @@ mod tests {
         let _tt = fresh_tt();
         let search_value = {
             let mut q = QSearch::new(net.network());
+            q.move_limit_rule = rule;
             q.run_search(
                 &mut pos(&sfen),
                 -VALUE_INFINITE,
@@ -6499,17 +6667,18 @@ mod tests {
                 true,
             )
         };
+        [qsearch_value, search_value]
+    }
 
-        for value in [qsearch_value, search_value] {
-            if mate_lands_inside_move_limit(game_ply) {
-                assert!(is_win(value), "a mate inside the limit, got {value}");
-            } else if FLATTEN {
-                assert!(
-                    !is_decisive(value),
-                    "a mate past the limit must not be claimed, got {value}"
-                );
-            }
-        }
+    /// A fixed-depth root search of `sfen` under `rule`, on an emptied table:
+    /// its score and best move.
+    fn root_under(rule: MoveLimitRule, sfen: &str, depth: i32) -> (Value, Move) {
+        let net = zero_net();
+        let _tt = fresh_tt();
+        let mut q = QSearch::new(net.network());
+        q.move_limit_rule = rule;
+        let out = q.run_root(&pos(sfen), depth);
+        (out.score, out.best_move)
     }
 
     // Repetition draws + the ±1 dither.
@@ -7322,6 +7491,113 @@ mod tests {
                 out.score
             );
         }
+    }
+
+    /// The gold-drop mate in one at `game_ply`.
+    fn mate_in_one_at(game_ply: u16) -> String {
+        format!("k8/9/G1N6/9/9/9/9/9/8K b G {game_ply}")
+    }
+
+    /// `mate_on_max_move = "draw"`: a root at the limit's own ply whose side to
+    /// move mates in one scores the draw, as the mated position past the limit
+    /// is the move-limit draw.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_mate_on_the_last_move_is_the_draw_when_it_draws() {
+        let (score, _) = root_under(rule(50, false), &mate_in_one_at(50), 2);
+        assert!(!is_decisive(score), "the mate must not stand, got {score}");
+        assert!(
+            score.abs() <= DRAW_CONTEMPT_BLACK.abs() + 1,
+            "the score must be in the draw band, got {score}"
+        );
+    }
+
+    /// `mate_on_max_move = "win"`: the same root scores the mate, and its best
+    /// move is the mating one.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_mate_on_the_last_move_wins_when_it_wins() {
+        let sfen = mate_in_one_at(50);
+        let (score, best) = root_under(rule(50, true), &sfen, 2);
+        let want = if FLATTEN { VALUE_MATE_FLAT } else { mate_in(1) };
+        assert_eq!(score, want, "the root must score the mate");
+        let mut after = pos(&sfen);
+        after.do_move(best);
+        assert!(
+            legal_moves(&after).is_empty(),
+            "the best move must be the mating one, got {best:?}"
+        );
+    }
+
+    /// Past the limit, under `"win"`, a side to move with no legal move is
+    /// mated and one with a legal move is the draw — in the main search and the
+    /// quiescence search alike. Under `"draw"` both are the draw.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn past_the_limit_only_a_position_without_a_legal_move_is_mated_when_it_wins() {
+        const PLY: i32 = 3;
+        let net = zero_net();
+        let mut mated = pos(&mate_in_one_at(50));
+        let mate = mated.mate_1ply().expect("the fixture mates in one");
+        mated.do_move(mate);
+        assert_eq!(
+            mated.ply(),
+            51,
+            "the mated position is one ply past the limit"
+        );
+        assert!(legal_moves(&mated).is_empty(), "and has no legal move");
+        let open = pos("4k4/9/9/9/9/9/9/9/4K4 w - 51");
+        assert!(!legal_moves(&open).is_empty());
+
+        for wins in [false, true] {
+            for (p, no_move) in [(&mated, true), (&open, false)] {
+                for main in [false, true] {
+                    let _tt = fresh_tt();
+                    let mut q = QSearch::new(net.network());
+                    q.move_limit_rule = rule(50, wins);
+                    let value = if main {
+                        q.run_search_at(&mut p.clone(), PLY, -1, 0, 1, false, false)
+                    } else {
+                        q.pv_node = false;
+                        q.root_us = p.side_to_move();
+                        q.nodes = 0;
+                        q.qsearch_at(&mut p.clone(), PLY, -1, 0)
+                    };
+                    let what = format!("wins={wins} no_move={no_move} main={main}");
+                    if wins && no_move {
+                        assert_eq!(value, q.mated_for(p.side_to_move(), PLY), "{what}");
+                        assert!(is_loss(value), "{what}: got {value}");
+                        if !FLATTEN {
+                            assert_eq!(value, mated_in(PLY), "{what}");
+                        }
+                    } else {
+                        assert!(!is_decisive(value), "{what}: got {value}");
+                        assert!(
+                            value.abs() <= DRAW_CONTEMPT_BLACK.abs() + 1,
+                            "{what}: the draw band, got {value}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Under `"win"` only the last move the limit allows may mate: a mate in
+    /// three whose third move is that move wins, and the same mate one ply
+    /// later, whose third move is past the limit, is the draw.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_mate_that_needs_a_move_past_the_limit_is_the_draw_when_it_wins() {
+        const MATE_IN_THREE: &str = "k8/9/9/9/9/9/9/9/8K b R2G";
+        assert!(
+            pos(&format!("{MATE_IN_THREE} 1")).mate_1ply().is_none(),
+            "the fixture has no mate in one"
+        );
+        let win = rule(50, true);
+        let (inside, _) = root_under(win, &format!("{MATE_IN_THREE} 48"), 5);
+        assert!(is_win(inside), "mated at ply 51, got {inside}");
+        let (past, _) = root_under(win, &format!("{MATE_IN_THREE} 49"), 5);
+        assert!(!is_decisive(past), "mated at ply 52, got {past}");
     }
 
     // Interior main search (`QSearch::search`). Values here are hand-computed
