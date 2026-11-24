@@ -396,10 +396,16 @@ fn reply_allocations(out: &str) -> Vec<u64> {
 /// or without a book. A node bound is an analysis clause, so this needs
 /// `verbose2`; the book is probed and the game path recorded for it all the
 /// same.
+///
+/// The counts are the whole process's, so the sessions run in a process that
+/// runs this test alone ([`common::in_own_process`]).
 #[cfg(feature = "verbose2")]
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_loaded_yorkie_book_adds_no_allocation_to_a_reply() {
+    if !common::in_own_process("a_loaded_yorkie_book_adds_no_allocation_to_a_reply") {
+        return;
+    }
     // Each game draws its evaluation noise from process entropy, so two noisy
     // sessions run different searches and their counts are not comparable.
     #[cfg(feature = "random")]

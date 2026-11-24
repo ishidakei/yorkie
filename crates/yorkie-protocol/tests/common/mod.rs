@@ -345,6 +345,41 @@ pub fn drive_with_yorkie_book_skipping(
     output.text()
 }
 
+/// The environment variable that marks a run of a test binary started by
+/// [`in_own_process`], holding the name of the one test that run is for.
+const OWN_PROCESS_TEST: &str = "YORKIE_TEST_OWN_PROCESS";
+
+/// Whether the calling test, named `test`, should run its body here: `true`
+/// in a process that runs `test` alone, `false` once this call has run `test`
+/// in such a process and seen it pass (it panics with the child's output if it
+/// does not). A test calls it first and returns at once on `false`.
+///
+/// For a test that compares the `alloc=` counts of the statistics line. That
+/// count is the whole process's, and the engine allocates on its worker
+/// threads, so no narrower count would do; a test binary run as one process
+/// with its tests on parallel threads adds every neighbour's allocations to
+/// it. Under `cargo nextest` each test is already its own process and this
+/// costs one more.
+pub fn in_own_process(test: &str) -> bool {
+    if std::env::var_os(OWN_PROCESS_TEST).is_some_and(|name| name == test) {
+        return true;
+    }
+    let exe = std::env::current_exe().expect("test executable path");
+    let out = std::process::Command::new(exe)
+        .args([test, "--exact", "--test-threads=1", "--nocapture"])
+        .env(OWN_PROCESS_TEST, test)
+        .output()
+        .expect("run the test binary for one test");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "{test} in a process of its own did not pass:\n{stdout}\n{stderr}"
+    );
+    eprint!("{stderr}");
+    false
+}
+
 /// Room the transcript of [`drive_counting_allocations`] starts with, far more
 /// than such a session writes.
 const COUNTED_TRANSCRIPT_BYTES: usize = 1 << 20;

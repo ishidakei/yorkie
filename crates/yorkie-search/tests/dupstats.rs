@@ -21,6 +21,7 @@ use yorkie_search::dupstats::{
 };
 use yorkie_search::timeline::{Iteration, RootEntry};
 use yorkie_search::{QSearch, SearchControl, TallySlot, WorkerResult, generate_root_moves};
+mod serial;
 mod text_str;
 
 #[cfg(not(feature = "tt-entry16"))]
@@ -210,6 +211,7 @@ fn check_timeline(r: &WorkerResult, completed: i32, stopped: bool, what: &str) {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn one_worker_matches_the_fixtures_and_sees_no_other_worker() {
+    let _search = serial::serial_search();
     let Some(owned) = network() else { return };
     let net = owned.network();
     let mut first_move_nodes = 0;
@@ -291,6 +293,7 @@ fn two_workers<N: yorkie_eval::NetworkParams + Copy + Send>(
 #[cfg_attr(miri, ignore)]
 #[test]
 fn two_workers_finish_the_fixtures_and_find_each_others_work() {
+    let _search = serial::serial_search();
     let Some(owned) = network() else { return };
     let net = owned.network();
     let mut total = DupCounts::ZERO;
@@ -319,6 +322,7 @@ fn two_workers_finish_the_fixtures_and_find_each_others_work() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn one_worker_counts_each_verification_search_once() {
+    let _search = serial::serial_search();
     let Some(owned) = network() else { return };
     let net = owned.network();
     TranspositionTable::shared().clear();
@@ -338,6 +342,7 @@ static STOP: AtomicBool = AtomicBool::new(false);
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_search_stopped_by_time_leaves_the_tables_empty() {
+    let _search = serial::serial_search();
     let Some(owned) = network() else { return };
     let net = owned.network();
     TranspositionTable::shared().clear();

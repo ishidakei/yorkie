@@ -14,6 +14,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use yorkie_search::defer::BusyTable;
 use yorkie_search::{QSearch, SearchControl, TallySlot, WorkerResult, generate_root_moves};
+mod serial;
 mod text_str;
 
 #[cfg(not(feature = "tt-entry16"))]
@@ -87,6 +88,7 @@ fn is_legal(pos: &Position, mv: Move) -> bool {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn one_worker_with_defer_on_matches_the_fixtures() {
+    let _search = serial::serial_search();
     let Some(owned) = network() else { return };
     let net = owned.network();
     for name in FIXTURES {
@@ -163,6 +165,7 @@ fn two_workers<N: yorkie_eval::NetworkParams + Copy + Send>(
 /// Two workers with `switches` on finish every fixture with a legal move and
 /// leave no entry in the table; between them they enter moves.
 fn two_workers_finish_the_fixtures(switches: Switches) {
+    let _search = serial::serial_search();
     let Some(owned) = network() else { return };
     let net = owned.network();
     #[cfg(feature = "verbose1")]
@@ -194,6 +197,7 @@ static STOP: AtomicBool = AtomicBool::new(false);
 /// A search stopped from outside unwinds from wherever its workers were — the
 /// clock's stop takes the same path — and leaves no entry in the table.
 fn a_stopped_search_leaves_the_table_empty(switches: Switches) {
+    let _search = serial::serial_search();
     let Some(owned) = network() else { return };
     let net = owned.network();
     TranspositionTable::shared().clear();

@@ -874,22 +874,27 @@ mod tests {
     /// where the same worker on the heap takes one block for each. What both
     /// still allocate are the vectors inside the tables (the stack cells' PVs,
     /// the finny table's feature lists), whose lengths are run-time values.
+    ///
+    /// Both bundles are built on this thread alone, so the test counts this
+    /// thread's blocks: the process-wide tally also holds whatever the other
+    /// tests of the binary allocate meanwhile when they run as threads of one
+    /// process.
     #[cfg(all(feature = "verbose1", not(miri)))]
     #[test]
     fn a_worker_over_its_block_allocates_none_of_its_tables() {
         let _lock = crate::worker_block::claim_lock();
         let shared = SharedHistories::new(1);
-        yorkie_storage::clear_alloc_count();
+        yorkie_storage::take_thread_alloc_count();
         let mut on_heap = WorkerHistories::with_shared(shared.clone());
         // SAFETY: nothing has been lent out of this bundle.
         let heap_tables = unsafe { on_heap.lend_search_tables() };
-        let heap_count = yorkie_storage::take_alloc_count();
+        let heap_count = yorkie_storage::take_thread_alloc_count();
         let mut in_block = WorkerHistories::for_worker(0, shared.clone());
         assert!(in_block.block().is_some(), "block 0 is free");
         in_block.fill_if_pending();
         // SAFETY: nothing has been lent out of this bundle.
         let block_tables = unsafe { in_block.lend_search_tables() };
-        let block_count = yorkie_storage::take_alloc_count();
+        let block_count = yorkie_storage::take_thread_alloc_count();
         eprintln!("allocations per worker: heap {heap_count}, block {block_count}");
         assert_eq!(heap_count - block_count, 9);
         drop((heap_tables, block_tables));

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 use yorkie_search::{QSearch, TallySlot, WorkerResult, generate_root_moves};
+mod serial;
 mod text_str;
 
 #[cfg(not(feature = "tt-entry16"))]
@@ -83,6 +84,7 @@ fn is_legal(pos: &Position, mv: Move) -> bool {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn one_worker_with_the_spread_on_matches_the_fixtures() {
+    let _search = serial::serial_search();
     let Some(owned) = network() else { return };
     let net = owned.network();
     for name in FIXTURES {
@@ -143,6 +145,7 @@ fn two_workers<N: yorkie_eval::NetworkParams + Copy + Send>(
 #[cfg_attr(miri, ignore)]
 #[test]
 fn two_workers_with_the_spread_on_finish_the_fixtures() {
+    let _search = serial::serial_search();
     let Some(owned) = network() else { return };
     let net = owned.network();
     #[cfg(feature = "verbose1")]

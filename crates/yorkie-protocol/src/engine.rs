@@ -5075,9 +5075,15 @@ mod tests {
     /// A node's set over its block takes nothing from the allocator: neither
     /// table, nor a count to share them by. The same set on the heap takes a
     /// block for each table and one for the count.
+    ///
+    /// Every set is built on this thread, so the test counts this thread's
+    /// blocks: the process-wide tally also holds whatever the other tests of the
+    /// binary allocate meanwhile when they run as threads of one process.
     #[cfg(all(feature = "verbose1", not(miri)))]
     #[test]
     fn a_set_over_its_block_allocates_nothing() {
+        use yorkie_storage::take_thread_alloc_count;
+
         let _session = serial_session();
         let claim = NodeClaim::claim().expect("no engine holds the region");
         let node = config::WORKER_SYSTEM_NODES[0];
@@ -5085,17 +5091,17 @@ mod tests {
             .block(node)
             .expect("worker 0's node has a block")
             .thread_count;
-        clear_alloc_count();
+        take_thread_alloc_count();
         let on_heap = SharedHistories::new(thread_count);
-        let heap_count = yorkie_storage::take_alloc_count();
+        let heap_count = take_thread_alloc_count();
         let in_block = SharedHistories::build(
             thread_count,
             claim.correction(node, thread_count),
             claim.pawn(node, thread_count),
         );
-        let block_count = yorkie_storage::take_alloc_count();
+        let block_count = take_thread_alloc_count();
         let copies: Vec<SharedHistories> = (0..4).map(|_| in_block.clone()).collect();
-        let clone_count = yorkie_storage::take_alloc_count() - 1;
+        let clone_count = take_thread_alloc_count() - 1;
         eprintln!("allocations per set: heap {heap_count}, block {block_count}");
         assert_eq!(heap_count, 3);
         assert_eq!(block_count, 0);

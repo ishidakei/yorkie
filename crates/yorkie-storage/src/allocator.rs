@@ -43,11 +43,30 @@
 //! no wrapper, no counter, no branch on the allocation path.
 
 #[cfg(feature = "verbose1")]
+use std::cell::Cell;
+#[cfg(feature = "verbose1")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The process-wide allocation tally the installed [`CountingAlloc`] raises.
 #[cfg(feature = "verbose1")]
 static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "verbose1")]
+thread_local! {
+    /// The blocks handed to the calling thread, raised beside the counter a
+    /// [`CountingAlloc`] borrows.
+    ///
+    /// A measurement of code that allocates only on the thread running it reads
+    /// this rather than the process-wide tally, which also holds whatever every
+    /// other thread of the process allocated meanwhile — the other tests of a
+    /// test binary that runs its tests as threads of one process, for one.
+    ///
+    /// A `const`-initialised `Cell<u64>` has no destructor, so the slot is a
+    /// plain thread-local word: reaching it registers nothing and allocates
+    /// nothing (which would re-enter the allocator), and it stays readable while
+    /// the thread is being torn down.
+    static THREAD_ALLOC_COUNT: Cell<u64> = const { Cell::new(0) };
+}
 
 /// The process-wide allocator.
 #[cfg(all(not(miri), not(feature = "verbose1")))]
@@ -85,23 +104,31 @@ impl<A> CountingAlloc<A> {
     pub const fn new(inner: A, count: &'static AtomicU64) -> Self {
         Self { inner, count }
     }
+
+    /// Count one block handed out, in the borrowed counter and in the calling
+    /// thread's.
+    fn count_block(&self) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        THREAD_ALLOC_COUNT.with(|count| count.set(count.get().wrapping_add(1)));
+    }
 }
 
 // SAFETY: every method forwards to `inner`, whose own `GlobalAlloc` impl upholds
 // the contract; the wrapper returns exactly what it returns and passes each
-// pointer and layout through unchanged. The added counter increment is a relaxed
-// read-modify-write on an unrelated atomic, which allocates nothing and so
-// cannot re-enter the allocator.
+// pointer and layout through unchanged. The added counting is a relaxed
+// read-modify-write on an unrelated atomic and a write to a destructor-free
+// thread-local word, neither of which allocates, so neither can re-enter the
+// allocator.
 #[cfg(feature = "verbose1")]
 unsafe impl<A: std::alloc::GlobalAlloc> std::alloc::GlobalAlloc for CountingAlloc<A> {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        self.count.fetch_add(1, Ordering::Relaxed);
+        self.count_block();
         // SAFETY: `layout` is the caller's, forwarded unchanged.
         unsafe { self.inner.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
-        self.count.fetch_add(1, Ordering::Relaxed);
+        self.count_block();
         // SAFETY: `layout` is the caller's, forwarded unchanged.
         unsafe { self.inner.alloc_zeroed(layout) }
     }
@@ -113,7 +140,7 @@ unsafe impl<A: std::alloc::GlobalAlloc> std::alloc::GlobalAlloc for CountingAllo
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
-        self.count.fetch_add(1, Ordering::Relaxed);
+        self.count_block();
         // SAFETY: `ptr` was handed out by `inner` under `layout`, and `new_size`
         // is the caller's, forwarded unchanged.
         unsafe { self.inner.realloc(ptr, layout, new_size) }
@@ -132,6 +159,17 @@ pub fn take_alloc_count() -> u64 {
 #[cfg(feature = "verbose1")]
 pub fn clear_alloc_count() {
     ALLOC_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Read the calling thread's allocation tally and reset it to zero in one
+/// step: the blocks the installed allocator handed to this thread since its
+/// previous take, and to no other thread.
+///
+/// What [`take_alloc_count`] is to the process, this is to one thread. It
+/// leaves the process-wide tally alone, and that one leaves this alone.
+#[cfg(feature = "verbose1")]
+pub fn take_thread_alloc_count() -> u64 {
+    THREAD_ALLOC_COUNT.with(|count| count.replace(0))
 }
 
 #[cfg(test)]
@@ -213,5 +251,53 @@ mod tests {
         // SAFETY: `zeroed` came from this allocator under exactly `small`.
         unsafe { alloc.dealloc(zeroed, small) };
         assert_eq!(COUNT.load(Ordering::Relaxed), 3);
+    }
+
+    /// A thread's tally holds the blocks handed to that thread and none handed
+    /// to another. Each take sits right after the calls it weighs, so nothing
+    /// the installed allocator hands this thread in between (the test's own
+    /// bookkeeping) lands in it.
+    #[cfg(feature = "verbose1")]
+    #[test]
+    fn a_thread_tally_counts_the_blocks_handed_to_that_thread_alone() {
+        use std::alloc::{GlobalAlloc, System};
+        use std::sync::atomic::AtomicU64;
+
+        use super::{CountingAlloc, take_thread_alloc_count};
+
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        let alloc = CountingAlloc::new(System, &COUNT);
+        let small = Layout::from_size_align(64, 8).unwrap();
+
+        take_thread_alloc_count();
+        // SAFETY: `small` has non-zero size.
+        let mine = unsafe { alloc.alloc(small) };
+        let counted_here = take_thread_alloc_count();
+        let counted_there = std::thread::scope(|s| {
+            s.spawn(|| {
+                take_thread_alloc_count();
+                // SAFETY: `small` has non-zero size.
+                let (a, b) = unsafe { (alloc.alloc(small), alloc.alloc(small)) };
+                let counted = take_thread_alloc_count();
+                // SAFETY: both came from this allocator under exactly `small`.
+                unsafe {
+                    alloc.dealloc(a, small);
+                    alloc.dealloc(b, small);
+                }
+                counted
+            })
+            .join()
+            .unwrap()
+        });
+        take_thread_alloc_count();
+        // SAFETY: `mine` came from this allocator under exactly `small`.
+        unsafe { alloc.dealloc(mine, small) };
+        let after_free = take_thread_alloc_count();
+        assert_eq!(counted_here, 1);
+        assert_eq!(counted_there, 2, "the other thread's tally is its own");
+        assert_eq!(
+            after_free, 0,
+            "a free hands out no block and must not count"
+        );
     }
 }
