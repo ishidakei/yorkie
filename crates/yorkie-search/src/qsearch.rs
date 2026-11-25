@@ -2649,7 +2649,7 @@ impl<N: NetworkParams> QSearch<N> {
             // Step 6. Pruning, only while not already losing.
             if !is_loss(best_value) {
                 if !gives_check && Some(mv.to_sq()) != prev_sq && !is_loss(futility_base) {
-                    if move_count > 2 {
+                    if move_count > params::QS_MOVE_COUNT.get() {
                         continue;
                     }
                     let futility_value =
@@ -3770,7 +3770,7 @@ impl<N: NetworkParams> QSearch<N> {
         captured: Option<Piece>,
     ) -> i32 {
         if let (true, Some(cap_piece)) = (capture, captured) {
-            863 * piece_value(cap_piece) / 128
+            params::LMR_CAPTURE_STAT.get() * piece_value(cap_piece) / 128
                 + self
                     .histories
                     .capture
@@ -3815,7 +3815,7 @@ impl<N: NetworkParams> QSearch<N> {
     fn reduction(&self, improving: bool, d: i32, mn: i32, delta: i32) -> i32 {
         let reduction_scale = REDUCTIONS[d as usize] * REDUCTIONS[mn as usize];
         reduction_scale - delta * params::LMR_DELTA.get() / self.root_delta_divisor()
-            + (!improving as i32) * reduction_scale * 206 / 512
+            + (!improving as i32) * reduction_scale * params::LMR_NOT_IMPROVING.get() / 512
             + params::LMR_BASE.get()
     }
 
@@ -3823,8 +3823,8 @@ impl<N: NetworkParams> QSearch<N> {
     /// channel reads keyed by the position's partial keys, plus the `(ss-2)` /
     /// `(ss-4)` continuation-correction reads when `(ss-1)`'s move is ok.
     ///
-    /// On fresh tables the sum is small enough that
-    /// [`to_corrected_static_eval`] divides it away to zero.
+    /// On fresh tables, at the default weights and init values, the sum is
+    /// small enough that [`to_corrected_static_eval`] divides it away to zero.
     fn correction_value(&self, pos: &Position, ply: i32) -> i32 {
         let us = pos.side_to_move();
         let pcv = self
@@ -3865,13 +3865,16 @@ impl<N: NetworkParams> QSearch<N> {
                             .continuation_correction
                             .get_at(prev4.cont_corr, pc, to)
                 }
-                None => 8,
+                None => params::CORR_CONT_NO_MOVE.get(),
             }
         } else {
-            8
+            params::CORR_CONT_NO_MOVE.get()
         };
 
-        12153 * pcv + 8620 * micv + 12355 * (wnpcv + bnpcv) + 7982 * cntcv
+        params::CORR_PAWN.get() * pcv
+            + params::CORR_MINOR.get() * micv
+            + params::CORR_NON_PAWN.get() * (wnpcv + bnpcv)
+            + params::CORR_CONT.get() * cntcv
     }
 
     /// Drive the shared search body directly, at ply 0 but as a *non-root*
@@ -4158,7 +4161,7 @@ impl<N: NetworkParams> QSearch<N> {
                 && tt_data.depth > depth - (tt_value <= beta) as i32
                 && is_valid(tt_value)
                 && bound_matches(tt_data.bound, tt_value >= beta)
-                && (cut_node == (tt_value >= beta) || depth > 5);
+                && (cut_node == (tt_value >= beta) || depth > params::TT_CUTOFF_DEPTH.get());
             self.channel_use(pos_key, tt_hit, &tt_data, depth, cut);
         }
 
@@ -4188,7 +4191,7 @@ impl<N: NetworkParams> QSearch<N> {
                 && tt_deep
                 && is_valid(tt_value)
                 && bound_matches(tt_data.bound, tt_value >= beta)
-                && (cut_node == (tt_value >= beta) || depth > 5);
+                && (cut_node == (tt_value >= beta) || depth > params::TT_CUTOFF_DEPTH.get());
             let event = if tt_cut {
                 Event::TtCut
             } else if !tt_hit {
@@ -4205,7 +4208,7 @@ impl<N: NetworkParams> QSearch<N> {
             && tt_data.depth > depth - (tt_value <= beta) as i32
             && is_valid(tt_value)
             && bound_matches(tt_data.bound, tt_value >= beta)
-            && (cut_node == (tt_value >= beta) || depth > 5)
+            && (cut_node == (tt_value >= beta) || depth > params::TT_CUTOFF_DEPTH.get())
         {
             if let Some(ttm) = tt_move
                 && tt_value >= beta
@@ -4217,11 +4220,13 @@ impl<N: NetworkParams> QSearch<N> {
                         &self.stack[..],
                         s,
                         ttm,
-                        (130 * depth - 71).min(1043),
+                        (params::TT_CUT_BONUS_DEPTH.get() * depth
+                            + params::TT_CUT_BONUS_OFFSET.get())
+                        .min(params::TT_CUT_BONUS_MAX.get()),
                     );
                 }
                 if let Some(psq) = prev_sq
-                    && self.stack[s - 1].move_count <= 4
+                    && self.stack[s - 1].move_count <= params::TT_CUT_PARENT_MOVE_COUNT.get()
                     && !prior_capture
                     && let Some(pc) = pos.board().get(psq)
                 {
@@ -4231,7 +4236,7 @@ impl<N: NetworkParams> QSearch<N> {
                         s - 1,
                         pc,
                         psq,
-                        -2142,
+                        params::TT_CUT_CONT_PENALTY.get(),
                     );
                 }
             }
@@ -4397,20 +4402,26 @@ impl<N: NetworkParams> QSearch<N> {
                 && !self.stack[s - 1].in_check
                 && !prior_capture
             {
-                let eval_diff =
-                    (-(self.stack[s - 1].static_eval + static_eval)).clamp(-214, 171) + 60;
-                self.histories
-                    .main
-                    .update(us.flip(), prev_move, eval_diff * 10);
+                let eval_diff = (-(self.stack[s - 1].static_eval + static_eval))
+                    .clamp(params::EVAL_DIFF_MIN.get(), params::EVAL_DIFF_MAX.get())
+                    + params::EVAL_DIFF_OFFSET.get();
+                self.histories.main.update(
+                    us.flip(),
+                    prev_move,
+                    eval_diff * params::EVAL_DIFF_MAIN.get(),
+                );
                 if !tt_hit
                     && let Some(psq) = prev_sq
                     && let Some(pc) = pos.board().get(psq)
                 {
                     let not_pawn = pc.kind != PieceKind::Pawn || pc.promoted;
                     if not_pawn && !prev_move.is_promote() {
-                        self.histories
-                            .shared
-                            .pawn_update(pos.pawn_key(), pc, psq, eval_diff * 12);
+                        self.histories.shared.pawn_update(
+                            pos.pawn_key(),
+                            pc,
+                            psq,
+                            eval_diff * params::EVAL_DIFF_PAWN.get(),
+                        );
                     }
                 }
             }
@@ -4418,12 +4429,12 @@ impl<N: NetworkParams> QSearch<N> {
             improving = static_eval > self.stack[s - 2].static_eval;
             let opponent_worsening = static_eval > -self.stack[s - 1].static_eval;
 
-            if prior_reduction >= 3 && !opponent_worsening {
+            if prior_reduction >= params::HINDSIGHT_EXTEND.get() && !opponent_worsening {
                 depth += 1;
             }
-            if prior_reduction >= 2
+            if prior_reduction >= params::HINDSIGHT_REDUCE.get()
                 && depth >= 2
-                && static_eval + self.stack[s - 1].static_eval > 173
+                && static_eval + self.stack[s - 1].static_eval > params::HINDSIGHT_EVAL_SUM.get()
             {
                 depth -= 1;
             }
@@ -4439,13 +4450,16 @@ impl<N: NetworkParams> QSearch<N> {
             }
 
             // Step 8. Futility pruning.
-            let futility_mult = params::FUTILITY_MULT.get() - 21 * (!tt_hit) as i32;
+            let futility_mult =
+                params::FUTILITY_MULT.get() - params::FUTILITY_TT_MISS.get() * (!tt_hit) as i32;
             let margin = futility_mult * depth
-                - (2686 * improving as i32 + 362 * opponent_worsening as i32) * futility_mult
+                - (params::FUTILITY_IMPROVING.get() * improving as i32
+                    + params::FUTILITY_WORSENING.get() * opponent_worsening as i32)
+                    * futility_mult
                     / 1024
                 + correction_value.abs() / params::FUTILITY_CORRECTION_DIV.get();
             if !ttpv
-                && depth < 15
+                && depth < params::FUTILITY_MAX_DEPTH.get()
                 && eval >= beta
                 && eval - margin >= beta
                 && (tt_move.is_none() || tt_capture)
@@ -4461,7 +4475,10 @@ impl<N: NetworkParams> QSearch<N> {
             // what disables the pass while a verification search is in flight.
             if cut_node
                 && static_eval
-                    >= beta - 16 * depth - 53 * improving as i32 + params::NMP_MARGIN.get()
+                    >= beta
+                        - params::NMP_DEPTH_MARGIN.get() * depth
+                        - params::NMP_IMPROVING.get() * improving as i32
+                        + params::NMP_MARGIN.get()
                 && !excluded_move.is_some_and(Move::is_ok)
                 && ply >= self.nmp_min_ply
                 && !is_loss(beta)
@@ -4496,7 +4513,7 @@ impl<N: NetworkParams> QSearch<N> {
                 let null_marks = self.child_marks(node_marks);
                 pos.undo_null_move();
                 if null_value >= beta && !is_win(null_value) {
-                    if self.nmp_min_ply != 0 || depth < 16 {
+                    if self.nmp_min_ply != 0 || depth < params::NMP_VERIFY_DEPTH.get() {
                         #[cfg(feature = "verbose3")]
                         self.merge_held(null_marks, pos);
                         return null_value;
@@ -4550,18 +4567,21 @@ impl<N: NetworkParams> QSearch<N> {
             // Step 10. Internal iterative reduction.
             if !self.stack[s].follow_pv
                 && !all_node
-                && depth >= 6
+                && depth >= params::IIR_MIN_DEPTH.get()
                 && tt_move.is_none()
-                && prior_reduction <= 3
+                && prior_reduction <= params::IIR_MAX_PRIOR_REDUCTION.get()
             {
                 depth -= 1;
             }
 
             // Step 11. ProbCut.
-            let prob_cut_beta = beta + params::PROBCUT_MARGIN.get() - 61 * improving as i32;
-            if depth >= 3 && !is_decisive(beta) && !(is_valid(tt_value) && tt_value < prob_cut_beta)
+            let prob_cut_beta = beta + params::PROBCUT_MARGIN.get()
+                - params::PROBCUT_IMPROVING.get() * improving as i32;
+            if depth >= params::PROBCUT_MIN_DEPTH.get()
+                && !is_decisive(beta)
+                && !(is_valid(tt_value) && tt_value < prob_cut_beta)
             {
-                let prob_cut_depth = depth - 4;
+                let prob_cut_depth = depth - params::PROBCUT_REDUCTION.get();
                 // This picker is done before the node's own is built, so the
                 // buffer it takes is the one that picker will take.
                 let (slot, scratch) = Self::split_picker_scratch(scratch);
@@ -4650,7 +4670,7 @@ impl<N: NetworkParams> QSearch<N> {
         // Step 12. Small ProbCut.
         let prob_cut_beta = beta + params::SMALL_PROBCUT_MARGIN.get();
         if bound_matches(tt_data.bound, true)
-            && tt_data.depth >= depth - 4
+            && tt_data.depth >= depth - params::SMALL_PROBCUT_DEPTH.get()
             && tt_value >= prob_cut_beta
             && !is_decisive(beta)
             && is_valid(tt_value)
@@ -4771,13 +4791,16 @@ impl<N: NetworkParams> QSearch<N> {
             // persists for the rest of this node's move loop. The pre-loop
             // `ttpv` snapshot must NOT be used past this point.
             if self.stack[s].tt_pv {
-                r += 1013;
+                r += params::LMR_TTPV.get();
             }
 
             // Step 14. Pruning at shallow depths. Skipped at the root, where
             // every move must be searched.
             if !root_node && !is_loss(best_value) {
-                if move_count >= (3 + depth * depth) / (2 - improving as i32) {
+                if move_count
+                    >= (params::MOVE_COUNT_PRUNE_BASE.get() + depth * depth)
+                        / (2 - improving as i32)
+                {
                     mp.skip_quiet_moves();
                     #[cfg(lazy_smp_spread)]
                     self.spread.skip_quiets(s);
@@ -4789,17 +4812,19 @@ impl<N: NetworkParams> QSearch<N> {
                         Some(v) => self.histories.capture.get(moved_piece, mv.to_sq(), v),
                         None => self.histories.capture.get_empty(moved_piece, mv.to_sq()),
                     };
-                    if !gives_check && lmr_depth < 7 {
+                    if !gives_check && lmr_depth < params::CAPTURE_FUTILITY_MAX_DEPTH.get() {
                         let futility_value = static_eval
-                            + 218
-                            + 223 * lmr_depth
+                            + params::CAPTURE_FUTILITY_BASE.get()
+                            + params::CAPTURE_FUTILITY_DEPTH.get() * lmr_depth
                             + victim.map_or(0, piece_value)
-                            + 131 * capt_hist / 1024;
+                            + params::CAPTURE_FUTILITY_HISTORY.get() * capt_hist / 1024;
                         if futility_value <= alpha {
                             continue;
                         }
                     }
-                    let margin = (167 * depth + capt_hist * 34 / 1024).max(0);
+                    let margin = (params::CAPTURE_SEE_DEPTH.get() * depth
+                        + capt_hist * params::CAPTURE_SEE_HISTORY.get() / 1024)
+                        .max(0);
                     if alpha >= VALUE_DRAW && !pos.see_ge(mv, -margin) {
                         continue;
                     }
@@ -4817,17 +4842,22 @@ impl<N: NetworkParams> QSearch<N> {
                         moved_piece,
                         mv.to_sq(),
                     );
-                    if history < -4097 * depth {
+                    if history < params::CONT_HISTORY_PRUNE.get() * depth {
                         continue;
                     }
-                    history += 71 * self.histories.main.get(us, mv) / 32;
+                    history +=
+                        params::MAIN_HISTORY_PRUNE.get() * self.histories.main.get(us, mv) / 32;
                     lmr_depth += history / params::LMR_HISTORY_DIV.get();
                     let futility_value = static_eval
-                        + 42
-                        + 151 * (!best_move.is_some_and(Move::is_ok)) as i32
+                        + params::QUIET_FUTILITY_BASE.get()
+                        + params::QUIET_FUTILITY_NO_BEST.get()
+                            * (!best_move.is_some_and(Move::is_ok)) as i32
                         + params::QUIET_FUTILITY_DEPTH.get() * lmr_depth
-                        + 86 * (static_eval > alpha) as i32;
-                    if !in_check && lmr_depth < 13 && futility_value <= alpha {
+                        + params::QUIET_FUTILITY_EVAL.get() * (static_eval > alpha) as i32;
+                    if !in_check
+                        && lmr_depth < params::QUIET_FUTILITY_MAX_DEPTH.get()
+                        && futility_value <= alpha
+                    {
                         if best_value <= futility_value
                             && !is_decisive(best_value)
                             && !is_win(futility_value)
@@ -4837,7 +4867,7 @@ impl<N: NetworkParams> QSearch<N> {
                         continue;
                     }
                     lmr_depth = lmr_depth.max(0);
-                    if !pos.see_ge(mv, -25 * lmr_depth * lmr_depth) {
+                    if !pos.see_ge(mv, -params::QUIET_SEE.get() * lmr_depth * lmr_depth) {
                         continue;
                     }
                 }
@@ -4850,16 +4880,18 @@ impl<N: NetworkParams> QSearch<N> {
             if !root_node
                 && Some(mv) == tt_move
                 && !excluded_move.is_some_and(Move::is_ok)
-                && depth >= 6 + self.stack[s].tt_pv as i32
+                && depth
+                    >= params::SINGULAR_MIN_DEPTH.get()
+                        + params::SINGULAR_TTPV_DEPTH.get() * self.stack[s].tt_pv as i32
                 && is_valid(tt_value)
                 && !is_decisive(tt_value)
                 && bound_matches(tt_data.bound, true)
-                && tt_data.depth >= depth - 3
+                && tt_data.depth >= depth - params::SINGULAR_TT_DEPTH_MARGIN.get()
                 && !self.is_shuffling(mv, capture, ply, pos)
             {
                 let singular_beta = tt_value
                     - (params::SINGULAR_MARGIN.get()
-                        + 66 * (self.stack[s].tt_pv && !pv_node) as i32)
+                        + params::SINGULAR_OFF_PV.get() * (self.stack[s].tt_pv && !pv_node) as i32)
                         * depth
                         / params::SINGULAR_MARGIN_DIV.get();
                 let singular_depth = new_depth * 1024 / params::SINGULAR_DEPTH_DIV.get();
@@ -4907,20 +4939,25 @@ impl<N: NetworkParams> QSearch<N> {
                 }
 
                 if s_value < singular_beta {
-                    let corr_val_adj = correction_value.abs() / 210590;
-                    let double_margin = -4 + 212 * pv_node as i32
-                        - 182 * (!tt_capture) as i32
+                    let corr_val_adj =
+                        correction_value.abs() / params::SINGULAR_CORRECTION_DIV.get();
+                    let double_margin = params::DOUBLE_EXT_BASE.get()
+                        + params::DOUBLE_EXT_PV_NODE.get() * pv_node as i32
+                        - params::DOUBLE_EXT_QUIET.get() * (!tt_capture) as i32
                         - corr_val_adj
-                        - 906 * self.histories.tt_move.get() / 116517
-                        - (ply > self.root_depth) as i32 * 44;
-                    // `92 * ss->ttPv` reads `ss->ttPv` live, after the
+                        - params::DOUBLE_EXT_TT_MOVE_HISTORY.get() * self.histories.tt_move.get()
+                            / params::DOUBLE_EXT_TT_MOVE_HISTORY_DIV.get()
+                        - (ply > self.root_depth) as i32 * params::DOUBLE_EXT_LATE_PLY.get();
+                    // The TT-PV term reads `ss->ttPv` live, after the
                     // re-entry, which failed low here and so applied
                     // `ss->ttPv |= (ss-1)->ttPv`. The guard and `singular_beta`
                     // above ran first and see the original value.
-                    let triple_margin = 73 + 320 * pv_node as i32 - 218 * (!tt_capture) as i32
-                        + 92 * self.stack[s].tt_pv as i32
+                    let triple_margin = params::TRIPLE_EXT_BASE.get()
+                        + params::TRIPLE_EXT_PV_NODE.get() * pv_node as i32
+                        - params::TRIPLE_EXT_QUIET.get() * (!tt_capture) as i32
+                        + params::TRIPLE_EXT_TTPV.get() * self.stack[s].tt_pv as i32
                         - corr_val_adj
-                        - (ply > self.root_depth) as i32 * 45;
+                        - (ply > self.root_depth) as i32 * params::TRIPLE_EXT_LATE_PLY.get();
 
                     extension = 1
                         + (s_value < singular_beta - double_margin) as i32
@@ -4934,18 +4971,20 @@ impl<N: NetworkParams> QSearch<N> {
                 // if excluding it still fails high over beta this is not a
                 // singular node.
                 else if s_value >= beta && !is_decisive(s_value) {
-                    self.histories
-                        .tt_move
-                        .update((-424 - 107 * depth).max(-3375));
+                    self.histories.tt_move.update(
+                        (params::MULTICUT_TT_MOVE_BASE.get()
+                            - params::MULTICUT_TT_MOVE_DEPTH.get() * depth)
+                            .max(params::MULTICUT_TT_MOVE_MIN.get()),
+                    );
                     #[cfg(feature = "verbose3")]
                     self.merge_held(singular_marks, pos);
                     #[cfg(feature = "dupstats")]
                     self.dup.count(crate::dupstats::Event::SeMulticut, dup_at);
                     return s_value;
                 } else if tt_value >= beta {
-                    extension = -3;
+                    extension = params::NEG_EXT_TT_FAIL_HIGH.get();
                 } else if cut_node {
-                    extension = -2;
+                    extension = params::NEG_EXT_CUT_NODE.get();
                 }
                 // Every branch but the multi-cut's leaves its outcome in
                 // `extension`, which is 0 until this block sets it.
@@ -5006,32 +5045,37 @@ impl<N: NetworkParams> QSearch<N> {
             let node_count = self.nodes;
 
             if self.stack[s].tt_pv {
-                r -= 2819
-                    + pv_node as i32 * 973
-                    + (tt_value > alpha) as i32 * 905
-                    + (tt_data.depth >= depth) as i32 * (935 + cut_node as i32 * 959);
+                r -= params::LMR_TTPV_BASE.get()
+                    + pv_node as i32 * params::LMR_TTPV_PV_NODE.get()
+                    + (tt_value > alpha) as i32 * params::LMR_TTPV_TT_VALUE.get()
+                    + (tt_data.depth >= depth) as i32
+                        * (params::LMR_TTPV_TT_DEPTH.get()
+                            + cut_node as i32 * params::LMR_TTPV_CUT_NODE.get());
             }
-            r += 691;
-            r -= move_count * 65;
+            r += params::LMR_OFFSET.get();
+            r -= move_count * params::LMR_MOVE_COUNT.get();
             r -= correction_value.abs() / params::LMR_CORRECTION_DIV.get();
             if cut_node {
-                r += params::LMR_CUT_NODE.get() + 985 * tt_move.is_none() as i32;
+                r += params::LMR_CUT_NODE.get()
+                    + params::LMR_CUT_NODE_NO_TT_MOVE.get() * tt_move.is_none() as i32;
             }
             if tt_capture {
-                r += 1054;
+                r += params::LMR_TT_CAPTURE.get();
             }
             if self.stack[s + 1].cutoff_cnt > 1 {
-                r +=
-                    251 + 1124 * (self.stack[s + 1].cutoff_cnt > 2) as i32 + 1042 * all_node as i32;
+                r += params::LMR_CUTOFF.get()
+                    + params::LMR_CUTOFF_MANY.get() * (self.stack[s + 1].cutoff_cnt > 2) as i32
+                    + params::LMR_CUTOFF_ALL_NODE.get() * all_node as i32;
             }
             if Some(mv) == tt_move {
-                r -= 2239;
+                r -= params::LMR_TT_MOVE.get();
             }
             let stat_score = self.move_stat_score(us, moved_piece, mv, s, capture, undo.captured());
             self.stack[s].stat_score = stat_score;
-            r -= stat_score * 428 / 4096;
+            r -= stat_score * params::LMR_STAT_SCORE.get() / 4096;
             if all_node {
-                r += r * 273 / (256 * depth + 260);
+                r += r * params::LMR_ALL_NODE.get()
+                    / (256 * depth + params::LMR_ALL_NODE_OFFSET.get());
             }
 
             // A widened root reads each candidate move unreduced, with the
@@ -5085,8 +5129,9 @@ impl<N: NetworkParams> QSearch<N> {
                 );
                 self.stack[s].reduction = 0;
                 if value > alpha {
-                    let do_deeper = d < new_depth && value > best_value + 48;
-                    let do_shallower = value < best_value + 9;
+                    let do_deeper =
+                        d < new_depth && value > best_value + params::LMR_DEEPER_MARGIN.get();
+                    let do_shallower = value < best_value + params::LMR_SHALLOWER_MARGIN.get();
                     new_depth += do_deeper as i32 - do_shallower as i32;
                     if new_depth > d {
                         value = -self.search(
@@ -5108,7 +5153,7 @@ impl<N: NetworkParams> QSearch<N> {
                         s,
                         moved_piece,
                         mv.to_sq(),
-                        1426,
+                        params::RESEARCH_CONT_BONUS.get(),
                     );
                 }
             }
@@ -5131,9 +5176,11 @@ impl<N: NetworkParams> QSearch<N> {
                 );
             } else if !pv_node || move_count > 1 {
                 if tt_move.is_none() {
-                    r += 1057;
+                    r += params::LMR_FULL_NO_TT_MOVE.get();
                 }
-                let nd = new_depth - (r > 4628) as i32 - (r > 5772 && new_depth > 2) as i32;
+                let nd = new_depth
+                    - (r > params::LMR_FULL_THRESHOLD.get()) as i32
+                    - (r > params::LMR_FULL_THRESHOLD_DEEP.get() && new_depth > 2) as i32;
                 self.pv_node = false;
                 self.set_read_tt(true);
                 value = -self.search(
@@ -5342,7 +5389,10 @@ impl<N: NetworkParams> QSearch<N> {
                         }
                         break;
                     }
-                    if depth > 2 && depth < 14 && !is_decisive(value) {
+                    if depth > params::ALPHA_RAISE_MIN_DEPTH.get()
+                        && depth < params::ALPHA_RAISE_MAX_DEPTH.get()
+                        && !is_decisive(value)
+                    {
                         depth -= 2;
                     }
                     alpha = value;
@@ -5414,21 +5464,35 @@ impl<N: NetworkParams> QSearch<N> {
                 prior_capture,
             );
             if !pv_node {
-                self.histories
-                    .tt_move
-                    .update(if Some(best) == tt_move { 805 } else { -787 });
+                self.histories.tt_move.update(if Some(best) == tt_move {
+                    params::TT_MOVE_BONUS.get()
+                } else {
+                    params::TT_MOVE_MALUS.get()
+                });
             }
         } else if !prior_capture && let Some(psq) = prev_sq {
-            let mut bonus_scale = -232;
-            bonus_scale -= self.stack[s - 1].stat_score / 108;
-            bonus_scale += (59 * depth).min(454);
-            bonus_scale += 169 * (self.stack[s - 1].move_count > 8) as i32;
-            bonus_scale += 145 * (!in_check && best_value <= static_eval - 110) as i32;
-            bonus_scale += 154
-                * (!self.stack[s - 1].in_check && best_value <= -self.stack[s - 1].static_eval - 73)
+            let mut bonus_scale = params::PRIOR_BASE.get();
+            bonus_scale -= self.stack[s - 1].stat_score / params::PRIOR_STAT_DIV.get();
+            bonus_scale += (params::PRIOR_DEPTH.get() * depth).min(params::PRIOR_DEPTH_MAX.get());
+            bonus_scale += params::PRIOR_MOVE_COUNT_BONUS.get()
+                * (self.stack[s - 1].move_count > params::PRIOR_MOVE_COUNT.get()) as i32;
+            bonus_scale += params::PRIOR_EVAL_BONUS.get()
+                * (!in_check && best_value <= static_eval - params::PRIOR_EVAL_MARGIN.get()) as i32;
+            bonus_scale += params::PRIOR_PARENT_EVAL_BONUS.get()
+                * (!self.stack[s - 1].in_check
+                    && best_value
+                        <= -self.stack[s - 1].static_eval - params::PRIOR_PARENT_EVAL_MARGIN.get())
                     as i32;
             bonus_scale = bonus_scale.max(0);
-            let scaled_bonus = (135 * depth - 80).min(1400) * bonus_scale;
+            let scaled_bonus = (params::PRIOR_SCALED_DEPTH.get() * depth
+                + params::PRIOR_SCALED_OFFSET.get())
+            .min(params::PRIOR_SCALED_MAX.get())
+                * bonus_scale;
+            // The scaled bonus can reach 2^24 under the registered ranges, so
+            // each share is taken in `i64`; every share fits `i32` again, and
+            // at the defaults each is the quotient the `i32` arithmetic gives.
+            let share =
+                |scale: i32, unit: i64| (i64::from(scaled_bonus) * i64::from(scale) / unit) as i32;
             if let Some(pc) = pos.board().get(psq) {
                 update_continuation_histories(
                     &mut self.histories,
@@ -5436,12 +5500,14 @@ impl<N: NetworkParams> QSearch<N> {
                     s - 1,
                     pc,
                     psq,
-                    scaled_bonus * 221 / 16384,
+                    share(params::PRIOR_CONT_SCALE.get(), 16384),
                 );
                 if let Some(prev_move) = self.stack[s - 1].current_move {
-                    self.histories
-                        .main
-                        .update(us.flip(), prev_move, scaled_bonus * 235 / 32768);
+                    self.histories.main.update(
+                        us.flip(),
+                        prev_move,
+                        share(params::PRIOR_MAIN_SCALE.get(), 32768),
+                    );
                 }
                 let not_pawn = pc.kind != PieceKind::Pawn || pc.promoted;
                 if not_pawn && !self.stack[s - 1].current_move.is_some_and(Move::is_promote) {
@@ -5449,7 +5515,7 @@ impl<N: NetworkParams> QSearch<N> {
                         pos.pawn_key(),
                         pc,
                         psq,
-                        scaled_bonus * 290 / 8192,
+                        share(params::PRIOR_PAWN_SCALE.get(), 8192),
                     );
                 }
             }
@@ -5458,7 +5524,9 @@ impl<N: NetworkParams> QSearch<N> {
             && let Some(pc) = pos.board().get(psq)
             && let Some(cap) = prior_captured
         {
-            self.histories.capture.update(pc, psq, cap, 1018);
+            self.histories
+                .capture
+                .update(pc, psq, cap, params::PRIOR_CAPTURE_BONUS.get());
         }
 
         if best_value <= alpha {
@@ -5509,14 +5577,18 @@ impl<N: NetworkParams> QSearch<N> {
         if !(in_check || best_move.is_some_and(|m| m.is_ok() && Self::is_capture(pos, m)))
             && (best_value > static_eval) == best_move_ok
         {
-            let sign = if best_move_ok { 12 } else { 17 };
+            let sign = if best_move_ok {
+                params::CORR_BONUS_BEST.get()
+            } else {
+                params::CORR_BONUS_NO_BEST.get()
+            };
             let bonus = ((best_value - static_eval) * depth * sign / 128).clamp(-256, 256);
             update_correction_history(
                 &mut self.histories,
                 pos,
                 &self.stack[..],
                 s,
-                1069 * bonus / 1024,
+                params::CORR_BONUS_SCALE.get() * bonus / 1024,
             );
         }
 

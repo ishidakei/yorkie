@@ -39,11 +39,29 @@ use crate::config::GENERATE_ALL_LEGAL_MOVES;
 #[cfg(test)]
 use crate::history::LOW_PLY_HISTORY_SIZE;
 use crate::history::{ContPlane, MoveRow, PawnPlane, PieceSquare, PieceToHistory};
+use crate::params;
 use crate::update::WorkerHistories;
 
 /// `goodQuietThreshold`: quiets scoring above this go to `GOOD_QUIET`, the rest
 /// to `BAD_QUIET`.
-const GOOD_QUIET_THRESHOLD: i32 = -14000;
+#[inline(always)]
+fn good_quiet_threshold() -> i32 {
+    params::MP_GOOD_QUIET_THRESHOLD.get()
+}
+
+/// The SEE threshold a capture scored `value` must pass to be a good capture:
+/// `-value / 18` at the default, read as `-value * 1024 / k`. A capture's
+/// score stays under 2^17 in magnitude, so the product stays inside `i32`.
+#[inline(always)]
+fn good_capture_see(value: i32) -> i32 {
+    -value * 1024 / params::MP_GOOD_CAPTURE_SEE_DIV.get()
+}
+
+/// The quiet moves are sorted down to this score.
+#[inline(always)]
+fn quiet_sort_limit(depth: i32) -> i32 {
+    params::MP_QUIET_SORT.get() * depth
+}
 
 /// The reference `MovePicker`'s fixed buffer capacity. The maximum number of
 /// legal moves in a shogi position is 593; 600 leaves a small margin.
@@ -241,7 +259,8 @@ fn score_capture(pos: &Position, m: Move, hist: &WorkerHistories) -> i32 {
     let Some(victim) = pos.board().get(to) else {
         return 0;
     };
-    hist.capture.get(moved, to, victim) + 7 * piece_value(victim)
+    hist.capture.get(moved, to, victim)
+        + piece_value(victim) * params::MP_CAPTURE_WEIGHT.get() / 256
 }
 
 /// `score<EVASIONS>` for a single evasion. The `1 << 28` term makes capturing
@@ -283,10 +302,10 @@ fn score_quiet(
     let to = m.to_sq();
     let pc = m.moved_piece_after();
 
-    let mut value = 2 * hist.main.get(us, m);
+    let mut value = hist.main.get(us, m) * params::MP_MAIN_WEIGHT.get() / 256;
     // `pawn_entry(pos)` selects the plane by `pos.pawn_key()`, then indexes
     // `[pc][to]`.
-    value += 2 * hist.shared.pawn_get(pos.pawn_key(), pc, to);
+    value += hist.shared.pawn_get(pos.pawn_key(), pc, to) * params::MP_PAWN_WEIGHT.get() / 256;
     value += hist.continuation.get_at(cont_planes[0], pc, to);
     value += hist.continuation.get_at(cont_planes[1], pc, to);
     value += hist.continuation.get_at(cont_planes[2], pc, to);
@@ -296,14 +315,15 @@ fn score_quiet(
     // Bonus for a direct check that is not a losing sacrifice. Reads the
     // `checkSquares` snapshot taken once at `QUIET_INIT` entry, rather than
     // re-entering the lazy `check_info()` accessor per scored quiet.
-    if check_squares.gives_direct_check(m) && pos.see_ge(m, -75) {
-        value += 16384;
+    if check_squares.gives_direct_check(m) && pos.see_ge(m, params::MP_CHECK_SEE.get()) {
+        value += params::MP_CHECK_BONUS.get();
     }
 
     // lowPlyHistory near the root. Integer division truncates toward zero
     // exactly as the C++ `/` does.
     if (ply as usize) < LOW_PLY_HISTORY_SIZE {
-        value += 8 * hist.low_ply.get(ply as usize, m) / (1 + ply);
+        value +=
+            hist.low_ply.get(ply as usize, m) * params::MP_LOW_PLY_WEIGHT.get() / 256 / (1 + ply);
     }
 
     value
@@ -350,8 +370,8 @@ impl<'h> QuietScorer<'h> {
     fn score(&self, pos: &Position, m: Move, check_squares: &CheckSquares) -> i32 {
         let ps = PieceSquare::new(m.moved_piece_after(), m.to_sq());
 
-        let mut value = 2 * self.main.get(m);
-        value += 2 * self.pawn.get(ps);
+        let mut value = self.main.get(m) * params::MP_MAIN_WEIGHT.get() / 256;
+        value += self.pawn.get(ps) * params::MP_PAWN_WEIGHT.get() / 256;
         value += self.cont[0].get_ps(ps);
         value += self.cont[1].get_ps(ps);
         value += self.cont[2].get_ps(ps);
@@ -361,13 +381,13 @@ impl<'h> QuietScorer<'h> {
         // Bonus for a direct check that is not a losing sacrifice. Reads the
         // `checkSquares` snapshot taken once at `QUIET_INIT` entry, rather than
         // re-entering the lazy `check_info()` accessor per scored quiet.
-        if check_squares.gives_direct_check(m) && pos.see_ge(m, -75) {
-            value += 16384;
+        if check_squares.gives_direct_check(m) && pos.see_ge(m, params::MP_CHECK_SEE.get()) {
+            value += params::MP_CHECK_BONUS.get();
         }
 
         // Integer division truncates toward zero exactly as the C++ `/` does.
         if let Some((row, divisor)) = self.low_ply {
-            value += 8 * row.get(m) / divisor;
+            value += row.get(m) * params::MP_LOW_PLY_WEIGHT.get() / 256 / divisor;
         }
 
         value
@@ -379,7 +399,7 @@ impl<'h> QuietScorer<'h> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     /// Main search, not in check: captures split by SEE (`GOOD`/`BAD_CAPTURE`),
-    /// then quiets split by the `-14000` threshold.
+    /// then quiets split by the good-quiet threshold (`-14000` by default).
     Main,
     /// Quiescence, not in check: captures only, full sort, no split.
     QSearch,
@@ -423,7 +443,7 @@ pub struct MovePicker<'a> {
     kind: Kind,
     tt: Option<Move>,
     /// Search depth (`> 0` for the main picker) — the `QUIET_INIT` partial-sort
-    /// limit is `-3560 * depth`. `0` for qsearch / ProbCut.
+    /// limit is `-3560 * depth` by default. `0` for qsearch / ProbCut.
     depth: i32,
     /// `ss->ply`, read by `score<QUIETS>`'s `lowPlyHistory` term. Only the main
     /// picker scores quiets, so it is irrelevant for the other kinds.
@@ -674,7 +694,7 @@ impl<'a> MovePicker<'a> {
         for e in quiets.iter_mut() {
             e.value = scorer.score(pos, e.mv, &check_squares);
         }
-        partial_insertion_sort(quiets, -3560 * depth);
+        partial_insertion_sort(quiets, quiet_sort_limit(depth));
     }
 
     /// The next move in picker order, or `None` when exhausted. `hist` are the
@@ -710,7 +730,7 @@ impl<'a> MovePicker<'a> {
                 Stage::GoodCapture => {
                     if let Some(m) = self.select(pos, |s, p| {
                         let e = s.scratch[s.cur];
-                        if p.see_ge(e.mv, -e.value / 18) {
+                        if p.see_ge(e.mv, good_capture_see(e.value)) {
                             true
                         } else {
                             s.scratch.as_mut_slice().swap(s.end_bad_captures, s.cur);
@@ -751,7 +771,7 @@ impl<'a> MovePicker<'a> {
                     if !self.skip_quiets
                         && let Some(m) = self.select(pos, |s, p| {
                             let e = s.scratch[s.cur];
-                            e.value > GOOD_QUIET_THRESHOLD && p.is_legal(e.mv)
+                            e.value > good_quiet_threshold() && p.is_legal(e.mv)
                         })
                     {
                         return Some(m);
@@ -783,7 +803,7 @@ impl<'a> MovePicker<'a> {
                     }
                     return self.select(pos, |s, p| {
                         let e = s.scratch[s.cur];
-                        e.value <= GOOD_QUIET_THRESHOLD && p.is_legal(e.mv)
+                        e.value <= good_quiet_threshold() && p.is_legal(e.mv)
                     });
                 }
 
@@ -854,8 +874,8 @@ mod twin {
     use yorkie_state::{Move, Position};
 
     use super::{
-        ContPlane, ExtMove, GENERATE_ALL_LEGAL_MOVES, GOOD_QUIET_THRESHOLD, Kind,
-        partial_insertion_sort, score_capture, score_evasion, score_quiet,
+        ContPlane, ExtMove, GENERATE_ALL_LEGAL_MOVES, Kind, good_capture_see, good_quiet_threshold,
+        partial_insertion_sort, quiet_sort_limit, score_capture, score_evasion, score_quiet,
     };
     use crate::update::WorkerHistories;
 
@@ -1054,7 +1074,7 @@ mod twin {
                 Kind::Main => {
                     for i in 0..self.scratch.scored.len() {
                         let e = self.scratch.scored[i];
-                        if pos.see_ge(e.mv, -e.value / 18) {
+                        if pos.see_ge(e.mv, good_capture_see(e.value)) {
                             self.scratch.good_captures.push(e.mv);
                         } else {
                             self.scratch.bad_captures.push(e.mv);
@@ -1086,10 +1106,10 @@ mod twin {
                 let value = score_quiet(pos, m, self.ply, hist, self.cont_planes, &check_squares);
                 self.scratch.scored.push(ExtMove { mv: m, value });
             }
-            partial_insertion_sort(&mut self.scratch.scored, -3560 * self.depth);
+            partial_insertion_sort(&mut self.scratch.scored, quiet_sort_limit(self.depth));
             for i in 0..self.scratch.scored.len() {
                 let e = self.scratch.scored[i];
-                if e.value > GOOD_QUIET_THRESHOLD {
+                if e.value > good_quiet_threshold() {
                     self.scratch.good_quiets.push(e.mv);
                 } else {
                     self.scratch.bad_quiets.push(e.mv);

@@ -273,7 +273,7 @@ impl CapturePieceToHistory {
     }
 
     /// Overwrite every entry with `v` — the reference's
-    /// `captureHistory.fill(v)` (init `-678`).
+    /// `captureHistory.fill(v)` (init `-678` by default).
     pub fn fill(&mut self, v: i16) {
         self.table
             .iter_mut()
@@ -572,9 +572,12 @@ impl CorrChannel {
 }
 
 /// Reference `SharedHistories::clear()` init values: correction entries `0`,
-/// pawn entries `-1238`.
+/// pawn entries the registered `pawn_history_init`, whose range lies inside
+/// `i16`.
 const CORRECTION_INIT: i16 = 0;
-const PAWN_INIT: i16 = -1238;
+fn pawn_init() -> i16 {
+    crate::params::PAWN_HISTORY_INIT.get() as i16
+}
 
 /// The atomic gravity update: identical arithmetic to [`apply_gravity`], but a
 /// plain relaxed load-modify-store rather than a CAS loop. The reference does
@@ -755,7 +758,7 @@ impl SharedHistories {
         // node, and so static storage an earlier set left values in starts
         // over.
         out.fill_correction(CORRECTION_INIT);
-        out.fill_pawn(PAWN_INIT);
+        out.fill_pawn(pawn_init());
         out
     }
 
@@ -912,7 +915,7 @@ impl SharedHistories {
     }
 
     /// The pawn-structure bonus for piece `pc` moving to `to` in the plane keyed
-    /// by `pawn_key`. `-1238` on a fresh table.
+    /// by `pawn_key`. `-1238` on a fresh table by default.
     pub fn pawn_get(&self, pawn_key: u64, pc: Piece, to: Square) -> i32 {
         self.pawn_cell(pawn_key, pc, to).load(Ordering::Relaxed) as i32
     }
@@ -1468,7 +1471,7 @@ mod shared_tests {
             third.pawn_get(7, bp(), to()),
             second.pawn_get(7, bp(), to())
         );
-        assert_ne!(third.pawn_get(7, bp(), to()), PAWN_INIT as i32);
+        assert_ne!(third.pawn_get(7, bp(), to()), pawn_init() as i32);
         assert_ne!(third.correction_get(7, Color::Black, CorrChannel::Minor), 0);
         let other = SharedHistories::new(1);
         assert!(!other.same_tables(&second));
@@ -1501,7 +1504,7 @@ mod shared_tests {
             sh.correction_get(3, Color::White, CorrChannel::Pawn)
         );
         assert_ne!(corr[i].load(Ordering::Relaxed), 0);
-        assert_eq!(sh.pawn_get(3, bp(), to()), PAWN_INIT as i32);
+        assert_eq!(sh.pawn_get(3, bp(), to()), pawn_init() as i32);
     }
 
     /// Static storage of the wrong length is refused.

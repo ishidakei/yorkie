@@ -17,17 +17,29 @@ use crate::history::{
     ContinuationHistory, CorrChannel, CorrPlane, LOW_PLY_HISTORY_SIZE, LowPlyHistory,
     SharedHistories, TtMoveHistory,
 };
+use crate::params;
 use crate::worker_block::{BlockClaim, SearchTables};
 
-/// Reference `clear()` init constants.
-const MAIN_HISTORY_INIT: i16 = 0;
-const CAPTURE_HISTORY_INIT: i16 = -678;
-const CONTINUATION_INIT: i16 = -523;
-const CONTINUATION_CORRECTION_INIT: i16 = 6;
-/// The pawn-history init (`-1238`) is applied by the shared table
+// The reference `clear()` init values. Each parameter's range lies inside
+// `i16`, so the narrowing is exact.
+fn main_history_init() -> i16 {
+    params::MAIN_HISTORY_INIT.get() as i16
+}
+fn capture_history_init() -> i16 {
+    params::CAPTURE_HISTORY_INIT.get() as i16
+}
+fn continuation_init() -> i16 {
+    params::CONTINUATION_HISTORY_INIT.get() as i16
+}
+fn continuation_correction_init() -> i16 {
+    params::CONT_CORRECTION_INIT.get() as i16
+}
+/// The pawn-history init is applied by the shared table
 /// ([`SharedHistories::new`]); the tests below assert the bundle exposes it.
 #[cfg(test)]
-const PAWN_HISTORY_INIT: i16 = -1238;
+fn pawn_history_init() -> i16 {
+    params::PAWN_HISTORY_INIT.get() as i16
+}
 
 /// Capacity of a searched-move list (`SEARCHEDLIST_CAPACITY`): both
 /// `quietsSearched` and `capturesSearched` hold at most 32 moves.
@@ -98,9 +110,9 @@ pub struct WorkerHistories {
     /// (to `98`); `clear()` itself leaves it, so this bundle leaves it zero and
     /// the per-`go` fill happens at the root.
     pub low_ply: LowPlyHistory,
-    /// `captureHistory[pc][to][captured type]` (init `-678`).
+    /// `captureHistory[pc][to][captured type]` (init `-678` by default).
     pub capture: CapturePieceToHistory,
-    /// `continuationHistory[in_check][capture][pc][to]` planes (init `-523`).
+    /// `continuationHistory[in_check][capture][pc][to]` planes (init `-523` by default).
     pub continuation: ContinuationHistory,
     /// `continuationCorrectionHistory[pc][to]` planes (init `6`).
     pub continuation_correction: ContinuationCorrectionHistory,
@@ -249,11 +261,11 @@ impl WorkerHistories {
         if self.filled != 0 {
             return;
         }
-        self.main.fill(MAIN_HISTORY_INIT);
-        self.capture.fill(CAPTURE_HISTORY_INIT);
-        self.continuation.fill(CONTINUATION_INIT);
+        self.main.fill(main_history_init());
+        self.capture.fill(capture_history_init());
+        self.continuation.fill(continuation_init());
         self.continuation_correction
-            .fill(CONTINUATION_CORRECTION_INIT);
+            .fill(continuation_correction_init());
         if self.block.is_some() {
             self.low_ply.fill(0);
         }
@@ -395,10 +407,39 @@ impl Default for SearchStackCell {
 }
 
 /// Weights for [`update_continuation_histories`], one per ply back from the
-/// current cell starting at `ss - 1`: `{1:1157, 2:648, 3:288, 4:576, 5:140,
-/// 6:441}`. The position in the table *is* the ply distance, which is what lets
-/// the walk pair a weight with a cell by stepping backwards over the stack.
-const CONTHIST_BONUSES: [i32; 6] = [1157, 648, 288, 576, 140, 441];
+/// current cell starting at `ss - 1`. The position in the table *is* the ply
+/// distance, which is what lets the walk pair a weight with a cell by stepping
+/// backwards over the stack.
+///
+/// In every build but `tune` the weights are constants, and the table is one
+/// `static` the walk reads rather than an array assembled on each call.
+#[cfg(not(feature = "tune"))]
+#[inline(always)]
+fn conthist_bonuses() -> &'static [i32; 6] {
+    const WEIGHTS: [i32; 6] = [
+        params::CONT_WEIGHT_1.get(),
+        params::CONT_WEIGHT_2.get(),
+        params::CONT_WEIGHT_3.get(),
+        params::CONT_WEIGHT_4.get(),
+        params::CONT_WEIGHT_5.get(),
+        params::CONT_WEIGHT_6.get(),
+    ];
+    &WEIGHTS
+}
+
+/// The weights as the `tune` build holds them, read afresh on each call.
+#[cfg(feature = "tune")]
+#[inline(always)]
+fn conthist_bonuses() -> [i32; 6] {
+    [
+        params::CONT_WEIGHT_1.get(),
+        params::CONT_WEIGHT_2.get(),
+        params::CONT_WEIGHT_3.get(),
+        params::CONT_WEIGHT_4.get(),
+        params::CONT_WEIGHT_5.get(),
+        params::CONT_WEIGHT_6.get(),
+    ]
+}
 
 /// A *plain* capture test (`Position::capture`): a non-drop landing on an
 /// occupied square. In this engine `capture_stage == capture`, so this is the
@@ -422,12 +463,13 @@ pub fn update_continuation_histories(
     to: Square,
     bonus: i32,
 ) {
-    debug_assert!(ss >= CONTHIST_BONUSES.len());
+    let weights = conthist_bonuses();
+    debug_assert!(ss >= weights.len());
     let in_check = stack[ss].in_check;
     // Walking the cells below `ss` backwards pairs each weight with the ply it
     // belongs to, and the `zip` stops at the shorter of the two — so the walk
     // carries the bound that `stack[ss - i]` had to be checked for.
-    let plies_back = CONTHIST_BONUSES.iter().zip(stack[..ss].iter().rev());
+    let plies_back = weights.iter().zip(stack[..ss].iter().rev());
     for (distance, (weight, prev)) in plies_back.enumerate() {
         let i = distance + 1;
         // Only update the first 2 continuation histories if we are in check.
@@ -435,7 +477,7 @@ pub fn update_continuation_histories(
             break;
         }
         if prev.current_move.is_some_and(Move::is_ok) {
-            let value = (bonus * weight / 1024) + 88 * (i < 2) as i32;
+            let value = (bonus * weight / 1024) + params::CONT_NEAR_PLY.get() * (i < 2) as i32;
             hist.continuation.update_at(prev.cont_hist, pc, to, value);
         }
     }
@@ -456,16 +498,30 @@ pub fn update_quiet_histories(
 
     let ply = stack[ss].ply;
     if (ply as usize) < LOW_PLY_HISTORY_SIZE {
-        hist.low_ply.update(ply as usize, m, bonus * 761 / 1024);
+        hist.low_ply
+            .update(ply as usize, m, bonus * params::LOW_PLY_BONUS.get() / 1024);
     }
 
     // `pos.moved_piece(move)` is `moved_piece_after` in this engine.
     let moved = m.moved_piece_after();
-    update_continuation_histories(hist, stack, ss, moved, m.to_sq(), bonus * 955 / 1024);
+    update_continuation_histories(
+        hist,
+        stack,
+        ss,
+        moved,
+        m.to_sq(),
+        bonus * params::CONT_BONUS.get() / 1024,
+    );
 
-    // Asymmetric pawn-history bump: +850/1024 of a positive bonus, +550/1024 of
-    // a non-positive one.
-    let pawn_bonus = bonus * if bonus > 0 { 850 } else { 550 } / 1024;
+    // Asymmetric pawn-history bump: one share of a positive bonus, another of a
+    // non-positive one.
+    let pawn_bonus = bonus
+        * if bonus > 0 {
+            params::PAWN_BONUS.get()
+        } else {
+            params::PAWN_MALUS.get()
+        }
+        / 1024;
     hist.shared
         .pawn_update(pos.pawn_key(), moved, m.to_sq(), pawn_bonus);
 }
@@ -494,18 +550,27 @@ pub fn update_all_stats(
     let moved_piece = best_move.moved_piece_after();
     let prev = &stack[ss - 1];
 
-    let bonus = (128 * depth - 77).min(1529)
-        + 353 * (Some(best_move) == tt_move) as i32
-        + prev.stat_score / 32;
-    let malus = (882 * depth - 204).min(2122);
+    let bonus = (params::STAT_BONUS_DEPTH.get() * depth + params::STAT_BONUS_OFFSET.get())
+        .min(params::STAT_BONUS_MAX.get())
+        + params::STAT_BONUS_TT_MOVE.get() * (Some(best_move) == tt_move) as i32
+        + prev.stat_score / params::STAT_BONUS_PARENT_DIV.get();
+    let malus = (params::STAT_MALUS_DEPTH.get() * depth + params::STAT_MALUS_OFFSET.get())
+        .min(params::STAT_MALUS_MAX.get());
 
     if !is_capture(pos, best_move) {
-        update_quiet_histories(hist, pos, stack, ss, best_move, bonus * 806 / 1024);
+        update_quiet_histories(
+            hist,
+            pos,
+            stack,
+            ss,
+            best_move,
+            bonus * params::QUIET_BONUS_SCALE.get() / 1024,
+        );
 
         // Decrease stats for all non-best quiet moves.
-        let mut actual_malus = malus * 1113 / 1024;
+        let mut actual_malus = malus * params::QUIET_MALUS_SCALE.get() / 1024;
         for mv in quiets_searched.iter().flatten() {
-            actual_malus = actual_malus * 977 / 1024;
+            actual_malus = actual_malus * params::QUIET_MALUS_DECAY.get() / 1024;
             update_quiet_histories(hist, pos, stack, ss, *mv, -actual_malus);
         }
     } else if let Some(captured) = pos.board().get(best_move.to_sq()) {
@@ -516,7 +581,7 @@ pub fn update_all_stats(
             moved_piece,
             best_move.to_sq(),
             captured,
-            bonus * 1286 / 1024,
+            bonus * params::CAPTURE_BONUS_SCALE.get() / 1024,
         );
     }
 
@@ -533,7 +598,7 @@ pub fn update_all_stats(
             ss - 1,
             prev_piece,
             prev_sq,
-            -malus * 616 / 1024,
+            -malus * params::REFUTATION_PENALTY.get() / 1024,
         );
     }
 
@@ -541,8 +606,12 @@ pub fn update_all_stats(
     for &mv in captures_searched.iter().flatten() {
         let moved = mv.moved_piece_after();
         if let Some(captured) = pos.board().get(mv.to_sq()) {
-            hist.capture
-                .update(moved, mv.to_sq(), captured, -malus * 1559 / 1024);
+            hist.capture.update(
+                moved,
+                mv.to_sq(),
+                captured,
+                -malus * params::CAPTURE_MALUS_SCALE.get() / 1024,
+            );
         }
     }
 }
@@ -564,19 +633,19 @@ pub fn update_correction_history(
         pos.minor_piece_key(),
         us,
         CorrChannel::Minor,
-        bonus * 153 / 128,
+        bonus * params::CORR_UPDATE_MINOR.get() / 128,
     );
     hist.shared.correction_update(
         pos.non_pawn_key(Color::White),
         us,
         CorrChannel::NonPawnWhite,
-        bonus * 187 / 128,
+        bonus * params::CORR_UPDATE_NON_PAWN.get() / 128,
     );
     hist.shared.correction_update(
         pos.non_pawn_key(Color::Black),
         us,
         CorrChannel::NonPawnBlack,
-        bonus * 187 / 128,
+        bonus * params::CORR_UPDATE_NON_PAWN.get() / 128,
     );
 
     // `ss - 1`, `ss - 2` and `ss - 4` all sit in the four cells below `ss`, so
@@ -589,10 +658,18 @@ pub fn update_correction_history(
     {
         let to = m.to_sq();
         if let Some(pc) = pos.board().get(to) {
-            hist.continuation_correction
-                .update_at(prev2.cont_corr, pc, to, bonus * 126 / 128);
-            hist.continuation_correction
-                .update_at(prev4.cont_corr, pc, to, bonus * 63 / 128);
+            hist.continuation_correction.update_at(
+                prev2.cont_corr,
+                pc,
+                to,
+                bonus * params::CORR_UPDATE_CONT_2.get() / 128,
+            );
+            hist.continuation_correction.update_at(
+                prev4.cont_corr,
+                pc,
+                to,
+                bonus * params::CORR_UPDATE_CONT_4.get() / 128,
+            );
         }
     }
 }
@@ -760,29 +837,32 @@ mod tests {
         let m = Move::make(Square::new(4, 4).unwrap(), to, bp);
 
         // mainHistory init 0 (both a low and a high index).
-        assert_eq!(hist.main.get(Color::Black, m), MAIN_HISTORY_INIT as i32);
-        assert_eq!(hist.main.get(Color::White, m), MAIN_HISTORY_INIT as i32);
+        assert_eq!(hist.main.get(Color::Black, m), main_history_init() as i32);
+        assert_eq!(hist.main.get(Color::White, m), main_history_init() as i32);
         // lowPlyHistory left zero by clear() (per-`go` fill is elsewhere).
         assert_eq!(hist.low_ply.get(0, m), 0);
         assert_eq!(hist.low_ply.get(LOW_PLY_HISTORY_SIZE - 1, m), 0);
         // captureHistory init -678 (occupied-victim and empty-victim slots).
-        assert_eq!(hist.capture.get(bs, to, bp), CAPTURE_HISTORY_INIT as i32);
-        assert_eq!(hist.capture.get_empty(bs, to), CAPTURE_HISTORY_INIT as i32);
+        assert_eq!(hist.capture.get(bs, to, bp), capture_history_init() as i32);
+        assert_eq!(
+            hist.capture.get_empty(bs, to),
+            capture_history_init() as i32
+        );
         // pawnHistory init -1238, across distinct pawn-key planes.
-        assert_eq!(hist.shared.pawn_get(0, bs, to), PAWN_HISTORY_INIT as i32);
+        assert_eq!(hist.shared.pawn_get(0, bs, to), pawn_history_init() as i32);
         assert_eq!(
             hist.shared.pawn_get(0xFFFF, bs, to),
-            PAWN_HISTORY_INIT as i32
+            pawn_history_init() as i32
         );
         // continuationHistory init -523, across distinct planes.
         assert_eq!(
             hist.continuation.get_at(ContPlane::SENTINEL, bs, to),
-            CONTINUATION_INIT as i32
+            continuation_init() as i32
         );
         let last_plane = ContinuationHistory::plane_index(true, true, bs, to);
         assert_eq!(
             hist.continuation.get_at(last_plane, bs, to),
-            CONTINUATION_INIT as i32
+            continuation_init() as i32
         );
         // correctionHistory init 0 across all four channels and both colors.
         for &color in &[Color::Black, Color::White] {
@@ -800,12 +880,12 @@ mod tests {
         assert_eq!(
             hist.continuation_correction
                 .get_at(CorrPlane::SENTINEL, bs, to),
-            CONTINUATION_CORRECTION_INIT as i32,
+            continuation_correction_init() as i32,
         );
         let deep = ContinuationCorrectionHistory::plane_index(bs, to);
         assert_eq!(
             hist.continuation_correction.get_at(deep, bs, to),
-            CONTINUATION_CORRECTION_INIT as i32,
+            continuation_correction_init() as i32,
         );
         // ttMoveHistory init 0.
         assert_eq!(hist.tt_move.get(), 0);
@@ -947,7 +1027,7 @@ mod tests {
         update_continuation_histories(&mut hist, &stack, ss, pc, to, bonus);
 
         for (idx, i) in (1..=6).enumerate() {
-            let weight = CONTHIST_BONUSES[idx];
+            let weight = conthist_bonuses()[idx];
             let write = (bonus * weight / 1024) + 88 * (i < 2) as i32;
             let expected = apply_gravity(pre[idx] as i16, write, CONTINUATION_HISTORY_D) as i32;
             assert_eq!(
@@ -980,16 +1060,16 @@ mod tests {
         // Planes 1,2 changed; 3..6 remain at the -523 init.
         assert_ne!(
             hist.continuation.get_at(ContPlane::new(1), pc, to),
-            CONTINUATION_INIT as i32
+            continuation_init() as i32
         );
         assert_ne!(
             hist.continuation.get_at(ContPlane::new(2), pc, to),
-            CONTINUATION_INIT as i32
+            continuation_init() as i32
         );
         for i in 3..=6 {
             assert_eq!(
                 hist.continuation.get_at(ContPlane::new(i), pc, to),
-                CONTINUATION_INIT as i32,
+                continuation_init() as i32,
                 "plane {i} must be untouched in check",
             );
         }
@@ -1017,12 +1097,12 @@ mod tests {
 
         assert_ne!(
             hist.continuation.get_at(ContPlane::new(1), pc, to),
-            CONTINUATION_INIT as i32
+            continuation_init() as i32
         );
         // Plane 0 (the sentinel the other cells point at) is untouched.
         assert_eq!(
             hist.continuation.get_at(ContPlane::SENTINEL, pc, to),
-            CONTINUATION_INIT as i32
+            continuation_init() as i32
         );
     }
 
@@ -1070,7 +1150,7 @@ mod tests {
             apply_gravity(low_pre, bonus * 761 / 1024, MAIN_HISTORY_D) as i32,
         );
         // continuation write uses bonus*955/1024 (+88 since i==1) at plane 3.
-        let cont_write = (bonus * 955 / 1024 * CONTHIST_BONUSES[0] / 1024) + 88;
+        let cont_write = (bonus * 955 / 1024 * conthist_bonuses()[0] / 1024) + 88;
         assert_eq!(
             hist.continuation.get_at(ContPlane::new(3), moved, to),
             apply_gravity(cont_pre, cont_write, CONTINUATION_HISTORY_D) as i32,
@@ -1301,7 +1381,7 @@ mod tests {
             false,
         );
 
-        let write = (-malus * 616 / 1024 * CONTHIST_BONUSES[0] / 1024) + 88;
+        let write = (-malus * 616 / 1024 * conthist_bonuses()[0] / 1024) + 88;
         assert_eq!(
             hist.continuation
                 .get_at(ContPlane::new(5), prev_piece, prev_sq),
@@ -1420,7 +1500,7 @@ mod tests {
         assert_eq!(
             hist.continuation_correction
                 .get_at(sentinel, bp, Square::new(4, 3).unwrap()),
-            CONTINUATION_CORRECTION_INIT as i32,
+            continuation_correction_init() as i32,
         );
     }
 }
