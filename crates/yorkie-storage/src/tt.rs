@@ -374,9 +374,10 @@ pub struct TTData {
 }
 
 impl TTData {
-    /// The miss sentinel a failed [`TranspositionTable::probe`] returns.
+    /// The miss sentinel a failed [`TranspositionTable::probe`] returns, and
+    /// what a search reads an entry it rejects as.
     #[inline]
-    fn none() -> TTData {
+    pub fn none() -> TTData {
         TTData {
             move16: None,
             value: VALUE_NONE,

@@ -544,6 +544,27 @@ pub fn declaration_win(pos: &Position, config: &EnteringKingConfig) -> Option<Mo
     }
 }
 
+/// Whether the side to move's king stands where the compiled rule could let it
+/// declare: inside the enemy three ranks under a point rule, within a step of
+/// the try square's rank under the try rule, nowhere under no rule.
+///
+/// False implies [`declaration_win`] is `None`, so a search node runs this
+/// one bitboard lookup and skips the full predicate, which scans the board,
+/// wherever the king is elsewhere. The guard follows `SH11235/rshogi#1639`.
+#[inline]
+pub fn may_declare(pos: &Position) -> bool {
+    let us = pos.side_to_move();
+    let ranks = match ENTERING_KING_RULE {
+        EnteringKingRule::None => return false,
+        EnteringKingRule::Try => 2,
+        _ => 3,
+    };
+    pos.king_square(us).is_some_and(|sq| match us {
+        Color::Black => sq.rank() < ranks,
+        Color::White => sq.rank() >= 9 - ranks,
+    })
+}
+
 /// The CSA point-law branch with the per-side threshold taken from the
 /// precomputed `points` (`enteringKingPoint[us]`).
 fn declaration_win_points(pos: &Position, points: [i32; Color::COUNT]) -> Option<Move> {
@@ -832,6 +853,31 @@ mod tests {
                 "compiled rule {ENTERING_KING_RULE:?} on `{sfen}`"
             );
         }
+    }
+
+    /// The guard never turns a declaration away: wherever it says no, the
+    /// compiled rule's predicate says no too, for either side to move.
+    #[test]
+    fn may_declare_holds_wherever_the_compiled_rule_declares() {
+        for sfen in [
+            NYUGYOKU,
+            STARTPOS,
+            IN_CHECK,
+            "GGGGKGGGG/GG7/9/9/9/9/9/9/8k b 18P 1",
+            "8K/9/9/9/9/9/9/gg7/ggggkgggg w 17p 1",
+            "9/9/9/4K4/9/9/9/9/8k b 2R4P 1",
+            "3k5/4K4/9/9/9/9/9/9/9 b - 1",
+            "9/9/9/9/9/9/9/4k4/5K3 w - 1",
+        ] {
+            let p = pos(sfen);
+            if declaration_win(&p, &EnteringKingConfig::new(&p)).is_some() {
+                assert!(may_declare(&p), "`{sfen}` declares past the guard");
+            }
+        }
+        if ENTERING_KING_RULE != EnteringKingRule::None {
+            assert!(may_declare(&pos(NYUGYOKU)));
+        }
+        assert!(!may_declare(&pos(STARTPOS)));
     }
 
     #[test]

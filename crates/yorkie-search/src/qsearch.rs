@@ -43,7 +43,7 @@ struct Held {
     marks: ValueMarks,
     causes: PathCauses,
 }
-use yorkie_storage::{Bound, TranspositionTable, TtSlot, Value};
+use yorkie_storage::{Bound, TTData, TranspositionTable, TtSlot, Value};
 
 #[cfg(feature = "verbose2")]
 use crate::config::GENERATE_ALL_LEGAL_MOVES;
@@ -54,6 +54,7 @@ use crate::movepick::{MovePicker, PickerScratch};
 use crate::params;
 use crate::root::{
     EnteringKingConfig, RootKind, RootMove, RootOutcome, declaration_win, generate_root_moves,
+    may_declare,
 };
 use crate::timeman::TimeManagement;
 use crate::update::{
@@ -2012,6 +2013,17 @@ impl<N: NetworkParams> QSearch<N> {
         }
     }
 
+    /// [`declaration_win`] behind the [`may_declare`] guard, so a node whose
+    /// king stands outside the declaring ranks pays one bitboard lookup.
+    #[inline]
+    fn declaration(&self, pos: &Position) -> Option<Move> {
+        if may_declare(pos) {
+            declaration_win(pos, &self.entering_king)
+        } else {
+            None
+        }
+    }
+
     /// Write a TT entry to the exact `slot` captured by the node's initial
     /// [`TranspositionTable::locate`] probe, reproducing the reference's single-
     /// `TTWriter`-per-node discipline. Writing by a fixed slot (rather than a
@@ -2433,14 +2445,52 @@ impl<N: NetworkParams> QSearch<N> {
             TranspositionTable::shared().locate(pos_key, side, |m16| pos.to_move(m16).is_some());
         #[cfg(feature = "dupstats")]
         let tt_data = crate::channels::mask_pv(tt_data);
-        let tt_hit = found && self.reads_tt();
+        let mut tt_hit = found && self.reads_tt();
         // Widened O(1), without legal-move generation; the MovePicker's TT
         // stage re-validates with `pseudo_legal` + `is_legal`.
-        let tt_move = if tt_hit {
+        let mut tt_move = if tt_hit {
             tt_data.move16.and_then(|m16| pos.to_move(m16))
         } else {
             None
         };
+
+        // A declaring position never receives a normal table move, since both
+        // searches ask before they store one, so only an entry without a move
+        // or with the declaration's own needs the question asked. A
+        // declaration entry is asked again rather than believed: a key that
+        // only matches in its stored bits can bring one to a position that
+        // cannot declare, and that entry is then read as a miss.
+        if tt_move.is_none() || tt_move == Some(Move::win()) {
+            if let Some(mv) = self.declaration(pos) {
+                // The value is the declaration rule's.
+                #[cfg(feature = "verbose3")]
+                {
+                    self.marks.decl_rule = true;
+                }
+                let value = self.mate_for(us, ply + 1);
+                // A try is a normal move, and an entry holding a normal move
+                // is not asked again, so only the point rules' sentinel is
+                // stored.
+                if mv == Move::win() {
+                    self.tt_store(
+                        tt_slot,
+                        pos_key,
+                        value_to_tt(value, ply),
+                        tt_hit && tt_data.is_pv,
+                        Bound::Exact,
+                        DEPTH_QS,
+                        move16_of(Some(mv)),
+                        VALUE_NONE,
+                    );
+                }
+                return value;
+            }
+            if tt_move.is_some() {
+                tt_hit = false;
+                tt_move = None;
+            }
+        }
+
         let tt_value = if tt_hit {
             value_from_tt(tt_data.value, ply)
         } else {
@@ -4035,6 +4085,26 @@ impl<N: NetworkParams> QSearch<N> {
             TranspositionTable::shared().locate(pos_key, side, |m16| pos.to_move(m16).is_some());
         #[cfg(feature = "dupstats")]
         let tt_data = crate::channels::mask_pv(tt_data);
+        // A declaration entry is asked again rather than believed, as in the
+        // quiescence search, and one whose position cannot declare is read as
+        // a miss. Either way the sentinel never reaches the code below, which
+        // takes a table move for a move on the board.
+        let (tt_hit, tt_data) = if !root_node
+            && tt_hit
+            && tt_data.move16.is_some()
+            && tt_data.move16 == Move::win().move16_stored()
+        {
+            if self.declaration(pos).is_some() {
+                #[cfg(feature = "verbose3")]
+                {
+                    self.marks.decl_rule = true;
+                }
+                return self.mate_for(us, ply + 1);
+            }
+            (false, TTData::none())
+        } else {
+            (tt_hit, tt_data)
+        };
         self.stack[s].tt_hit = tt_hit;
         // At the root the current PV line's move is treated as the TT move
         // regardless of what the probe returned; the rest of `tt_data` is still
@@ -4183,8 +4253,46 @@ impl<N: NetworkParams> QSearch<N> {
         #[cfg(feature = "dupstats")]
         let (_dup_frame, _dup_presence) = self.dup_enter(pos_key, depth, dup_at);
 
-        // Step 5. Mate-in-1 and declaration win.
+        // Step 5. Declaration win and mate-in-1. The declaration is asked first:
+        // the mate in one would otherwise store a normal move for a declaring
+        // position, and an entry with a normal move is not asked again.
         let mut unadjusted_static_eval = VALUE_NONE;
+        if (tt_move.is_none() || pv_node)
+            && let Some(mv) = self.declaration(pos)
+        {
+            // The value is the declaration rule's; a node that asked and was
+            // told no is not marked.
+            #[cfg(feature = "verbose3")]
+            {
+                self.marks.decl_rule = true;
+            }
+            best_value = self.mate_for(us, ply + 1);
+            // A try is a normal move, so only the point rules' sentinel is
+            // stored, where a later visit asks the question again.
+            if mv == Move::win() && !excluded_move.is_some_and(Move::is_ok) {
+                #[cfg(feature = "dupstats")]
+                let dup_updates = self.dup_store(
+                    tt_slot,
+                    pos_key,
+                    (MAX_PLY - 1).min(depth + 6),
+                    tt_hit,
+                    dup_at,
+                );
+                self.tt_store(
+                    tt_slot,
+                    pos_key,
+                    value_to_tt(best_value, ply),
+                    ttpv,
+                    Bound::Exact,
+                    (MAX_PLY - 1).min(depth + 6),
+                    move16_of(Some(mv)),
+                    VALUE_NONE,
+                );
+                #[cfg(feature = "dupstats")]
+                self.dup_stored(pos_key, dup_updates);
+            }
+            return best_value;
+        }
         if !root_node
             && !tt_hit
             && !excluded_move.is_some_and(Move::is_ok)
@@ -4216,15 +4324,6 @@ impl<N: NetworkParams> QSearch<N> {
             #[cfg(feature = "dupstats")]
             self.dup_stored(pos_key, dup_updates);
             return best_value;
-        }
-        if (tt_move.is_none() || pv_node) && declaration_win(pos, &self.entering_king).is_some() {
-            // The value is the declaration rule's; a node that asked and was
-            // told no is not marked.
-            #[cfg(feature = "verbose3")]
-            {
-                self.marks.decl_rule = true;
-            }
-            return self.mate_for(us, ply + 1);
         }
 
         // Step 6. Static evaluation.
@@ -7296,6 +7395,113 @@ mod tests {
         let (found, data) = probe_root(&table, &p);
         assert!(found, "the node stores its own entry over the skipped one");
         assert_ne!(data.value, 500);
+    }
+
+    // The declaration inside the search, per side to move. Each declaring
+    // position is the other's 180-degree turn: a 32-point entered king with a
+    // gold and a silver that can step back onto an undefended pawn.
+
+    const BLACK_DECLARES_WITH_A_CAPTURE: &str = "+R+R+B+B5/3GKG3/2SGGGS2/3p5/9/9/9/9/4k4 b R 1";
+    const WHITE_DECLARES_WITH_A_CAPTURE: &str = "4K4/9/9/9/9/5P3/2sgggs2/3gkg3/5+b+b+r+r w r 1";
+
+    /// A declaring position the quiescence search meets first, and a non-PV
+    /// main-search node meets after it. Each capture's child is seeded to fail
+    /// low by 500, so a quiescence search that searched a capture instead of
+    /// asking would leave a normal move in the table, and the main-search node
+    /// would skip its own check on seeing it.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_declaration_first_met_in_the_quiescence_search_is_a_win_in_the_main_search() {
+        let net = zero_net();
+        for sfen in [BLACK_DECLARES_WITH_A_CAPTURE, WHITE_DECLARES_WITH_A_CAPTURE] {
+            let table = fresh_tt();
+            let p = pos(sfen);
+            assert_eq!(
+                declaration_win(&p, &EnteringKingConfig::new(&p)),
+                Some(Move::win()),
+                "`{sfen}` declares"
+            );
+            assert!(p.mate_1ply().is_none(), "`{sfen}` has no mate in one");
+
+            for m in captures(&p) {
+                let mut child = p.clone();
+                let _undo = child.do_move(m);
+                prewrite(&table, &child, -500, false, Bound::Upper, DEPTH_QS, None, 0);
+            }
+
+            let leaf = {
+                let mut q = QSearch::new(net.network());
+                q.run(&mut p.clone(), 0, 1, false, true)
+            };
+            assert!(
+                is_win(leaf.value),
+                "`{sfen}`: the leaf is a win, got {}",
+                leaf.value
+            );
+            assert_eq!(leaf.nodes, 0, "`{sfen}`: the leaf searches no move");
+            let (found, data) = probe_root(&table, &p);
+            assert!(found);
+            assert_eq!(data.move16, Move::win().move16_stored(), "`{sfen}`");
+            assert_eq!(data.bound, Bound::Exact);
+
+            let mut q = QSearch::new(net.network());
+            let interior = q.run_search(&mut p.clone(), 0, 1, 1, true, false);
+            assert!(
+                is_win(interior),
+                "`{sfen}`: the non-PV node is a win, got {interior}"
+            );
+            assert_eq!(q.nodes, 0, "`{sfen}`: the stored declaration is taken");
+        }
+    }
+
+    /// A declaration entry for a position that cannot declare, as a key
+    /// matching only in its stored bits brings: both searches read it as a
+    /// miss, and neither returns its win. The kings stand in the enemy camp
+    /// in one pair of cases and at home in the other, so both the full
+    /// predicate and its guard say no.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_declaration_entry_for_a_position_that_cannot_declare_is_a_miss() {
+        let net = zero_net();
+        for sfen in [
+            "4K4/9/9/9/9/9/9/9/4k4 b - 1",
+            "4K4/9/9/9/9/9/9/9/4k4 w - 1",
+            "4k4/9/9/9/9/9/9/9/4K4 b - 1",
+            "4k4/9/9/9/9/9/9/9/4K4 w - 1",
+        ] {
+            let table = fresh_tt();
+            let p = pos(sfen);
+            assert!(declaration_win(&p, &EnteringKingConfig::new(&p)).is_none());
+            let stale = |table: &TranspositionTable| {
+                table.clear();
+                prewrite(
+                    table,
+                    &p,
+                    value_to_tt(mate_in(1), 0),
+                    false,
+                    Bound::Exact,
+                    MAX_PLY - 1,
+                    Move::win().move16_stored(),
+                    VALUE_NONE,
+                );
+            };
+
+            stale(&table);
+            let leaf = {
+                let mut q = QSearch::new(net.network());
+                q.run(&mut p.clone(), 0, 1, false, true)
+            };
+            assert_eq!(leaf.value, 0, "`{sfen}`: the stand pat, not the stored win");
+
+            stale(&table);
+            let mut q = QSearch::new(net.network());
+            let interior = q.run_search(&mut p.clone(), 0, 1, 3, true, false);
+            assert!(
+                !is_win(interior),
+                "`{sfen}`: the non-PV node is searched, got {interior}"
+            );
+            assert!(q.nodes > 0, "`{sfen}`: the node is searched");
+        }
     }
 
     #[cfg_attr(miri, ignore)]

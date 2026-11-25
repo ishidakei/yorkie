@@ -19,6 +19,12 @@ YaneuraOu の探索部は同じく GPLv3 で公開されている Stockfish か�
 そのため本ソフトウェアは Stockfish の派生物でもあります。Stockfish の著作権は
 Stockfish の開発者に帰属します。
 
+本ソフトウェアは静止探索でも入玉宣言勝ちを判定します。判定の前には、手番側の玉が宣言勝ちの
+成立しうる位置にいるかだけを調べ、いなければ判定そのものを省きます。その位置は、ビルド時の
+`entering_king_rule` が `CSARule27` などの点数のルールなら敵陣の三段以内、`TryRule` なら
+相手側の端から二段以内です。この安価な前提条件は同じく GPLv3 で公開されている
+rshogi（<https://github.com/SH11235/rshogi>）に倣ったものです。
+
 上流のソースコードは以下で公開されています。
 
 - YaneuraOu: <https://github.com/yaneurao/YaneuraOu>
