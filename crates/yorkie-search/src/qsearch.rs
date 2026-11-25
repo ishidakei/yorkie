@@ -3383,7 +3383,9 @@ impl<N: NetworkParams> QSearch<N> {
         #[cfg(not(feature = "verbose2"))]
         let line = &root_moves[0];
         let mut delta: Value = params::ASPIRATION_DELTA.get()
-            + (line.mean_squared_score.unsigned_abs() / 9000) as Value;
+            + (line.mean_squared_score.unsigned_abs()
+                / u64::from(params::ASPIRATION_SPREAD_DIV.get().unsigned_abs()))
+                as Value;
         let avg = line.average_score;
         let mut alpha = (avg - delta).max(-VALUE_INFINITE);
         let mut beta = (avg + delta).min(VALUE_INFINITE);
@@ -3398,8 +3400,11 @@ impl<N: NetworkParams> QSearch<N> {
             self.channels.pass = 0;
         }
         loop {
-            let adjusted_depth =
-                1.max(root_depth - failed_high_cnt - 3 * (search_again_counter + 1) / 4);
+            let adjusted_depth = 1.max(
+                root_depth
+                    - failed_high_cnt
+                    - 3 * (search_again_counter + 1) * 1024 / params::SEARCH_AGAIN_DIV.get(),
+            );
             #[cfg(feature = "dupstats")]
             let nodes_before = self.nodes;
             self.set_root_delta(window_width(alpha, beta));
@@ -3482,7 +3487,10 @@ impl<N: NetworkParams> QSearch<N> {
             } else {
                 break;
             }
-            delta += delta / 3;
+            // In `i64`: at the spread divisor's floor the half-width reaches a
+            // million, which times 1024 leaves `i32`.
+            delta +=
+                (i64::from(delta) * 1024 / i64::from(params::ASPIRATION_WIDEN_DIV.get())) as Value;
         }
 
         best_value
@@ -4435,7 +4443,7 @@ impl<N: NetworkParams> QSearch<N> {
             let margin = futility_mult * depth
                 - (2686 * improving as i32 + 362 * opponent_worsening as i32) * futility_mult
                     / 1024
-                + correction_value.abs() / 180600;
+                + correction_value.abs() / params::FUTILITY_CORRECTION_DIV.get();
             if !ttpv
                 && depth < 15
                 && eval >= beta
@@ -4458,7 +4466,7 @@ impl<N: NetworkParams> QSearch<N> {
                 && ply >= self.nmp_min_ply
                 && !is_loss(beta)
             {
-                let r = params::NMP_REDUCTION.get() + depth / 3;
+                let r = params::NMP_REDUCTION.get() + depth * 1024 / params::NMP_DEPTH_DIV.get();
                 self.stack[s].current_move = Some(Move::null());
                 self.stack[s].cont_hist = NULL_MOVE_CONT_PLANE;
                 self.stack[s].cont_corr = CorrPlane::SENTINEL;
@@ -4500,7 +4508,7 @@ impl<N: NetworkParams> QSearch<N> {
 
                     // Verify by re-searching this *same* node — same ply,
                     // same stack cell, no `do_move`.
-                    self.nmp_min_ply = ply + 3 * (depth - r) / 4;
+                    self.nmp_min_ply = ply + 3 * (depth - r) * 1024 / params::NMP_VERIFY_DIV.get();
                     #[cfg(feature = "verbose3")]
                     let node_marks = self.held();
                     let v = self.search(
@@ -4813,7 +4821,7 @@ impl<N: NetworkParams> QSearch<N> {
                         continue;
                     }
                     history += 71 * self.histories.main.get(us, mv) / 32;
-                    lmr_depth += history / 3220;
+                    lmr_depth += history / params::LMR_HISTORY_DIV.get();
                     let futility_value = static_eval
                         + 42
                         + 151 * (!best_move.is_some_and(Move::is_ok)) as i32
@@ -4853,8 +4861,8 @@ impl<N: NetworkParams> QSearch<N> {
                     - (params::SINGULAR_MARGIN.get()
                         + 66 * (self.stack[s].tt_pv && !pv_node) as i32)
                         * depth
-                        / 55;
-                let singular_depth = new_depth / 2;
+                        / params::SINGULAR_MARGIN_DIV.get();
+                let singular_depth = new_depth * 1024 / params::SINGULAR_DEPTH_DIV.get();
                 #[cfg(feature = "dupstats")]
                 self.dup.count(crate::dupstats::Event::SeTried, dup_at);
 
@@ -5005,7 +5013,7 @@ impl<N: NetworkParams> QSearch<N> {
             }
             r += 691;
             r -= move_count * 65;
-            r -= correction_value.abs() / 25600;
+            r -= correction_value.abs() / params::LMR_CORRECTION_DIV.get();
             if cut_node {
                 r += params::LMR_CUT_NODE.get() + 985 * tt_move.is_none() as i32;
             }

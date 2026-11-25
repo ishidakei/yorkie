@@ -155,6 +155,50 @@ search_params! {
     /// added. At least one, so each fail widens the window.
     ASPIRATION_DELTA = b"aspiration_delta", 5, 1..=1000;
 
+    // The divisors of the formulas above. A large one is registered as it is.
+    // A small one, `x / d`, is read as `x * 1024 / k` with the default
+    // `k = 1024 * d`: for integer `x` that is the same quotient as `x / d`,
+    // and a step of one on `k` moves the quotient by a thousandth rather than
+    // by a whole share of `d`. Every lower bound keeps the divisor positive.
+
+    /// The aspiration window's half-width: the divisor of the root score's
+    /// mean square. A mean square is at most the infinite score's square, so
+    /// the floor keeps the half-width near a million.
+    ASPIRATION_SPREAD_DIV = b"aspiration_spread_div", 9000, 1000..=100000;
+    /// The aspiration window: each fail widens the half-width by its own
+    /// `1024 / this` (a third at the default).
+    ASPIRATION_WIDEN_DIV = b"aspiration_widen_div", 3072, 1024..=16384;
+    /// The aspiration loop: a root depth searched again is shallower by
+    /// `3 * (repeats + 1) * 1024 / this` plies (three quarters a repeat at the
+    /// default).
+    SEARCH_AGAIN_DIV = b"search_again_div", 4096, 1024..=16384;
+    /// Futility pruning: the divisor of the correction value's magnitude
+    /// added to the margin. A correction value stays under 2^26 in
+    /// magnitude, so the floor keeps the term under 7000.
+    FUTILITY_CORRECTION_DIV = b"futility_correction_div", 180600, 10000..=2000000;
+    /// Null-move pruning: the depth reduction's depth term is
+    /// `depth * 1024 / this` (a third of the depth at the default).
+    NMP_DEPTH_DIV = b"nmp_depth_div", 3072, 512..=16384;
+    /// Null-move pruning: the verification search disables the null move for
+    /// `3 * (depth - R) * 1024 / this` plies (three quarters of the reduced
+    /// depth at the default).
+    NMP_VERIFY_DIV = b"nmp_verify_div", 4096, 1024..=16384;
+    /// Singular extension: the divisor of the margin times the depth.
+    SINGULAR_MARGIN_DIV = b"singular_margin_div", 55, 20..=500;
+    /// Singular extension: the excluded-move search's depth is
+    /// `new_depth * 1024 / this` (half at the default). The floor keeps it at
+    /// most the node's own.
+    SINGULAR_DEPTH_DIV = b"singular_depth_div", 2048, 1024..=8192;
+    /// Quiet-move pruning at shallow depth: the divisor of the history added
+    /// to the reduced depth. The history sum stays under 90000 in magnitude,
+    /// so the floor keeps the reduced depth's square, and the SEE threshold it
+    /// sets, inside `i32`.
+    LMR_HISTORY_DIV = b"lmr_history_div", 3220, 100..=100000;
+    /// Late-move reduction: the divisor of the correction value's magnitude
+    /// taken off the reduction. The floor keeps the reduction small enough
+    /// that its all-node scaling stays inside `i32`.
+    LMR_CORRECTION_DIV = b"lmr_correction_div", 25600, 1000..=1000000;
+
     // The time allocation. None of these can make a search outlast the clock:
     // the optimum and the maximum are clamped to the remaining time after the
     // terms below, and the search loop's per-iteration target is capped at the
@@ -351,6 +395,30 @@ mod scaled_defaults {
             );
         }
         assert_eq!(TM_MAX_RATIO.get() as f32 / 1000.0, 5.0f32);
+    }
+
+    /// A small divisor read as `x * 1024 / k` gives at its default the
+    /// quotient of the literal `x / d` it replaces, negative `x` included.
+    #[test]
+    fn each_small_divisor_at_its_default_is_the_literal() {
+        for (k, d, wide) in [
+            (ASPIRATION_WIDEN_DIV.get(), 3, true),
+            (SEARCH_AGAIN_DIV.get(), 4, false),
+            (NMP_DEPTH_DIV.get(), 3, false),
+            (NMP_VERIFY_DIV.get(), 4, false),
+            (SINGULAR_DEPTH_DIV.get(), 2, false),
+        ] {
+            assert_eq!(k, 1024 * d);
+            let reach = if cfg!(miri) { 100 } else { 100_000 };
+            for x in -reach..=reach {
+                assert_eq!(x * 1024 / k, x / d, "{x} / {d}");
+            }
+            if wide {
+                for x in [i64::from(i32::MAX), 1 << 40, -(1 << 40)] {
+                    assert_eq!(x * 1024 / i64::from(k), x / i64::from(d), "{x} / {d}");
+                }
+            }
+        }
     }
 }
 
