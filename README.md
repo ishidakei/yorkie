@@ -13,10 +13,16 @@ USI 将棋エンジンです。
 [`LICENSE`](LICENSE) を参照してください。
 
 本ソフトウェアは GPLv3 で公開されている YaneuraOu の派生物です。YaneuraOu の著作権は
-yaneurao 氏および YaneuraOu の各コントリビューターに帰属します。上流のソースコードは
-以下で公開されています。
+yaneurao 氏および YaneuraOu の各コントリビューターに帰属します。
+
+YaneuraOu の探索部は同じく GPLv3 で公開されている Stockfish から派生しています。
+そのため本ソフトウェアは Stockfish の派生物でもあります。Stockfish の著作権は
+Stockfish の開発者に帰属します。
+
+上流のソースコードは以下で公開されています。
 
 - YaneuraOu: <https://github.com/yaneurao/YaneuraOu>
+- Stockfish: <https://github.com/official-stockfish/Stockfish>
 
 ## 対応環境
 

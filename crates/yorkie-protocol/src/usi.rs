@@ -61,8 +61,7 @@ use crate::stats::{StatsBuf, clear_search_counts, take_search_counts};
 /// The public values used in the `id name` / `id author` lines.
 ///
 /// The version part is this project's own generation number (see
-/// `CHANGELOG.md`), not an upstream-tracking number; the upstream YaneuraOu
-/// baseline is documented in `README.md` instead.
+/// `CHANGELOG.md`), not an upstream-tracking number.
 pub const ENGINE_NAME: &[u8] = b"Yorkie 3.3.0";
 pub const ENGINE_AUTHOR: &[u8] = b"Kei Ishida <ishida.kei@gmail.com>";
 

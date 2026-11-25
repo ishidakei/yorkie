@@ -6,8 +6,7 @@ members = ["crates/yorkie", "crates/yorkie-eval", "crates/yorkie-numa", "crates/
 edition = "2024"
 # One version for every workspace member. The number is this project's own
 # generation number, matching `CHANGELOG.md`; it does not encode the upstream
-# YaneuraOu baseline the port tracks, which `README.md` documents instead. The
-# USI `id name` derives from it.
+# YaneuraOu baseline the port tracks. The USI `id name` derives from it.
 version = "3.3.0"
 
 # The lint only sees workspace members, so vendored non-member sources are out of
