@@ -7,7 +7,7 @@ USI 将棋エンジンです。
 > 公開リポジトリ名は `yorkie`、ビルドされるバイナリ名は `yorkie`、USI の
 > `id name` は `Yorkie 3.3.0` です。
 
-## ライセンスと帰属
+## ライセンスと参考にした実装
 
 本ソフトウェアは GNU General Public License v3（GPLv3） で配布されます。全文は
 [`LICENSE`](LICENSE) を参照してください。
@@ -24,6 +24,11 @@ Stockfish の開発者に帰属します。
 `entering_king_rule` が `CSARule27` などの点数のルールなら敵陣の三段以内、`TryRule` なら
 相手側の端から二段以内です。この安価な前提条件は同じく GPLv3 で公開されている
 rshogi（<https://github.com/SH11235/rshogi>）に倣ったものです。
+
+探索の定数のうちチューニングで値を動かせるものは、rshogi と
+p2shogi（<https://github.com/pekoshi/p2shogi>）がそれぞれチューニングの対象として公開している
+パラメータの一覧を参考に選びました。p2shogi も同じく GPLv3 で公開されています。各定数の既定値と
+名前、値を動かす仕組みは本ソフトウェアのものであり、どちらのコードも取り入れていません。
 
 上流のソースコードは以下で公開されています。
 
