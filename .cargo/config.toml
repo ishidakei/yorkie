@@ -9,8 +9,19 @@ xtask = "run --quiet -p xtask --"
 # the other dense matches predicts better on current x86-64 cores than one
 # indirect jump through a table; measured at +1.4 % search throughput with
 # identical search output. The measurement is written up in the design notes.
+#
+# llvm-args=-align-all-functions=5: every function starts on a 32-byte
+# boundary. Without it a small change moves the code after it by a few dozen
+# bytes, and that alone moves one-thread search throughput by up to about 2 %;
+# with it the one-thread search measured +1.5 % faster, with identical search
+# output. LLVM's option names are not a stable interface: if a later LLVM drops
+# this one, the build fails rather than losing the alignment unnoticed.
 [build]
-rustflags = ["-C", "target-cpu=native", "-C", "jump-tables=no"]
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "jump-tables=no",
+    "-C", "llvm-args=-align-all-functions=5",
+]
 
 # Keeps a release that is yanked or found bad right after publication out of Cargo.lock.
 [registry]
