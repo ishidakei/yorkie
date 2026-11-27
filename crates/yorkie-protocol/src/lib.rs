@@ -3,6 +3,9 @@
 pub mod bench;
 pub(crate) mod bestmove;
 pub mod config;
+// The CSA server-protocol client — present only under `csa`.
+#[cfg(feature = "csa")]
+pub mod csa;
 pub mod engine;
 pub mod formatter;
 pub(crate) mod node_block;

@@ -9,6 +9,14 @@ publish = false
 name = "parity_perft"
 path = "tests/parity/perft.rs"
 
+# The CSA server-protocol client: a binary of its own, so that `yorkie` stays the
+# USI engine in every build, the `--all-features` test run included, and the
+# client binary never reads USI. Built only with `csa`.
+[[bin]]
+name = "yorkie-csa"
+path = "src/bin/yorkie-csa.rs"
+required-features = ["csa"]
+
 [dependencies]
 yorkie-protocol = { path = "../yorkie-protocol" }
 yorkie-state = { path = "../yorkie-state" }
@@ -29,8 +37,10 @@ yorkie-eval = { path = "../yorkie-eval" }
 # which drives `bench` and prints the search `info` lines its guards read.
 # `dupstats` adds the counts of how parallel search workers repeat each other's
 # work to the statistics line; it slows the search, so a build measuring time to
-# depth leaves it off.
+# depth leaves it off. `csa` adds the `yorkie-csa` binary, a client of the CSA
+# server protocol.
 [features]
+csa = ["yorkie-protocol/csa"]
 dupstats = ["yorkie-protocol/dupstats"]
 verbose1 = ["yorkie-protocol/verbose1"]
 verbose2 = ["yorkie-protocol/verbose2"]

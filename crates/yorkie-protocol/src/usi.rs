@@ -80,7 +80,7 @@ const DIAG_BYTES: usize = 1024;
 /// Room the `verbose2` PV / book `info` body is composed in: the fixed fields,
 /// then a principal variation as deep as the search can return.
 #[cfg(feature = "verbose2")]
-const INFO_BYTES: usize = 128 + (yorkie_state::MAX_USI_MOVE_LEN + 1) * 256;
+pub(crate) const INFO_BYTES: usize = 128 + (yorkie_state::MAX_USI_MOVE_LEN + 1) * 256;
 // --- isready keep-alive (reference `Engine::run_heavy_job`).
 /// How often the keep-alive helper thread polls the stop flag while the heavy
 /// `isready` initialisation runs (reference: `sleep_for(100ms)`).
@@ -1019,7 +1019,7 @@ impl<R: BufRead, O: UsiOutput> UsiEngine<R, O> {
 ///
 /// `verbose2` only: the default build renders no PV line.
 #[cfg(feature = "verbose2")]
-fn write_pv_info<W: Write + ?Sized>(w: &mut W, info: &PvInfo) -> io::Result<()> {
+pub(crate) fn write_pv_info<W: Write + ?Sized>(w: &mut W, info: &PvInfo) -> io::Result<()> {
     let mut bytes = [0u8; INFO_BYTES];
     let mut body = TextWriter::new(&mut bytes);
     body.bytes(b"depth ").i64(i64::from(info.depth));
@@ -1057,7 +1057,10 @@ fn write_pv_info<W: Write + ?Sized>(w: &mut W, info: &PvInfo) -> io::Result<()> 
 }
 
 #[cfg(feature = "verbose1")]
-fn emit_stats<W: Write + ?Sized>(w: &mut W, #[cfg(feature = "verbose3")] marks: ReplyMarks) {
+pub(crate) fn emit_stats<W: Write + ?Sized>(
+    w: &mut W,
+    #[cfg(feature = "verbose3")] marks: ReplyMarks,
+) {
     let mut buf = StatsBuf::new();
     if let Some(line) = crate::stats::render(
         &mut buf,

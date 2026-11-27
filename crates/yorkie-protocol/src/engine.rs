@@ -1945,7 +1945,14 @@ impl<P: EngineSink> Engine<P> {
         // anything this `go` does — including ending a search left thinking
         // ahead, whose stop and join are then spent on this move's own budget
         // rather than quietly outside it.
-        let received = Instant::now();
+        self.go_at(params, Instant::now())
+    }
+
+    /// [`Self::go`] for a request that arrived at `received`: the search's
+    /// clock starts there rather than at the call, so whatever the caller did
+    /// between reading the request and making it — replaying the game into a
+    /// position, for one — is spent on this move's budget.
+    pub fn go_at(&mut self, params: GoParams, received: Instant) -> GoOutcome {
         // A new `go` supersedes any lingering search; reclaim its state first.
         self.finish_search_join();
         // What was pondered on this position was decided when the position was

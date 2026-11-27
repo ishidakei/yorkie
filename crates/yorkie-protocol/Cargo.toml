@@ -16,6 +16,9 @@ yorkie-numa = { path = "../yorkie-numa" }
 yorkie-search = { path = "../yorkie-search" }
 yorkie-state = { path = "../yorkie-state" }
 yorkie-storage = { path = "../yorkie-storage" }
+# The CSA client's `SIGTERM` handler: the standard library has no way to catch a
+# signal, and the handler only raises a flag the session reads between lines.
+libc = { version = "0.2", optional = true }
 
 # The build script reads the building machine's NUMA layout and L3 domains with
 # the same code the engine would have read them with, and compiles the result in.
@@ -119,7 +122,13 @@ serde_json = "~1.0"
 # turning it on: with the key off, no worker is lowered. The key alone compiles
 # the same code in; the feature is how the tests reach it under a config that
 # leaves the key off. Off by default.
+#
+# `csa` compiles in the client of the CSA server protocol (the `csa` module),
+# which the binary crate's `yorkie-csa` runs. Orthogonal to the verbosity axis,
+# which decides what that client writes to its log beside the protocol lines.
+# Off by default.
 [features]
+csa = ["dep:libc"]
 lazy-smp-defer = ["yorkie-search/lazy-smp-defer"]
 lazy-smp-spread = ["yorkie-search/lazy-smp-spread"]
 low-priority-worker = []
