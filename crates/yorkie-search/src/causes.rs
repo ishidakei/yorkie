@@ -148,10 +148,12 @@ impl PathCauses {
 
     /// The cause a repetition verdict at `pos` over a `look_back`-ply window
     /// rests on: the earlier occurrence it matched, or an open set if that
-    /// cannot be found (which a verdict other than "none" rules out).
-    pub fn of_repetition(pos: &Position, look_back: u32) -> PathCauses {
+    /// cannot be found (which a verdict other than "none" rules out). With
+    /// `inferior` unset, the verdict is one that leaves the inferior verdict
+    /// out.
+    pub fn of_repetition(pos: &Position, look_back: u32, inferior: bool) -> PathCauses {
         let mut out = PathCauses::NONE;
-        match pos.repetition_origin(look_back) {
+        match pos.repetition_origin(look_back, inferior) {
             Some(at) => out.insert(at),
             None => out.open = true,
         }

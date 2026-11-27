@@ -1608,6 +1608,42 @@ impl<N: NetworkParams> QSearch<N> {
         }
     }
 
+    /// The repetition verdict on `pos`, `ply` plies from the root.
+    ///
+    /// At the root's children every earlier occurrence lies in the game before
+    /// the root, and the inferior verdict is not returned there: it would give
+    /// the root move the maximal non-mate value on a hand comparison against
+    /// that game, and the root would take the move without searching it. The
+    /// walk then goes on past that occurrence as past a coincidental board
+    /// match. p2shogi, derived from the same reference engine, handles the
+    /// case this way. The second walk runs only after an inferior verdict, so
+    /// a node whose board matches nothing pays nothing for it.
+    #[inline(always)]
+    fn repetition_at(&self, pos: &Position, ply: i32) -> RepetitionState {
+        let verdict = self.repetition(pos);
+        if verdict == RepetitionState::Inferior && ply == 1 {
+            return self.repetition_without_inferior(pos);
+        }
+        verdict
+    }
+
+    /// [`Self::repetition`] with the inferior verdict left out.
+    #[cold]
+    #[inline(never)]
+    fn repetition_without_inferior(&self, pos: &Position) -> RepetitionState {
+        #[cfg(repetition_index)]
+        {
+            pos.is_repetition_within_without_inferior(
+                self.repetition_look_back,
+                &self.histories.history_index,
+            )
+        }
+        #[cfg(not(repetition_index))]
+        {
+            pos.is_repetition_without_inferior()
+        }
+    }
+
     /// Install the raw `MultiPV` option value for this `go`. Every worker gets
     /// it, since it shapes the search; the main worker's PV *output* is
     /// configured separately by [`Self::set_pv_output`]. Both clamp to
@@ -2289,11 +2325,12 @@ impl<N: NetworkParams> QSearch<N> {
     }
 
     /// The value at `pos` is a repetition verdict: mark it, and record the
-    /// earlier position the verdict matched.
+    /// earlier position the verdict matched, `ply` plies from the root as
+    /// [`Self::repetition_at`] takes it.
     #[cfg(feature = "verbose3")]
-    fn mark_repetition(&mut self, pos: &Position) {
+    fn mark_repetition(&mut self, pos: &Position, ply: i32) {
         self.marks.path_dep = true;
-        let found = PathCauses::of_repetition(pos, self.repetition_window());
+        let found = PathCauses::of_repetition(pos, self.repetition_window(), ply != 1);
         self.causes.merge_below(&found, usize::MAX);
     }
 
@@ -2402,13 +2439,13 @@ impl<N: NetworkParams> QSearch<N> {
 
         // Step 2. Immediate draw / max ply.
         let us = pos.side_to_move();
-        let draw_type = self.repetition(pos);
+        let draw_type = self.repetition_at(pos, ply);
         if draw_type != RepetitionState::None {
             // The judgement read the move history, so the value is path
             // dependent by construction — this is where the mark originates.
             #[cfg(feature = "verbose3")]
             {
-                self.mark_repetition(pos);
+                self.mark_repetition(pos, ply);
             }
             if draw_type == RepetitionState::Draw {
                 // Ordinary repetition: the ±1 dither.
@@ -3677,7 +3714,7 @@ impl<N: NetworkParams> QSearch<N> {
         let mut applied: Vec<(Move, yorkie_state::Undo)> = Vec::new();
         let mut ply = 0usize;
         while ply < MAX_PLY as usize {
-            if ply >= 1 && self.repetition(&pos) != RepetitionState::None {
+            if ply >= 1 && self.repetition_at(&pos, ply as i32) != RepetitionState::None {
                 break;
             }
             let m = if ply < root_pv.len() {
@@ -4007,14 +4044,14 @@ impl<N: NetworkParams> QSearch<N> {
         // The root never draws or mate-distance-prunes.
         if !root_node {
             // Step 2. Immediate draw / max ply.
-            let draw_type = self.repetition(pos);
+            let draw_type = self.repetition_at(pos, ply);
             if draw_type != RepetitionState::None {
                 // The judgement read the move history, so the value is path
                 // dependent by construction — this is where the mark
                 // originates.
                 #[cfg(feature = "verbose3")]
                 {
-                    self.mark_repetition(pos);
+                    self.mark_repetition(pos, ply);
                 }
                 if draw_type == RepetitionState::Draw {
                     return self.draw_value(RepetitionState::Draw, us) + value_draw(self.nodes);
@@ -7706,6 +7743,45 @@ mod tests {
             if let Some(past) = u16::try_from(limit).ok().and_then(|l| l.checked_add(1)) {
                 assert!(!is_past_move_limit(past - 1));
                 assert!(is_past_move_limit(past));
+            }
+        }
+    }
+
+    /// Both lines recreate their start six plies on, with Black to move and
+    /// a hand pawn more or less than at the start. Taken as a child of the
+    /// root, every earlier occurrence lies before the root: the inferior
+    /// verdict is not returned there and the superior one is. From two plies
+    /// on, both are.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn the_inferior_verdict_is_left_out_at_the_roots_children_alone() {
+        use crate::text_str::parse_usi_move;
+        let net = zero_net();
+        let q = QSearch::new(net.network());
+        let cases = [
+            (
+                "4k4/9/9/9/9/9/9/9/4K4 b p 1",
+                "5i4h P*5h 4h5h 5a5b 5h5i 5b5a",
+                RepetitionState::Superior,
+                RepetitionState::Superior,
+            ),
+            (
+                "4k4/9/9/9/9/9/9/9/4K4 b P 1",
+                "P*5b 5a5b 5i5h 5b4a 5h5i 4a5a",
+                RepetitionState::None,
+                RepetitionState::Inferior,
+            ),
+        ];
+        for (sfen, line, at_child, deeper) in cases {
+            let mut p = pos(sfen);
+            for usi in line.split(' ') {
+                let mv = parse_usi_move(usi, &p).expect("a legal move");
+                p.do_move(mv);
+            }
+            assert_eq!(q.repetition(&p), deeper, "{line}");
+            assert_eq!(q.repetition_at(&p, 1), at_child, "{line}, ply 1");
+            for ply in [2, 6] {
+                assert_eq!(q.repetition_at(&p, ply), deeper, "{line}, ply {ply}");
             }
         }
     }

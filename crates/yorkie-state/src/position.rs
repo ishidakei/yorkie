@@ -847,6 +847,26 @@ impl Position {
     /// verdict even if an earlier cycle was not. This is a search rule only:
     /// the game itself ends in a repetition at the fourth occurrence alone.
     pub fn is_repetition(&self) -> RepetitionState {
+        self.repetition_walk::<true>()
+    }
+
+    /// [`Self::is_repetition`] with the inferior verdict left out: an earlier
+    /// occurrence over which the side to move's hand has lost pieces is taken
+    /// as a coincidental board match, and the walk goes on past it.
+    ///
+    /// This is the judgement for a child of the search root, where every
+    /// earlier occurrence lies in the game before the root. There the inferior
+    /// verdict would give the root move the maximal non-mate value on a hand
+    /// comparison alone, and the root would take that move without searching
+    /// it.
+    pub fn is_repetition_without_inferior(&self) -> RepetitionState {
+        self.repetition_walk::<false>()
+    }
+
+    /// The walk behind [`Self::is_repetition`], returning the inferior verdict
+    /// only when `INFERIOR` is set.
+    #[inline(always)]
+    fn repetition_walk<const INFERIOR: bool>(&self) -> RepetitionState {
         let end = MAX_REPETITION_PLY.min(self.current_plies_from_null());
         // A repetition needs at least a four-ply cycle to return.
         if end < 4 {
@@ -883,7 +903,7 @@ impl Position {
                 if hand_is_equal_or_superior(cur_hand, prev_hand) {
                     return RepetitionState::Superior;
                 }
-                if hand_is_equal_or_superior(prev_hand, cur_hand) {
+                if INFERIOR && hand_is_equal_or_superior(prev_hand, cur_hand) {
                     return RepetitionState::Inferior;
                 }
             }
@@ -921,8 +941,30 @@ impl Position {
         look_back: u32,
         before_root: &HistoryIndex,
     ) -> RepetitionState {
+        self.repetition_walk_within::<true>(look_back, before_root)
+    }
+
+    /// [`Self::is_repetition_within`] with the inferior verdict left out, as
+    /// [`Self::is_repetition_without_inferior`] leaves it out of
+    /// [`Self::is_repetition`].
+    pub fn is_repetition_within_without_inferior(
+        &self,
+        look_back: u32,
+        before_root: &HistoryIndex,
+    ) -> RepetitionState {
+        self.repetition_walk_within::<false>(look_back, before_root)
+    }
+
+    /// The walk behind [`Self::is_repetition_within`], returning the inferior
+    /// verdict only when `INFERIOR` is set.
+    #[inline(always)]
+    fn repetition_walk_within<const INFERIOR: bool>(
+        &self,
+        look_back: u32,
+        before_root: &HistoryIndex,
+    ) -> RepetitionState {
         if look_back == MAX_REPETITION_PLY as u32 {
-            return self.is_repetition();
+            return self.repetition_walk::<INFERIOR>();
         }
         let pfn = self.current_plies_from_null();
         let end = if look_back == 0 {
@@ -951,7 +993,7 @@ impl Position {
             if let Some(prev) = self.state_back(i as usize)
                 && prev.board_key == self.board_key
             {
-                let verdict = self.classify_recurrence(&prev.hands, i, cc_stm, cc_opp);
+                let verdict = self.classify_recurrence::<INFERIOR>(&prev.hands, i, cc_stm, cc_opp);
                 if verdict != RepetitionState::None {
                     return verdict;
                 }
@@ -972,7 +1014,7 @@ impl Position {
                 if dist < 4 || dist % 2 != 0 {
                     continue;
                 }
-                let verdict = self.classify_recurrence(hands, dist, cc_stm, cc_opp);
+                let verdict = self.classify_recurrence::<INFERIOR>(hands, dist, cc_stm, cc_opp);
                 if verdict != RepetitionState::None {
                     return verdict;
                 }
@@ -1071,8 +1113,11 @@ impl Position {
     /// and inferior — so the walk looks for that same state, nearest first.
     /// It walks every state in the window, so it costs what the plain
     /// sixteen-ply judgement costs per ply of window.
+    ///
+    /// With `inferior` unset, the verdict looked for is the one
+    /// [`Self::is_repetition_within_without_inferior`] gives.
     #[cfg(feature = "verbose3")]
-    pub fn repetition_origin(&self, look_back: u32) -> Option<usize> {
+    pub fn repetition_origin(&self, look_back: u32, inferior: bool) -> Option<usize> {
         let pfn = self.current_plies_from_null();
         let end = if look_back == 0 {
             pfn
@@ -1086,7 +1131,11 @@ impl Position {
         while i <= end {
             if let Some(prev) = self.state_back(i as usize)
                 && prev.board_key == self.board_key
-                && self.classify_recurrence(&prev.hands, i, cc_stm, cc_opp) != RepetitionState::None
+                && match self.classify_recurrence::<true>(&prev.hands, i, cc_stm, cc_opp) {
+                    RepetitionState::None => false,
+                    RepetitionState::Inferior => inferior,
+                    _ => true,
+                }
             {
                 return Some(self.history.len() - i as usize);
             }
@@ -1113,8 +1162,9 @@ impl Position {
     /// The verdict on an earlier state `dist` plies back whose board key is the
     /// current one and whose hands were `prev_hands`, given the current
     /// continuous-check runs of the side to move and of its opponent:
-    /// [`RepetitionState::None`] when neither hand dominates the other.
-    fn classify_recurrence(
+    /// [`RepetitionState::None`] when neither hand dominates the other, or when
+    /// the side to move's hand has lost pieces and `INFERIOR` is unset.
+    fn classify_recurrence<const INFERIOR: bool>(
         &self,
         prev_hands: &[Hand; Color::COUNT],
         dist: i32,
@@ -1136,7 +1186,7 @@ impl Position {
         if hand_is_equal_or_superior(cur_hand, prev_hand) {
             return RepetitionState::Superior;
         }
-        if hand_is_equal_or_superior(prev_hand, cur_hand) {
+        if INFERIOR && hand_is_equal_or_superior(prev_hand, cur_hand) {
             return RepetitionState::Inferior;
         }
         RepetitionState::None
@@ -2249,6 +2299,71 @@ mod tests {
     }
 
     #[test]
+    fn without_inferior_the_walk_passes_a_lost_hand_and_keeps_every_other_verdict() {
+        let filler = superiority_state(9, 9);
+        let current = superiority_state(0, 1);
+        let judge = |p: &Position| {
+            let index = p.history_index();
+            [
+                p.is_repetition_without_inferior(),
+                p.is_repetition_within_without_inferior(16, &HistoryIndex::default()),
+                p.is_repetition_within_without_inferior(0, &HistoryIndex::default()),
+                p.is_repetition_within_without_inferior(0, &index),
+                p.is_repetition_within_without_inferior(30, &index),
+            ]
+        };
+
+        // Four plies back the side to move held more: inferior, which is left
+        // out, and nothing lies beyond it.
+        let lost = assemble(
+            superiority_board(),
+            &[
+                filler.clone(),
+                filler.clone(),
+                filler.clone(),
+                current.clone(),
+            ],
+            superiority_state(1, 0),
+        );
+        assert_eq!(lost.is_repetition(), RepetitionState::Inferior);
+        assert_eq!(
+            lost.is_repetition_within(0, &lost.history_index()),
+            RepetitionState::Inferior
+        );
+        assert_eq!(judge(&lost), [RepetitionState::None; 5]);
+
+        // The superior verdict stays.
+        let gained = assemble(
+            superiority_board(),
+            &[
+                filler.clone(),
+                filler.clone(),
+                filler.clone(),
+                superiority_state(1, 0),
+            ],
+            superiority_state(0, 1),
+        );
+        assert_eq!(judge(&gained), [RepetitionState::Superior; 5]);
+
+        // Past the inferior occurrence four plies back, the walk finds the same
+        // position six plies back: a draw.
+        let draw_beyond = assemble(
+            superiority_board(),
+            &[
+                filler.clone(),
+                superiority_state(1, 0),
+                filler.clone(),
+                filler.clone(),
+                filler,
+                current.clone(),
+            ],
+            current,
+        );
+        assert_eq!(draw_beyond.is_repetition(), RepetitionState::Inferior);
+        assert_eq!(judge(&draw_beyond), [RepetitionState::Draw; 5]);
+    }
+
+    #[test]
     fn is_repetition_finds_a_six_ply_cycle_only_when_it_closes() {
         // Both kings walk a triangle and return to the root only after six
         // plies; no earlier position recurs.
@@ -2532,14 +2647,18 @@ mod tests {
                 );
                 assert_eq!(p.timeline_index(), len);
                 let within_16 = (back <= 16).then_some(at);
-                assert_eq!(p.repetition_origin(16), within_16, "{name}, at {at}, 16");
                 assert_eq!(
-                    p.repetition_origin(0),
+                    p.repetition_origin(16, true),
+                    within_16,
+                    "{name}, at {at}, 16"
+                );
+                assert_eq!(
+                    p.repetition_origin(0, true),
                     Some(at),
                     "{name}, at {at}, unlimited"
                 );
                 assert_eq!(
-                    p.repetition_origin(0).is_some(),
+                    p.repetition_origin(0, true).is_some(),
                     p.is_repetition_within(0, &p.history_index()) != RepetitionState::None,
                     "{name}, at {at}: an origin exactly when there is a verdict",
                 );
@@ -2555,8 +2674,8 @@ mod tests {
             ],
             recurring_state(black_hand(0, 1), none),
         );
-        assert_eq!(p.repetition_origin(0), Some(0));
-        assert_eq!(p.repetition_origin(30), None);
+        assert_eq!(p.repetition_origin(0, true), Some(0));
+        assert_eq!(p.repetition_origin(30, true), None);
     }
 
     #[test]

@@ -522,23 +522,21 @@ mod value_marks {
         assert_eq!(reply_causes(&out), (vec![4], false), "in:\n{out}");
     }
 
-    /// The inferior verdict, which compares hands: Black dropped a pawn
-    /// White's king took, and with the king's walk back to 5a the board is the
-    /// starting one again, Black to move and a pawn short of what it held
-    /// there. The position named is that start, ply 0.
+    /// The inferior verdict, which compares hands, at a child of the root:
+    /// Black dropped a pawn White's king took, and with the king's walk back
+    /// to 5a the board would be the starting one again, Black to move and a
+    /// pawn short of what it held there. Every earlier occurrence of a root
+    /// child's board lies in the game before the root, and there the search
+    /// does not take the inferior verdict, so the reply does not rest on that
+    /// start, ply 0.
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn an_inferior_recurrence_names_the_position_with_the_other_hands() {
+    fn an_inferior_recurrence_at_a_root_child_names_nothing() {
         let _session = common::serial_session();
         let out =
             searched("position sfen 4k4/9/9/9/9/9/9/9/4K4 b P 1 moves P*5b 5a5b 5i5h 5b4a 5h5i");
-        assert_eq!(
-            played(&out),
-            "4a5a",
-            "the recurrence is White's best, in:\n{out}"
-        );
-        assert_eq!(reply_marks(&out), [true, false, false], "in:\n{out}");
-        assert_eq!(reply_causes(&out), (vec![0], false), "in:\n{out}");
+        let (plies, _) = reply_causes(&out);
+        assert!(!plies.contains(&0), "in:\n{out}");
     }
 
     /// The superior verdict: White dropped a pawn Black's king took, and with
