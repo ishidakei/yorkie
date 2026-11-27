@@ -481,7 +481,7 @@ enum Dirty {
     Hand {
         color: Color,
         kind: PieceKind,
-        count: usize,
+        count: u8,
     },
 }
 
@@ -501,7 +501,7 @@ impl Dirty {
                 encode_feature(sq_k_code, p_adj)
             }
             Dirty::Hand { color, kind, count } => {
-                encode_feature(sq_k_code, hand_plane(kind, color == persp) + count)
+                encode_feature(sq_k_code, hand_plane(kind, color == persp) + count as usize)
             }
         }
     }
@@ -553,6 +553,9 @@ const _: () = assert!(size_of::<PerspectiveDelta>() == 20);
 /// The per-perspective feature delta a move induces, computed straight from the
 /// pre-move position without the [`active_features`] scan. `half(color)` is
 /// `None` when that perspective must be fully refreshed instead.
+///
+/// The default is the delta of no move in particular: both halves `None`.
+#[derive(Clone, Copy, Default)]
 pub struct MoveDelta {
     halves: [Option<PerspectiveDelta>; Color::COUNT],
 }
@@ -563,6 +566,11 @@ pub struct MoveDelta {
 const _: () = assert!(size_of::<MoveDelta>() == 48);
 
 impl MoveDelta {
+    /// The [`Default`] delta, usable in a `const` initialiser.
+    pub const NONE: MoveDelta = MoveDelta {
+        halves: [None, None],
+    };
+
     /// This move's delta for `perspective`, or `None` if that perspective's own
     /// king moved and its half must be refreshed from scratch.
     #[inline]
@@ -577,6 +585,80 @@ impl MoveDelta {
     /// Panics if a non-drop move has no piece on its origin square, or if an
     /// incrementally-updated perspective is missing its king.
     pub fn from_move(pos: &Position, mv: Move) -> MoveDelta {
+        let dirty = DirtyMove::from_move(pos, mv);
+        let half = |persp: Color| (!dirty.refreshes(persp)).then(|| dirty.encode(persp, pos));
+        MoveDelta {
+            halves: [half(Color::Black), half(Color::White)],
+        }
+    }
+}
+
+/// The board and hand slots a move touches, not yet encoded into either
+/// perspective's feature indices: what a [`MoveDelta`] is built from, held so
+/// that the encoding can wait until a perspective's half is actually updated.
+#[derive(Clone, Copy)]
+pub struct DirtyMove {
+    removed: [Option<Dirty>; 2],
+    added: [Option<Dirty>; 2],
+    /// Indexed by [`Color::index`]: whether that perspective's own king moved.
+    refresh: [bool; Color::COUNT],
+}
+
+impl DirtyMove {
+    /// The slots of no move in particular: nothing touched, and both
+    /// perspectives marked for a rebuild, so nothing is ever encoded from it.
+    pub const NONE: DirtyMove = DirtyMove {
+        removed: [None, None],
+        added: [None, None],
+        refresh: [true; Color::COUNT],
+    };
+
+    /// Whether `mv` moved `perspective`'s own king, so that its half is rebuilt
+    /// rather than updated.
+    #[inline]
+    pub fn refreshes(&self, perspective: Color) -> bool {
+        self.refresh[perspective.index()]
+    }
+
+    /// The feature delta of the move for `persp`, whose own king it did not
+    /// move.
+    ///
+    /// `pos` is read only for `persp`'s king square, which must be the square
+    /// that king stood on across the move: the position before or after it, or
+    /// any later position reached without moving that king.
+    ///
+    /// # Panics
+    /// Panics if `pos` is missing `persp`'s king.
+    #[inline]
+    pub fn encode(&self, persp: Color, pos: &Position) -> PerspectiveDelta {
+        debug_assert!(!self.refreshes(persp));
+        let king_persp = from_persp(king_square(pos, persp), persp);
+        let mirror = needs_mirror(king_persp);
+        let sq_k_code = mirror_if_needed(king_persp, mirror).index() as usize;
+
+        // Zipping the destination slots against the dirty slots pairs each
+        // encoded column with the slot it belongs in, and stops at the
+        // shorter of the two — so the walk carries the bound that indexing
+        // by the running count did not, and the count is what the walk ran
+        // to rather than what drove it.
+        let mut pd = PerspectiveDelta::default();
+        for (slot, d) in pd.removed.iter_mut().zip(self.removed.iter().flatten()) {
+            *slot = d.encode(persp, sq_k_code, mirror);
+            pd.n_removed += 1;
+        }
+        for (slot, d) in pd.added.iter_mut().zip(self.added.iter().flatten()) {
+            *slot = d.encode(persp, sq_k_code, mirror);
+            pd.n_added += 1;
+        }
+        pd
+    }
+
+    /// Record the slots `mv` touches, read from the **pre-move** `pos`, which
+    /// is not mutated.
+    ///
+    /// # Panics
+    /// Panics if a non-drop move has no piece on its origin square.
+    pub fn from_move(pos: &Position, mv: Move) -> DirtyMove {
         let mover = pos.side_to_move();
         let to = mv.to_sq();
 
@@ -587,7 +669,7 @@ impl MoveDelta {
             // The top held slot leaves the hand and an unpromoted board piece
             // appears at `to`.
             let kind = mv.dropped_piece_kind();
-            let count = pos.hand(mover).count(kind) as usize;
+            let count = pos.hand(mover).count(kind);
             removed[0] = Some(Dirty::Hand {
                 color: mover,
                 kind,
@@ -633,7 +715,7 @@ impl MoveDelta {
                     piece: captured,
                 });
                 let base = captured.kind;
-                let count = pos.hand(mover).count(base) as usize + 1;
+                let count = pos.hand(mover).count(base) + 1;
                 added[1] = Some(Dirty::Hand {
                     color: mover,
                     kind: base,
@@ -642,35 +724,13 @@ impl MoveDelta {
             }
         }
 
-        let encode_half = |persp: Color| -> Option<PerspectiveDelta> {
-            if requires_full_refresh(mv, persp) {
-                return None;
-            }
-            // This perspective's own king did not move, so its `(sq_k_code,
-            // mirror)` is the same pre- and post-move.
-            let king_persp = from_persp(king_square(pos, persp), persp);
-            let mirror = needs_mirror(king_persp);
-            let sq_k_code = mirror_if_needed(king_persp, mirror).index() as usize;
-
-            // Zipping the destination slots against the dirty slots pairs each
-            // encoded column with the slot it belongs in, and stops at the
-            // shorter of the two — so the walk carries the bound that indexing
-            // by the running count did not, and the count is what the walk ran
-            // to rather than what drove it.
-            let mut pd = PerspectiveDelta::default();
-            for (slot, d) in pd.removed.iter_mut().zip(removed.iter().flatten()) {
-                *slot = d.encode(persp, sq_k_code, mirror);
-                pd.n_removed += 1;
-            }
-            for (slot, d) in pd.added.iter_mut().zip(added.iter().flatten()) {
-                *slot = d.encode(persp, sq_k_code, mirror);
-                pd.n_added += 1;
-            }
-            Some(pd)
-        };
-
-        MoveDelta {
-            halves: [encode_half(Color::Black), encode_half(Color::White)],
+        DirtyMove {
+            removed,
+            added,
+            refresh: [
+                requires_full_refresh(mv, Color::Black),
+                requires_full_refresh(mv, Color::White),
+            ],
         }
     }
 }
@@ -973,6 +1033,29 @@ mod tests {
         check_diff_invariant("4k4/9/9/9/9/9/9/9/4K4 b P 1", "P*5e");
         check_diff_invariant("4k4/9/9/1P7/9/9/9/9/4K4 b - 1", "8d8c+");
         check_diff_invariant("4k4/2p6/9/9/9/9/9/1B7/4K4 b - 1", "8h7b+");
+    }
+
+    /// Encoding a move's slots against a position two plies later — the
+    /// moving side's king untouched in between — gives the delta encoded
+    /// against the pre-move position, for that perspective.
+    #[test]
+    fn dirty_move_encodes_the_same_delta_against_a_later_position() {
+        let mut pos = parse_sfen("4k4/2p6/9/9/9/9/9/1B7/4K4 b P 1").unwrap();
+        let mv = parse_usi_move("8h7b+", &pos).unwrap();
+        let dirty = DirtyMove::from_move(&pos, mv);
+        let delta = MoveDelta::from_move(&pos, mv);
+        let _ = pos.do_move(mv);
+        let reply = parse_usi_move("5a4b", &pos).unwrap();
+        let _ = pos.do_move(reply);
+        let pd = dirty.encode(Color::Black, &pos);
+        let expected = delta.half(Color::Black).unwrap();
+        assert_eq!(pd.removed(), expected.removed());
+        assert_eq!(pd.added(), expected.added());
+        assert!(!dirty.refreshes(Color::Black) && !dirty.refreshes(Color::White));
+
+        let king = parse_sfen("4k4/9/9/9/9/9/9/9/4K4 b - 1").unwrap();
+        let km = DirtyMove::from_move(&king, parse_usi_move("5i5h", &king).unwrap());
+        assert!(km.refreshes(Color::Black) && !km.refreshes(Color::White));
     }
 
     #[test]

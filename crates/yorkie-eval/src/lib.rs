@@ -50,7 +50,7 @@ mod transformer;
 mod types;
 
 pub use features::{
-    FEATURE_DIMENSION, FeatureIndex, MAX_ACTIVE_FEATURES, MoveDelta, PerspectiveDelta,
+    DirtyMove, FEATURE_DIMENSION, FeatureIndex, MAX_ACTIVE_FEATURES, MoveDelta, PerspectiveDelta,
     active_features, active_features_both, requires_full_refresh,
 };
 pub use finny::FinnyCache;

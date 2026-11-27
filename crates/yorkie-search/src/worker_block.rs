@@ -61,7 +61,7 @@ use std::ptr::NonNull;
 use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use yorkie_eval::{Accumulator, FinnyCache};
+use yorkie_eval::FinnyCache;
 use yorkie_storage::{LARGE_PAGE_ALIGN, LargePageAlloc, Zeroable};
 
 use crate::history::{
@@ -69,7 +69,7 @@ use crate::history::{
 };
 use crate::movepick::PickerScratch;
 use crate::qsearch::{
-    ACC_LEN, AccStack, MAX_PLY, PICKER_SCRATCH_LEN, PickerStack, STACK_LEN, SearchStack,
+    ACC_LEN, AccSlot, AccStack, MAX_PLY, PICKER_SCRATCH_LEN, PickerStack, STACK_LEN, SearchStack,
 };
 use crate::update::SearchStackCell;
 
@@ -357,7 +357,7 @@ unsafe fn write_search_stack(p: *mut SearchStack) {
     }
 }
 
-/// Write a zeroed accumulator into every slot of `p`.
+/// Write a zeroed, not computed slot into every slot of `p`.
 ///
 /// # Safety
 ///
@@ -366,7 +366,7 @@ unsafe fn write_acc_stack(p: *mut AccStack) {
     for slot in 0..ACC_LEN {
         // SAFETY: `slot < ACC_LEN`, so the slot is inside the storage the
         // caller hands over.
-        unsafe { (&raw mut (*p)[slot]).write(Accumulator::new()) };
+        unsafe { (&raw mut (*p)[slot]).write(AccSlot::new()) };
     }
 }
 

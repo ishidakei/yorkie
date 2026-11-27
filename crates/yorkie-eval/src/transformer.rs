@@ -243,6 +243,48 @@ impl Accumulator {
         }
     }
 
+    /// Write `color`'s half of `dst` as `src`'s half less every `removed`
+    /// column plus every `added` one, leaving the other half of `dst` as it
+    /// is. Under wrapping `i16` the columns may come in any order and from any
+    /// number of moves, so the delta of several plies summed into one list
+    /// gives the half those plies' one-by-one updates would.
+    #[inline]
+    pub fn derive_perspective<N: NetworkParams>(
+        src: &Accumulator,
+        dst: &mut Accumulator,
+        net: N,
+        color: Color,
+        added: &[FeatureIndex],
+        removed: &[FeatureIndex],
+    ) {
+        let i = color.index();
+        apply_diff_from(
+            &src.perspectives[i],
+            &mut dst.perspectives[i],
+            net.ft_columns(),
+            added,
+            removed,
+        );
+    }
+
+    /// Rebuild `color`'s half for `pos` through the finny table `cache`,
+    /// leaving the other half as it is — the arm of
+    /// [`Accumulator::derive_into_cached`] that a perspective whose own king
+    /// moved takes.
+    ///
+    /// # Panics
+    /// Panics if `pos` is missing `color`'s king.
+    #[inline]
+    pub fn refresh_perspective_cached<N: NetworkParams>(
+        &mut self,
+        net: N,
+        pos: &Position,
+        color: Color,
+        cache: &mut FinnyCache,
+    ) {
+        cache.refresh_into(net, pos, color, &mut self.perspectives[color.index()]);
+    }
+
     /// Pack the accumulator into `out`, the byte input buffer for `fc_0`, as
     /// `[stm-half | ~stm-half]`, and hand it back as the filled array it now
     /// is. See the module docs for the fold.

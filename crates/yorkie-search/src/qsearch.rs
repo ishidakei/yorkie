@@ -4,9 +4,9 @@
 //! above that function, which describes a `DEPTH_QS_CHECKS` /
 //! `DEPTH_QS_RECAPTURES` design the code does not implement.
 //!
-//! The NNUE accumulator is derived eagerly on every `do_move` rather than
-//! lazily on first evaluation as the reference does; both reach the same
-//! accumulator. qsearch reads the worker history tables and never writes them,
+//! As in the reference, the NNUE accumulator is derived on a node's first
+//! evaluation, not on the `do_move` into it, so a node that returns before
+//! evaluating costs no update. qsearch reads the worker history tables and never writes them,
 //! so no history update occurs inside a pure-qsearch subtree.
 //!
 //! The reference holds one `TTWriter` from the Step-3 probe and writes through
@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
-use yorkie_eval::{Accumulator, FinnyCache, MoveDelta, NetworkParams, evaluate_with};
+use yorkie_eval::{Accumulator, DirtyMove, FinnyCache, NetworkParams, evaluate_with};
 use yorkie_state::{Color, Move, Piece, PieceKind, Position, RepetitionState, piece_value};
 #[cfg(feature = "verbose3")]
 use yorkie_storage::ValueMarks;
@@ -461,7 +461,41 @@ pub(crate) type SearchStack = [SearchStackCell; STACK_LEN];
 pub(crate) const ACC_LEN: usize = MAX_PLY as usize + 8;
 
 /// The accumulator stack's storage.
-pub(crate) type AccStack = [Accumulator; ACC_LEN];
+pub(crate) type AccStack = [AccSlot; ACC_LEN];
+
+/// One ply of the accumulator stack: the accumulator of the position reached at
+/// that ply, the feature delta of the move into it, and which of the
+/// accumulator's two halves hold that position's values yet.
+///
+/// A half is derived when the node, or a node below it, first evaluates, not
+/// when the move is made, so a node that returns before evaluating pays for
+/// no update. Until then the half holds whatever an earlier visit to the ply
+/// left there.
+///
+/// The delta and the flags fill the cache line the accumulator's 64-byte
+/// alignment pads the slot to, so both rows of every slot still start on a
+/// line boundary.
+#[repr(C)]
+pub struct AccSlot {
+    acc: Accumulator,
+    /// The delta from the slot below. Not read in slot `0`, which is always
+    /// computed.
+    delta: DirtyMove,
+    /// Indexed by [`Color::index`].
+    computed: [bool; Color::COUNT],
+}
+
+const _: () = assert!(size_of::<AccSlot>() == size_of::<Accumulator>() + 64);
+
+impl AccSlot {
+    pub(crate) const fn new() -> Self {
+        AccSlot {
+            acc: Accumulator::new(),
+            delta: DirtyMove::NONE,
+            computed: [false; Color::COUNT],
+        }
+    }
+}
 
 /// Number of [`PickerScratch`] buffers: one per [`MovePicker`] that can be live
 /// at once, which is two per ply.
@@ -1908,11 +1942,59 @@ impl<N: NetworkParams> QSearch<N> {
         value
     }
 
-    /// The current node's live accumulator (`acc_stack[acc_depth]`), read by the
-    /// six evaluation sites via [`yorkie_eval::evaluate_with`].
+    /// The current node's accumulator (`acc_stack[acc_depth]`), first brought
+    /// up to date for `pos`, the current node's position. Read by every
+    /// evaluation site via [`Self::static_eval`].
     #[inline]
-    fn acc(&self) -> &Accumulator {
-        &self.acc_stack[self.acc_depth]
+    fn acc(&mut self, pos: &Position) -> &Accumulator {
+        let d = self.acc_depth;
+        if self.acc_stack[d].computed != [true; Color::COUNT] {
+            self.catch_up_accumulator(pos);
+        }
+        &self.acc_stack[d].acc
+    }
+
+    /// Make both halves of the current slot computed, giving exactly the
+    /// values a derivation at every `do_move` on the way would have.
+    ///
+    /// Per perspective, the walk back from the current slot stops at the
+    /// nearest slot whose half is computed, or at slot `0`, the root's — which
+    /// [`Self::seed_accumulator`] computes at every real root; a test that
+    /// enters the search unseeded derives from whatever slot `0` holds, as a
+    /// derivation at every `do_move` would. A half whose own king moved is
+    /// rebuilt at the push, so the walk passes none. Only then is any feature
+    /// index built: the half is derived forward from that slot through every
+    /// ply in between, each of which stays computed for a sibling to start
+    /// from.
+    ///
+    /// No ply the walk passes moved that perspective's king, so `pos` has the
+    /// king square every one of those plies' deltas is encoded against.
+    #[inline(never)]
+    fn catch_up_accumulator(&mut self, pos: &Position) {
+        let net = self.net;
+        let d = self.acc_depth;
+        let slots = &mut self.acc_stack[..];
+        for color in [Color::Black, Color::White] {
+            let i = color.index();
+            let mut base = d;
+            while base > 0 && !slots[base].computed[i] {
+                base -= 1;
+            }
+            for k in base + 1..=d {
+                let (below, rest) = slots.split_at_mut(k);
+                let slot = &mut rest[0];
+                let pd = slot.delta.encode(color, pos);
+                Accumulator::derive_perspective(
+                    &below[k - 1].acc,
+                    &mut slot.acc,
+                    net,
+                    color,
+                    pd.added(),
+                    pd.removed(),
+                );
+                slot.computed[i] = true;
+            }
+        }
     }
 
     /// The node's NNUE static evaluation, read through the differentially
@@ -1934,9 +2016,19 @@ impl<N: NetworkParams> QSearch<N> {
         {
             self.evals += 1;
         }
-        let value = evaluate_with(self.net, self.acc(), pos);
+        let net = self.net;
+        let value = evaluate_with(net, self.acc(pos), pos);
         #[cfg(test)]
         if self.verify_accumulator {
+            let mut fresh = Accumulator::new();
+            fresh.refresh(net, pos);
+            for color in [Color::Black, Color::White] {
+                assert_eq!(
+                    self.acc_stack[self.acc_depth].acc.perspective(color),
+                    fresh.perspective(color),
+                    "{color:?}: lazily derived accumulator half diverged from a full refresh",
+                );
+            }
             assert_eq!(
                 value,
                 yorkie_eval::evaluate(self.net, pos),
@@ -1948,25 +2040,37 @@ impl<N: NetworkParams> QSearch<N> {
         value
     }
 
-    /// Full-refresh the root accumulator into slot `0` and reset the do/undo
-    /// depth. Every deeper node's accumulator is derived incrementally from
-    /// here, so this must run once at the start of every fresh search.
+    /// Full-refresh the root accumulator into slot `0`, mark it computed, and
+    /// reset the do/undo depth. Every deeper node's accumulator is derived
+    /// incrementally from here, so this must run once at the start of every
+    /// fresh search.
     #[inline]
     fn seed_accumulator(&mut self, pos: &Position) {
         let net = self.net;
         self.acc_depth = 0;
-        self.acc_stack[0].refresh(net, pos);
+        let root = &mut self.acc_stack[0];
+        root.acc.refresh(net, pos);
+        root.computed = [true; Color::COUNT];
     }
 
-    /// Derive the child accumulator from the current top and advance the depth,
-    /// mirroring a `do_move`. `post_pos` is the position *after* the move, used
-    /// only to rebuild a perspective whose own king moved; `delta` is the
-    /// add/sub feature delta captured from the pre-move position.
+    /// Record the move into the child in the next slot and advance the depth,
+    /// mirroring a `do_move`. `delta` holds the slots the move touches, read
+    /// from the pre-move position; a half the move updates incrementally is
+    /// derived from it only when an evaluation needs it ([`Self::acc`]).
     ///
-    /// `mv` is the move just made; with `post_pos` it addresses the shared
-    /// history entries the child reads, which are prefetched here.
+    /// A half whose own king the move moved is rebuilt here instead, through
+    /// the finny table from `post_pos`, the position *after* the move. The
+    /// rebuild reads the whole position, which a later catch-up no longer has
+    /// for this ply. Rebuilding at the evaluated node instead would repeat it
+    /// at every node below that evaluates, where a rebuild here serves them
+    /// all; and it leaves the finny table updated at the same moves, in the
+    /// same order, as a derivation at every `do_move` would.
+    ///
+    /// `post_pos` and `mv`, the move just made, also address the TT cluster
+    /// and the shared history entries the child reads, which are prefetched
+    /// here.
     #[inline]
-    fn push_accumulator(&mut self, post_pos: &Position, mv: Move, delta: &MoveDelta) {
+    fn push_accumulator(&mut self, post_pos: &Position, mv: Move, delta: &DirtyMove) {
         // The reference prefetches the child's TT cluster and its shared
         // history entries inside `do_move`, the moment the post-move keys are
         // known. This port's `Position` cannot reach either table, so the hints
@@ -1979,18 +2083,19 @@ impl<N: NetworkParams> QSearch<N> {
             .shared
             .prefetch_child(post_pos, mv.moved_piece_after(), mv.to_sq());
 
-        let net = self.net;
-        let d = self.acc_depth;
-        let (parent_slots, child_slots) = self.acc_stack.split_at_mut(d + 1);
-        Accumulator::derive_into_cached(
-            &parent_slots[d],
-            &mut child_slots[0],
-            net,
-            post_pos,
-            delta,
-            &mut self.finny,
-        );
-        self.acc_depth = d + 1;
+        let d = self.acc_depth + 1;
+        let child = &mut self.acc_stack[d];
+        child.delta = *delta;
+        child.computed = [false; Color::COUNT];
+        for color in [Color::Black, Color::White] {
+            if delta.refreshes(color) {
+                child
+                    .acc
+                    .refresh_perspective_cached(self.net, post_pos, color, &mut self.finny);
+                child.computed[color.index()] = true;
+            }
+        }
+        self.acc_depth = d;
     }
 
     /// Prefetch the two continuation-correction entries the child of `mv`,
@@ -2009,8 +2114,9 @@ impl<N: NetworkParams> QSearch<N> {
         cc.prefetch_at(self.stack[s - 3].cont_corr, pc, to);
     }
 
-    /// Pop the child accumulator, mirroring an `undo_move`. The parent slot is
-    /// never mutated by [`Self::push_accumulator`], so the parent accumulator is
+    /// Pop the child accumulator, mirroring an `undo_move`. A push or a
+    /// catch-up changes a slot below the current one only to make a half
+    /// computed with the value that ply's position has, so the parent is
     /// restored simply by dropping back to it.
     #[inline]
     fn pop_accumulator(&mut self) {
@@ -2713,7 +2819,7 @@ impl<N: NetworkParams> QSearch<N> {
 
             // Step 7. Make and search. The accumulator delta must be taken
             // from the pre-move position.
-            let acc_delta = MoveDelta::from_move(pos, mv);
+            let acc_delta = DirtyMove::from_move(pos, mv);
             self.nodes += 1; // the search's sole node-count increment
             #[cfg(feature = "dupstats")]
             self.node_hist
@@ -4632,7 +4738,7 @@ impl<N: NetworkParams> QSearch<N> {
                     if Some(mv) == excluded_move || !pos.is_legal(mv) {
                         continue;
                     }
-                    let acc_delta = MoveDelta::from_move(pos, mv);
+                    let acc_delta = DirtyMove::from_move(pos, mv);
                     self.nodes += 1;
                     #[cfg(feature = "dupstats")]
                     self.node_hist.count(
@@ -5059,7 +5165,7 @@ impl<N: NetworkParams> QSearch<N> {
 
             // Step 16. Make the move. The accumulator delta must be taken
             // from the pre-move position.
-            let acc_delta = MoveDelta::from_move(pos, mv);
+            let acc_delta = DirtyMove::from_move(pos, mv);
             self.nodes += 1;
             #[cfg(feature = "dupstats")]
             self.node_hist.count(
