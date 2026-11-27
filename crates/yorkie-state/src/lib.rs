@@ -1,6 +1,7 @@
 pub mod bitboard;
 pub mod board;
 pub mod color;
+pub mod csa;
 pub mod hand;
 pub mod key;
 #[cfg(test)]
@@ -20,6 +21,10 @@ pub mod text;
 pub use bitboard::Bitboard;
 pub use board::Board;
 pub use color::Color;
+pub use csa::{
+    CSA_MOVE_LEN, CSA_POSITION_CAPACITY, CsaError, CsaMoveBuf, parse_csa_move, parse_csa_position,
+    parse_csa_position_into, write_csa_move, write_csa_position,
+};
 pub use hand::Hand;
 pub use move_::{
     MAX_USI_MOVE_LEN, Move, UsiMoveBuf, UsiMoveParseError, flip_move16, parse_usi_move,
