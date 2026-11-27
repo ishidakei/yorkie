@@ -461,3 +461,16 @@ slow_mover = 100
 
 # Use the clock right up to each whole second (`RoundUpToFullSecond`).
 round_up_to_full_second = true
+
+# ---------------------------------------------------------------------------
+# Search parameters
+# ---------------------------------------------------------------------------
+
+# The SPSA settings file: the values of the search's pruning, reduction,
+# extension, history and move-ordering parameters and of the time-allocation
+# coefficients, compiled into the build. A relative path is taken against the
+# repository root, and the `YORKIE_SPSA_CONFIG` environment variable, when set,
+# names the file instead. `configs/spsa/yorkie.toml` holds the values the
+# engine plays with; `configs/spsa/yaneuraou.toml` holds YaneuraOu's, with
+# which a build searches node for node as YaneuraOu does.
+spsa_config = "configs/spsa/yorkie.toml"

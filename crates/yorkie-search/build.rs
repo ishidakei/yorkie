@@ -28,8 +28,20 @@
 //! one it leaves out is the NUMA layout, which is not a value in the file but the
 //! machine's own, and which only the crate that plans thread binding compiles
 //! in.
+//!
+//! The script also compiles in the values of the search and time-allocation
+//! parameters `src/params.rs` registers. They come from an SPSA settings file:
+//! the one the `YORKIE_SPSA_CONFIG` environment variable names, or, when it is
+//! unset, the one the engine config's `spsa_config` key names (the play config
+//! names `configs/spsa/yorkie.toml`, the test configs
+//! `configs/spsa/yaneuraou.toml`). A relative path is taken against the
+//! repository root. The file is checked against the registry in `params.rs` —
+//! every parameter given once, nothing else, each value an integer inside the
+//! parameter's range — and the build stops on the first thing wrong, naming
+//! the file and the parameter.
 
 include!("../yorkie-protocol/build_config.rs");
+include!("build_spsa.rs");
 
 /// Report a build-stopping configuration error and exit. `process::exit` rather
 /// than `panic!`, so cargo surfaces the message without a backtrace header
@@ -86,6 +98,66 @@ fn main() {
     if let Err(e) = std::fs::write(&out, generated.code) {
         fail(&format!(
             "cannot write the generated config `{}`: {e}",
+            out.display()
+        ));
+    }
+
+    compile_spsa_values(&repo_root, &contents, &label);
+}
+
+/// Write the values of the registered search parameters, read from the SPSA
+/// settings file this build selects, to `$OUT_DIR/spsa_values.rs`.
+fn compile_spsa_values(repo_root: &Path, config_contents: &str, config_label: &str) {
+    println!("cargo:rerun-if-changed=build_spsa.rs");
+    println!("cargo:rerun-if-changed=src/params.rs");
+    println!("cargo:rerun-if-env-changed={SPSA_CONFIG_ENV}");
+
+    // The engine config compiled cleanly above, so the key is there and is a
+    // string.
+    let from_config = match parse_config(config_contents, config_label)
+        .ok()
+        .and_then(|mut entries| entries.remove("spsa_config"))
+    {
+        Some(Entry {
+            value: Value::Str(s),
+            ..
+        }) => s,
+        _ => fail(&format!(
+            "{config_label}: the `spsa_config` key does not name an SPSA settings file"
+        )),
+    };
+    let path = spsa_config_path(repo_root, std::env::var_os(SPSA_CONFIG_ENV), &from_config);
+    println!("cargo:rerun-if-changed={}", path.display());
+
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => fail(&format!(
+            "cannot read the SPSA settings file `{}`: {e}\n       \
+             set {SPSA_CONFIG_ENV}, or the engine config's `spsa_config` key, to a readable \
+             SPSA settings file",
+            path.display()
+        )),
+    };
+    let params_rs = match std::fs::read_to_string("src/params.rs") {
+        Ok(c) => c,
+        Err(e) => fail(&format!("cannot read `src/params.rs`: {e}")),
+    };
+    let label = path.display().to_string();
+    let code = match compile_spsa(
+        &contents,
+        &label,
+        &display_source(repo_root, &path),
+        &params_rs,
+    ) {
+        Ok(code) => code,
+        Err(e) => fail(&e),
+    };
+
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"))
+        .join("spsa_values.rs");
+    if let Err(e) = std::fs::write(&out, code) {
+        fail(&format!(
+            "cannot write the generated parameter values `{}`: {e}",
             out.display()
         ));
     }

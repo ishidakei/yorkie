@@ -523,6 +523,12 @@ const SCHEMA: &[Spec] = &[
     int("minimum_thinking_time", "MinimumThinkingTime", 1, 100_000),
     int("slow_mover", "SlowMover", 1, 1_000),
     boolean("round_up_to_full_second", "RoundUpToFullSecond"),
+    // --- Search parameters. The search crate's build script reads the file this
+    // names unless `YORKIE_SPSA_CONFIG` names another.
+    text(
+        "spsa_config",
+        "(none: the SPSA settings file the search and time-allocation parameters' values are read from)",
+    ),
 ];
 
 /// A parsed scalar, with the source line it came from for diagnostics.

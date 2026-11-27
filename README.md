@@ -19,21 +19,13 @@ YaneuraOu の探索部は同じく GPLv3 で公開されている Stockfish か�
 そのため本ソフトウェアは Stockfish の派生物でもあります。Stockfish の著作権は
 Stockfish の開発者に帰属します。
 
-本ソフトウェアは静止探索でも入玉宣言勝ちを判定します。判定の前には、手番側の玉が宣言勝ちの
-成立しうる位置にいるかだけを調べ、いなければ判定そのものを省きます。その位置は、ビルド時の
-`entering_king_rule` が `CSARule27` などの点数のルールなら敵陣の三段以内、`TryRule` なら
-相手側の端から二段以内です。この安価な前提条件は同じく GPLv3 で公開されている
-rshogi（<https://github.com/SH11235/rshogi>）に倣ったものです。
-
-探索の定数のうちチューニングで値を動かせるものは、rshogi と
-p2shogi（<https://github.com/pekoshi/p2shogi>）がそれぞれチューニングの対象として公開している
-パラメータの一覧を参考に選びました。p2shogi も同じく GPLv3 で公開されています。各定数の既定値と
-名前、値を動かす仕組みは本ソフトウェアのものであり、どちらのコードも取り入れていません。
-
-上流のソースコードは以下で公開されています。
-
 - YaneuraOu: <https://github.com/yaneurao/YaneuraOu>
 - Stockfish: <https://github.com/official-stockfish/Stockfish>
+
+また、以下のソフトウェアに倣っている部分があります。
+
+- rshogi: <https://github.com/SH11235/rshogi>
+- p2shogi: <https://github.com/pekoshi/p2shogi>
 
 ## 対応環境
 
@@ -203,6 +195,34 @@ YORKIE_CONFIG=configs/test.toml cargo build --release  # こちらを読む
   ```bash
   YORKIE_CONFIG=configs/test-limits.toml cargo nextest run -p yorkie-protocol --all-features
   ```
+
+探索の枝刈り・延長・手の並べ替えの係数や、時間配分の係数の値は、config とは別の
+**SPSA 設定値ファイル**に書かれ、こちらもビルド時に定数として埋め込まれます。
+このファイルはパラメータ 1 つにつき `name = value` を 1 行ずつ並べたものです。
+[`configs/spsa/`](configs/spsa/) に 2 つあります。
+
+- [`configs/spsa/yorkie.toml`](configs/spsa/yorkie.toml) は対局に使う値です。
+  `configs/default.toml` が指定しているので、普通にビルドすればこの値で探索します。
+  チューニングの結果を採り入れるときは、このファイルの値を書き換えます。
+- [`configs/spsa/yaneuraou.toml`](configs/spsa/yaneuraou.toml) はやねうら王と同じ値です。
+  この値でビルドすると、探索がやねうら王とノード単位で一致します。テスト用の
+  config（`configs/test.toml` と `configs/test-limits.toml`）はこちらを指定しているので、
+  やねうら王との一致を確かめるテストは、対局用の値を変えても影響を受けません。
+
+現時点では 2 つのファイルの値は同じです。
+
+どちらのファイルを読むかは config の `spsa_config` キーで決まります。環境変数
+`YORKIE_SPSA_CONFIG` を指定すると、キーより優先してそのファイルを読みます。相対パスは
+リポジトリのルートを基準に解決します。変数やファイルが変わると、探索のクレートは
+ビルドし直されます。
+
+```bash
+YORKIE_SPSA_CONFIG=configs/spsa/yaneuraou.toml cargo build --release  # やねうら王の値で対局用にビルド
+```
+
+SPSA 設定値ファイルも厳密に検証されます。登録されたパラメータの抜けや重複、未知の名前、
+整数でない値、探索が許す範囲を外れた値はいずれもビルドエラーになり、エラーには
+ファイルとパラメータの名前が出ます。
 
 feature を 1 つも指定しない既定ビルド（対局用バイナリそのもの）でしか走らないテスト
 もあります。対局では使わない `go` の指定を受け取っても探索を開始しないことと、
@@ -394,6 +414,7 @@ TOML ファイルを参照してください。
 | `minimum_thinking_time` | 整数 | 1〜100000 | 最小思考時間 [ms] |
 | `slow_mover` | 整数 | 1〜1000 | 思考時間の倍率 [%] |
 | `round_up_to_full_second` | 真偽値 | `true` / `false` | 秒単位に切り上げて時間を使う（秒読み用） |
+| `spsa_config` | 文字列 | 任意 | 探索と時間配分のパラメータの値を読む SPSA 設定値ファイル。相対パスはリポジトリのルート基準。環境変数 `YORKIE_SPSA_CONFIG` を指定すると、そちらが優先される。ビルド時にのみ読まれる |
 
 ### ワーカーの載る CPU と NUMA レイアウトはビルド時に決まる
 

@@ -1,0 +1,308 @@
+# The search and time-allocation parameters with the values YaneuraOu uses.
+# A build from this file searches node for node as YaneuraOu does, so every
+# check of the search against YaneuraOu builds from it: the test configs name
+# it in their `spsa_config` key.
+#
+# One `name = value` line per parameter the engine registers
+# (`crates/yorkie-search/src/params.rs`), every one of them and nothing else.
+# Each value is an integer in the units the parameter is registered in: a
+# coefficient the engine computes with as a fraction is scaled by the power of
+# ten the comment above it gives. The build refuses a file that leaves a
+# parameter out, names one the engine does not register, names one twice, or
+# gives a value that is not an integer inside the range the engine accepts.
+
+# Razoring: alpha - razor_base - razor_depth * depth^2.
+razor_base = 502
+razor_depth = 306
+
+# Futility pruning per ply; the no-TT-hit margin is this less 21.
+futility_mult = 76
+
+# Null move: tried while static eval >= beta - 16 * depth - 53 * improving + this.
+nmp_margin = 378
+
+# Null move: R = this + depth / 3.
+nmp_reduction = 7
+
+# ProbCut beta = beta + this - 61 * improving.
+probcut_margin = 224
+
+# TT ProbCut at the head of the move loop: beta + this.
+small_probcut_margin = 416
+
+# Singular beta = ttValue - (this + 66 * off-PV ttPv) * depth / 55.
+singular_margin = 60
+
+# LMR base reduction: ... - delta * lmr_delta / rootDelta + ... + lmr_base.
+lmr_base = 1133
+lmr_delta = 585
+
+# LMR at a cut node: r += this + 985 * no TT move.
+lmr_cut_node = 3611
+
+# Quiet futility at shallow depth: per ply of the reduced depth.
+quiet_futility_depth = 120
+
+# Quiescence search futility margin.
+qs_futility_margin = 328
+
+# Quiescence search SEE threshold for a capture.
+qs_see_margin = -73
+
+# Aspiration window half-width before the score-spread term.
+aspiration_delta = 5
+
+# The divisors of the formulas above. A small divisor `d` is registered as
+# `k = 1024 * d` and read as `x * 1024 / k`, so a step of 1 on `k` moves the
+# quotient by about a thousandth.
+#
+# Aspiration half-width: aspiration_delta + |mean squared score| / this.
+aspiration_spread_div = 9000
+
+# Aspiration window: each fail adds delta * 1024 / this to the half-width.
+aspiration_widen_div = 3072
+
+# Aspiration loop: depth - 3 * (search-again count + 1) * 1024 / this.
+search_again_div = 4096
+
+# Futility margin: ... + |correction value| / this.
+futility_correction_div = 180600
+
+# Null move: R = nmp_reduction + depth * 1024 / this.
+nmp_depth_div = 3072
+
+# Null-move verification: nmpMinPly = ply + 3 * (depth - R) * 1024 / this.
+nmp_verify_div = 4096
+
+# Singular beta: ... * depth / this.
+singular_margin_div = 55
+
+# Singular search depth: new_depth * 1024 / this.
+singular_depth_div = 2048
+
+# Quiet pruning at shallow depth: lmr_depth += history / this.
+lmr_history_div = 3220
+
+# LMR: r -= |correction value| / this.
+lmr_correction_div = 25600
+
+# The time allocation.
+#
+# Planning horizon in plies: with an increment or byoyomi it is
+# tm_move_horizon + tm_opening_inc - min(ply, tm_opening_inc_plies); on a
+# sudden-death clock tm_move_horizon + tm_opening_forfeit - min(ply,
+# tm_opening_forfeit). The own moves planned for are half of it.
+tm_move_horizon = 160
+tm_opening_forfeit = 40
+tm_opening_inc = 20
+tm_opening_inc_plies = 80
+
+# Maximum time: minimum + estimate * tm_max_ratio / 1000 / moves, capped at
+# estimate * tm_max_share / 1000.
+tm_max_ratio = 5000
+tm_max_share = 300
+
+# Falling evaluation: clamp((tm_falling_base / 1000 + tm_falling_average / 1000
+# * drop from the previous move's average + tm_falling_iteration / 1000 * drop
+# from four iterations back) / 100, tm_falling_min / 10000, tm_falling_max /
+# 10000).
+tm_falling_base = 11325
+tm_falling_average = 2115
+tm_falling_iteration = 987
+tm_falling_min = 5688
+tm_falling_max = 15698
+
+# Best-move stability: r = tm_reduction_base / 1000 + tm_reduction_amplitude /
+# 1000 / (1.104 + exp(-tm_reduction_k / 10000 * (depth - last change -
+# tm_reduction_center / 100))); the factor is (tm_reduction_previous / 1000 +
+# the previous move's r) / (2.2375 * r).
+tm_reduction_k = 5189
+tm_reduction_center = 1157
+tm_reduction_base = 723
+tm_reduction_amplitude = 790
+tm_reduction_previous = 1455
+
+# Best-move instability: tm_instability_base / 1000 + tm_instability_weight /
+# 10000 * aged best-move changes / threads.
+tm_instability_base = 1040
+tm_instability_weight = 18956
+
+# The factor at depth 10 and up when the best move took most of the nodes, in
+# thousandths.
+tm_effort_factor = 666
+
+# The next iteration deepens only if it starts within this share of the target
+# time, in thousandths.
+tm_deepen_share = 503
+
+# The pruning constants beside the ones above: the terms of the futility,
+# null-move, ProbCut and shallow-depth margins, and the depth and move-count
+# gates that switch each pruning on.
+futility_tt_miss = 21
+futility_improving = 2686
+futility_worsening = 362
+futility_max_depth = 15
+nmp_depth_margin = 16
+nmp_improving = 53
+nmp_verify_depth = 16
+iir_min_depth = 6
+iir_max_prior_reduction = 3
+hindsight_extend = 3
+hindsight_reduce = 2
+hindsight_eval_sum = 173
+probcut_improving = 61
+probcut_min_depth = 3
+probcut_reduction = 4
+small_probcut_depth = 4
+tt_cutoff_depth = 5
+move_count_prune_base = 3
+capture_futility_base = 218
+capture_futility_depth = 223
+capture_futility_history = 131
+capture_futility_max_depth = 7
+capture_see_depth = 167
+capture_see_history = 34
+cont_history_prune = -4097
+main_history_prune = 71
+quiet_futility_base = 42
+quiet_futility_no_best = 151
+quiet_futility_eval = 86
+quiet_futility_max_depth = 13
+quiet_see = 25
+alpha_raise_min_depth = 2
+alpha_raise_max_depth = 14
+qs_move_count = 2
+
+# The late-move reduction's terms, in 1024ths of a ply.
+lmr_not_improving = 206
+lmr_ttpv = 1013
+lmr_ttpv_base = 2819
+lmr_ttpv_pv_node = 973
+lmr_ttpv_tt_value = 905
+lmr_ttpv_tt_depth = 935
+lmr_ttpv_cut_node = 959
+lmr_offset = 691
+lmr_move_count = 65
+lmr_cut_node_no_tt_move = 985
+lmr_tt_capture = 1054
+lmr_cutoff = 251
+lmr_cutoff_many = 1124
+lmr_cutoff_all_node = 1042
+lmr_tt_move = 2239
+lmr_capture_stat = 863
+lmr_stat_score = 428
+lmr_all_node = 273
+lmr_all_node_offset = 260
+lmr_deeper_margin = 48
+lmr_shallower_margin = 9
+lmr_full_no_tt_move = 1057
+lmr_full_threshold = 4628
+lmr_full_threshold_deep = 5772
+
+# The singular extension's gates and margins.
+singular_min_depth = 6
+singular_ttpv_depth = 1
+singular_tt_depth_margin = 3
+singular_off_pv = 66
+singular_correction_div = 210590
+double_ext_base = -4
+double_ext_pv_node = 212
+double_ext_quiet = 182
+double_ext_tt_move_history = 906
+double_ext_tt_move_history_div = 116517
+double_ext_late_ply = 44
+triple_ext_base = 73
+triple_ext_pv_node = 320
+triple_ext_quiet = 218
+triple_ext_ttpv = 92
+triple_ext_late_ply = 45
+neg_ext_tt_fail_high = -3
+neg_ext_cut_node = -2
+
+# The history and correction-history updates and weights.
+stat_bonus_depth = 128
+stat_bonus_offset = -77
+stat_bonus_max = 1529
+stat_bonus_tt_move = 353
+stat_bonus_parent_div = 32
+stat_malus_depth = 882
+stat_malus_offset = -204
+stat_malus_max = 2122
+quiet_bonus_scale = 806
+quiet_malus_scale = 1113
+quiet_malus_decay = 977
+capture_bonus_scale = 1286
+capture_malus_scale = 1559
+refutation_penalty = 616
+low_ply_bonus = 761
+cont_bonus = 955
+pawn_bonus = 850
+pawn_malus = 550
+cont_weight_1 = 1157
+cont_weight_2 = 648
+cont_weight_3 = 288
+cont_weight_4 = 576
+cont_weight_5 = 140
+cont_weight_6 = 441
+cont_near_ply = 88
+tt_cut_bonus_depth = 130
+tt_cut_bonus_offset = -71
+tt_cut_bonus_max = 1043
+tt_cut_parent_move_count = 4
+tt_cut_cont_penalty = -2142
+research_cont_bonus = 1426
+tt_move_bonus = 805
+tt_move_malus = -787
+multicut_tt_move_base = -424
+multicut_tt_move_depth = 107
+multicut_tt_move_min = -3375
+prior_capture_bonus = 1018
+prior_base = -232
+prior_stat_div = 108
+prior_depth = 59
+prior_depth_max = 454
+prior_move_count = 8
+prior_move_count_bonus = 169
+prior_eval_bonus = 145
+prior_eval_margin = 110
+prior_parent_eval_bonus = 154
+prior_parent_eval_margin = 73
+prior_scaled_depth = 135
+prior_scaled_offset = -80
+prior_scaled_max = 1400
+prior_cont_scale = 221
+prior_main_scale = 235
+prior_pawn_scale = 290
+eval_diff_min = -214
+eval_diff_max = 171
+eval_diff_offset = 60
+eval_diff_main = 10
+eval_diff_pawn = 12
+corr_pawn = 12153
+corr_minor = 8620
+corr_non_pawn = 12355
+corr_cont = 7982
+corr_cont_no_move = 8
+corr_update_minor = 153
+corr_update_non_pawn = 187
+corr_update_cont_2 = 126
+corr_update_cont_4 = 63
+corr_bonus_best = 12
+corr_bonus_no_best = 17
+corr_bonus_scale = 1069
+main_history_init = 0
+capture_history_init = -678
+continuation_history_init = -523
+cont_correction_init = 6
+pawn_history_init = -1238
+
+# The move-ordering scores.
+mp_capture_weight = 1792
+mp_main_weight = 512
+mp_pawn_weight = 512
+mp_low_ply_weight = 2048
+mp_check_see = -75
+mp_check_bonus = 16384
+mp_quiet_sort = -3560
+mp_good_capture_see_div = 18432
+mp_good_quiet_threshold = -14000

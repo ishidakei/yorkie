@@ -124,3 +124,11 @@ slow_mover = 100
 # DIFFERENCE: true in default.toml. With it on, every move thinks at least a
 # whole second, which the clock of a game a second or two long cannot pay for.
 round_up_to_full_second = false
+
+# ---------------------------------------------------------------------------
+# Search parameters
+# ---------------------------------------------------------------------------
+
+# The values the engine plays with, as in default.toml: a measurement of
+# playing strength measures the engine as it plays.
+spsa_config = "configs/spsa/yorkie.toml"
