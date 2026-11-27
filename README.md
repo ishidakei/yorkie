@@ -631,9 +631,11 @@ CSA サーバープロトコル（バージョン 1.2.1）のクライアント 
 ままです。
 
 ```bash
-cargo build --release -p yorkie -F csa
+cargo build --release -p yorkie -F csa --bin yorkie-csa
 # target/release/yorkie-csa ができる
 ```
+
+`--bin yorkie-csa` を付けないと、USI エンジンの `yorkie` もいっしょにビルドされます。
 
 ### 接続先の設定
 
