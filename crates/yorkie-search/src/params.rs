@@ -77,6 +77,9 @@ macro_rules! search_params {
     };
 }
 
+// Which of the search's constants are tunable was chosen with reference to
+// the parameter lists of `SH11235/rshogi` and `pekoshi/p2shogi`. The defaults,
+// the names and the mechanism are this engine's own.
 search_params! {
     /// Razoring: the margin below alpha at depth 0, before the depth term.
     RAZOR_BASE = b"razor_base", 0..=2000;

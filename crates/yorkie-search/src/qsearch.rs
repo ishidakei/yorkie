@@ -1659,9 +1659,9 @@ impl<N: NetworkParams> QSearch<N> {
     /// the root move the maximal non-mate value on a hand comparison against
     /// that game, and the root would take the move without searching it. The
     /// walk then goes on past that occurrence as past a coincidental board
-    /// match. p2shogi, derived from the same reference engine, handles the
-    /// case this way. The second walk runs only after an inferior verdict, so
-    /// a node whose board matches nothing pays nothing for it.
+    /// match. This follows `pekoshi/p2shogi`. The second walk runs only after
+    /// an inferior verdict, so a node whose board matches nothing pays nothing
+    /// for it.
     #[inline(always)]
     fn repetition_at(&self, pos: &Position, ply: i32) -> RepetitionState {
         let verdict = self.repetition(pos);

@@ -543,7 +543,8 @@ pub fn probe_book(
     // A cycle of waiting moves inside the book is invisible to a one-ply check
     // when the opponent is the side that completes each repetition, so each
     // candidate is followed along the book's own line. This measure, the
-    // repeated-root check above and the selection rule below follow Nagisa.
+    // repeated-root check above and the selection rule below follow Nagisa
+    // (`keinoda/YaneuraOu`).
     if config.repetition_ply >= 2 {
         let draw_value =
             i16::try_from(crate::qsearch::root_draw_value(pos.side_to_move())).unwrap_or(0);
