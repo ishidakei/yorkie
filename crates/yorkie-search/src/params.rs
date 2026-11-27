@@ -102,6 +102,10 @@ macro_rules! search_params {
             #[cfg(feature = "tune")]
             pub(crate) static $id: Param = Param::new($default);
             const _: () = assert!($min <= $default && $default <= $max);
+            // The read the search makes, evaluated where only a compile-time
+            // constant is accepted: the build fails if a parameter is not one.
+            #[cfg(not(feature = "tune"))]
+            const _: i32 = $id.get();
         )+
 
         /// Every parameter a tuning list can name.

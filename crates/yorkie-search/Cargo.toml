@@ -99,8 +99,15 @@ yorkie-eval = { path = "../yorkie-eval", features = ["source-network"] }
 # judges a repetition with the plain sixteen-ply walk alone. The feature is how
 # the tests reach the code under a config that keeps `16`: they set a
 # worker's window themselves. Off by default.
+#
+# `param-probes` compiles in the `probes` module and builds the `param-probes`
+# binary that calls it: pairs of functions, one reading a search parameter and
+# one with its value written in, whose machine code is compared to show that a
+# parameter costs what the literal would. The engine never calls the module, and
+# no other build has it. Off by default.
 [features]
 lazy-smp-defer = []
+param-probes = []
 lazy-smp-spread = []
 random = []
 repetition-index = []
@@ -110,6 +117,15 @@ verbose1 = ["yorkie-storage/verbose1"]
 verbose2 = ["verbose1", "yorkie-storage/verbose2"]
 verbose3 = ["verbose2", "yorkie-state/verbose3", "yorkie-storage/verbose3"]
 dupstats = ["verbose1", "yorkie-storage/dupstats"]
+
+# Only for the machine-code comparison of the `probes` module; see the
+# `param-probes` feature above.
+[[bin]]
+name = "param-probes"
+path = "src/bin/param_probes.rs"
+required-features = ["param-probes"]
+test = false
+doc = false
 
 [lints]
 workspace = true

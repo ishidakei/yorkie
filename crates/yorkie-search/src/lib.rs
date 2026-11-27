@@ -32,6 +32,11 @@ pub mod dupstats;
 pub mod history;
 pub mod movepick;
 pub mod params;
+// The pairs of functions that show a parameter compiles to its constant: only
+// the build of the binary that carries them.
+#[cfg(feature = "param-probes")]
+#[doc(hidden)]
+pub mod probes;
 pub mod qsearch;
 pub mod root;
 // Parallel workers shifting their move order apart: only a build that asks for
