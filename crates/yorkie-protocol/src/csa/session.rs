@@ -12,6 +12,7 @@ use super::summary::{
     GameSummary, MAX_SUMMARY_BYTES, SummaryError, parse_game_summary, split_move_line,
 };
 use crate::engine::GoParams;
+use yorkie_search::EnteringKingRule;
 use yorkie_state::STARTPOS_SFEN;
 use yorkie_state::write_usi_move;
 
@@ -109,6 +110,81 @@ impl GameResult {
     }
 }
 
+/// The rules this build plays a game under, which a server's summary is held
+/// against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BuildRules {
+    /// The ply past which the search scores every position a draw
+    /// (`max_moves_to_draw`); `None` for no limit.
+    pub(crate) move_limit: Option<u64>,
+    /// The rule the engine checks before it declares (`entering_king_rule`).
+    pub(crate) rule: EnteringKingRule,
+}
+
+impl BuildRules {
+    /// The rules this binary was built with.
+    pub(crate) const COMPILED: Self = Self {
+        move_limit: match crate::config::MAX_MOVES_TO_DRAW {
+            0 => None,
+            n => Some(n as u64),
+        },
+        rule: EnteringKingRule::from_option(crate::config::ENTERING_KING_RULE.as_bytes()),
+    };
+}
+
+/// The server's move limit against the build's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LimitCheck {
+    Same,
+    /// The server ends the game before the build's limit: the engine plans
+    /// for moves the game will not have, and loses nothing by it.
+    ServerShorter,
+    /// The server plays on past the build's limit, into positions the engine
+    /// scores as drawn whatever they are: the game is refused.
+    ServerLonger,
+}
+
+impl LimitCheck {
+    fn of(server: Option<u64>, build: Option<u64>) -> Self {
+        match (server, build) {
+            (s, b) if s == b => Self::Same,
+            (_, None) => Self::ServerShorter,
+            (Some(s), Some(b)) if s < b => Self::ServerShorter,
+            _ => Self::ServerLonger,
+        }
+    }
+}
+
+/// The declaration rule the summary names, against the build's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuleCheck {
+    /// The summary names the build's rule.
+    Same,
+    /// The summary names another rule, which this one is: a declaration the
+    /// engine makes under its own rule may be refused, and lose the game.
+    Differs(EnteringKingRule),
+    /// The summary names a rule this client does not know.
+    Unknown,
+    /// The summary names no rule.
+    NotNamed,
+}
+
+impl RuleCheck {
+    fn of(declaration: &[u8], build: EnteringKingRule) -> Self {
+        let server = match declaration {
+            b"" => return Self::NotNamed,
+            // The CSA's own declaration rule, version 1.1: the 27-point rule.
+            b"Jishogi 1.1" => EnteringKingRule::Point27,
+            _ => return Self::Unknown,
+        };
+        if server == build {
+            Self::Same
+        } else {
+            Self::Differs(server)
+        }
+    }
+}
+
 /// What one received line means for the caller.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Step<'a> {
@@ -119,8 +195,15 @@ pub(crate) enum Step<'a> {
     LoginRefused,
     LoggedOut,
     /// A game is offered and its summary was read: prepare the engine and
-    /// agree to it.
-    Offered,
+    /// agree to it. What the summary says about the move limit and the
+    /// declaration rule, against the build's, is for the log.
+    Offered {
+        limit: LimitCheck,
+        rule: RuleCheck,
+    },
+    /// A game is offered whose move limit is longer than the build's, or that
+    /// has none where the build has one: refuse it.
+    LimitTooLong,
     /// A summary that cannot be read: refuse the game.
     Unreadable(SummaryError),
     /// The offered game was refused, by either side.
@@ -139,6 +222,8 @@ pub(crate) enum Step<'a> {
     GameOver {
         reason: Option<EndReason>,
         result: GameResult,
+        /// The game ended on a declaration this client made.
+        declared: bool,
     },
     /// A line this client did not expect where it came.
     Unexpected(&'a [u8]),
@@ -237,22 +322,27 @@ impl Game {
 /// The protocol state: the phase, the summary being read and the game being
 /// played.
 pub(crate) struct Session {
+    build: BuildRules,
     phase: Phase,
     summary: Vec<u8>,
     summary_too_long: bool,
     game: Option<Game>,
     reason: Option<EndReason>,
+    /// The `%KACHI` the server relayed was this client's.
+    declared: bool,
 }
 
 impl Session {
-    /// A session whose `LOGIN` has been sent.
-    pub(crate) fn new() -> Self {
+    /// A session whose `LOGIN` has been sent, for a build of `build`.
+    pub(crate) fn new(build: BuildRules) -> Self {
         Self {
+            build,
             phase: Phase::LoggingIn,
             summary: Vec::with_capacity(4096),
             summary_too_long: false,
             game: None,
             reason: None,
+            declared: false,
         }
     }
 
@@ -316,6 +406,7 @@ impl Session {
                     if line.starts_with(b"START:") {
                         self.phase = Phase::Playing;
                         self.reason = None;
+                        self.declared = false;
                         return Step::Started;
                     }
                     if line.starts_with(b"REJECT:") {
@@ -346,8 +437,13 @@ impl Session {
         }
         match parse_game_summary(&self.summary) {
             Ok(summary) => {
+                let limit = LimitCheck::of(summary.max_moves, self.build.move_limit);
+                let rule = RuleCheck::of(&summary.declaration, self.build.rule);
                 self.game = Some(Game::new(summary));
-                Step::Offered
+                if limit == LimitCheck::ServerLonger {
+                    return Step::LimitTooLong;
+                }
+                Step::Offered { limit, rule }
             }
             Err(e) => Step::Unreadable(e),
         }
@@ -380,14 +476,21 @@ impl Session {
                 }
             }
             // `%TORYO` and `%KACHI` repeat the move that ends the game; the `#`
-            // lines after them say how it ended.
-            b'%' => Step::Nothing,
+            // lines after them say how it ended. The declaration is the side
+            // to move's, since a declaration is made in place of a move.
+            b'%' => {
+                if line == b"%KACHI" {
+                    self.declared = !game.lost_track && game.pos.side_to_move() == game.us();
+                }
+                Step::Nothing
+            }
             b'#' => match GameResult::of(line) {
                 Some(result) => {
                     self.phase = Phase::Waiting;
                     Step::GameOver {
                         reason: self.reason.take(),
                         result,
+                        declared: std::mem::take(&mut self.declared),
                     }
                 }
                 None => {
@@ -430,6 +533,15 @@ PI
 END Position
 END Game_Summary";
 
+    /// A build with no move limit, declaring under the 27-point rule.
+    const UNLIMITED: BuildRules = BuildRules {
+        move_limit: None,
+        rule: EnteringKingRule::Point27,
+    };
+
+    /// What [`SUMMARY`] offers a build of [`UNLIMITED`].
+    const OFFERED: &str = "Offered { limit: Same, rule: NotNamed }";
+
     /// Feed `transcript` line by line and collect what each line asked for,
     /// leaving out the lines that ask for nothing.
     fn run(session: &mut Session, transcript: &str) -> Vec<String> {
@@ -444,7 +556,7 @@ END Game_Summary";
     }
 
     fn started() -> Session {
-        let mut s = Session::new();
+        let mut s = Session::new(UNLIMITED);
         run(&mut s, "LOGIN:black OK");
         run(&mut s, SUMMARY);
         s.agreed();
@@ -454,7 +566,7 @@ END Game_Summary";
 
     #[test]
     fn login_answers() {
-        let mut s = Session::new();
+        let mut s = Session::new(UNLIMITED);
         assert_eq!(run(&mut s, "LOGIN:incorrect"), ["LoginRefused"]);
         assert_eq!(s.phase(), Phase::LoggingIn);
         assert_eq!(run(&mut s, "LOGIN:black OK"), ["LoginOk"]);
@@ -465,9 +577,9 @@ END Game_Summary";
 
     #[test]
     fn a_summary_offers_a_game() {
-        let mut s = Session::new();
+        let mut s = Session::new(UNLIMITED);
         run(&mut s, "LOGIN:black OK");
-        assert_eq!(run(&mut s, SUMMARY), ["Offered"]);
+        assert_eq!(run(&mut s, SUMMARY), [OFFERED]);
         let g = s.game().unwrap();
         assert_eq!(g.summary.game_id, b"test-game");
         assert!(g.our_move());
@@ -478,7 +590,7 @@ END Game_Summary";
 
     #[test]
     fn a_rejected_offer_goes_back_to_waiting() {
-        let mut s = Session::new();
+        let mut s = Session::new(UNLIMITED);
         run(&mut s, "LOGIN:black OK");
         run(&mut s, SUMMARY);
         s.agreed();
@@ -486,22 +598,22 @@ END Game_Summary";
         assert_eq!(s.phase(), Phase::Waiting);
         assert!(s.game().is_none());
         // And a fresh offer after it is read as one.
-        assert_eq!(run(&mut s, SUMMARY), ["Offered"]);
+        assert_eq!(run(&mut s, SUMMARY), [OFFERED]);
     }
 
     #[test]
     fn an_offer_that_never_starts_is_replaced_by_the_next() {
-        let mut s = Session::new();
+        let mut s = Session::new(UNLIMITED);
         run(&mut s, "LOGIN:black OK");
         run(&mut s, SUMMARY);
         s.agreed();
-        assert_eq!(run(&mut s, SUMMARY), ["Offered"]);
+        assert_eq!(run(&mut s, SUMMARY), [OFFERED]);
         assert_eq!(s.phase(), Phase::Waiting);
     }
 
     #[test]
     fn an_unreadable_summary_is_said_so() {
-        let mut s = Session::new();
+        let mut s = Session::new(UNLIMITED);
         run(&mut s, "LOGIN:black OK");
         let steps = run(
             &mut s,
@@ -541,7 +653,7 @@ END Game_Summary";
         assert_eq!(run(&mut s, "-3334FU,T1"), Vec::<String>::new());
         assert_eq!(
             run(&mut s, "#ILLEGAL_MOVE\n#WIN"),
-            ["GameOver { reason: Some(IllegalMove), result: Win }"]
+            ["GameOver { reason: Some(IllegalMove), result: Win, declared: false }"]
         );
     }
 
@@ -577,19 +689,23 @@ END Game_Summary";
             let mut s = started();
             run(&mut s, "+7776FU,T1");
             let steps = run(&mut s, lines);
-            assert_eq!(steps, [format!("GameOver {{ reason: {want} }}")], "{lines}");
+            assert_eq!(
+                steps,
+                [format!("GameOver {{ reason: {want}, declared: false }}")],
+                "{lines}"
+            );
             assert_eq!(s.phase(), Phase::Waiting, "{lines}");
             // The next game is offered and read as usual.
-            assert_eq!(run(&mut s, SUMMARY), ["Offered"], "{lines}");
+            assert_eq!(run(&mut s, SUMMARY), [OFFERED], "{lines}");
         }
     }
 
     #[test]
     fn a_game_resumed_past_its_start_carries_its_moves() {
-        let mut s = Session::new();
+        let mut s = Session::new(UNLIMITED);
         run(&mut s, "LOGIN:black OK");
         let summary = SUMMARY.replace("PI\n+\n", "PI\n+\n+7776FU,T1\n-3334FU,T1\n");
-        assert_eq!(run(&mut s, &summary), ["Offered"]);
+        assert_eq!(run(&mut s, &summary), [OFFERED]);
         let g = s.game().unwrap();
         assert_eq!(g.usi_moves(), b"7g7f 3c3d");
         assert!(g.our_move());
@@ -599,16 +715,150 @@ END Game_Summary";
 
     #[test]
     fn a_position_other_than_the_initial_one_is_named_by_its_sfen() {
-        let mut s = Session::new();
+        let mut s = Session::new(UNLIMITED);
         run(&mut s, "LOGIN:black OK");
         // The initial position without Black's bishop.
         let summary = SUMMARY.replace("PI\n", "PI88KA\n");
-        assert_eq!(run(&mut s, &summary), ["Offered"]);
+        assert_eq!(run(&mut s, &summary), [OFFERED]);
         let fields = s.game().unwrap().start_fields().unwrap();
         assert_eq!(
             fields[0],
             b"lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/7R1/LNSGKGSNL"
         );
         assert_eq!(&fields[1..], [&b"b"[..], b"-", b"1"]);
+    }
+
+    /// [`SUMMARY`] with `Max_Moves` and `Declaration` lines, each left out
+    /// where `None`.
+    fn summary_with(max_moves: Option<&str>, declaration: Option<&str>) -> String {
+        let mut extra = String::new();
+        if let Some(n) = max_moves {
+            extra.push_str(&format!("Max_Moves:{n}\n"));
+        }
+        if let Some(d) = declaration {
+            extra.push_str(&format!("Declaration:{d}\n"));
+        }
+        SUMMARY.replace("To_Move:+\n", &format!("To_Move:+\n{extra}"))
+    }
+
+    fn offer(build: BuildRules, summary: &str) -> (Session, Vec<String>) {
+        let mut s = Session::new(build);
+        run(&mut s, "LOGIN:black OK");
+        let steps = run(&mut s, summary);
+        (s, steps)
+    }
+
+    #[test]
+    fn the_servers_move_limit_is_held_against_the_builds() {
+        let limited = BuildRules {
+            move_limit: Some(256),
+            ..UNLIMITED
+        };
+        let cases: &[(BuildRules, Option<&str>, &str)] = &[
+            (
+                limited,
+                Some("256"),
+                "Offered { limit: Same, rule: NotNamed }",
+            ),
+            (
+                limited,
+                Some("200"),
+                "Offered { limit: ServerShorter, rule: NotNamed }",
+            ),
+            (limited, Some("300"), "LimitTooLong"),
+            (limited, None, "LimitTooLong"),
+            (
+                UNLIMITED,
+                Some("256"),
+                "Offered { limit: ServerShorter, rule: NotNamed }",
+            ),
+            (UNLIMITED, None, "Offered { limit: Same, rule: NotNamed }"),
+        ];
+        for &(build, max_moves, want) in cases {
+            let (s, steps) = offer(build, &summary_with(max_moves, None));
+            assert_eq!(steps, [want], "{build:?} {max_moves:?}");
+            assert_eq!(s.phase(), Phase::Waiting);
+        }
+    }
+
+    #[test]
+    fn a_game_refused_for_its_move_limit_leaves_the_client_waiting_for_the_next() {
+        let limited = BuildRules {
+            move_limit: Some(256),
+            ..UNLIMITED
+        };
+        let (mut s, steps) = offer(limited, &summary_with(Some("300"), None));
+        assert_eq!(steps, ["LimitTooLong"]);
+        assert_eq!(s.game().unwrap().summary.max_moves, Some(300));
+        s.refused();
+        assert!(s.game().is_none());
+        assert_eq!(
+            run(&mut s, &summary_with(Some("256"), None)),
+            ["Offered { limit: Same, rule: NotNamed }"]
+        );
+    }
+
+    #[test]
+    fn the_declaration_rule_the_summary_names_is_held_against_the_builds() {
+        let point24 = BuildRules {
+            rule: EnteringKingRule::Point24,
+            ..UNLIMITED
+        };
+        let cases: &[(BuildRules, Option<&str>, &str)] = &[
+            (UNLIMITED, Some("Jishogi 1.1"), "Same"),
+            (point24, Some("Jishogi 1.1"), "Differs(Point27)"),
+            (UNLIMITED, Some("Something 9.9"), "Unknown"),
+            (UNLIMITED, None, "NotNamed"),
+        ];
+        for &(build, declaration, want) in cases {
+            let (_, steps) = offer(build, &summary_with(None, declaration));
+            assert_eq!(
+                steps,
+                [format!("Offered {{ limit: Same, rule: {want} }}")],
+                "{declaration:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_declaration_of_ours_the_server_accepts() {
+        let mut s = started();
+        assert!(s.game().unwrap().our_move());
+        assert_eq!(
+            run(&mut s, "%KACHI\n#JISHOGI\n#WIN"),
+            ["GameOver { reason: Some(Jishogi), result: Win, declared: true }"]
+        );
+    }
+
+    #[test]
+    fn a_declaration_of_ours_the_server_refuses() {
+        let mut s = started();
+        assert_eq!(
+            run(&mut s, "%KACHI\n#ILLEGAL_MOVE\n#LOSE"),
+            ["GameOver { reason: Some(IllegalMove), result: Lose, declared: true }"]
+        );
+    }
+
+    #[test]
+    fn a_declaration_of_the_opponents_is_not_ours() {
+        let mut s = started();
+        run(&mut s, "+7776FU,T1");
+        assert_eq!(
+            run(&mut s, "%KACHI\n#JISHOGI\n#LOSE"),
+            ["GameOver { reason: Some(Jishogi), result: Lose, declared: false }"]
+        );
+    }
+
+    #[test]
+    fn a_declaration_belongs_to_its_own_game_only() {
+        let mut s = started();
+        run(&mut s, "%KACHI\n#JISHOGI\n#WIN");
+        run(&mut s, SUMMARY);
+        s.agreed();
+        run(&mut s, "START:test-game");
+        assert_eq!(
+            run(&mut s, "#TIME_UP\n#LOSE"),
+            ["GameOver { reason: Some(TimeUp), result: Lose, declared: false }"]
+        );
     }
 }

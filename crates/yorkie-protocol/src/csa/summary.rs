@@ -3,7 +3,7 @@
 //!
 //! The block is a list of `Key:Value` lines with nested sections. What is read:
 //! `Protocol_Version`, `Format`, `Game_ID`, `Name+`, `Name-`, `Your_Turn`,
-//! `To_Move` and `Max_Moves` at the top; the time section `BEGIN Time` …
+//! `To_Move`, `Max_Moves` and `Declaration` at the top; the time section `BEGIN Time` …
 //! `END Time`, which applies to both sides, and `BEGIN Time+` / `BEGIN Time-`,
 //! which apply to one side and win over the shared one key by key; and the
 //! position section `BEGIN Position` … `END Position`, with the moves already
@@ -94,6 +94,9 @@ pub(crate) struct GameSummary {
     /// The side this client plays.
     pub(crate) your_turn: Color,
     pub(crate) max_moves: Option<u64>,
+    /// `Declaration`: the entering-king declaration rule the server judges a
+    /// `%KACHI` by, as the summary spells it; empty when it names none.
+    pub(crate) declaration: Vec<u8>,
     /// Each side's time control, indexed by [`Color::index`].
     pub(crate) time: [SideTime; 2],
     /// The position the game starts from, before [`Self::moves`].
@@ -226,6 +229,7 @@ pub(crate) fn parse_game_summary(block: &[u8]) -> Result<GameSummary, SummaryErr
     let mut your_turn = None;
     let mut to_move = None;
     let mut max_moves = None;
+    let mut declaration = Vec::new();
     let mut shared = TimeKeys::default();
     let mut per_side = [TimeKeys::default(); 2];
     let mut remaining = [None; 2];
@@ -303,6 +307,7 @@ pub(crate) fn parse_game_summary(block: &[u8]) -> Result<GameSummary, SummaryErr
                 b"Max_Moves" => {
                     max_moves = Some(atoi_u64(value).ok_or(SummaryError::BadValue(b"Max_Moves"))?);
                 }
+                b"Declaration" => declaration = value.to_vec(),
                 _ => {}
             },
             Section::Time(side) => {
@@ -339,6 +344,7 @@ pub(crate) fn parse_game_summary(block: &[u8]) -> Result<GameSummary, SummaryErr
         names,
         your_turn,
         max_moves,
+        declaration,
         time,
         start,
         moves,
@@ -455,6 +461,7 @@ END Position
         assert_eq!(s.your_turn, Color::White);
         assert_eq!(s.start.side_to_move(), Color::Black);
         assert_eq!(s.max_moves, Some(256));
+        assert_eq!(s.declaration, b"Jishogi 1.1");
         let side = SideTime {
             unit_ms: 1000,
             total: 300,

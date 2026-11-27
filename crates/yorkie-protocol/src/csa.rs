@@ -17,9 +17,22 @@
 //! server's, from the time control in the summary and the `,T<n>` on every
 //! move it relays, and a move it relays that the client's position does not
 //! allow is logged and followed by the server's verdict rather than argued
-//! with. The entering-king declaration, the move limit and re-login after a
-//! dropped connection are not implemented; a game the engine resigns ends with
-//! `%TORYO`.
+//! with. A game the engine resigns ends with `%TORYO`, and one it wins by the
+//! entering-king declaration ends with `%KACHI`, sent in place of a move when
+//! the engine's search finds the declaration available under the rule the
+//! build selects (`entering_king_rule`). The server judges the declaration by
+//! its own rule; where the summary names that rule (`Declaration`) and it is
+//! not the build's, the client says so in the log when the game is offered.
+//!
+//! The move limit is compiled in (`max_moves_to_draw`) and the engine cannot
+//! take the server's at run time. A game whose `Max_Moves` is the build's is
+//! played as is. One whose limit is shorter is played too, with a note in the
+//! log: the server ends it as a draw before the engine's limit, which costs the
+//! engine nothing it could lose. One whose limit is longer, or that has none
+//! where the build has one, is refused with `REJECT`: past its own limit the
+//! engine scores every position a draw, and could lose the game unawares.
+//!
+//! Re-login after a dropped connection is not implemented.
 
 mod clock;
 mod session;
@@ -35,9 +48,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use yorkie_search::BookHit;
 #[cfg(feature = "verbose3")]
 use yorkie_search::causes::ReplyMarks;
+use yorkie_search::{BookHit, EnteringKingRule};
 #[cfg(feature = "verbose2")]
 use yorkie_search::{PvInfo, PvSink};
 use yorkie_state::text::atoi_u16;
@@ -49,7 +62,7 @@ use crate::engine::{
     Engine, EngineSink, GoOutcome, NOTICE_BYTES, PositionSfen, ReadyOutcome, Reply,
 };
 use crate::usi::ENGINE_NAME;
-use session::{Phase, Session, Step};
+use session::{BuildRules, EndReason, LimitCheck, Phase, RuleCheck, Session, Step};
 use summary::SideTime;
 
 use wire::{Log, MAX_CREDENTIAL_BYTES, Wire, write_io_error};
@@ -405,7 +418,7 @@ impl CsaEngine {
             settings,
             wire,
             engine,
-            session: Session::new(),
+            session: Session::new(BuildRules::COMPILED),
         })
     }
 
@@ -549,8 +562,10 @@ impl CsaEngine {
                 self.log().note(&[b"logged out"]);
                 return Ok(true);
             }
-            Step::Offered => {
+            Step::Offered { limit, rule } => {
                 self.log_offer();
+                self.log_limit(limit);
+                self.log_rule(rule);
                 self.engine.new_game()?;
                 let game = self.session.game().expect("an offered game");
                 let mut bytes = [0u8; 512];
@@ -569,6 +584,12 @@ impl CsaEngine {
                 out.bytes(b"unreadable game summary: ");
                 e.write_message(&mut out);
                 self.log().note(&[out.as_bytes(), b"; refusing the game"]);
+                self.wire.send(b"REJECT")?;
+                self.session.refused();
+            }
+            Step::LimitTooLong => {
+                self.log_offer();
+                self.log_limit(LimitCheck::ServerLonger);
                 self.wire.send(b"REJECT")?;
                 self.session.refused();
             }
@@ -597,7 +618,11 @@ impl CsaEngine {
                 self.wire.disarm();
                 self.engine.stop();
             }
-            Step::GameOver { reason, result } => {
+            Step::GameOver {
+                reason,
+                result,
+                declared,
+            } => {
                 self.wire.disarm();
                 self.engine.stop();
                 self.engine.finish_search_join();
@@ -608,6 +633,9 @@ impl CsaEngine {
                     reason.map_or(&b"no reason given"[..], |r| r.name()),
                     b")",
                 ]);
+                if declared {
+                    self.log_declaration_answer(reason);
+                }
             }
             Step::Unexpected(_) => self.log().note(&[b"(not expected here; ignored)"]),
         }
@@ -647,6 +675,81 @@ impl CsaEngine {
                 wire.log.note(&[b"no evaluation network loaded; resigning"]);
                 wire.send_reply(Reply::Resign);
             }
+        }
+    }
+
+    /// What the server made of this client's `%KACHI`.
+    fn log_declaration_answer(&self, reason: Option<EndReason>) {
+        match reason {
+            Some(EndReason::Jishogi) => self.log().note(&[b"the server accepted the declaration"]),
+            Some(EndReason::IllegalMove) => self.log().note(&[
+                b"the server refused the declaration made under ",
+                rule_name(BuildRules::COMPILED.rule),
+                b": the server's rule, or its reading of the position, is not this build's",
+            ]),
+            _ => self
+                .log()
+                .note(&[b"the server ended the game after the declaration"]),
+        }
+    }
+
+    /// The server's move limit against the build's.
+    fn log_limit(&self, limit: LimitCheck) {
+        let Some(game) = self.session.game() else {
+            return;
+        };
+        let mut bytes = [0u8; 256];
+        let mut out = TextWriter::new(&mut bytes);
+        out.bytes(b"move limit: the server's ");
+        write_limit(&mut out, game.summary.max_moves);
+        out.bytes(b", this build's ");
+        write_limit(&mut out, BuildRules::COMPILED.move_limit);
+        out.bytes(match limit {
+            LimitCheck::Same => b"",
+            LimitCheck::ServerShorter => {
+                b"; the game ends before the build's limit and is played under the server's"
+            }
+            LimitCheck::ServerLonger => {
+                b"; the game runs past the build's limit, where the engine scores every \
+                  position a draw: refusing the game"
+            }
+        });
+        self.log().note(&[out.as_bytes()]);
+    }
+
+    /// The declaration rule the summary names, against the build's.
+    fn log_rule(&self, rule: RuleCheck) {
+        let ours = rule_name(BuildRules::COMPILED.rule);
+        match rule {
+            RuleCheck::Same => {
+                self.log()
+                    .note(&[b"declaration rule: ", ours, b", the server's as well"]);
+            }
+            RuleCheck::Differs(theirs) => self.log().note(&[
+                b"declaration rule MISMATCH: this build declares under ",
+                ours,
+                b", the server judges by ",
+                rule_name(theirs),
+                b"; a declaration the server refuses loses the game",
+            ]),
+            RuleCheck::Unknown => {
+                let named = self
+                    .session
+                    .game()
+                    .map_or(&b""[..], |g| &g.summary.declaration[..]);
+                self.log().note(&[
+                    b"declaration rule: this build declares under ",
+                    ours,
+                    b"; the server names ",
+                    named,
+                    b", a rule this client does not know",
+                ]);
+            }
+            RuleCheck::NotNamed => self.log().note(&[
+                b"declaration rule: this build declares under ",
+                ours,
+                b"; the summary does not name the server's",
+            ]),
         }
     }
 
@@ -700,11 +803,32 @@ impl CsaEngine {
     }
 }
 
+/// The `entering_king_rule` spelling of `rule`.
+fn rule_name(rule: EnteringKingRule) -> &'static [u8] {
+    use EnteringKingRule as R;
+    let i = match rule {
+        R::None => 0,
+        R::Point24 => 1,
+        R::Point24H => 2,
+        R::Point27 => 3,
+        R::Point27H => 4,
+        R::Try => 5,
+    };
+    EnteringKingRule::SPELLINGS[i]
+}
+
 fn sign(side: Color) -> u8 {
     match side {
         Color::Black => b'+',
         Color::White => b'-',
     }
+}
+
+fn write_limit(out: &mut TextWriter<'_>, limit: Option<u64>) {
+    match limit {
+        Some(n) => out.u64(n),
+        None => out.bytes(b"none"),
+    };
 }
 
 fn write_side_time(out: &mut TextWriter<'_>, t: &SideTime) {

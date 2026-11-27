@@ -330,6 +330,16 @@ mod tests {
     }
 
     #[test]
+    fn a_declaration_goes_out_as_kachi_in_place_of_a_move() {
+        let w = wire();
+        w.arm();
+        w.send_reply(Reply::Win);
+        // The declaration is the reply the arming owed; nothing follows it.
+        w.send_reply(Reply::Resign);
+        assert_eq!(sent(&w), b"%KACHI\n");
+    }
+
+    #[test]
     fn a_keep_alive_is_a_bare_line_and_only_after_the_idle_time() {
         let w = wire();
         w.keep_alive(std::time::Duration::from_secs(3600)).unwrap();
