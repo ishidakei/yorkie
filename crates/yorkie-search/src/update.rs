@@ -411,9 +411,8 @@ impl Default for SearchStackCell {
 /// distance, which is what lets the walk pair a weight with a cell by stepping
 /// backwards over the stack.
 ///
-/// In every build but `tune` the weights are constants, and the table is one
-/// `static` the walk reads rather than an array assembled on each call.
-#[cfg(not(feature = "tune"))]
+/// The weights are constants, and the table is one `static` the walk reads
+/// rather than an array assembled on each call.
 #[inline(always)]
 fn conthist_bonuses() -> &'static [i32; 6] {
     const WEIGHTS: [i32; 6] = [
@@ -425,20 +424,6 @@ fn conthist_bonuses() -> &'static [i32; 6] {
         params::CONT_WEIGHT_6.get(),
     ];
     &WEIGHTS
-}
-
-/// The weights as the `tune` build holds them, read afresh on each call.
-#[cfg(feature = "tune")]
-#[inline(always)]
-fn conthist_bonuses() -> [i32; 6] {
-    [
-        params::CONT_WEIGHT_1.get(),
-        params::CONT_WEIGHT_2.get(),
-        params::CONT_WEIGHT_3.get(),
-        params::CONT_WEIGHT_4.get(),
-        params::CONT_WEIGHT_5.get(),
-        params::CONT_WEIGHT_6.get(),
-    ]
 }
 
 /// A *plain* capture test (`Position::capture`): a non-drop landing on an

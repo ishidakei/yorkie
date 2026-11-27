@@ -37,7 +37,6 @@ verbose2 = ["yorkie-protocol/verbose2"]
 verbose3 = ["yorkie-protocol/verbose3"]
 tt-entry16 = ["yorkie-protocol/tt-entry16"]
 random = ["yorkie-protocol/random"]
-tune = ["yorkie-protocol/tune"]
 
 [lints]
 workspace = true

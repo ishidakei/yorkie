@@ -11,9 +11,6 @@ pub(crate) mod settings;
 /// The per-reply statistics line, which only a `verbose1` build writes.
 #[cfg(feature = "verbose1")]
 pub(crate) mod stats;
-/// The startup read of the search parameters, which only a `tune` build has.
-#[cfg(feature = "tune")]
-pub mod tune;
 pub mod usi;
 
 #[cfg(feature = "verbose3")]

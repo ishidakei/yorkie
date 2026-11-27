@@ -2,12 +2,12 @@
 //!
 //! Each pair has one function that reads a parameter the way the search does,
 //! through `params::NAME.get()` or `.scaled(..)`, and one that does the same
-//! arithmetic with the parameter's value written in. In a build without `tune`
-//! the two compile to the same machine code: a divisor becomes a multiply and
-//! shift, a comparison folds into the branch, and nothing is loaded from
-//! memory. The `param-probes` binary, built in release mode, carries both
-//! functions of every pair, and disassembling it shows whether their
-//! instructions are identical.
+//! arithmetic with the parameter's value written in. The two compile to the
+//! same machine code: a divisor becomes a multiply and shift, a comparison
+//! folds into the branch, and nothing is loaded from memory. The
+//! `param-probes` binary, built in release mode, carries both functions of
+//! every pair, and disassembling it shows whether their instructions are
+//! identical.
 //!
 //! The arithmetic of each pair mirrors one use site in the search, so the
 //! types and the operations are the ones the search compiles.

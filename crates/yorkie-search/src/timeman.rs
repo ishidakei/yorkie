@@ -1049,24 +1049,6 @@ mod tests {
         assert_the_defaults_allocate_as_the_literals();
     }
 
-    /// A tuning list that spells out the time parameters' defaults allocates
-    /// as no list does.
-    #[cfg(feature = "tune")]
-    #[test]
-    fn the_time_parameters_defaults_spelled_out_allocate_as_the_literals() {
-        params::apply(
-            b"tm_move_horizon=160,tm_opening_forfeit=40,tm_opening_inc=20,\
-              tm_opening_inc_plies=80,tm_max_ratio=5000,tm_max_share=300,\
-              tm_falling_base=11325,tm_falling_average=2115,tm_falling_iteration=987,\
-              tm_falling_min=5688,tm_falling_max=15698,tm_reduction_k=5189,\
-              tm_reduction_center=1157,tm_reduction_base=723,tm_reduction_amplitude=790,\
-              tm_reduction_previous=1455,tm_instability_base=1040,\
-              tm_instability_weight=18956,tm_effort_factor=666,tm_deepen_share=503",
-        )
-        .expect("the defaults are in range");
-        assert_the_defaults_allocate_as_the_literals();
-    }
-
     /// No credit is today's arithmetic, floor included.
     #[test]
     fn no_credit_ends_the_search_as_it_always_has() {

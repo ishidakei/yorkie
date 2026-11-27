@@ -54,12 +54,6 @@ yorkie-eval = { path = "../yorkie-eval", features = ["source-network"] }
 # branch that adds it — is behind the feature, and a build without it evaluates
 # exactly as before. Off by default.
 #
-# `tune` is orthogonal too: it turns the search and time-allocation parameters
-# `params` registers from constants into statics written once at startup from a
-# tuning list, so a tuning run can vary them without a rebuild. A `tune` build
-# given no list searches and allocates time exactly as the build without it.
-# Off by default.
-#
 # `dupstats` is a measuring feature: it counts where and how much parallel
 # search workers repeat each other's work (the `dupstats` module), using two
 # statistics-only tables beside the transposition table, and what each worker's
@@ -111,7 +105,6 @@ param-probes = []
 lazy-smp-spread = []
 random = []
 repetition-index = []
-tune = []
 tt-entry16 = ["yorkie-storage/tt-entry16"]
 verbose1 = ["yorkie-storage/verbose1"]
 verbose2 = ["verbose1", "yorkie-storage/verbose2"]
