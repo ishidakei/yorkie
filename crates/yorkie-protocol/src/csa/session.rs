@@ -4,6 +4,16 @@
 //! ([`Step`]); the caller does what that asks of the engine and of the
 //! connection. Nothing here touches either, so a whole exchange can be played
 //! through it from a transcript.
+//!
+//! A lost connection is [`Session::connection_lost`]: the session goes back to
+//! waiting for the answer to a fresh `LOGIN`, and a game that was agreed or
+//! under way is kept as the interrupted one. What the server sends after the
+//! new `LOGIN` decides what becomes of it. A summary with the interrupted
+//! game's `Game_ID` offers it back, and the game is resumed from that summary
+//! — the position, the moves and the clocks the server states, whatever the
+//! client remembered. A summary of another game replaces it. A result line
+//! ends it. The caller gives up on it when none of these comes
+//! ([`Session::abandon_interrupted`]).
 
 use yorkie_state::{Color, CsaError, Move, Position, SfenBuf, format_sfen, parse_csa_move};
 
@@ -185,6 +195,17 @@ impl RuleCheck {
     }
 }
 
+/// What an offered game is to the game the lost connection interrupted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Resumption {
+    /// No game was interrupted.
+    Fresh,
+    /// The offer is the interrupted game, given back.
+    Resumes,
+    /// The offer is another game: the interrupted one is over.
+    Replaces,
+}
+
 /// What one received line means for the caller.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Step<'a> {
@@ -244,6 +265,9 @@ pub(crate) struct Game {
     /// The server relayed a move this client could not play, so it no longer
     /// knows the position.
     lost_track: bool,
+    /// The moves the server relayed since the game started, after those the
+    /// summary listed.
+    relayed: usize,
 }
 
 /// Room for a whole game's move list: the engine refuses one longer than
@@ -265,6 +289,7 @@ impl Game {
             start_sfen,
             usi_moves: Vec::with_capacity(USI_MOVES_CAPACITY),
             lost_track: false,
+            relayed: 0,
             summary,
         };
         for i in 0..game.summary.moves.len() {
@@ -288,6 +313,25 @@ impl Game {
     /// The side this client plays.
     pub(crate) fn us(&self) -> Color {
         self.summary.your_turn
+    }
+
+    /// The number of moves played so far.
+    pub(crate) fn ply(&self) -> usize {
+        self.summary.moves.len() + self.relayed
+    }
+
+    /// Whether this game, as the server states it, continues `earlier` as the
+    /// client knew it: the same start, and the moves of one the first moves of
+    /// the other.
+    pub(crate) fn continues(&self, earlier: &Game) -> bool {
+        let (long, short) = if self.usi_moves.len() >= earlier.usi_moves.len() {
+            (&self.usi_moves, &earlier.usi_moves)
+        } else {
+            (&earlier.usi_moves, &self.usi_moves)
+        };
+        self.start_sfen == earlier.start_sfen
+            && long.starts_with(short)
+            && (short.is_empty() || long.len() == short.len() || long[short.len()] == b' ')
     }
 
     /// Whether the engine owes the server a move now.
@@ -327,6 +371,9 @@ pub(crate) struct Session {
     summary: Vec<u8>,
     summary_too_long: bool,
     game: Option<Game>,
+    /// The game a lost connection interrupted, until the server offers it
+    /// back, offers another or ends it.
+    interrupted: Option<Game>,
     reason: Option<EndReason>,
     /// The `%KACHI` the server relayed was this client's.
     declared: bool,
@@ -341,6 +388,7 @@ impl Session {
             summary: Vec::with_capacity(4096),
             summary_too_long: false,
             game: None,
+            interrupted: None,
             reason: None,
             declared: false,
         }
@@ -355,19 +403,71 @@ impl Session {
         self.game.as_ref()
     }
 
+    /// The game a lost connection interrupted, while the server has not said
+    /// what became of it.
+    pub(crate) fn interrupted(&self) -> Option<&Game> {
+        self.interrupted.as_ref()
+    }
+
+    /// Whether a game is agreed, under way, or interrupted by a lost
+    /// connection and not yet over.
+    pub(crate) fn game_in_progress(&self) -> bool {
+        matches!(self.phase, Phase::Agreed | Phase::Playing) || self.interrupted.is_some()
+    }
+
+    /// What the game offered last is to the interrupted one.
+    pub(crate) fn resumption(&self) -> Resumption {
+        match (&self.interrupted, &self.game) {
+            (Some(old), Some(new)) if old.summary.game_id == new.summary.game_id => {
+                Resumption::Resumes
+            }
+            (Some(_), Some(_)) => Resumption::Replaces,
+            _ => Resumption::Fresh,
+        }
+    }
+
+    /// The connection was lost; a fresh `LOGIN` is about to be sent. A game
+    /// agreed or under way becomes the interrupted one, and one being offered
+    /// is forgotten: the server offers it again or not at all.
+    pub(crate) fn connection_lost(&mut self) {
+        match self.phase {
+            Phase::LoggingOut => return,
+            Phase::Agreed | Phase::Playing => {
+                if let Some(game) = self.game.take() {
+                    self.interrupted = Some(game);
+                }
+            }
+            Phase::LoggingIn | Phase::Waiting | Phase::Summary => self.game = None,
+        }
+        self.reason = None;
+        self.declared = false;
+        self.phase = Phase::LoggingIn;
+    }
+
+    /// The server has not offered the interrupted game back: it is taken as
+    /// over.
+    pub(crate) fn abandon_interrupted(&mut self) {
+        self.interrupted = None;
+    }
+
     /// `LOGOUT` has been sent.
     pub(crate) fn logging_out(&mut self) {
         self.phase = Phase::LoggingOut;
     }
 
-    /// The offered game has been agreed to.
+    /// The offered game has been agreed to. It is the interrupted one given
+    /// back, or replaces it.
     pub(crate) fn agreed(&mut self) {
         self.phase = Phase::Agreed;
+        self.interrupted = None;
     }
 
-    /// The offered game has been refused by this client.
+    /// The offered game has been refused by this client. An interrupted game
+    /// the server offered back, or one it offered another in place of, is
+    /// over with it.
     pub(crate) fn refused(&mut self) {
         self.game = None;
+        self.interrupted = None;
         self.phase = Phase::Waiting;
     }
 
@@ -402,6 +502,9 @@ impl Session {
                     self.game = None;
                     return Step::Nothing;
                 }
+                if self.phase == Phase::Waiting && self.interrupted.is_some() {
+                    return self.interrupted_line(line);
+                }
                 if self.phase == Phase::Agreed {
                     if line.starts_with(b"START:") {
                         self.phase = Phase::Playing;
@@ -418,6 +521,29 @@ impl Session {
             }
             Phase::Playing => self.game_line(line),
             Phase::Summary | Phase::LoggingOut => Step::Nothing,
+        }
+    }
+
+    /// A line read while the interrupted game's fate is unknown: a result
+    /// ends it; anything else of a game's is the old connection's and has
+    /// nothing to act on.
+    fn interrupted_line<'a>(&mut self, line: &'a [u8]) -> Step<'a> {
+        match line[0] {
+            b'#' => match GameResult::of(line) {
+                Some(result) => {
+                    self.interrupted = None;
+                    Step::GameOver {
+                        reason: self.reason.take(),
+                        result,
+                        declared: false,
+                    }
+                }
+                None => {
+                    self.reason = Some(EndReason::of(line));
+                    Step::Nothing
+                }
+            },
+            _ => Step::Unexpected(line),
         }
     }
 
@@ -464,6 +590,7 @@ impl Session {
                 match parse_csa_move(text, &game.pos) {
                     Ok(m) => {
                         game.play(m);
+                        game.relayed += 1;
                         game.clock.charge(mover, time.unwrap_or(0));
                         Step::Moved {
                             ours: mover == game.us(),
@@ -860,5 +987,196 @@ END Game_Summary";
             run(&mut s, "#TIME_UP\n#LOSE"),
             ["GameOver { reason: Some(TimeUp), result: Lose, declared: false }"]
         );
+    }
+
+    /// [`SUMMARY`] for the game in progress, as a server offering it back
+    /// states it: the moves played, each with its time, and both clocks.
+    fn resumed(game_id: &str, moves: &str, black: u64, white: u64) -> String {
+        SUMMARY
+            .replace("Game_ID:test-game", &format!("Game_ID:{game_id}"))
+            .replace(
+                "Increment:2\nEND Time+",
+                &format!("Increment:2\nRemaining_Time+:{black}\nEND Time+"),
+            )
+            .replace(
+                "Increment:2\nEND Time-",
+                &format!("Increment:2\nRemaining_Time-:{white}\nEND Time-"),
+            )
+            .replace("PI\n+\n", &format!("PI\n+\n{moves}"))
+    }
+
+    /// A game two moves in, its connection lost with Black to move, and the
+    /// fresh `LOGIN` accepted.
+    fn interrupted() -> Session {
+        let mut s = started();
+        run(&mut s, "+7776FU,T3\n-3334FU,T7");
+        s.connection_lost();
+        assert_eq!(s.phase(), Phase::LoggingIn);
+        assert!(s.game().is_none());
+        assert!(s.game_in_progress());
+        assert_eq!(run(&mut s, "LOGIN:black OK"), ["LoginOk"]);
+        assert_eq!(s.interrupted().unwrap().ply(), 2);
+        s
+    }
+
+    #[test]
+    fn a_game_offered_back_is_resumed_from_the_servers_position_and_clocks() {
+        let mut s = interrupted();
+        let summary = resumed("test-game", "+7776FU,T3\n-3334FU,T7\n", 170, 590);
+        assert_eq!(run(&mut s, &summary), [OFFERED]);
+        assert_eq!(s.resumption(), Resumption::Resumes);
+        let g = s.game().unwrap();
+        assert!(g.continues(s.interrupted().unwrap()));
+        assert_eq!(g.usi_moves(), b"7g7f 3c3d");
+        assert!(g.our_move());
+        // The server's clocks, not the 179 and 595 the client had.
+        let p = g.go_params();
+        assert_eq!((p.btime, p.wtime), (Some(170_000), Some(590_000)));
+        s.agreed();
+        assert!(s.interrupted().is_none());
+        assert_eq!(run(&mut s, "START:test-game"), ["Started"]);
+        assert_eq!(run(&mut s, "+2726FU,T4"), ["Moved { ours: true }"]);
+        assert_eq!(s.game().unwrap().clock.remaining_units(Color::Black), 168);
+    }
+
+    /// The client sent a move and lost the connection before the server
+    /// relayed it: the summary says whether the server took it, and only
+    /// where it did not is a move owed again.
+    #[test]
+    fn a_move_sent_but_not_relayed_is_owed_again_only_if_the_server_lacks_it() {
+        let mut s = interrupted();
+        let taken = resumed(
+            "test-game",
+            "+7776FU,T3\n-3334FU,T7\n+2726FU,T2\n",
+            177,
+            595,
+        );
+        run(&mut s, &taken);
+        let g = s.game().unwrap();
+        assert!(g.continues(s.interrupted().unwrap()));
+        assert_eq!(g.ply(), 3);
+        assert!(!g.our_move());
+
+        let mut s = interrupted();
+        run(
+            &mut s,
+            &resumed("test-game", "+7776FU,T3\n-3334FU,T7\n", 179, 595),
+        );
+        assert!(s.game().unwrap().our_move());
+    }
+
+    #[test]
+    fn a_position_the_server_states_differently_is_the_one_played() {
+        let mut s = interrupted();
+        run(
+            &mut s,
+            &resumed("test-game", "+2726FU,T3\n-8384FU,T7\n", 179, 595),
+        );
+        assert_eq!(s.resumption(), Resumption::Resumes);
+        let g = s.game().unwrap();
+        assert!(!g.continues(s.interrupted().unwrap()));
+        assert_eq!(g.usi_moves(), b"2g2f 8c8d");
+    }
+
+    #[test]
+    fn a_new_game_offered_in_place_of_the_interrupted_one_replaces_it() {
+        let mut s = interrupted();
+        let summary = SUMMARY.replace("Game_ID:test-game", "Game_ID:next-game");
+        assert_eq!(run(&mut s, &summary), [OFFERED]);
+        assert_eq!(s.resumption(), Resumption::Replaces);
+        assert_eq!(s.game().unwrap().ply(), 0);
+        s.agreed();
+        assert!(s.interrupted().is_none());
+        assert_eq!(run(&mut s, "START:next-game"), ["Started"]);
+    }
+
+    #[test]
+    fn a_result_sent_after_the_new_login_ends_the_interrupted_game() {
+        let mut s = interrupted();
+        assert_eq!(
+            run(&mut s, "#TIME_UP\n#LOSE"),
+            ["GameOver { reason: Some(TimeUp), result: Lose, declared: false }"]
+        );
+        assert!(!s.game_in_progress());
+        assert_eq!(s.phase(), Phase::Waiting);
+    }
+
+    #[test]
+    fn a_move_sent_after_the_new_login_without_a_summary_is_not_played() {
+        let mut s = interrupted();
+        let steps = run(&mut s, "+2726FU,T1");
+        assert_eq!(steps.len(), 1);
+        assert!(steps[0].starts_with("Unexpected"));
+        assert!(s.game().is_none());
+        assert_eq!(s.interrupted().unwrap().ply(), 2);
+    }
+
+    #[test]
+    fn an_interrupted_game_never_offered_back_is_given_up() {
+        let mut s = interrupted();
+        s.abandon_interrupted();
+        assert!(!s.game_in_progress());
+        assert_eq!(run(&mut s, SUMMARY), [OFFERED]);
+        assert_eq!(s.resumption(), Resumption::Fresh);
+    }
+
+    #[test]
+    fn a_refused_login_after_the_loss_keeps_the_game_interrupted() {
+        let mut s = started();
+        run(&mut s, "+7776FU,T3");
+        s.connection_lost();
+        // `shogi-server` refuses a second login of a player it still counts
+        // as in a game.
+        assert_eq!(run(&mut s, "LOGIN:incorrect"), ["LoginRefused"]);
+        assert!(s.game_in_progress());
+        s.connection_lost();
+        assert_eq!(s.interrupted().unwrap().ply(), 1);
+        assert_eq!(run(&mut s, "LOGIN:black OK"), ["LoginOk"]);
+        assert!(s.game_in_progress());
+    }
+
+    #[test]
+    fn a_connection_lost_between_games_leaves_nothing_in_progress() {
+        let mut s = started();
+        run(&mut s, "%TORYO\n#RESIGN\n#WIN");
+        s.connection_lost();
+        assert!(!s.game_in_progress());
+        assert!(s.interrupted().is_none());
+        assert_eq!(run(&mut s, "LOGIN:black OK"), ["LoginOk"]);
+        assert_eq!(run(&mut s, SUMMARY), [OFFERED]);
+        assert_eq!(s.resumption(), Resumption::Fresh);
+    }
+
+    #[test]
+    fn a_summary_half_read_when_the_connection_drops_is_forgotten() {
+        let mut s = Session::new(UNLIMITED);
+        run(&mut s, "LOGIN:black OK");
+        run(&mut s, "BEGIN Game_Summary\nProtocol_Version:1.2");
+        s.connection_lost();
+        assert!(!s.game_in_progress());
+        run(&mut s, "LOGIN:black OK");
+        assert_eq!(run(&mut s, SUMMARY), [OFFERED]);
+    }
+
+    #[test]
+    fn an_agreed_game_not_yet_started_is_interrupted_too() {
+        let mut s = Session::new(UNLIMITED);
+        run(&mut s, "LOGIN:black OK");
+        run(&mut s, SUMMARY);
+        s.agreed();
+        s.connection_lost();
+        assert!(s.game_in_progress());
+        run(&mut s, "LOGIN:black OK");
+        run(&mut s, SUMMARY);
+        assert_eq!(s.resumption(), Resumption::Resumes);
+    }
+
+    #[test]
+    fn a_loss_while_logging_out_changes_nothing() {
+        let mut s = Session::new(UNLIMITED);
+        run(&mut s, "LOGIN:black OK");
+        s.logging_out();
+        s.connection_lost();
+        assert_eq!(s.phase(), Phase::LoggingOut);
     }
 }

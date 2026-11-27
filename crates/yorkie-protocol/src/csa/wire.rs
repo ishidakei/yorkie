@@ -135,6 +135,8 @@ struct WireState<W> {
     armed: bool,
     /// When the last line went out.
     last_sent: Instant,
+    /// A write to the connection failed: it is taken as lost.
+    broken: bool,
 }
 
 /// The sending half of the connection, shared by the session and the search.
@@ -151,6 +153,7 @@ impl<W: Write> Wire<W> {
                 out: None,
                 armed: false,
                 last_sent: Instant::now(),
+                broken: false,
             }),
             log,
         }
@@ -165,6 +168,22 @@ impl<W: Write> Wire<W> {
         let mut s = self.lock();
         s.out = Some(out);
         s.last_sent = Instant::now();
+        s.broken = false;
+    }
+
+    /// Stop sending to the connection, which is lost, and hand it back to be
+    /// closed. No move is owed across the gap: a reply the engine gives before
+    /// the next connection is attached and a move is owed again is dropped.
+    pub(crate) fn detach(&self) -> Option<W> {
+        let mut s = self.lock();
+        s.armed = false;
+        s.broken = false;
+        s.out.take()
+    }
+
+    /// Whether a write to the connection has failed since it was attached.
+    pub(crate) fn is_broken(&self) -> bool {
+        self.lock().broken
     }
 
     /// Write `line` and its line feed in one write.
@@ -182,6 +201,9 @@ impl<W: Write> Wire<W> {
         };
         bytes.fill(0);
         state.last_sent = Instant::now();
+        if result.is_err() {
+            state.broken = true;
+        }
         result
     }
 
@@ -346,6 +368,47 @@ mod tests {
         assert_eq!(sent(&w), b"");
         w.keep_alive(std::time::Duration::ZERO).unwrap();
         assert_eq!(sent(&w), b"\n");
+    }
+
+    /// A connection whose writes all fail.
+    struct Dead;
+
+    impl Write for Dead {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_write_marks_the_connection_lost_until_another_is_attached() {
+        let w = Wire::new(Log::Memory(Mutex::new(Vec::new())));
+        w.attach(Dead);
+        assert!(!w.is_broken());
+        assert!(w.send(b"AGREE").is_err());
+        assert!(w.is_broken());
+        w.attach(Dead);
+        assert!(!w.is_broken());
+        // The search thread's reply fails the same way.
+        w.arm();
+        w.send_reply(Reply::Resign);
+        assert!(w.is_broken());
+        assert!(w.detach().is_some());
+        assert!(!w.is_broken());
+    }
+
+    #[test]
+    fn nothing_is_owed_across_a_lost_connection() {
+        let w = wire();
+        w.arm();
+        let old = w.detach().unwrap();
+        assert_eq!(old, b"");
+        w.attach(Vec::new());
+        // A reply the stopped search gives now reaches neither connection.
+        w.send_reply(Reply::Resign);
+        assert_eq!(sent(&w), b"");
     }
 
     #[test]

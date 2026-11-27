@@ -32,7 +32,25 @@
 //! where the build has one, is refused with `REJECT`: past its own limit the
 //! engine scores every position a draw, and could lose the game unawares.
 //!
-//! Re-login after a dropped connection is not implemented.
+//! A lost connection is logged in again. The loss is a read that returns end
+//! of file or an error, a write that fails, or a server silent for longer than
+//! 60 seconds. The client reconnects at once, then at growing intervals
+//! up to 4 seconds, for as long as a game is in progress or no
+//! `SIGTERM` has asked it to stop. Before it reconnects, it stops a running
+//! search and drops whatever reply the search still gives: no move is owed
+//! across the gap. The transposition table and the histories are kept. After
+//! the new `LOGIN`, a summary with the interrupted game's `Game_ID` resumes
+//! that game from the position and the clocks the summary states, and the
+//! engine moves again only if that position leaves it to move. A summary of
+//! another game is played as that game. With no offer within 30 seconds,
+//! the interrupted game is taken as over.
+//!
+//! `shogi-server` itself never offers a game back. It ends the game of a player
+//! whose connection closes: at once, as a resignation, when that player is to
+//! move, and at the opponent's next move otherwise. It refuses (`LOGIN:incorrect`)
+//! a second login under a name it still counts as playing. That is why a refused
+//! re-login is tried again rather than taken as final, and why the client waits
+//! for an offer for those 30 seconds only.
 
 mod clock;
 mod session;
@@ -41,7 +59,7 @@ mod wire;
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs as _};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -62,7 +80,7 @@ use crate::engine::{
     Engine, EngineSink, GoOutcome, NOTICE_BYTES, PositionSfen, ReadyOutcome, Reply,
 };
 use crate::usi::ENGINE_NAME;
-use session::{BuildRules, EndReason, LimitCheck, Phase, RuleCheck, Session, Step};
+use session::{BuildRules, EndReason, LimitCheck, Phase, Resumption, RuleCheck, Session, Step};
 use summary::SideTime;
 
 use wire::{Log, MAX_CREDENTIAL_BYTES, Wire, write_io_error};
@@ -78,6 +96,27 @@ pub const LOG_VAR: &str = "YORKIE_CSA_LOG";
 /// How long the client stays silent before it sends a bare line feed. The
 /// protocol forbids sending them more often than every 30 seconds.
 const KEEP_ALIVE_IDLE: Duration = Duration::from_secs(40);
+
+/// How long the server may stay silent before the connection is taken as lost.
+/// `shogi-server` answers every blank line at once with one of its own, in a
+/// game and out of one, and the client sends one after [`KEEP_ALIVE_IDLE`]
+/// without sending anything. So a live server is heard from at least that often.
+/// The rest of the limit is the time its answer may take.
+const SILENCE_LIMIT: Duration = Duration::from_secs(60);
+
+/// How long a connection attempt may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The first wait between reconnection attempts after the immediate one. Each
+/// wait doubles it, up to [`BACKOFF_CEILING`].
+const BACKOFF_FIRST: Duration = Duration::from_millis(250);
+
+/// The longest wait between reconnection attempts.
+const BACKOFF_CEILING: Duration = Duration::from_secs(4);
+
+/// How long, after logging in again, the client waits for the server to offer
+/// the interrupted game back before it takes that game as over.
+const RESUME_WAIT: Duration = Duration::from_secs(30);
 
 /// How often a blocked read gives the session's thread back, to send the
 /// keep-alive and to look at the shutdown flag.
@@ -117,12 +156,12 @@ impl SettingsError {
 /// Where to connect and who to log in as, read at start-up from the
 /// environment.
 ///
-/// The password is held only until `LOGIN` is sent, and is then overwritten:
-/// re-login after a dropped connection is not implemented, so nothing needs it
-/// afterwards. The variable itself is removed from the process environment as
-/// it is read, so no child process and no later reader of the environment
-/// table sees it; the copy the kernel placed in the process's initial stack at
-/// `exec` is outside this program's reach.
+/// The password is held in memory for as long as the client runs, since every
+/// reconnection logs in with it again, and is overwritten when the settings are
+/// dropped. It is never logged. The variable itself is removed from the
+/// process environment as it is read, so no child process and no later reader
+/// of the environment table sees it; the copy the kernel placed in the
+/// process's initial stack at `exec` is outside this program's reach.
 pub struct CsaSettings {
     host: OsString,
     port: u16,
@@ -176,6 +215,24 @@ impl CsaSettings {
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
         })
+    }
+}
+
+impl Drop for CsaSettings {
+    fn drop(&mut self) {
+        self.password.fill(0);
+        std::hint::black_box(&self.password);
+    }
+}
+
+/// The wait before reconnection attempt `attempt`, counted from 0: none for
+/// the first, then [`BACKOFF_FIRST`] doubling to [`BACKOFF_CEILING`].
+fn backoff(attempt: u32) -> Duration {
+    match attempt {
+        0 => Duration::ZERO,
+        n => BACKOFF_FIRST
+            .saturating_mul(1 << (n - 1).min(16))
+            .min(BACKOFF_CEILING),
     }
 }
 
@@ -395,6 +452,19 @@ pub struct CsaEngine {
     wire: Arc<Wire<TcpStream>>,
     engine: Engine<CsaSink>,
     session: Session,
+    /// Connection attempts since the client was last logged in, which the
+    /// wait before the next one grows with.
+    attempts: u32,
+    /// The client has been logged in before on an earlier connection.
+    relogin: bool,
+}
+
+/// How serving one connection ended.
+enum Served {
+    /// The session is over: logged out, or ended by the server.
+    Done,
+    /// The connection was lost, and is to be made again.
+    Lost,
 }
 
 impl CsaEngine {
@@ -419,6 +489,8 @@ impl CsaEngine {
             wire,
             engine,
             session: Session::new(BuildRules::COMPILED),
+            attempts: 0,
+            relogin: false,
         })
     }
 
@@ -432,6 +504,11 @@ impl CsaEngine {
     /// A `SIGTERM` between games logs out and returns. During a game — or once
     /// a game has been agreed to — the game is played to its end first, and
     /// the client logs out as soon as it is over.
+    ///
+    /// The first connection failing, or the first `LOGIN` refused, ends the
+    /// session with an error. A connection lost after that is made again, for
+    /// as long as a game is in progress or no `SIGTERM` has come; one lost with
+    /// no game in progress after a `SIGTERM` ends the session.
     pub fn run(mut self) -> io::Result<()> {
         install_sigterm_handler()?;
         // This thread reads the server; it runs where the host keeps its
@@ -439,62 +516,200 @@ impl CsaEngine {
         self.engine.pin_to_shared_cpu();
         self.log().note(&[b"starting ", ENGINE_NAME]);
         self.ready()?;
-        let stream = self.connect()?;
+        let mut stream = self.connect()?;
+        loop {
+            if let Served::Done = self.serve(stream)? {
+                self.engine.finish_search_join();
+                return Ok(());
+            }
+            self.drop_connection();
+            if self.session.phase() == Phase::LoggingOut {
+                self.log().note(&[b"connection closed while logging out"]);
+                return Ok(());
+            }
+            match self.reconnect() {
+                Some(s) => stream = s,
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Log in on `stream` and play over it until the session is over or the
+    /// connection is lost.
+    fn serve(&mut self, stream: TcpStream) -> io::Result<Served> {
         let mut reader = LineReader::new(stream.try_clone()?);
         self.wire.attach(stream);
         let login = self
             .wire
             .send_login(&self.settings.id, &self.settings.password);
-        self.settings.password.fill(0);
-        std::hint::black_box(&self.settings.password);
-        self.settings.password = Vec::new();
-        login?;
+        if let Err(e) = login {
+            write_io_error(self.log(), b"sending LOGIN failed", &e);
+            return self.lost_or(e);
+        }
 
         let mut line = [0u8; LINE_BYTES];
         let mut logout_deadline = None;
+        let mut resume_deadline: Option<Instant> = None;
+        let mut last_received = Instant::now();
         loop {
             if TERM_REQUESTED.load(Ordering::Relaxed)
                 && logout_deadline.is_none()
                 && matches!(self.session.phase(), Phase::LoggingIn | Phase::Waiting)
+                && !self.session.game_in_progress()
             {
                 self.log().note(&[b"SIGTERM: logging out"]);
                 self.session.logging_out();
-                self.wire.send(b"LOGOUT")?;
+                if let Err(e) = self.wire.send(b"LOGOUT") {
+                    return self.lost_or(e);
+                }
                 logout_deadline = Some(Instant::now() + LOGOUT_WAIT);
             }
             if logout_deadline.is_some_and(|d| Instant::now() >= d) {
                 self.log().note(&[b"no answer to LOGOUT; closing"]);
-                return Ok(());
+                return Ok(Served::Done);
             }
-            match reader.next(&mut line)? {
-                Received::Line(len, at) => {
+            self.watch_resumption(&mut resume_deadline);
+            if self.wire.is_broken() {
+                self.log().note(&[b"a write to the server failed"]);
+                return Ok(Served::Lost);
+            }
+            match reader.next(&mut line) {
+                Ok(Received::Line(len, at)) => {
+                    last_received = at;
                     let text = &line[..len];
                     self.log().line(b'<', &[text]);
                     let step = self.session.on_line(text);
-                    if self.act(step, at)? {
-                        self.engine.finish_search_join();
-                        return Ok(());
+                    match self.act(step, at) {
+                        Ok(Some(served)) => return Ok(served),
+                        Ok(None) => {}
+                        Err(e) => return self.lost_or(e),
                     }
                 }
-                Received::TooLong => self.log().note(&[b"received a line too long to read"]),
-                Received::Idle => {}
-                Received::Closed => {
-                    self.wire.disarm();
-                    self.engine.stop();
-                    self.engine.finish_search_join();
-                    if self.session.phase() == Phase::LoggingOut {
-                        self.log().note(&[b"connection closed"]);
-                        return Ok(());
-                    }
+                Ok(Received::TooLong) => {
+                    last_received = Instant::now();
+                    self.log().note(&[b"received a line too long to read"]);
+                }
+                Ok(Received::Idle) => {}
+                Ok(Received::Closed) => {
                     self.log().note(&[b"the server closed the connection"]);
-                    return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+                    return Ok(Served::Lost);
+                }
+                Err(e) => {
+                    write_io_error(self.log(), b"reading from the server failed", &e);
+                    return Ok(Served::Lost);
                 }
             }
-            if let Err(e) = self.wire.keep_alive(KEEP_ALIVE_IDLE) {
+            if last_received.elapsed() > SILENCE_LIMIT {
+                self.log()
+                    .note(&[b"nothing from the server for too long; the connection is lost"]);
+                return Ok(Served::Lost);
+            }
+            // A blank line before the login is answered would be read as a
+            // malformed `LOGIN`.
+            if self.session.phase() != Phase::LoggingIn
+                && let Err(e) = self.wire.keep_alive(KEEP_ALIVE_IDLE)
+            {
                 write_io_error(self.log(), b"keep-alive failed", &e);
-                return Err(e);
+                return Ok(Served::Lost);
             }
         }
+    }
+
+    /// An error while serving a connection: the connection lost, if a write
+    /// to it failed; the error itself otherwise.
+    fn lost_or(&self, e: io::Error) -> io::Result<Served> {
+        if self.wire.is_broken() {
+            Ok(Served::Lost)
+        } else {
+            Err(e)
+        }
+    }
+
+    /// Start the wait for the interrupted game to be offered back once the
+    /// login is answered, and give the game up when the wait runs out.
+    fn watch_resumption(&mut self, deadline: &mut Option<Instant>) {
+        let waiting =
+            self.session.phase() == Phase::Waiting && self.session.interrupted().is_some();
+        match *deadline {
+            _ if !waiting => *deadline = None,
+            None => *deadline = Some(Instant::now() + RESUME_WAIT),
+            Some(d) if Instant::now() >= d => {
+                self.log_interrupted(b"the server has not offered ", b" back; taking it as over");
+                self.session.abandon_interrupted();
+                *deadline = None;
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// The connection is lost: stop the search, close the connection and
+    /// keep the game it interrupted.
+    fn drop_connection(&mut self) {
+        self.wire.disarm();
+        self.engine.stop();
+        self.engine.finish_search_join();
+        if let Some(stream) = self.wire.detach() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        self.session.connection_lost();
+        if self.session.interrupted().is_some() {
+            self.log_interrupted(b"connection lost during ", b"");
+        } else {
+            self.log()
+                .note(&[b"connection lost with no game in progress"]);
+        }
+    }
+
+    /// Connect again, after the wait the attempts so far call for, until a
+    /// connection is made. `None` when a `SIGTERM` has asked the client to
+    /// stop and no game is in progress.
+    fn reconnect(&mut self) -> Option<TcpStream> {
+        loop {
+            let wait = backoff(self.attempts);
+            let until = Instant::now() + wait;
+            loop {
+                if TERM_REQUESTED.load(Ordering::Relaxed) && !self.session.game_in_progress() {
+                    self.log()
+                        .note(&[b"SIGTERM with no game in progress: not reconnecting"]);
+                    return None;
+                }
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                std::thread::sleep(left.min(Duration::from_millis(100)));
+            }
+            self.attempts = self.attempts.saturating_add(1);
+            let mut bytes = [0u8; 128];
+            let mut out = TextWriter::new(&mut bytes);
+            out.bytes(b"reconnecting: attempt ")
+                .u64(u64::from(self.attempts))
+                .bytes(b", after waiting ")
+                .u64(wait.as_millis() as u64)
+                .bytes(b" ms");
+            self.log().note(&[out.as_bytes()]);
+            if let Ok(stream) = self.connect() {
+                self.relogin = true;
+                return Some(stream);
+            }
+        }
+    }
+
+    /// A note about the interrupted game: `before`, its id and the move it
+    /// stood at, `after`.
+    fn log_interrupted(&self, before: &[u8], after: &[u8]) {
+        let Some(game) = self.session.interrupted() else {
+            return;
+        };
+        let mut bytes = [0u8; 512];
+        let mut out = TextWriter::new(&mut bytes);
+        out.bytes(before)
+            .bytes(b"game ")
+            .bytes(&game.summary.game_id)
+            .bytes(b" after move ")
+            .u64(game.ply() as u64)
+            .bytes(after);
+        self.log().note(&[out.as_bytes()]);
     }
 
     /// The heavy initialisation, before the client logs in, so that the engine
@@ -536,37 +751,70 @@ impl CsaEngine {
 
     /// Open the connection: plain TCP, `TCP_NODELAY` so a move goes out the
     /// moment it is written, and a read timeout so the session's thread wakes
-    /// up regularly. The address is not logged.
+    /// up regularly. Each address the host resolves to is tried in turn, for
+    /// at most [`CONNECT_TIMEOUT`] each. The address is not logged.
     fn connect(&self) -> io::Result<TcpStream> {
         self.log().note(&[b"connecting to the server"]);
         let host = OsStr::to_str(&self.settings.host).unwrap_or_default();
-        let stream = TcpStream::connect((host, self.settings.port)).inspect_err(|e| {
+        let stream = Self::open(host, self.settings.port).inspect_err(|e| {
             write_io_error(self.log(), b"connecting failed", e);
         })?;
-        stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(READ_TIMEOUT))?;
         self.log().note(&[b"connected"]);
         Ok(stream)
     }
 
-    /// Do what `step` asks. Returns whether the session is over.
-    fn act(&mut self, step: Step<'_>, at: Instant) -> io::Result<bool> {
+    fn open(host: &str, port: u16) -> io::Result<TcpStream> {
+        let mut last = io::Error::from(io::ErrorKind::NotFound);
+        for addr in (host, port).to_socket_addrs()? {
+            match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+                Ok(stream) => {
+                    stream.set_nodelay(true)?;
+                    stream.set_read_timeout(Some(READ_TIMEOUT))?;
+                    return Ok(stream);
+                }
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
+    /// Do what `step` asks. Returns how serving the connection ended, if it
+    /// did.
+    fn act(&mut self, step: Step<'_>, at: Instant) -> io::Result<Option<Served>> {
         match step {
             Step::Nothing => {}
-            Step::LoginOk => self.log().note(&[b"logged in"]),
+            Step::LoginOk => {
+                self.attempts = 0;
+                if self.relogin {
+                    self.log().note(&[b"logged in again"]);
+                    self.log_interrupted(b"waiting for the server to offer ", b" back");
+                } else {
+                    self.log().note(&[b"logged in"]);
+                }
+            }
+            Step::LoginRefused if self.relogin => {
+                // `shogi-server` refuses a name it still counts as playing,
+                // until it has noticed the old connection is gone.
+                self.log()
+                    .note(&[b"login refused; the server may still hold the lost connection"]);
+                return Ok(Some(Served::Lost));
+            }
             Step::LoginRefused => {
                 self.log().note(&[b"login refused"]);
                 return Err(io::Error::from(io::ErrorKind::PermissionDenied));
             }
             Step::LoggedOut => {
                 self.log().note(&[b"logged out"]);
-                return Ok(true);
+                return Ok(Some(Served::Done));
             }
             Step::Offered { limit, rule } => {
                 self.log_offer();
                 self.log_limit(limit);
                 self.log_rule(rule);
-                self.engine.new_game()?;
+                // A game given back keeps what the engine learned in it.
+                if self.log_resumption() != Resumption::Resumes {
+                    self.engine.new_game()?;
+                }
                 let game = self.session.game().expect("an offered game");
                 let mut bytes = [0u8; 512];
                 let mut agree = TextWriter::new(&mut bytes);
@@ -639,7 +887,48 @@ impl CsaEngine {
             }
             Step::Unexpected(_) => self.log().note(&[b"(not expected here; ignored)"]),
         }
-        Ok(false)
+        Ok(None)
+    }
+
+    /// What the offered game is to the interrupted one, and, for the
+    /// interrupted game given back, how the server's statement of it compares
+    /// with what this client remembered.
+    fn log_resumption(&self) -> Resumption {
+        let resumption = self.session.resumption();
+        let (Some(game), Some(old)) = (self.session.game(), self.session.interrupted()) else {
+            return resumption;
+        };
+        let mut bytes = [0u8; 512];
+        let mut out = TextWriter::new(&mut bytes);
+        match resumption {
+            Resumption::Fresh => return resumption,
+            Resumption::Replaces => {
+                out.bytes(b"the server offers another game in place of ")
+                    .bytes(&old.summary.game_id)
+                    .bytes(b", which is over");
+            }
+            Resumption::Resumes => {
+                out.bytes(b"resuming ")
+                    .bytes(&game.summary.game_id)
+                    .bytes(b" after move ")
+                    .u64(game.ply() as u64)
+                    .bytes(b" with the server's clock +")
+                    .u64(game.clock.remaining_units(Color::Black))
+                    .bytes(b" -")
+                    .u64(game.clock.remaining_units(Color::White))
+                    .bytes(b"; this client had move ")
+                    .u64(old.ply() as u64)
+                    .bytes(b", clock +")
+                    .u64(old.clock.remaining_units(Color::Black))
+                    .bytes(b" -")
+                    .u64(old.clock.remaining_units(Color::White));
+                if !game.continues(old) {
+                    out.bytes(b"; the server's moves are not this client's: playing the server's");
+                }
+            }
+        }
+        self.log().note(&[out.as_bytes()]);
+        resumption
     }
 
     /// Search and answer, if the engine owes the server a move.
@@ -896,6 +1185,19 @@ mod tests {
             lines(vec![b"LOGIN:a OK\r\n+77", b"76FU,T1\n\n-33", b"34FU,T2\n"]),
             ["LOGIN:a OK", "+7776FU,T1", "", "-3334FU,T2", "<idle>"]
         );
+    }
+
+    #[test]
+    fn reconnection_starts_at_once_and_backs_off_to_a_ceiling() {
+        let ms: Vec<u128> = (0..8).map(|n| backoff(n).as_millis()).collect();
+        assert_eq!(ms, [0, 250, 500, 1000, 2000, 4000, 4000, 4000]);
+        assert_eq!(backoff(u32::MAX), BACKOFF_CEILING);
+    }
+
+    #[test]
+    fn a_live_server_is_heard_from_well_inside_the_silence_limit() {
+        // Its answer to a keep-alive must have time to arrive.
+        assert!(SILENCE_LIMIT >= KEEP_ALIVE_IDLE + Duration::from_secs(10));
     }
 
     #[test]
