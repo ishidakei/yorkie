@@ -787,6 +787,25 @@ impl Position {
             .count()
     }
 
+    /// How many times the current position has occurred on its line, the
+    /// current state and the position the line was set up from included: `1`
+    /// for a position reached for the first time. Two states are the same
+    /// position when the board, both hands and the side to move are equal.
+    ///
+    /// Neither a look-back window nor a null move bounds the count, and nothing
+    /// is allocated; the cost grows with the length of the line.
+    pub fn occurrences_on_line(&self) -> usize {
+        let mut count = 1;
+        let mut dist = 2;
+        while let Some(state) = self.state_back(dist) {
+            if self.matches_current_state(state) {
+                count += 1;
+            }
+            dist += 2;
+        }
+        count
+    }
+
     /// Yield the history entries after the most-recent prior occurrence of the
     /// current position, oldest-to-newest, so consumers can pair entries with
     /// the moves that produced them by index. Empty if there is no prior
@@ -1643,6 +1662,21 @@ mod tests {
             p.do_move(m);
         }
         assert_eq!(p.position_occurrences(), 1);
+    }
+
+    #[test]
+    fn occurrences_on_line_count_the_setup_position_and_the_current_one() {
+        let mut p = setup_king_shuffle_pos();
+        assert_eq!(p.occurrences_on_line(), 1);
+        for _ in 0..2 {
+            for m in shuffle_cycle() {
+                p.do_move(m);
+            }
+        }
+        assert_eq!(p.occurrences_on_line(), 3);
+        let first = shuffle_cycle()[0];
+        p.do_move(first);
+        assert_eq!(p.occurrences_on_line(), 3);
     }
 
     #[test]

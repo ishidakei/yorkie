@@ -207,6 +207,8 @@ fn book_config(book_moves: i64) -> BookConfig {
         #[cfg(feature = "verbose2")]
         pv_moves: 8,
         flipped_book: false,
+        repetition_ply: 1,
+        ignore_repeated_root: false,
     }
 }
 

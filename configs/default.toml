@@ -287,6 +287,44 @@ ignore_book_ply = true
 # Also probe the mirrored position (`FlippedBook`).
 flipped_book = true
 
+# How far the `.ybb` probe follows the book's own line from each candidate move
+# in search of a repetition draw, in plies, the candidate itself being ply 1.
+#
+# A book whose entries carry values can hold a cycle of waiting moves, all
+# valued near zero, that leads back to a position already reached. When the
+# opponent is the side that completes each repetition, no candidate of ours
+# ever moves into a position the game has seen, so looking one move ahead
+# finds nothing. From each candidate, the probe therefore plays on along the
+# line where both sides take the best-valued legal book move. If that line
+# reaches a repetition draw within this many plies, against the game so far
+# or within the line itself, the candidate is valued as the draw: the value
+# the search gives a repetition draw for the side to move (`draw_value_black`
+# / `draw_value_white`). The line is given up, with the candidate's value kept,
+# when it leaves the book and when a repetition other than a draw (perpetual
+# check, a superior or inferior position) appears on it.
+#
+# A candidate valued as the draw is still compared with the best stored value
+# by the eval-gap filter (`book_eval_diff`) on its stored value, and with the
+# eval floor (`book_eval_*_limit`) on the draw value. Of the moves that pass,
+# it is played only when its draw value beats every other move left, and then
+# with no random draw; otherwise it is dropped and the others are drawn from
+# as usual.
+#
+# `1` follows nothing past the candidate and checks nothing, which is the probe
+# without this measure. An integer from 1 to 64. The yorkie book is not read by
+# it: when that book answers, the `.ybb` probe does not run.
+book_repetition_ply = 16
+
+# Leave the `.ybb` book when the position to move from has already occurred in
+# the game: the move the book gave there last time did not break the cycle, so
+# the search answers instead, and the draw values above steer it. The count
+# covers the whole game of the `position` command, so after a server preamble
+# that returns to the initial position (`5i5h 5a5b 5h5i 5b5a`), the first move
+# of the game proper is a repeated root and is searched. The yorkie book is not
+# affected: it is probed first, and a position it answers never reaches this
+# check.
+book_ignore_repeated_root = true
+
 # ---------------------------------------------------------------------------
 # Search behaviour
 # ---------------------------------------------------------------------------

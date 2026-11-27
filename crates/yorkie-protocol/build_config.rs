@@ -426,6 +426,16 @@ const SCHEMA: &[Spec] = &[
     int("book_pv_moves", "BookPvMoves", 1, 246),
     boolean("ignore_book_ply", "IgnoreBookPly"),
     boolean("flipped_book", "FlippedBook"),
+    int(
+        "book_repetition_ply",
+        "(none: plies of the `.ybb` book's own line followed from each candidate for a repetition draw)",
+        1,
+        64,
+    ),
+    boolean(
+        "book_ignore_repeated_root",
+        "(none: leave the `.ybb` book at a root the game has already reached)",
+    ),
     // --- Search behaviour.
     choice(
         "entering_king_rule",

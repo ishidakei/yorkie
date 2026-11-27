@@ -26,6 +26,7 @@ Stockfish の開発者に帰属します。
 
 - rshogi: <https://github.com/SH11235/rshogi>
 - p2shogi: <https://github.com/pekoshi/p2shogi>
+- Nagisa: <https://github.com/keinoda/YaneuraOu>
 
 ## 対応環境
 
@@ -384,6 +385,8 @@ TOML ファイルを参照してください。
 | `book_pv_moves` | 整数 | 1〜246 | 定跡から出力する PV の手数 |
 | `ignore_book_ply` | 真偽値 | `true` / `false` | 定跡照合時に手数を無視する |
 | `flipped_book` | 真偽値 | `true` / `false` | 左右反転した局面も定跡照合する |
+| `book_repetition_ply` | 整数 | 1〜64 | `.ybb` の定跡で、各候補手から定跡の手順をたどる手数（候補手を 1 手目と数える）。双方が定跡で評価値の最もよい合法手を指す手順をこの手数までたどり、対局中の局面または手順の中の局面と同じ局面が現れて千日手（引き分け）になれば、その候補手の評価値を、探索が手番側から見た千日手に与える値（`draw_value_black` / `draw_value_white`）に置き換える。手順が定跡から外れたとき、または千日手以外の同一局面（連続王手の千日手、優等局面、劣等局面）が現れたときは、置き換えずにたどるのをやめる。置き換えた候補手は、評価値の許容差（`book_eval_diff` など）では元の評価値で、評価値の下限（`book_eval_black_limit` / `book_eval_white_limit`）では置き換えた値で判定する。残った候補手の中で置き換えた値がほかのどの手の評価値よりも高いときだけ、抽選せずにその手を指し、そうでなければその手を候補から外す。`1` は候補手より先をたどらず、何も判定しない。yorkie 定跡はこの値を読まない |
+| `book_ignore_repeated_root` | 真偽値 | `true` / `false` | 指す局面が対局中にすでに現れていれば `.ybb` の定跡を使わず、探索で指す。数えるのは `position` コマンドの対局全体なので、平手初期局面に戻る手順（たとえば `5i5h 5a5b 5h5i 5b5a`）を対局の前に指す大会では、そのあとの最初の手を探索で指す。yorkie 定跡はこの値を読まない |
 | `entering_king_rule` | 文字列 | `NoEnteringKing` / `CSARule24` / `CSARule24H` / `CSARule27` / `CSARule27H` / `TryRule` | 入玉宣言勝ちのルール |
 | `depth_limit` | 整数 | 0〜2147483647 | 探索深さの上限（0 = 無制限）。`verbose2` のあるビルドでのみ効き、それのないビルドは深さの上限を持たない（時間と `stop` だけで探索を打ち切る）ため、`0` 以外を書いた config はビルドエラーになる |
 | `nodes_limit` | 整数 | 0〜9223372036854775807 | 探索ノード数の上限（0 = 無制限）。`depth_limit` と同じく `verbose2` のあるビルドでのみ効き、それのないビルドでは `0` 以外を書くとビルドエラーになる |

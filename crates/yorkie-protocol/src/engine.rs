@@ -327,6 +327,8 @@ const BOOK_CONFIG: BookConfig = BookConfig {
     #[cfg(feature = "verbose2")]
     pv_moves: crate::config::BOOK_PV_MOVES,
     flipped_book: crate::config::FLIPPED_BOOK,
+    repetition_ply: crate::config::BOOK_REPETITION_PLY as u16,
+    ignore_repeated_root: crate::config::BOOK_IGNORE_REPEATED_ROOT,
 };
 
 /// The reference `USIEngine::to_cp`: `100 * v / NormalizeToPawnValue`, with

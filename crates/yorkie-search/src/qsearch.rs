@@ -1246,6 +1246,16 @@ const DRAW_CONTEMPT_BLACK: Value =
 const DRAW_CONTEMPT_WHITE: Value =
     (crate::config::DRAW_VALUE_WHITE * PAWN_VALUE as i64 / 100) as Value;
 
+/// The value a search rooted at a position with `root_us` to move gives a
+/// repetition draw, from `root_us`'s own viewpoint:
+/// `drawValueTable[REPETITION_DRAW][root_us]`.
+pub(crate) const fn root_draw_value(root_us: Color) -> Value {
+    match root_us {
+        Color::Black => DRAW_CONTEMPT_BLACK,
+        Color::White => DRAW_CONTEMPT_WHITE,
+    }
+}
+
 /// A fresh evaluation-noise seed for one game.
 ///
 /// `RandomState`'s keys come from the operating system's randomness, drawn once
@@ -2139,10 +2149,7 @@ impl<N: NetworkParams> QSearch<N> {
             RepetitionState::Draw => {
                 // The magnitude is the root side's compiled contempt; the side
                 // asking only decides its sign.
-                let contempt = match self.root_us {
-                    Color::Black => DRAW_CONTEMPT_BLACK,
-                    Color::White => DRAW_CONTEMPT_WHITE,
-                };
+                let contempt = root_draw_value(self.root_us);
                 if c == self.root_us {
                     contempt
                 } else {

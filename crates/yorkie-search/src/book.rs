@@ -27,7 +27,8 @@
 #[cfg(feature = "verbose1")]
 use yorkie_state::TextWriter;
 use yorkie_state::{
-    Color, Move, PackedSfen, Piece, PieceKind, Position, Square, flip_move16, sfen_pack,
+    Color, HistoryIndex, Move, PackedSfen, Piece, PieceKind, Position, RepetitionState, Square,
+    flip_move16, sfen_pack,
 };
 use yorkie_storage::yorkie_book::WEIGHT_TOTAL;
 use yorkie_storage::{Book, BookMove, YorkieBook};
@@ -189,6 +190,12 @@ pub struct BookConfig {
     pub pv_moves: i64,
     /// `FlippedBook` — also probe the 180°-rotated position on a miss.
     pub flipped_book: bool,
+    /// How many plies of the book's own line each candidate is followed for,
+    /// the candidate itself being ply 1, in search of a repetition draw. `1`
+    /// follows nothing and checks nothing.
+    pub repetition_ply: u16,
+    /// Leave the book when the root position has already occurred in the game.
+    pub ignore_repeated_root: bool,
 }
 
 impl BookConfig {
@@ -322,6 +329,16 @@ pub enum BookDiagnostic {
         before: usize,
         after: usize,
     },
+    /// The book's line from a candidate reaches a repetition draw, so the
+    /// candidate's value is taken as the draw value.
+    RepetitionDraw {
+        mv: Move,
+        book_value: i16,
+        draw_value: i16,
+        ply: u16,
+    },
+    /// The root position has occurred before in the game, so the book is left.
+    RepeatedRoot { occurrences: usize },
 }
 
 #[cfg(feature = "verbose1")]
@@ -365,6 +382,27 @@ impl BookDiagnostic {
                     .u64(*after as u64)
                     .bytes(b" moves.");
             }
+            Self::RepetitionDraw {
+                mv,
+                book_value,
+                draw_value,
+                ply,
+            } => {
+                out.bytes(b"BookRepetition : ");
+                yorkie_state::write_usi_move(*mv, out);
+                out.bytes(b" book_value ")
+                    .i64(i64::from(*book_value))
+                    .bytes(b" -> ")
+                    .i64(i64::from(*draw_value))
+                    .bytes(b" (draw line in ")
+                    .u64(u64::from(*ply))
+                    .bytes(b" plies)");
+            }
+            Self::RepeatedRoot { occurrences } => {
+                out.bytes(b"BookRepetition : root position occurred ")
+                    .u64(*occurrences as u64)
+                    .bytes(b" times in this game, ignoring book.");
+            }
         }
     }
 }
@@ -385,7 +423,13 @@ pub struct BookProbeResult {
 #[derive(Clone, Copy, Debug)]
 struct Candidate {
     mv: Move,
+    /// The value the probe selects by: the stored one, or the draw value when
+    /// the book's line from this move reaches a repetition draw.
     value: i16,
+    /// The stored value, which the eval-gap filter keeps reading.
+    book_value: i16,
+    /// Whether `value` was taken as the draw value.
+    drawn: bool,
     depth: u16,
     count: u16,
 }
@@ -453,6 +497,20 @@ pub fn probe_book(
         return result;
     }
 
+    // A root the game has already reached means the book's answer here did not
+    // break the cycle last time, so the search answers instead. Checked only
+    // once an entry is found, so a miss costs nothing more.
+    if config.ignore_repeated_root {
+        let occurrences = pos.occurrences_on_line();
+        if occurrences >= 2 {
+            #[cfg(feature = "verbose1")]
+            result
+                .diagnostics
+                .push(BookDiagnostic::RepeatedRoot { occurrences });
+            return result;
+        }
+    }
+
     // Legality filter: widen each stored `move16` against the root's legal
     // moves. An entry that does not widen is a subset-violating illegal move and
     // is dropped with a diagnostic.
@@ -464,6 +522,8 @@ pub fn probe_book(
             Some(mv) => candidates.push(Candidate {
                 mv,
                 value: bm.value,
+                book_value: bm.value,
+                drawn: false,
                 depth: bm.depth,
                 count: bm.count,
             }),
@@ -478,6 +538,40 @@ pub fn probe_book(
     }
     if candidates.is_empty() {
         return result;
+    }
+
+    // A cycle of waiting moves inside the book is invisible to a one-ply check
+    // when the opponent is the side that completes each repetition, so each
+    // candidate is followed along the book's own line. This measure, the
+    // repeated-root check above and the selection rule below follow Nagisa.
+    if config.repetition_ply >= 2 {
+        let draw_value =
+            i16::try_from(crate::qsearch::root_draw_value(pos.side_to_move())).unwrap_or(0);
+        let mut work = pos.clone();
+        for c in &mut candidates {
+            let Some(ply) = book_line_draw_ply(
+                books,
+                ignore_book_ply,
+                &mut work,
+                config.flipped_book,
+                c.mv,
+                config.repetition_ply,
+                &mut legal,
+            ) else {
+                continue;
+            };
+            #[cfg(feature = "verbose1")]
+            result.diagnostics.push(BookDiagnostic::RepetitionDraw {
+                mv: c.mv,
+                book_value: c.book_value,
+                draw_value,
+                ply,
+            });
+            #[cfg(not(feature = "verbose1"))]
+            let _ = ply;
+            c.value = draw_value;
+            c.drawn = true;
+        }
     }
 
     // Info lines are built from the post-legality candidate set, before any
@@ -523,7 +617,10 @@ pub fn probe_book(
         });
         candidates.clear();
     } else {
-        let best_value = i64::from(candidates[0].value);
+        // The gap is measured on the stored values, so a move whose value was
+        // taken as a draw does not lift a weak move into the surviving set; the
+        // floor is applied to the values the probe selects by.
+        let best_value = i64::from(candidates[0].book_value);
         #[cfg(feature = "verbose1")]
         let (eval_diff_name, eval_diff) = config.eval_diff_for(stm);
         #[cfg(not(feature = "verbose1"))]
@@ -533,10 +630,11 @@ pub fn probe_book(
         let (limit_name, value_limit2) = config.eval_limit_for(stm);
         #[cfg(not(feature = "verbose1"))]
         let (_, value_limit2) = config.eval_limit_for(stm);
-        let value_limit = value_limit1.max(value_limit2);
         #[cfg(feature = "verbose1")]
         let before = candidates.len();
-        candidates.retain(|c| i64::from(c.value) >= value_limit);
+        candidates.retain(|c| {
+            i64::from(c.book_value) >= value_limit1 && i64::from(c.value) >= value_limit2
+        });
         #[cfg(feature = "verbose1")]
         if candidates.len() != before {
             result.diagnostics.push(BookDiagnostic::EvalFiltered {
@@ -553,11 +651,34 @@ pub fn probe_book(
         return result;
     }
 
+    // A move whose line draws is played only when its draw value beats every
+    // other surviving move, and then without a draw; otherwise it leaves the
+    // set, so the random pick cannot land on a draw a better move avoids.
+    let mut forced = None;
+    if candidates.iter().any(|c| c.drawn) {
+        let best_of = |drawn: bool| {
+            candidates
+                .iter()
+                .filter(|c| c.drawn == drawn)
+                .map(|c| c.value)
+                .max()
+        };
+        match (best_of(true), best_of(false)) {
+            (Some(d), normal) if normal.is_none_or(|n| n < d) => {
+                forced = candidates.iter().copied().find(|c| c.drawn && c.value == d);
+            }
+            _ => candidates.retain(|c| !c.drawn),
+        }
+    }
+
     // Selection: a uniform baseline, refined to an adoption-count-weighted pick
     // when `ConsiderBookMoveCount` is on (with the all-zero-counts => all-ones
     // rule). `forceHit` is never set on this root path.
-    let mut best = candidates[prng.rand(candidates.len() as u64) as usize];
-    if config.consider_move_count_active() {
+    let mut best = match forced {
+        Some(c) => c,
+        None => candidates[prng.rand(candidates.len() as u64) as usize],
+    };
+    if forced.is_none() && config.consider_move_count_active() {
         let sum: u64 = candidates.iter().map(|c| u64::from(c.count)).sum();
         let mut acc: u64 = 0;
         for c in &candidates {
@@ -716,6 +837,56 @@ fn build_yorkie_pv(
         path.push(sfen_pack(&work));
     }
     pv
+}
+
+/// The ply at which the book's own line from `first` reaches a repetition
+/// draw, `first` being ply 1, or `None` when it does not within `limit` plies.
+///
+/// After `first`, each side plays the first legal move of the entry
+/// [`find_in_books`] gives — the best stored value. A position is a repetition
+/// against the whole game behind `pos` as well as the line itself. The walk
+/// gives up without a verdict when the line leaves the book, and when a
+/// repetition other than a draw appears: whether perpetual check or a superior
+/// or inferior position is ever reached depends on choices the line does not
+/// make. `pos` is returned as it was given.
+fn book_line_draw_ply(
+    books: &[Book],
+    ignore_book_ply: bool,
+    pos: &mut Position,
+    flipped: bool,
+    first: Move,
+    limit: u16,
+    legal: &mut Vec<Move>,
+) -> Option<u16> {
+    let mut played = Vec::with_capacity(usize::from(limit));
+    played.push((first, pos.do_move(first)));
+    let mut found = None;
+    loop {
+        match pos.is_repetition_within(0, &HistoryIndex::default()) {
+            RepetitionState::None => {}
+            RepetitionState::Draw => {
+                found = Some(played.len() as u16);
+                break;
+            }
+            _ => break,
+        }
+        if played.len() >= usize::from(limit) {
+            break;
+        }
+        let Some(moves) = find_in_books(books, ignore_book_ply, pos, flipped) else {
+            break;
+        };
+        legal.clear();
+        pos.generate_legal_all(legal);
+        let Some(next) = moves.iter().find_map(|m| widen(legal, m.move16)) else {
+            break;
+        };
+        played.push((next, pos.do_move(next)));
+    }
+    while let Some((mv, undo)) = played.pop() {
+        pos.undo_move(mv, undo);
+    }
+    found
 }
 
 /// The ponder move for `best`: probe the post-`best` position, take its first
@@ -1000,6 +1171,8 @@ mod tests {
             #[cfg(feature = "verbose2")]
             pv_moves: 8,
             flipped_book: false,
+            repetition_ply: 1,
+            ignore_repeated_root: false,
         }
     }
 
@@ -2140,5 +2313,204 @@ mod tests {
             "a game that starts at the position has seen neither support"
         );
         assert_eq!(probe(&["7g7f"], STARTPOS_B), None);
+    }
+
+    // --- Repetition through the book's own lines. ---
+
+    /// The king shuffle that returns the initial board to itself.
+    const KING_CYCLE: [&str; 4] = ["5i5h", "5a5b", "5h5i", "5b5a"];
+
+    /// A book in which the initial position offers `5i5h` (50) and `7g7f`
+    /// (`quiet`), and the line after `5i5h` is the king shuffle, the best move of
+    /// each of its positions, back to the initial position. With `complete`
+    /// unset the book lacks the shuffle's last position, so its line leaves the
+    /// book there.
+    fn king_cycle_book(quiet: i16, complete: bool) -> Book {
+        let mut recs = vec![(
+            sfen_pack(&pos(STARTPOS_B)),
+            1u16,
+            vec![
+                (m16(STARTPOS_B, "5i5h"), 50, 20),
+                (m16(STARTPOS_B, "7g7f"), quiet, 20),
+            ],
+        )];
+        let steps = if complete { 3 } else { 2 };
+        for n in 1..=steps {
+            let (p, _) = walk(STARTPOS_B, &KING_CYCLE[..n]);
+            let mv = parse_usi_move(KING_CYCLE[n], &p).expect("legal").move16();
+            let value = if n % 2 == 0 { 50 } else { -50 };
+            recs.push((sfen_pack(&p), p.ply(), vec![(mv, value, 20)]));
+        }
+        Book::from_memory(build_ybb(&recs)).expect("valid ybb")
+    }
+
+    /// A config whose eval gap keeps both root moves of [`king_cycle_book`].
+    fn cycle_cfg(repetition_ply: u16) -> BookConfig {
+        BookConfig {
+            eval_diff: 30,
+            repetition_ply,
+            ..cfg()
+        }
+    }
+
+    fn picks(book: &Book, root: &Position, c: &BookConfig, seed: u64) -> Option<String> {
+        let mut prng = Prng::new(seed);
+        probe_book(None, one(book), true, root, c, &mut prng)
+            .hit
+            .map(|hit| usi(hit.best))
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_king_cycle_in_the_book_is_avoided_when_another_move_is_left() {
+        let book = king_cycle_book(40, true);
+        let root = pos(STARTPOS_B);
+
+        // Without the look-ahead both moves are drawn from.
+        let old = (1u64..=64)
+            .find(|&seed| picks(&book, &root, &cycle_cfg(1), seed).as_deref() == Some("5i5h"))
+            .expect("some seed draws the king move");
+        assert_eq!(
+            picks(&book, &root, &cycle_cfg(1), old).as_deref(),
+            Some("5i5h"),
+            "the ply limit at 1 is the old probe"
+        );
+
+        // The line after 5i5h is back at the root on ply 4.
+        for seed in (1u64..=64).chain([old]) {
+            assert_eq!(
+                picks(&book, &root, &cycle_cfg(16), seed).as_deref(),
+                Some("7g7f"),
+                "seed {seed}"
+            );
+            assert_eq!(
+                picks(&book, &root, &cycle_cfg(4), seed).as_deref(),
+                Some("7g7f"),
+                "seed {seed}"
+            );
+        }
+        assert_eq!(
+            picks(&book, &root, &cycle_cfg(3), old).as_deref(),
+            Some("5i5h"),
+            "a line cut off before the draw keeps the value"
+        );
+
+        #[cfg(feature = "verbose1")]
+        {
+            let mut prng = Prng::new(old);
+            let r = probe_book(None, one(&book), true, &root, &cycle_cfg(16), &mut prng);
+            let draw = crate::qsearch::root_draw_value(Color::Black);
+            assert_eq!(
+                r.diagnostics.iter().map(message).collect::<Vec<_>>(),
+                vec![format!(
+                    "BookRepetition : 5i5h book_value 50 -> {draw} (draw line in 4 plies)"
+                )]
+            );
+            let mut prng = Prng::new(old);
+            let r = probe_book(None, one(&book), true, &root, &cycle_cfg(1), &mut prng);
+            assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        }
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_line_that_leaves_the_book_keeps_its_value() {
+        let book = king_cycle_book(40, false);
+        let root = pos(STARTPOS_B);
+        let drawn: Vec<_> = (1u64..=64)
+            .filter_map(|seed| picks(&book, &root, &cycle_cfg(16), seed))
+            .collect();
+        assert!(drawn.iter().any(|m| m == "5i5h"), "{drawn:?}");
+        assert!(drawn.iter().any(|m| m == "7g7f"), "{drawn:?}");
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_draw_better_than_every_other_move_is_played() {
+        // 7g7f is worth less than the draw, so the cycle is the best there is.
+        let book = king_cycle_book(-100, true);
+        let root = pos(STARTPOS_B);
+        let c = BookConfig {
+            eval_diff: 99_999,
+            ..cycle_cfg(16)
+        };
+        for seed in 1u64..=16 {
+            assert_eq!(
+                picks(&book, &root, &c, seed).as_deref(),
+                Some("5i5h"),
+                "seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_root_leaves_the_book_only_when_asked() {
+        let book = three_move_book();
+        let (root, _) = walk(STARTPOS_B, &KING_CYCLE);
+        let mut c = cfg();
+        c.eval_diff = 0;
+
+        let mut prng = Prng::new(1);
+        let r = probe_book(None, one(&book), true, &root, &c, &mut prng);
+        assert_eq!(r.hit.map(|hit| usi(hit.best)).as_deref(), Some("7g7f"));
+
+        c.ignore_repeated_root = true;
+        let mut prng = Prng::new(1);
+        let r = probe_book(None, one(&book), true, &root, &c, &mut prng);
+        assert!(r.hit.is_none(), "a repeated root is left to the search");
+        #[cfg(feature = "verbose1")]
+        assert_eq!(
+            r.diagnostics.iter().map(message).collect::<Vec<_>>(),
+            vec!["BookRepetition : root position occurred 2 times in this game, ignoring book."]
+        );
+
+        // A root reached for the first time is answered as before.
+        let mut prng = Prng::new(1);
+        let r = probe_book(None, one(&book), true, &pos(STARTPOS_B), &c, &mut prng);
+        assert_eq!(r.hit.map(|hit| usi(hit.best)).as_deref(), Some("7g7f"));
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn the_yorkie_book_answers_as_before_with_both_measures_on() {
+        // The root has occurred before, and the `.ybb` book has the king cycle
+        // in it, so both measures would act on a `.ybb` answer.
+        let (root, path) = walk(STARTPOS_B, &KING_CYCLE);
+        let ybb = king_cycle_book(40, true);
+        let yorkie = weighted_book(&path);
+        let off = cycle_cfg(1);
+        let on = BookConfig {
+            ignore_repeated_root: true,
+            ..cycle_cfg(16)
+        };
+
+        let mut prng = Prng::new(1);
+        assert!(
+            probe_book(None, one(&ybb), true, &root, &on, &mut prng)
+                .hit
+                .is_none(),
+            "the `.ybb` book alone is left at this root"
+        );
+
+        for seed in 1u64..=32 {
+            let answer = |c: &BookConfig| {
+                let mut prng = Prng::new(seed);
+                let r = probe_book(
+                    Some(&yprobe(&yorkie, &path)),
+                    one(&ybb),
+                    true,
+                    &root,
+                    c,
+                    &mut prng,
+                );
+                #[cfg(feature = "verbose1")]
+                assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+                let hit = r.hit.expect("yorkie hit");
+                #[cfg(feature = "verbose1")]
+                assert_eq!(hit.source, BookSource::Yorkie);
+                (usi(hit.best), hit.value, prng.rand(u64::MAX))
+            };
+            assert_eq!(answer(&on), answer(&off), "seed {seed}");
+        }
     }
 }

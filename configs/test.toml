@@ -77,6 +77,8 @@ consider_book_move_count = false
 book_pv_moves = 8
 ignore_book_ply = false
 flipped_book = true
+book_repetition_ply = 1
+book_ignore_repeated_root = false
 
 # ---------------------------------------------------------------------------
 # Search behaviour
